@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,13 +32,30 @@ def _python(script: str, args: list[str]) -> dict[str, str]:
     return dict(line.split("=", 1) for line in output.strip().splitlines())
 
 
+def _disabled_buckets(recipe: Path) -> set[str]:
+    return {
+        bucket
+        for product in yaml.safe_load(recipe.read_text())["products"]
+        if product.get("testmon") is False
+        for bucket in product["test_case"]
+    }
+
+
 def main() -> None:
     """Restore each baseline, run the existing selector, and upload its plan."""
     if os.environ["TARGET_BRANCH"] != "main":
         raise ValueError("Testmon selection requires main")
     platform = os.environ["RECIPE_PLATFORM"]
     generation = f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+    baseline_generation = os.environ.get("TESTMON_GENERATION", "")
     temporary = Path(os.environ["RUNNER_TEMP"])
+    testmon_disabled_buckets = _disabled_buckets(temporary / "unit-tests.yaml")
+    if baseline_generation:
+        # Either checkout can opt out, including when the baseline predates the recipe flag.
+        recipe = (
+            Path("tests/test_utils/recipes") / platform.removeprefix("dgx_") / "unit-tests.yaml"
+        )
+        testmon_disabled_buckets.update(_disabled_buckets(recipe))
     cache_dir = Path("assets_dir/testmon")
     plan = "assets_dir/testmon-plan/plan.json"
     matrix = []
@@ -50,6 +69,10 @@ def main() -> None:
     # Restore sequentially: the path is part of the existing cache version.
     for entry in json.loads(os.environ["BUCKETS"]):
         bucket = entry["bucket"]
+        if bucket in testmon_disabled_buckets:
+            matrix.append({**entry, "mode": "testmon-disabled"})
+            summary.append(f"| `{bucket}` | full (Testmon disabled in recipe) | true |")
+            continue
         logger.info("Selecting %s", bucket)
         identity = _python(
             "testmon_cache.py",
@@ -68,13 +91,27 @@ def main() -> None:
         matched_key = ""
         key_file = temporary / "unit-testmon-matched-key"
         prefix = identity["cache_prefix"]
+        requested_key = prefix + (baseline_generation or f"lookup-{generation}")
         try:
             _actions(
-                "restore", str(cache_dir), f"{prefix}lookup-{generation}", prefix, str(key_file)
+                "restore",
+                str(cache_dir),
+                requested_key,
+                "" if baseline_generation else prefix,
+                str(key_file),
             )
             matched_key = key_file.read_text()
-        except subprocess.CalledProcessError:
-            logger.warning("Testmon cache restore failed for %s", bucket)
+            if baseline_generation and matched_key:
+                manifest = json.loads((cache_dir / "manifest.json").read_text())
+                if (
+                    matched_key != requested_key
+                    or not isinstance(manifest, dict)
+                    or manifest.get("source_sha") != os.environ.get("TESTMON_BASE_SHA")
+                ):
+                    raise ValueError("cache does not match the pinned baseline")
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            logger.warning("Testmon cache restore failed for %s: %s", bucket, error)
+            matched_key = ""
         result = _python(
             "testmon_selector.py",
             [

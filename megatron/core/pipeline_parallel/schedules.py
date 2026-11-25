@@ -10,11 +10,9 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
-from megatron.core.determinism.context import (
-    determinism_context,
-    get_determinism_context,
-)
+from megatron.core.determinism.context import determinism_context, get_determinism_context
 from megatron.core.determinism.trace import get_determinism_trace
+from megatron.core.extensions.te_cuda_graphs import set_te_cuda_graph_current_microbatch
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -30,7 +28,7 @@ from megatron.core.process_groups_config import (
     MultiModuleProcessGroupCollection,
     ProcessGroupCollection,
 )
-from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
+from megatron.core.transformer.cuda_graphs import create_cudagraphs
 from megatron.core.transformer.moe.paged_stash import paged_stash_reset
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
@@ -502,7 +500,7 @@ def forward_step(
     if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
         model.set_is_first_microbatch()
     if current_microbatch is not None:
-        set_current_microbatch(model, current_microbatch)
+        set_te_cuda_graph_current_microbatch(model, current_microbatch)
 
     unwrap_output_tensor = False
     if not isinstance(input_tensor, list):
@@ -862,6 +860,10 @@ def forward_backward_no_pipelining(
         total_num_tokens += num_tokens
 
         if not forward_only:
+            if config.gtp_weight_remat_size > 1:
+                from megatron.core.tensor_parallel.gtp_api import finalize_gtp_forward_counts
+
+                finalize_gtp_forward_counts(model)
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
             del output_tensor
 

@@ -39,7 +39,9 @@ async def _serve() -> None:
             "NCCL handoff across independent worker process groups is not supported"
         )
     engine_class = DynamoDynamicInferenceEngine if disaggregated else DynamicInferenceEngine
-    engine = get_dynamic_inference_engine(engine_class=engine_class)
+    engine = get_dynamic_inference_engine(
+        engine_class=engine_class, disaggregation_role=args.role if disaggregated else None
+    )
 
     replica_group = (
         engine.pg_collection.expt_dp
@@ -83,7 +85,7 @@ def main() -> None:
     )
     args.return_log_probs = True
     args.skip_prompt_log_probs = True
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    set_run_config(inference_cfg_container_from_args(args))
     initialize_runtime_services(args)
     initialize_megatron()
     try:

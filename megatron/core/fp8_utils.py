@@ -748,13 +748,16 @@ def is_first_last_bf16_layer(config: TransformerConfig, layer_no: int):
 def is_mxfp8_output_proj_active(config) -> bool:
     """Return True when the LM-head output projection should run under MXFP8.
 
-    Active when ``fp8_output_proj=True``, ``fp8=True``, ``fp8_recipe='mxfp8'``,
-    and Transformer Engine is installed.
+    Active when ``fp8_output_proj=True`` and Transformer Engine is installed, with either
+    ``fp8=True`` and ``fp8_recipe='mxfp8'``, or an FP4 model (``fp4`` set), whose LM head then
+    runs under its own MXFP8 autocast.
     """
     if not HAVE_TE:
         return False
     if not getattr(config, "fp8_output_proj", False):
         return False
+    if getattr(config, "fp4", None):
+        return True
     if not getattr(config, "fp8", False):
         return False
 
@@ -825,6 +828,12 @@ if HAVE_TE:
                 fp8_format=fp8_format,
                 override_linear_precision=(False, False, not config.fp8_wgrad),
             )
+
+        # Set recipe attrs
+        if fp8_recipe is not None and config.fp8_recipe_attrs is not None:
+            for key, val in config.fp8_recipe_attrs.items():
+                setattr(fp8_recipe, key, val)
+
         return fp8_recipe
 
     def get_fp8_recipe_for_a2a(a2a_dtype: str):
@@ -837,7 +846,7 @@ if HAVE_TE:
         communication payload).
 
         Arguments:
-            a2a_dtype (str): Wire dtype, 'bf16' (returns None) or 'mxfp8'.
+            a2a_dtype (str): Wire dtype, 'bf16' (returns None), 'mxfp8' or 'nvfp4'.
         """
         if a2a_dtype == 'bf16':
             return None
@@ -845,6 +854,8 @@ if HAVE_TE:
             return transformer_engine.common.recipe.MXFP8BlockScaling(
                 fp8_format=transformer_engine.common.recipe.Format.E4M3
             )
+        if a2a_dtype == 'nvfp4':
+            return transformer_engine.common.recipe.NVFP4BlockScaling()
         raise ValueError(f"Unsupported a2a wire dtype: {a2a_dtype!r}.")
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
@@ -1043,6 +1054,10 @@ if HAVE_TE:
         module.forward = padded_forward
         _fp8_inference_wrapped_modules.add(module)
 
+    def is_wrapped_for_fp8_inference(module: torch.nn.Module) -> bool:
+        """Whether prepare_model_for_fp8_inference padded this module's sequence dim (dim 0)."""
+        return module in _fp8_inference_wrapped_modules
+
     def prepare_model_for_fp8_inference(model):
         """Prepare a model for FP8 inference by wrapping TE linear layers with padding support.
 
@@ -1065,6 +1080,10 @@ if HAVE_TE:
         return model
 
 else:
+
+    def is_wrapped_for_fp8_inference(module: torch.nn.Module) -> bool:
+        """Without TE no module is wrapped for FP8 inference."""
+        return False
 
     def prepare_model_for_fp8_inference(model):
         """If trys using prepare_model_for_fp8_inference without TE we error"""

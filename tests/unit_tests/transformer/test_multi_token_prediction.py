@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import itertools
 import os
@@ -25,6 +25,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -33,7 +34,6 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -75,13 +75,14 @@ from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     initialize_runtime_services,
     set_args,
     set_run_config,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
@@ -365,6 +366,33 @@ class TestMultiTokenPredictionLayer:
         for peer_mixed in gathered[1:]:
             torch.testing.assert_close(peer_mixed, gathered[0])
         assert torch.unique(gathered[0][..., 0]).numel() > 1
+
+    def test_hsm_rng_differs_across_gtp_data_lanes(self):
+        """GTP ranks carry distinct microbatches and must draw independent HSM masks."""
+        gtp = 2
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size < gtp or world_size % gtp:
+            pytest.skip(f"GTP={gtp} requires a world size divisible by {gtp}")
+        Utils.initialize_model_parallel(gtp_remat_size=gtp)
+        model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['dp', 'gtp_remat']
+        )
+        rng_tracker_name = _initialize_hidden_state_mixing_rng_tracker(
+            pg_collection.dp, pg_collection.gtp_remat
+        )
+
+        history = [
+            torch.full((32, 2, 4), value, dtype=torch.float32, device="cuda")
+            for value in (1.0, 2.0, 3.0)
+        ]
+        mixed = _mix_hidden_state_history(
+            torch.stack(history[:-1]), history[-1], rng_tracker_name=rng_tracker_name
+        )
+        gathered = [torch.empty_like(mixed) for _ in range(gtp)]
+        torch.distributed.all_gather(gathered, mixed, group=pg_collection.gtp_remat)
+
+        assert not torch.equal(gathered[0], gathered[1])
 
     def test_hsm_rng_differs_across_sequence_parallel_owners(self):
         """Disjoint TP+CP token shards receive different tracked RNG slices."""
@@ -680,7 +708,13 @@ class TestMultiTokenPredictionLayer:
         mtp_block_spec = get_gpt_mtp_block_spec(
             config=config, spec=transformer_layer_spec, use_transformer_engine=False
         )
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
 
         assert isinstance(mtp, MultiTokenPredictionBlock)
         assert mtp.config.mtp_detach_heads is True
@@ -697,7 +731,13 @@ class TestMultiTokenPredictionLayer:
 
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp, cp=1)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
 
         assert isinstance(mtp, MultiTokenPredictionBlock)
         assert len(mtp.layers) == config.mtp_num_layers
@@ -723,7 +763,13 @@ class TestMultiTokenPredictionLayer:
         torch.manual_seed(_SEED)
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp, cp, use_te=True)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
 
         assert isinstance(mtp, MultiTokenPredictionBlock)
         assert len(mtp.layers) == config.mtp_num_layers
@@ -750,7 +796,13 @@ class TestMultiTokenPredictionLayer:
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(
             tp=1, cp=1, use_te=True, use_repeated_layer=repeated
         )
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'pp']
+            ),
+        )
 
         # Quantization is what would otherwise make TE act on the flag, so ask under it.
         config.fp8 = "hybrid"
@@ -775,7 +827,13 @@ class TestMultiTokenPredictionLayer:
             pytest.skip(f"TP={tp}, CP={cp} requires at least {tp * cp} ranks")
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=tp, cp=cp, use_te=cp > 1)
-        mtp_layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
+        mtp_layer = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        ).layers[0]
         # Only the token-field preprocessing is exercised; no attention forward runs.
         mtp_layer.config.attention_cp_layout = cp_layout
         cp_group = get_context_parallel_group()
@@ -856,7 +914,13 @@ class TestMultiTokenPredictionLayer:
         """Conditioning validity shares the token-ID roll instead of adding an exchange."""
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
-        mtp_layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
+        mtp_layer = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        ).layers[0]
         input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.int64)
         position_ids = torch.arange(input_ids.size(1), dtype=torch.int64).unsqueeze(0)
         hidden_states = torch.randn(input_ids.size(1), 1, config.hidden_size)
@@ -891,7 +955,13 @@ class TestMultiTokenPredictionLayer:
         """Packed CP rolling keeps token IDs and their validity exactly aligned."""
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=cp, use_te=cp > 1)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
         mtp_layer = mtp.layers[0]
         cp_group = get_context_parallel_group() if cp > 1 else None
         cp_rank = torch.distributed.get_rank(group=cp_group) if cp_group is not None else 0
@@ -953,7 +1023,13 @@ class TestMultiTokenPredictionLayer:
         """Test forward passes rolled padding_mask to transformer path."""
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
         mtp_layer = mtp.layers[0]
 
         seq_len = 4
@@ -1017,7 +1093,13 @@ class TestMultiTokenPredictionLayer:
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
         config.mtp_detach_heads = True
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
         mtp_layer = mtp.layers[0]
 
         seq_len = 4
@@ -1066,7 +1148,13 @@ class TestMultiTokenPredictionLayer:
         torch.manual_seed(_SEED)
         config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
         config.sequence_parallel = True
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        )
         mtp_layer = mtp.layers[0]
 
         seq_len = 4
@@ -1114,7 +1202,13 @@ class TestMultiTokenPredictionLayer:
         config.mtp_detach_heads = detach_heads
         # Runs on GPU because _concat_embeddings exercises the (fused) norm and
         # projection kernels; the rest of the MTP transformer layer is stubbed out.
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        ).cuda()
 
         # Replace each MTP transformer layer with an identity so the test isolates
         # gradient flow to the detach logic (not the attention kernels). Must be an
@@ -1195,7 +1289,13 @@ class TestMultiTokenPredictionLayer:
         mtp_block_spec = get_gpt_mtp_block_spec(
             config=config, spec=layer_spec, use_transformer_engine=False
         )
-        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['cp', 'tp', 'pp']
+            ),
+        ).cuda()
 
         vocab_size = 16
         invalid_token_ids = (9, 10)
@@ -1333,6 +1433,60 @@ class TestMultiTokenPredictionLayer:
         assert torch.count_nonzero(hidden_states.grad[seq_len:]) == 0
         assert output_weight.grad is not None
         assert torch.count_nonzero(output_weight.grad) == 0
+
+    @pytest.mark.parametrize(
+        ("normalize_by_main_tokens", "expected_valid_gradient"), [(False, 4.0 / 3.0), (True, 1.0)]
+    )
+    def test_process_mtp_loss_main_token_normalization_is_opt_in(
+        self, normalize_by_main_tokens, expected_valid_gradient
+    ):
+        """The opt-in path leaves MTP as a sum for global main-token finalization."""
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            mtp_normalize_loss_by_main_tokens=normalize_by_main_tokens,
+            calculate_per_token_loss=True,
+            num_layers=2,
+            hidden_size=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+        hidden_states = torch.ones(2 * seq_len, 1, 1, requires_grad=True)
+        mtp_module.MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+
+        result = process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.arange(seq_len).unsqueeze(0),
+            loss_mask=torch.ones(1, seq_len),
+            output_layer=lambda hidden, **kwargs: (hidden, None),
+            output_weight=None,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: logits.squeeze(-1).transpose(0, 1),
+            config=config,
+        )
+        result.sum().backward()
+
+        mtp_grad = hidden_states.grad[seq_len:, 0, 0]
+        expected = torch.tensor(
+            [expected_valid_gradient] * (seq_len - 1) + [0.0], dtype=mtp_grad.dtype
+        )
+        assert torch.allclose(mtp_grad, expected)
+
+    def test_main_token_mtp_normalization_requires_per_token_loss(self):
+        with pytest.raises(
+            ValueError,
+            match="mtp_normalize_loss_by_main_tokens=True requires calculate_per_token_loss=True",
+        ):
+            TransformerConfig(
+                mtp_num_layers=1,
+                mtp_normalize_loss_by_main_tokens=True,
+                calculate_per_token_loss=False,
+                num_layers=2,
+                hidden_size=1,
+                num_attention_heads=1,
+                use_cpu_initialization=True,
+            )
 
     def test_process_mtp_loss_masks_later_steps_after_invalid_input(self):
         """Mask an MTP prediction after its conditioning path reaches an invalid token."""
@@ -1632,13 +1786,13 @@ class TestMTPHiddenStateRollUnderParallelism:
     A hidden state's value encodes the index of the newest token it has consumed:
     the backbone state owning global position ``p`` starts at ``p + 1``, and each
     stubbed MTP layer adds ``1``. A distinct offset per (batch, channel) pair is
-    added so a transposed permute in the flatten/roll/unflatten round trip cannot
-    slip through. ``0`` is therefore never a legitimate value, which keeps it
-    usable as the "no local continuation" sentinel that ``roll_tensor`` writes
-    and hidden-state mixing replaces with the newest entry.
+    added to catch mixing across those axes when rolling the stacked history.
+    ``0`` is never a legitimate value, so it marks unavailable continuations that
+    hidden-state mixing replaces with the newest entry. Contiguous CP and CP=1
+    exchange across SP seams; zigzag CP keeps a local fallback under SP or padding.
 
     Under that encoding the alignment property collapses to one closed form: at
-    depth ``d``, *every* history entry must read ``base(p) + d`` in the slot
+    depth ``d``, every nonzero history entry must read ``base(p) + d`` in the slot
     owning global position ``p``, no matter how many times it was rolled. An
     entry created at depth ``j`` holds ``base(p) + j`` and is rolled ``d - j``
     times, giving ``base(p + d - j) + j == base(p) + d``. A misaligned roll shows
@@ -1648,8 +1802,7 @@ class TestMTPHiddenStateRollUnderParallelism:
     Nothing here needs weights, data, or a real model: a ``SimpleNamespace``
     supplies the attributes ``MultiTokenPredictionBlock.forward`` reads, and the
     sharding is reproduced with the same helpers production uses. Real process
-    groups and CUDA are still required, because ``roll_tensor``'s CP path *is*
-    point-to-point communication.
+    groups and CUDA are still required because the CP/SP paths exchange boundary tokens.
     """
 
     SEQ_LENGTH = 32
@@ -1660,6 +1813,22 @@ class TestMTPHiddenStateRollUnderParallelism:
     # a value still decodes to exactly one (position, batch, channel) triple, which is
     # what lets a cross-channel mix-up be told apart from a plain positional shift.
     CHANNEL_STRIDE = 1000.0
+
+    @classmethod
+    def _hsm_config(cls, tp, cp, sequence_parallel, cp_layout="zigzag"):
+        return TransformerConfig(
+            num_layers=2,
+            hidden_size=cls.HIDDEN_SIZE,
+            num_attention_heads=cls.HIDDEN_SIZE,
+            mtp_num_layers=cls.MTP_NUM_LAYERS,
+            mtp_hsm=True,
+            tensor_model_parallel_size=tp,
+            context_parallel_size=cp,
+            linear_cp_layout=cp_layout,
+            attention_cp_layout=cp_layout,
+            cp_comm_type="all_gather",
+            sequence_parallel=sequence_parallel,
+        )
 
     def setup_method(self, method):
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
@@ -1679,14 +1848,19 @@ class TestMTPHiddenStateRollUnderParallelism:
 
     @classmethod
     def _local_global_positions(
-        cls, cp_group, tp_group, sequence_parallel, cu_seqlens, cu_seqlens_padded=None
+        cls,
+        cp_group,
+        tp_group,
+        sequence_parallel,
+        cu_seqlens,
+        cu_seqlens_padded=None,
+        cp_layout="zigzag",
     ):
         """Return the global token positions this rank owns, in local order.
 
         Reproduces the production sharding: ``get_batch_on_this_cp_rank`` applies the
-        context-parallel layout (per-sequence zigzag, or per-document zigzag when the
-        batch is packed), then the sequence-parallel scatter keeps a contiguous 1/tp
-        slice of what remains (``tensor_parallel.mappings._split_along_first_dim``).
+        requested context-parallel layout, then the sequence-parallel scatter keeps
+        a contiguous 1/tp slice (``tensor_parallel.mappings._split_along_first_dim``).
         """
         positions = torch.arange(cls.SEQ_LENGTH, device="cuda").view(1, cls.SEQ_LENGTH)
         batch = {
@@ -1696,7 +1870,9 @@ class TestMTPHiddenStateRollUnderParallelism:
                 None if cu_seqlens_padded is None else cu_seqlens_padded.view(1, -1)
             ),
         }
-        batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=cp_group)
+        batch = get_batch_on_this_cp_rank(
+            batch, dynamic_cp=False, cp_group=cp_group, use_contiguous_cp=cp_layout == "contiguous"
+        )
         positions = batch["tokens"][0]
         if sequence_parallel:
             positions = positions.chunk(get_pg_size(tp_group))[get_pg_rank(tp_group)]
@@ -1727,7 +1903,13 @@ class TestMTPHiddenStateRollUnderParallelism:
 
     @classmethod
     def _sentinel_mask(
-        cls, global_positions, rolls, cu_seqlens, sequence_parallel, cu_seqlens_padded=None
+        cls,
+        global_positions,
+        rolls,
+        cu_seqlens,
+        sequence_parallel,
+        cu_seqlens_padded=None,
+        local_roll=True,
     ):
         """Slots where the roll legitimately has no continuation to pull in.
 
@@ -1736,7 +1918,7 @@ class TestMTPHiddenStateRollUnderParallelism:
         rule: MTP must not predict across a document boundary however the tokens are
         laid out.
 
-        Under sequence parallelism ``roll_tensor`` exchanges nothing across shards, so
+        Zigzag CP's local roll exchanges nothing across sequence-parallel shards, so
         a second, layout-driven rule applies: a slot is a sentinel whenever its
         continuation is not sitting in the next local slot. That covers the end of the
         shard, and with packed input it also covers the seam inside each document,
@@ -1747,7 +1929,7 @@ class TestMTPHiddenStateRollUnderParallelism:
         mask = global_positions + rolls >= cls._document_end(
             global_positions, cu_seqlens, cu_seqlens_padded
         )
-        if sequence_parallel or cu_seqlens_padded is not None:
+        if local_roll and (sequence_parallel or cu_seqlens_padded is not None):
             local_count = len(global_positions)
             target = torch.arange(local_count, device=global_positions.device) + rolls
             in_shard = target < local_count
@@ -1888,6 +2070,7 @@ class TestMTPHiddenStateRollUnderParallelism:
         sequence_parallel,
         num_depths,
         cu_seqlens_padded=None,
+        local_roll=True,
     ):
         """Assert every candidate, every mix, and every layer input targets the same token."""
         assert len(rolled_history) == num_depths - 1, "HSM should mix at every depth but the first"
@@ -1899,7 +2082,12 @@ class TestMTPHiddenStateRollUnderParallelism:
             for entry_index, entry in enumerate(history):
                 rolls = depth - entry_index
                 sentinel = self._sentinel_mask(
-                    global_positions, rolls, cu_seqlens, sequence_parallel, cu_seqlens_padded
+                    global_positions,
+                    rolls,
+                    cu_seqlens,
+                    sequence_parallel,
+                    cu_seqlens_padded,
+                    local_roll=local_roll,
                 )
                 tolerated = sentinel.view(-1, 1, 1).expand_as(entry) & (entry == 0)
                 report = self._mismatch_report(
@@ -1953,8 +2141,9 @@ class TestMTPHiddenStateRollUnderParallelism:
             (2, 4, True),  # Second CP width, so the property is not pinned to CP=2. Needs 8 ranks.
         ],
     )
+    @pytest.mark.parametrize("cp_layout", ["zigzag", "contiguous"])
     def test_hsm_roll_keeps_every_candidate_on_the_same_target(
-        self, monkeypatch, tp, cp, sequence_parallel, force_oldest_selection
+        self, monkeypatch, tp, cp, sequence_parallel, force_oldest_selection, cp_layout
     ):
         """Rolled HSM candidates must all predict the same token as the newest one."""
         if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
@@ -1963,21 +2152,12 @@ class TestMTPHiddenStateRollUnderParallelism:
         model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
 
         batch_size = 2
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=self.HIDDEN_SIZE,
-            num_attention_heads=self.HIDDEN_SIZE,
-            mtp_num_layers=self.MTP_NUM_LAYERS,
-            mtp_hsm=True,
-            tensor_model_parallel_size=tp,
-            context_parallel_size=cp,
-            sequence_parallel=sequence_parallel,
-        )
+        config = self._hsm_config(tp, cp, sequence_parallel, cp_layout)
         tp_group = get_tensor_model_parallel_group()
         cp_group = get_context_parallel_group()
 
         global_positions = self._local_global_positions(
-            cp_group, tp_group, sequence_parallel, cu_seqlens=None
+            cp_group, tp_group, sequence_parallel, cu_seqlens=None, cp_layout=cp_layout
         )
         assert len(global_positions) == self.SEQ_LENGTH // (cp * (tp if sequence_parallel else 1))
         hidden_states = self._base_values(global_positions, batch_size)
@@ -2003,6 +2183,7 @@ class TestMTPHiddenStateRollUnderParallelism:
             cu_seqlens=None,
             sequence_parallel=sequence_parallel,
             num_depths=self.MTP_NUM_LAYERS,
+            local_roll=cp_layout == "zigzag" and cp > 1,
         )
 
     @pytest.mark.skipif(not HAVE_TE, reason="per-document CP partitioning needs transformer_engine")
@@ -2029,8 +2210,16 @@ class TestMTPHiddenStateRollUnderParallelism:
         ],
     )
     @pytest.mark.parametrize("padded_boundaries", [False, True])
+    @pytest.mark.parametrize("cp_layout", ["zigzag", "contiguous"])
     def test_hsm_roll_respects_packed_document_boundaries(
-        self, monkeypatch, tp, cp, sequence_parallel, force_oldest_selection, padded_boundaries
+        self,
+        monkeypatch,
+        tp,
+        cp,
+        sequence_parallel,
+        force_oldest_selection,
+        padded_boundaries,
+        cp_layout,
     ):
         """With packed input the roll must stop at document ends, never cross them.
 
@@ -2047,16 +2236,7 @@ class TestMTPHiddenStateRollUnderParallelism:
         model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
 
         batch_size = 1
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=self.HIDDEN_SIZE,
-            num_attention_heads=self.HIDDEN_SIZE,
-            mtp_num_layers=self.MTP_NUM_LAYERS,
-            mtp_hsm=True,
-            tensor_model_parallel_size=tp,
-            context_parallel_size=cp,
-            sequence_parallel=sequence_parallel,
-        )
+        config = self._hsm_config(tp, cp, sequence_parallel, cp_layout)
         tp_group = get_tensor_model_parallel_group()
         cp_group = get_context_parallel_group()
 
@@ -2078,7 +2258,7 @@ class TestMTPHiddenStateRollUnderParallelism:
         )
 
         global_positions = self._local_global_positions(
-            cp_group, tp_group, sequence_parallel, cu_seqlens=cu_seqlens
+            cp_group, tp_group, sequence_parallel, cu_seqlens=cu_seqlens, cp_layout=cp_layout
         )
         assert len(global_positions) == self.SEQ_LENGTH // (cp * (tp if sequence_parallel else 1))
         hidden_states = self._base_values(global_positions, batch_size)
@@ -2105,6 +2285,7 @@ class TestMTPHiddenStateRollUnderParallelism:
             cu_seqlens=cu_seqlens,
             sequence_parallel=sequence_parallel,
             num_depths=self.MTP_NUM_LAYERS,
+            local_roll=cp_layout == "zigzag" and cp > 1,
         )
 
     def test_shard_boundary_translation_handles_production_packed_params(self):
@@ -2223,8 +2404,9 @@ class TestMTPHiddenStateRollUnderParallelism:
             (2, 4, True),
         ],
     )
+    @pytest.mark.parametrize("cp_layout", ["zigzag", "contiguous"])
     def test_hsm_roll_respects_genuinely_padded_boundaries(
-        self, monkeypatch, tp, cp, sequence_parallel, force_oldest_selection
+        self, monkeypatch, tp, cp, sequence_parallel, force_oldest_selection, cp_layout
     ):
         """Genuine padding stays aligned in every supported TP/CP/SP layout."""
         if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
@@ -2236,7 +2418,8 @@ class TestMTPHiddenStateRollUnderParallelism:
         tp_group = get_tensor_model_parallel_group()
         cp_group = get_context_parallel_group()
         cu_seqlens = torch.tensor([0, 10, 20], dtype=torch.int32, device="cuda")
-        padded = torch.tensor([0, 16, 32], dtype=torch.int32, device="cuda")
+        # CP1 needs no zigzag chunk alignment, including for odd physical lengths.
+        padded = torch.tensor([0, 15 if cp == 1 else 16, 32], dtype=torch.int32, device="cuda")
         params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
@@ -2245,20 +2428,16 @@ class TestMTPHiddenStateRollUnderParallelism:
             qkv_format='thd',
         )
         positions = self._local_global_positions(
-            cp_group, tp_group, sequence_parallel, cu_seqlens, cu_seqlens_padded=padded
+            cp_group,
+            tp_group,
+            sequence_parallel,
+            cu_seqlens,
+            cu_seqlens_padded=padded,
+            cp_layout=cp_layout,
         )
         batch_size = 2
         hidden_states = self._base_values(positions, batch_size=batch_size)
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=self.HIDDEN_SIZE,
-            num_attention_heads=self.HIDDEN_SIZE,
-            mtp_num_layers=self.MTP_NUM_LAYERS,
-            mtp_hsm=True,
-            tensor_model_parallel_size=tp,
-            context_parallel_size=cp,
-            sequence_parallel=sequence_parallel,
-        )
+        config = self._hsm_config(tp, cp, sequence_parallel, cp_layout)
         rolled_history, mixed_states, layer_inputs, output = self._run_hsm_block(
             monkeypatch,
             config,
@@ -2282,9 +2461,10 @@ class TestMTPHiddenStateRollUnderParallelism:
             sequence_parallel,
             self.MTP_NUM_LAYERS,
             cu_seqlens_padded=padded,
+            local_roll=cp_layout == "zigzag" and cp > 1,
         )
 
-        padding = ((positions >= 10) & (positions < 16)) | (positions >= 26)
+        padding = positions >= self._document_end(positions, cu_seqlens, padded)
         for history, mixed in zip(rolled_history, mixed_states):
             torch.testing.assert_close(mixed[padding], history[-1][padding])
 
@@ -2312,16 +2492,7 @@ class TestMTPHiddenStateRollUnderParallelism:
             cp_group, tp_group, True, cu_seqlens, cu_seqlens_padded=padded
         )
         hidden_states = self._base_values(positions, batch_size=1).requires_grad_()
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=self.HIDDEN_SIZE,
-            num_attention_heads=self.HIDDEN_SIZE,
-            mtp_num_layers=self.MTP_NUM_LAYERS,
-            mtp_hsm=True,
-            tensor_model_parallel_size=tp,
-            context_parallel_size=cp,
-            sequence_parallel=True,
-        )
+        config = self._hsm_config(tp, cp, sequence_parallel=True)
         _, _, _, output = self._run_hsm_block(
             monkeypatch,
             config,
@@ -2371,14 +2542,7 @@ class TestMTPHiddenStateRollUnderParallelism:
         model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
 
         batch_size = 1 if packed else 2
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=self.HIDDEN_SIZE,
-            num_attention_heads=self.HIDDEN_SIZE,
-            mtp_num_layers=self.MTP_NUM_LAYERS,
-            mtp_hsm=True,
-            context_parallel_size=cp,
-        )
+        config = self._hsm_config(1, cp, sequence_parallel=False)
         tp_group = get_tensor_model_parallel_group()
         cp_group = get_context_parallel_group()
 
@@ -2430,36 +2594,22 @@ class TestMTPHiddenStateRollUnderParallelism:
             num_depths=self.MTP_NUM_LAYERS,
         )
 
-    def test_sequence_parallel_shard_boundary_falls_back_to_newest_state(self, monkeypatch):
-        """Make the accepted sequence-parallel degradation explicit.
-
-        ``roll_tensor`` exchanges boundary tokens across CP ranks but not across
-        sequence-parallel shards, so the last slot of every shard loses its
-        continuation and is zero-filled. Those slots are exactly the ones
-        Hidden-state mixing maps back onto the newest entry, which is why the alignment
-        property above still holds. This test pins both halves of that bargain,
-        and pins that the loss is confined to the shard boundary.
-        """
+    @pytest.mark.parametrize("cp", [1, 2])
+    @pytest.mark.parametrize("cp_layout", ["zigzag", "contiguous"])
+    def test_sequence_parallel_shard_boundaries(self, monkeypatch, cp, cp_layout):
+        """Contiguous HSM retains SP continuations; zigzag CP keeps its local fallback."""
         tp = 2
-        if int(os.environ.get("WORLD_SIZE", "1")) < tp:
-            pytest.skip(f"TP={tp} requires at least {tp} ranks")
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp * cp:
+            pytest.skip(f"TP={tp} x CP={cp} requires at least {tp * cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
         model_parallel_cuda_manual_seed(_SEED, force_reset_rng=True)
 
         batch_size = 2
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=self.HIDDEN_SIZE,
-            num_attention_heads=self.HIDDEN_SIZE,
-            mtp_num_layers=2,
-            mtp_hsm=True,
-            tensor_model_parallel_size=tp,
-            sequence_parallel=True,
-        )
+        config = self._hsm_config(tp, cp, sequence_parallel=True, cp_layout=cp_layout)
         tp_group = get_tensor_model_parallel_group()
         cp_group = get_context_parallel_group()
         global_positions = self._local_global_positions(
-            cp_group, tp_group, sequence_parallel=True, cu_seqlens=None
+            cp_group, tp_group, sequence_parallel=True, cu_seqlens=None, cp_layout=cp_layout
         )
         hidden_states = self._base_values(global_positions, batch_size)
 
@@ -2476,19 +2626,12 @@ class TestMTPHiddenStateRollUnderParallelism:
         oldest_after_one_roll, newest = rolled_history[0]
         zeroed = (oldest_after_one_roll == 0).all(dim=-1).all(dim=-1)
 
-        # Exactly one slot per shard is lost: the final one.
-        expected_zeroed = torch.zeros_like(zeroed)
-        expected_zeroed[-1] = True
+        expected_zeroed = global_positions + 1 >= self.SEQ_LENGTH
+        if cp_layout == "zigzag" and cp > 1:
+            expected_zeroed[-1] = True
         torch.testing.assert_close(zeroed, expected_zeroed)
-
-        # On every rank but the last, that slot has a real continuation elsewhere in
-        # the sequence, so the zero is sequence-parallel sharding, not the sequence end.
-        last_global_position = int(global_positions[-1])
-        if get_pg_rank(tp_group) < tp - 1:
-            assert last_global_position + 1 < self.SEQ_LENGTH
-
-        # The fallback restores the target: the mixed state matches the newest entry.
-        torch.testing.assert_close(mixed_states[0][-1], newest[-1])
+        torch.testing.assert_close(oldest_after_one_roll[~zeroed], (hidden_states + 1)[~zeroed])
+        torch.testing.assert_close(mixed_states[0][zeroed], newest[zeroed])
         torch.testing.assert_close(mixed_states[0], hidden_states + 1)
 
 
@@ -2513,6 +2656,7 @@ class TestMultiTokenPrediction:
     ):
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn(
             args.num_experts, args.moe_grouped_gemm, args.qk_layernorm
@@ -2524,9 +2668,7 @@ class TestMultiTokenPrediction:
             config=config,
             transformer_layer_spec=transformer_layer_spec,
             mtp_block_spec=mtp_block_spec,
-            # create_test_args builds args without a tokenizer, so args.vocab_size stays
-            # None; padded_vocab_size is what the training entrypoint passes anyway.
-            vocab_size=args.padded_vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -2762,6 +2904,7 @@ class TestMultiTokenPrediction:
             tmp_path_dist_ckpt / 'test_mtp_model_reconfiguration_model_A'
         ) as ckpt_dir_A:
             set_ckpt_path(ckpt_dir_A)
+            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 gpt_model_ref,
@@ -2785,13 +2928,14 @@ class TestMultiTokenPrediction:
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
                 ModelType.encoder_or_decoder, self.model_provider
             )
+            sync_checkpoint_config(args)
             load_checkpoint(
                 gpt_model, optimizer, opt_param_scheduler, strict=False, restore_training_state=True
             )
             batch["output_ref"] = output_ref
             # Get batch for current CP rank (handles CP tensor splitting)
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch, dynamic_cp=False, cp_group=get_context_parallel_group()
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = gpt_model[0].forward(
@@ -2915,7 +3059,7 @@ class TestMultiTokenPrediction:
 
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         batch = get_batch_on_this_cp_rank(
-            batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            batch, dynamic_cp=False, cp_group=get_context_parallel_group()
         )
         gpt_model, _, _ = setup_model_and_optimizer(
             ModelType.encoder_or_decoder, self.model_provider
@@ -3158,9 +3302,7 @@ class TestMultiTokenPrediction:
             qkv_format='thd',
         )
 
-        rolled, rolled_sum = roll_tensor_precomputed_embeddings(
-            embeddings, packed_seq_params=packed_seq_params
-        )
+        rolled = roll_tensor_precomputed_embeddings(embeddings, packed_seq_params=packed_seq_params)
 
         expected = torch.cat(
             (
@@ -3171,7 +3313,6 @@ class TestMultiTokenPrediction:
             )
         )
         torch.testing.assert_close(rolled, expected)
-        torch.testing.assert_close(rolled_sum, expected.sum())
 
     def test_process_mtp_loss_skips_when_no_labels_and_no_input_ids(self):
         """When labels and input_ids are both None, MTP loss is skipped (early return)."""
@@ -4084,7 +4225,7 @@ class TestMultiTokenPredictionHybrid:
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="contiguous",
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=cp_group,
             additional_layouts=("zigzag",),
             sequence_parallel=tp > 1,
@@ -4316,8 +4457,8 @@ class TestMultiTokenPredictionHybrid:
             assert stack.residual_stream_readout is None
             assert len(stack.layers) == 2
             attention, moe = stack.layers
-            assert attention._get_self_attention_residual_connection(operation="read") is None
-            assert moe._get_mlp_residual_connection(operation="read") is None
+            assert attention._get_residual_connection_for_self_attention(operation="read") is None
+            assert moe._get_residual_connection_for_mlp(operation="read") is None
             assert list(moe.pre_mlp_layernorm.parameters()), "MTP must retain its MoE norm"
             calls = {"attention": [], "norm": []}
             recordings.append((moe, calls))
@@ -4386,6 +4527,7 @@ class TestMultiTokenPredictionHybrid:
         """
         model_parallel_cuda_manual_seed(_SEED)
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
 
         # MTP is configured via unified pattern in hybrid_layer_pattern
@@ -4393,7 +4535,7 @@ class TestMultiTokenPredictionHybrid:
         model = HybridModel(
             config=config,
             hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -4553,6 +4695,7 @@ class TestMultiTokenPredictionHybrid:
             pre_process=False,
             post_process=True,
             hybrid_layer_config_list=None,
+            _has_custom_layers=False,
             position_embedding_type='none',
             decoder=decoder,
             share_embeddings_and_output_weights=False,
@@ -4560,6 +4703,7 @@ class TestMultiTokenPredictionHybrid:
             embedding=None,
             mtp=MTPStub(),
             output_layer=output_layer,
+            lm_head_can_emit_fp32=False,
             training=True,
             compute_language_model_loss=compute_language_model_loss,
             pg_collection=types.SimpleNamespace(
@@ -4898,6 +5042,7 @@ class TestMultiTokenPredictionHybrid:
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_mtp_mamba_model_reconfiguration') as ckpt_dir:
             set_ckpt_path(ckpt_dir)
+            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 mamba_model_ref,
@@ -4925,6 +5070,7 @@ class TestMultiTokenPredictionHybrid:
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )
+            sync_checkpoint_config(args)
             load_checkpoint(
                 mamba_model,
                 optimizer,
@@ -4935,7 +5081,7 @@ class TestMultiTokenPredictionHybrid:
 
             batch["output_ref"] = output_ref
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch, dynamic_cp=False, cp_group=get_context_parallel_group()
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = mamba_model[0].forward(
@@ -4992,6 +5138,55 @@ class TestMultiTokenPredictionHybrid:
                 raise
 
 
+class TestContiguousMTPRoll:
+    """MTP activation rolls use the correct sequence axis, CP/SP groups, and boundaries."""
+
+    @pytest.fixture(scope="class", params=[1, 2], ids=lambda cp: f"tp2-cp{cp}")
+    def groups(self, request):
+        cp = request.param
+        if Utils.world_size < 2 * cp or Utils.world_size % (2 * cp):
+            pytest.skip(f"requires a world size divisible by TP2 x CP{cp}")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=cp)
+        yield get_tensor_model_parallel_group(), get_context_parallel_group()
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("activation", ["embeddings", "hsm"])
+    def test_activation_roll_forward_backward(self, groups, activation):
+        tp, cp = groups
+        full = torch.arange(1, 257, device="cuda", dtype=torch.float32).view(32, 2, 4)
+        full.requires_grad_()
+        params = PackedSeqParams(
+            cu_seqlens_q=torch.tensor([0, 5, 17], dtype=torch.int32, device="cuda"),
+            cu_seqlens_q_padded=torch.tensor([0, 8, 20], dtype=torch.int32, device="cuda"),
+        )
+        expected = torch.zeros_like(full)
+        # Two documents followed by the trailing segment outside the packed metadata.
+        for start, end in ((0, 5), (8, 20), (20, 32)):
+            expected[start : end - 1] = full[start + 1 : end]
+
+        def shard(tensor):
+            local = tensor.chunk(cp.size())[cp.rank()].chunk(tp.size())[tp.rank()]
+            return local.unsqueeze(2).movedim(0, 1) if activation == "hsm" else local
+
+        local = shard(full.detach()).contiguous().requires_grad_()
+        kwargs = dict(
+            cp_group=cp,
+            sp_group=tp,
+            packed_seq_params=params,
+            cp_layout="zigzag" if cp.size() == 1 else "contiguous",
+        )
+        if activation == "hsm":
+            output = mtp_module._roll_hidden_state_history(local, **kwargs)
+        else:
+            output = roll_tensor_precomputed_embeddings(local, **kwargs)
+        torch.testing.assert_close(output, shard(expected), atol=0, rtol=0)
+        assert output.is_contiguous()
+        dout = torch.arange(1, full.numel() + 1, device=full.device).view_as(full).float()
+        expected.backward(dout)
+        output.backward(shard(dout))
+        torch.testing.assert_close(local.grad, shard(full.grad), atol=0, rtol=0)
+
+
 class TestRollTensorWithCPSubgroup:
     """Roll-tensor CP paths on a CP group that is a strict subgroup of WORLD.
 
@@ -5013,7 +5208,8 @@ class TestRollTensorWithCPSubgroup:
         chunks = tensor.chunk(2 * cp_size, dim=dim)
         return torch.cat([chunks[cp_rank], chunks[2 * cp_size - 1 - cp_rank]], dim=dim)
 
-    def test_roll_tensor_cp_boundary_exchange(self, monkeypatch):
+    @pytest.mark.parametrize("dims", [0, 1, -1])
+    def test_roll_tensor_cp_boundary_exchange(self, monkeypatch, dims):
         cp_group = get_context_parallel_group()
         cp_size = cp_group.size()
         cp_rank = torch.distributed.get_rank(group=cp_group)
@@ -5021,28 +5217,32 @@ class TestRollTensorWithCPSubgroup:
         # Spy on the batched P2P launch: every boundary-exchange op must be
         # addressed to the CP communicator, never the default (WORLD) group.
         seen_groups = []
+        calls = []
         real_batch_isend_irecv = torch.distributed.batch_isend_irecv
 
         def spy_batch_isend_irecv(ops):
             seen_groups.extend(op.group for op in ops)
+            calls.append(len(ops))
             return real_batch_isend_irecv(ops)
 
         monkeypatch.setattr(torch.distributed, "batch_isend_irecv", spy_batch_isend_irecv)
 
-        full = torch.arange(2 * 16, dtype=torch.float32, device="cuda").reshape(2, 16)
+        full = torch.arange(16 * 2 * 3, dtype=torch.float32, device="cuda").reshape(16, 2, 3)
+        full = full.movedim(0, dims)
         # Oracle: the documented single-rank semantics on the full sequence.
-        expected_full, _ = roll_tensor(full.clone(), shifts=-1, dims=-1)
-        expected_local = self._cp_shard(expected_full, cp_rank, cp_size)
+        expected_full, _ = roll_tensor(full.clone(), shifts=-1, dims=dims)
+        expected_local = self._cp_shard(expected_full, cp_rank, cp_size, dim=dims)
 
-        local = self._cp_shard(full, cp_rank, cp_size).contiguous()
-        rolled, rolled_sum = roll_tensor(local, shifts=-1, dims=-1, cp_group=cp_group)
+        local = self._cp_shard(full, cp_rank, cp_size, dim=dims).contiguous()
+        rolled, rolled_sum = roll_tensor(local, shifts=-1, dims=dims, cp_group=cp_group)
 
         assert torch.equal(rolled, expected_local)
         assert rolled_sum == expected_local.sum()
         assert seen_groups, "CP boundary exchange must go through batch_isend_irecv"
+        assert len(calls) == 1
         assert all(group is cp_group for group in seen_groups)
 
-    @pytest.mark.parametrize("dims", [-1, 0])
+    @pytest.mark.parametrize("dims", [-1, 0, 1])
     def test_roll_tensor_packed_seq_cp_boundary_exchange(self, monkeypatch, dims):
         cp_group = get_context_parallel_group()
         cp_size = cp_group.size()
@@ -5059,7 +5259,7 @@ class TestRollTensorWithCPSubgroup:
 
         seq_lengths = [8, 16]  # each divisible by 2 * cp_size
         cu_seqlens = torch.tensor([0, 8, 24], dtype=torch.int32, device="cuda")
-        full = torch.arange(2 * 24, dtype=torch.float32, device="cuda").reshape(2, 24)
+        full = torch.arange(2 * 3 * 24, dtype=torch.float32, device="cuda").reshape(2, 3, 24)
 
         packed_seq_params = PackedSeqParams(cu_seqlens_q=cu_seqlens)
         # Oracle: single-rank packed semantics (per-sequence roll) on the full tensor.

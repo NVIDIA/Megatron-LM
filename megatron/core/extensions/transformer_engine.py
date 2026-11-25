@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import functools
 import importlib
 import inspect
 import io
@@ -12,6 +13,7 @@ import pickle
 import re
 import warnings
 from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
@@ -25,6 +27,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedState
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.ops.norm.torch_norm import LayerNormInterface
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_amax_reduction_group,
@@ -34,7 +37,11 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    resolve_gtp_remat_group,
+    warn_global_process_group_fallback,
+)
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import suspend_tensor_observations
@@ -52,7 +59,6 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import is_first_microbatch_tracked
-from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -197,6 +203,9 @@ class TEQuantizationRecipe:
     If no FP8 or FP4 quantization is configured, the recipe is execution
     in high-precision (BF16).
     """
+
+    recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the TE quantization recipe class."""
     custom_recipe_factory: Optional[str] = None
     """The path to a custom recipe factory if a custom Fp4 or Fp8 recipe is configured"""
     fp8_format: str = "e4m3"
@@ -393,6 +402,11 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         else:
             raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
 
+    # Set recipe attrs
+    if quant_recipe is not None and qrecipe.recipe_attrs is not None:
+        for key, val in qrecipe.recipe_attrs.items():
+            setattr(quant_recipe, key, val)
+
     return fp8_model_init(
         enabled=enabled,
         recipe=quant_recipe,
@@ -457,18 +471,38 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
             if qrecipe.fp4_quantization_recipe == Fp4Recipe.nvfp4:
                 quant_recipe = te.common.recipe.NVFP4BlockScaling()
             else:
-                raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp8_quantization_recipe}")
+                raise ValueError(f"Unhandled fp4 recipe: {qrecipe.fp4_quantization_recipe}")
+
+        # Set recipe attrs
+        if quant_recipe is not None and qrecipe.recipe_attrs is not None:
+            for key, val in qrecipe.recipe_attrs.items():
+                setattr(quant_recipe, key, val)
 
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
 
-def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+def _get_fp8_autocast_recipe_for_quant_params(
+    qparams: TEQuantizationParams | None, training: bool
+) -> TEQuantizationRecipe | None:
+    """Return the active module override, or None when it inherits the surrounding context.
+
+    Resolve this before entering any module-specific context. In particular, op-fuser callers
+    need to compare both linears' overrides against the same surrounding autocast state.
+    """
     if qparams is None:
-        return nullcontext()
+        return None
     elif not training and qparams.evaluation_recipe is not None:
-        return _get_fp8_autocast_for_quant_recipe(qparams.evaluation_recipe)
+        recipe = qparams.evaluation_recipe
     else:
-        return _get_fp8_autocast_for_quant_recipe(qparams.training_recipe)
+        recipe = qparams.training_recipe
+    if FP8GlobalStateManager.is_fp8_enabled():
+        return recipe if recipe.override_quantized_autocast else None
+    return recipe if recipe.override_nonquantized_autocast else None
+
+
+def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+    recipe = _get_fp8_autocast_recipe_for_quant_params(qparams, training)
+    return nullcontext() if recipe is None else _get_fp8_autocast_for_quant_recipe(recipe)
 
 
 def _get_should_context_be_quantized_recipe(
@@ -1952,7 +1986,8 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
     raise when set non-default — TE will not support them natively, so they
     would have to be implemented in this subclass, which has not been done yet.
 
-    Active only when ``fp8_output_proj=True`` with ``fp8_recipe='mxfp8'``.
+    Active only when ``fp8_output_proj=True`` with ``fp8_recipe='mxfp8'``, or with an FP4 model,
+    whose LM head runs under its own MXFP8 autocast.
     """
 
     def __init__(
@@ -1981,8 +2016,8 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
 
         if not is_mxfp8_output_proj_active(config):
             raise RuntimeError(
-                "TELMHeadColumnParallelLinear is only valid when fp8_output_proj=True, "
-                "fp8=True, and fp8_recipe='mxfp8'."
+                "TELMHeadColumnParallelLinear is only valid when fp8_output_proj=True, with "
+                "fp8=True and fp8_recipe='mxfp8' or with fp4."
             )
         if keep_master_weight_for_test:
             raise ValueError("TE output projection does not support keep_master_weight_for_test.")
@@ -2056,14 +2091,28 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         input_: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
+        output_dtype: Optional[torch.dtype] = None,
     ):
         """Run TE MXFP8 output projection. Returns ``(output, bias)``."""
         from megatron.core.fp8_utils import get_fp8_context
 
         if weight is not None and weight is not self.weight:
             raise RuntimeError("TE MXFP8 output projection does not support runtime weight.")
+        if output_dtype is not None and output_dtype != input_.dtype:
+            raise ValueError("TE MXFP8 output projection does not support output_dtype.")
 
-        with get_fp8_context(self.config):
+        if self.config.fp4:
+            # An FP4 model has no FP8 context: run the LM head under its own MXFP8 autocast.
+            # MXFP8 needs no amax reduction, so no group is passed.
+            lm_head_context = fp8_autocast(
+                enabled=True,
+                fp8_recipe=te.common.recipe.MXFP8BlockScaling(
+                    fp8_format=te.common.recipe.Format.E4M3
+                ),
+            )
+        else:
+            lm_head_context = get_fp8_context(self.config)
+        with lm_head_context:
             torch.cuda.nvtx.range_push("mxfp8_output_proj_telinear")
             try:
                 output_parallel, output_bias = super().forward(input_)
@@ -2299,6 +2348,11 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
 _te_dpa_supports_softcap = (
     "softcap" in inspect.signature(te.pytorch.DotProductAttention.__init__).parameters
 )
+_te_dpa_supports_no_load_balance = (
+    hasattr(getattr(te.pytorch, "CPLoadBalancingStrategy", None), "NO_LOAD_BALANCE")
+    and "load_balancing_strategy"
+    in inspect.signature(te.pytorch.DotProductAttention.set_context_parallel_group).parameters
+)
 
 
 class TEDotProductAttention(te.pytorch.DotProductAttention):
@@ -2362,22 +2416,23 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
 
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection(
                 tp=get_tensor_model_parallel_group(check_initialized=False),
                 cp=get_context_parallel_group(check_initialized=False),
                 hcp=get_hierarchical_context_parallel_groups(check_initialized=False),
             )
         else:
-            assert hasattr(
-                pg_collection, "tp"
-            ), "TEDotProductAttention pg_collection must have tp pg"
-            assert hasattr(
-                pg_collection, "cp"
-            ), "TEDotProductAttention pg_collection must have cp pg"
-            if cp_comm_type == "a2a+p2p":
-                assert hasattr(
-                    pg_collection, "hcp"
-                ), "TEDotProductAttention pg_collection must have hierarchical cp pg"
+            # ProcessGroupCollection returns None for a group that was never set, so a hasattr
+            # check cannot detect a missing one. cp is only read when context parallelism is on.
+            groups = vars(pg_collection)
+            if groups.get("tp") is None:
+                raise ValueError("TEDotProductAttention pg_collection must have a tp process group")
+            if groups.get("cp") is None and self.config.context_parallel_size > 1:
+                raise ValueError(
+                    "TEDotProductAttention pg_collection must have a cp process group when "
+                    "context_parallel_size > 1"
+                )
         self._tp_group = pg_collection.tp
 
         if is_te_min_version("0.10.0"):
@@ -2409,9 +2464,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                         "hierarchical cp commucation."
                     )
                     extra_kwargs["cp_comm_type"] = "a2a+p2p"
-                    extra_kwargs["cp_group"] = get_hierarchical_context_parallel_groups(
-                        check_initialized=False
-                    )
+                    # The global-group fallbacks and use_mpu_process_groups() carry hcp; a
+                    # collection built for another grid must set it.
+                    if vars(pg_collection).get("hcp") is None:
+                        raise ValueError(
+                            "TEDotProductAttention with cp_comm_type='a2a+p2p' requires "
+                            "pg_collection.hcp (the hierarchical context-parallel groups)"
+                        )
+                    extra_kwargs["cp_group"] = pg_collection.hcp
                 else:
                     extra_kwargs["cp_comm_type"] = cp_comm_type
 
@@ -2514,6 +2574,54 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+        if self.config.attention_cp_layout == "contiguous":
+            self.fused_attention.register_forward_hook(
+                self._make_fused_cp_grad_contiguous, with_kwargs=True
+            )
+            cp_comm_type = cp_comm_type or self.cp_comm_type
+            cp_groups = self.cp_group if isinstance(self.cp_group, list) else [self.cp_group]
+            if any(get_pg_size(group) > 1 for group in cp_groups):
+                if cp_comm_type != "all_gather":
+                    raise ValueError("Contiguous attention CP requires cp_comm_type='all_gather'.")
+                if not _te_dpa_supports_no_load_balance:
+                    raise RuntimeError(
+                        "Contiguous attention CP requires a Transformer Engine build with "
+                        "CPLoadBalancingStrategy.NO_LOAD_BALANCE support."
+                    )
+                if self.attention_type != "self":
+                    raise ValueError("Contiguous attention CP only supports self-attention.")
+            self.set_context_parallel_group(
+                self.cp_group, self.cp_global_ranks, self.cp_stream, cp_comm_type
+            )
+
+    @staticmethod
+    def _make_fused_cp_grad_contiguous(_module, _inputs, kwargs, output):
+        """Work around TE's fused THD all-gather backward ignoring gradient strides."""
+        if (
+            kwargs.get("qkv_layout", "").startswith("t")
+            and kwargs.get("cp_comm_type") == "all_gather"
+            and get_pg_size(kwargs.get("cp_group")) > 1
+        ):
+            output = output[0] if isinstance(output, tuple) else output
+            if output.requires_grad:
+                output.register_hook(lambda grad: grad.contiguous())
+
+    def set_context_parallel_group(
+        self, cp_group, cp_global_ranks, cp_stream, cp_comm_type="p2p", load_balancing_strategy=None
+    ):
+        """Keep TE's partition strategy consistent when a caller rebinds the CP group."""
+        cp_groups = cp_group if isinstance(cp_group, list) else [cp_group]
+        if self.config.attention_cp_layout == "contiguous" and any(
+            get_pg_size(group) > 1 for group in cp_groups
+        ):
+            load_balancing_strategy = te.pytorch.CPLoadBalancingStrategy.NO_LOAD_BALANCE
+        kwargs = {}
+        if load_balancing_strategy is not None:
+            kwargs["load_balancing_strategy"] = load_balancing_strategy
+        super().set_context_parallel_group(
+            cp_group, cp_global_ranks, cp_stream, cp_comm_type, **kwargs
+        )
+
     @contextmanager
     def _temporary_runtime_context_parallel_group(
         self, packed_seq_params: Optional[PackedSeqParams]
@@ -2532,11 +2640,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if runtime_cp_group.size() == 1:
                 # Dynamic CP metadata retains the singleton group, while TE
                 # must see CP disabled for this microbatch.
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+                self.set_context_parallel_group(None, None, None, self.cp_comm_type)
             else:
                 if TEDotProductAttention.cp_stream is None:
                     TEDotProductAttention.cp_stream = torch.cuda.Stream()
-                super().set_context_parallel_group(
+                self.set_context_parallel_group(
                     runtime_cp_group,
                     torch.distributed.get_process_group_ranks(runtime_cp_group),
                     TEDotProductAttention.cp_stream,
@@ -2545,9 +2653,9 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             yield
         finally:
             if original_cp_group is None or original_cp_group.size() == 1:
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+                self.set_context_parallel_group(None, None, None, self.cp_comm_type)
             else:
-                super().set_context_parallel_group(
+                self.set_context_parallel_group(
                     original_cp_group,
                     original_cp_global_ranks,
                     TEDotProductAttention.cp_stream,
@@ -2607,6 +2715,48 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             else {}
         )
         qkv_format = packed_seq_kwargs.get('qkv_format', self.qkv_format)
+
+        if self.config.attention_cp_layout == "contiguous" and get_pg_size(self.cp_group) > 1:
+            if attention_bias is not None:
+                raise ValueError("Contiguous attention CP does not support attention bias.")
+            if qkv_format == "sbhd":
+                if attn_mask_type != AttnMaskType.causal:
+                    raise ValueError(
+                        "Padded contiguous attention CP requires THD sequence metadata."
+                    )
+                # Adapt dense inputs to the THD format required by TE's no-load-balance CP.
+                from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+                    get_full_cu_seqlens,
+                )
+
+                seq_length = query.size(0) * self.cp_group.size()
+                cu_seqlens = get_full_cu_seqlens(1, seq_length, query.device)
+                sample_params = PackedSeqParams(
+                    qkv_format="thd",
+                    cu_seqlens_q=cu_seqlens,
+                    cu_seqlens_kv=cu_seqlens,
+                    cu_seqlens_q_padded=cu_seqlens,
+                    cu_seqlens_kv_padded=cu_seqlens,
+                    max_seqlen_q=seq_length,
+                    max_seqlen_kv=seq_length,
+                    pad_between_seqs=False,
+                )
+                outputs = [
+                    self._forward(
+                        q.contiguous(),
+                        k.contiguous(),
+                        v.contiguous(),
+                        None,
+                        attn_mask_type,
+                        packed_seq_params=sample_params,
+                        num_splits=num_splits,
+                        bf16_backward=bf16_backward,
+                    )
+                    for q, k, v in zip(query.unbind(1), key.unbind(1), value.unbind(1))
+                ]
+                return outputs[0].unsqueeze(1) if len(outputs) == 1 else torch.stack(outputs, dim=1)
+            if qkv_format != "thd":
+                raise ValueError("Contiguous attention CP requires SBHD or THD input.")
 
         attention_bias_kwargs = {}
         if attention_bias is not None:
@@ -2777,6 +2927,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             # The comms between TP and EP group is explicitly handled by MoE token dispatcher.
             # So we disable comms by making TE agnostic of model parallel.
             if pg_collection is None:
+                warn_global_process_group_fallback(type(self).__name__)
                 pg_collection = ProcessGroupCollection.use_mpu_process_groups()
             self._pg_collection = pg_collection
             assert is_expert, "TEGroupedLinear only supports expert parallelism"
@@ -3701,9 +3852,39 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             # Build fused impl and cache recipe lazily on first forward pass.
             # Both are created once and reused — avoids object creation every call.
+            # This recipe cache is a hack (TEFusedMLP does not need
+            # it). Keep it for now for expediency, but future
+            # developers are warned that this should be refactored to
+            # use the model's recipe config like the other TE modules.
             if not hasattr(self, '_recipe'):
                 if os.getenv("FP4_RECIPE", "") == "nvfp4":
                     self._recipe = te.common.recipe.NVFP4BlockScaling()
+                elif os.getenv("FP4_RECIPE", "") == "nvfp4_ue5m3":
+
+                    def _make_nvfp4_ue5m3_quantizer(
+                        role: te.pytorch.QuantizerRole,
+                    ) -> te.pytorch.NVFP4Quantizer:
+                        """Construct NVFP4 quantizer with UE5M3 scales and no per-tensor
+                        scale for activations."""
+                        tensor_type = role.tensor_type if role is not None else None
+                        if not tensor_type:
+                            tensor_type = "input"
+                        with_rht = tensor_type in ("input", "grad_output")
+                        return te.pytorch.NVFP4Quantizer(
+                            scale_dtype=te.pytorch.DType.kFloat8UE5M3,
+                            with_rht=with_rht,
+                            with_post_rht_amax=with_rht,
+                            with_2d_quantization=tensor_type == "weight",
+                            stochastic_rounding=False,
+                            with_random_sign_mask=False,
+                            disable_second_level_scale=tensor_type == "input",
+                        )
+
+                    # Construct custom recipe for NVFP4 with UE5M3 scales
+                    self._recipe = te.common.recipe.CustomRecipe(
+                        qfactory=_make_nvfp4_ue5m3_quantizer
+                    )
+                    self._recipe.enable_cutedsl_fused_grouped_mlp = True
                 else:
                     self._recipe = te.common.recipe.MXFP8BlockScaling()
             recipe = self._recipe
@@ -4026,6 +4207,9 @@ try:
     _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX = (
         "return_argmax" in inspect.signature(parallel_cross_entropy).parameters
     )
+    _TE_FUSED_PARALLEL_CE_GRAD_QUANTIZER = (
+        "grad_quantizer" in inspect.signature(parallel_cross_entropy).parameters
+    )
     current_te_version = get_te_version()
 
     def te_parallel_cross_entropy(
@@ -4035,11 +4219,15 @@ try:
         is_cg_capturable: bool = False,
         overwrite_input: bool = True,
         return_argmax: bool = False,
+        grad_fp8_format: Optional[str] = None,
     ):
         """Wrapper function for TE's Cross Entropy Loss kernel
 
         With ``return_argmax``, returns ``(loss, argmax)``: the argmax of each row over the full
         vocabulary, found by the loss kernel, or None if this TE version cannot return it.
+
+        With ``grad_fp8_format`` ('e4m3' or 'e5m2'), backward returns the gradient of the logits
+        as an MXFP8 tensor in that format, for an MXFP8 LM head.
         """
         parallel_cross_entropy_kwargs = {
             "label_smoothing": 0.0,
@@ -4055,11 +4243,29 @@ try:
             parallel_cross_entropy_kwargs["is_cg_capturable"] = is_cg_capturable
             # According to TE CrossEntropyFunction, ignore_idx defaults to -100
             parallel_cross_entropy_kwargs["ignore_idx"] = -100
+        if grad_fp8_format is not None:
+            parallel_cross_entropy_kwargs["grad_quantizer"] = _mxfp8_grad_quantizer(grad_fp8_format)
         if return_argmax:
             if not _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX:
                 return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs), None
             parallel_cross_entropy_kwargs["return_argmax"] = True
         return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs)
+
+    @functools.lru_cache(maxsize=None)
+    def _mxfp8_grad_quantizer(grad_fp8_format: str):
+        """MXFP8 quantizer (row-wise and column-wise) for the gradient of the logits."""
+        if not _TE_FUSED_PARALLEL_CE_GRAD_QUANTIZER:
+            raise RuntimeError(
+                "An MXFP8 cross entropy gradient (cross_entropy_mxfp8_grad) requires a "
+                "Transformer Engine whose parallel_cross_entropy accepts grad_quantizer."
+            )
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+        fp8_dtypes = {"e4m3": tex.DType.kFloat8E4M3, "e5m2": tex.DType.kFloat8E5M2}
+        if grad_fp8_format not in fp8_dtypes:
+            raise ValueError(f"grad_fp8_format must be 'e4m3' or 'e5m2', got {grad_fp8_format!r}")
+        return MXFP8Quantizer(fp8_dtypes[grad_fp8_format], rowwise=True, columnwise=True)
 
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
@@ -4073,10 +4279,13 @@ def te_cross_entropy(
     cuda_graph_capturable: bool = False,
     overwrite_input: bool = True,
     return_argmax: bool = False,
+    grad_fp8_format: str | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """Adapt TE cross entropy to the backend target signature and required label stride.
 
     With ``return_argmax``, returns ``(loss, argmax)`` as ``te_parallel_cross_entropy`` does.
+    With ``grad_fp8_format``, backward returns an MXFP8 gradient of the logits, as
+    ``te_parallel_cross_entropy`` does.
     """
     if te_parallel_cross_entropy is None:
         raise RuntimeError("Trying to use a TE block when it's not present.")
@@ -4088,6 +4297,7 @@ def te_cross_entropy(
         cuda_graph_capturable,
         overwrite_input=overwrite_input,
         return_argmax=return_argmax,
+        grad_fp8_format=grad_fp8_format,
     )
 
 
@@ -4182,6 +4392,21 @@ else:
     fused_topk_with_score_function_supports_qb = False
     mark_qb_bin_bounds_validated = None
     fused_topk_with_score_function_supports_topk_indices = False
+
+
+@lru_cache(maxsize=1)
+def te_supports_deterministic_moe_aux_loss() -> bool:
+    """Whether the installed TE aux-loss API accepts a deterministic execution request."""
+    if fused_moe_aux_loss is None:
+        return False
+    try:
+        parameter = inspect.signature(fused_moe_aux_loss).parameters.get("deterministic")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 def set_save_original_input(module):

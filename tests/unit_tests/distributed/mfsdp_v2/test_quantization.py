@@ -17,12 +17,14 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     Placements,
+    PrefetchOrder,
+    RuntimePolicy,
     SchedulePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
-    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer import DBuffer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
@@ -238,7 +240,13 @@ def _check_mxfp8_mlp_matches_reference(
             optimizer.zero_grad(set_to_none=True)
             for index, (x, target) in enumerate(zip(step_inputs, step_targets)):
                 # HSDP/HFSDP reduce gradients across DP-outer only on the last microbatch.
-                with microbatch(context, is_last=index == num_microbatches - 1):
+                with context.finalize_gradients(
+                    mode=(
+                        GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+                        if index == num_microbatches - 1
+                        else GradientFinalizationMode.SKIP_OUTER
+                    )
+                ):
                     with te.autocast(recipe=recipe):
                         output = model(x)
                     loss = (output.float() - target.float()).square().mean()
@@ -285,15 +293,18 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements, sha
 @requires_mxfp8
 @pytest.mark.parametrize("placements", _MXFP8_2D_PLACEMENTS)
 @pytest.mark.parametrize("num_microbatches", [1, 3])
+@pytest.mark.parametrize("inner_dp_size", [1, 4])
 def test_mxfp8_mlp_training_on_2d_mesh_matches_reference(
-    distributed_setup, placements, num_microbatches
+    distributed_setup, placements, num_microbatches, inner_dp_size
 ):
     """MXFP8 MLP losses on a 2-D DP mesh track an independently trained unsharded model."""
     world_size = distributed_setup.world_size
-    if world_size < 4 or world_size % 2 != 0:
-        pytest.skip("A 2-D DP mesh requires an even number of at least 4 ranks.")
+    if world_size < 2 * inner_dp_size or world_size % inner_dp_size != 0:
+        pytest.skip("Requires at least two outer ranks and world size divisible by inner DP size.")
     mesh = init_device_mesh(
-        distributed_setup.device.type, (2, world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+        distributed_setup.device.type,
+        (world_size // inner_dp_size, inner_dp_size),
+        mesh_dim_names=("dp_outer", "dp_inner"),
     )
     _check_mxfp8_mlp_matches_reference(distributed_setup, mesh, placements, num_microbatches)
 
@@ -377,7 +388,8 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
         with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
             torch.manual_seed(2026)
             model = _RecomputedMLP(device, use_reentrant)
-        with fully_shard_context(FsdpContext(device=device)):
+        runtime_policy = RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
+        with fully_shard_context(FsdpContext(device=device, runtime_policy=runtime_policy)):
             fully_shard(model.fc1, mesh=mesh, placements=placements)
             fully_shard(model.fc2, mesh=mesh, placements=placements)
             fully_shard(model, mesh=mesh, placements=placements)
@@ -386,6 +398,50 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
         return model, optimizer
 
     _check_recompute_matches_no_recompute(distributed_setup, recipe, build, use_reentrant)
+
+
+@pytest.mark.launch_on_gb200
+@requires_mxfp8
+@pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
+def test_mxfp8_recorded_order_prefetches_rowwise_for_recompute(distributed_setup, use_reentrant):
+    """Checks a recorded order prefetches rowwise planes before each recomputation.
+
+    Backward prefetch gathers only columnwise planes, so without recorded recomputation
+    events the rowwise planes would be gathered on demand.
+    """
+    device = distributed_setup.device
+    if distributed_setup.world_size < 2:
+        pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
+
+    recipe = MXFP8BlockScaling()
+    with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+        model = _RecomputedMLP(device, use_reentrant)
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    runtime_policy = RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
+    with fully_shard_context(FsdpContext(device=device, runtime_policy=runtime_policy)):
+        fully_shard(model.fc1, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+        fully_shard(model.fc2, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+        fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+
+    # Reentrant checkpointing produces gradients only for inputs requiring grad.
+    x = torch.randn(32, 64, dtype=torch.bfloat16, device=device, requires_grad=True)
+
+    def train_step():
+        with te.autocast(recipe=recipe):
+            output = model(x)
+        output.float().square().mean().backward()
+
+    # The first step records the execution order.
+    train_step()
+
+    def check_rowwise_prefetched(module, _args):
+        if is_in_backward():
+            assert _is_rowwise_allocated(module)
+
+    for module in (model.fc1, model.fc2):
+        # Check before FSDP's own hook, so on-demand unsharding cannot satisfy the assertion.
+        module.register_forward_pre_hook(check_rowwise_prefetched, prepend=True)
+    train_step()
 
 
 @pytest.mark.launch_on_gb200

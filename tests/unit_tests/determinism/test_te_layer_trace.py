@@ -186,11 +186,16 @@ def test_production_recompute_closure_restores_microbatch(trace, reentrant):
         get_determinism_context=get_determinism_context,
         determinism_context=determinism_context,
         observe_layer_residuals=lambda *args: None,
+        hybrid_layer_utils=SimpleNamespace(get_custom_layer_type=lambda config: None),
         precision_aware_checkpoint=lambda function, config, group, *args, **kwargs: checkpoint(
             function, *args, use_reentrant=reentrant
         ),
     )
-    forward = isolated_function("megatron/core/recompute.py", "checkpointed_forward", namespace)
+    forward = isolated_function(
+        "megatron/core/activation_policy/recompute/recompute.py",
+        "checkpointed_forward",
+        namespace,
+    )
     inputs, outputs = [], []
     for microbatch in (0, 1):
         tensor = torch.tensor([2.0], requires_grad=True)

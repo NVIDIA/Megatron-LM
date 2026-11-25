@@ -12,6 +12,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.extensions.te_cuda_graphs import set_te_cuda_graph_current_microbatch
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
@@ -28,7 +29,6 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.schedules import set_current_microbatch
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
@@ -66,6 +66,7 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     set_args,
     set_global_variables,
 )
@@ -1140,6 +1141,7 @@ class TestLLaVACudaGraph:
             post_process=True,
             add_encoder=True,
             add_decoder=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -1160,8 +1162,8 @@ class TestLLaVACudaGraph:
         for param in self.llava_model.parameters():
             param.main_grad = torch.zeros_like(param)
 
-        set_current_microbatch(self.llava_model.vision_model, 1)
-        set_current_microbatch(self.llava_model.language_model, 1)
+        set_te_cuda_graph_current_microbatch(self.llava_model.vision_model, 1)
+        set_te_cuda_graph_current_microbatch(self.llava_model.language_model, 1)
 
         # Create test inputs
         batch_size = 2
@@ -1328,17 +1330,35 @@ _unique_buffer_counts = {}
 
 class TestTECudaGraphHelper:
     @pytest.mark.launch_on_gb200
-    @pytest.mark.parametrize("pp_size,cp_size,chunks", [(1, 1, 1), (2, 1, 1), (2, 2, 1), (2, 2, 2)])
+    @pytest.mark.parametrize(
+        "pp_size,cp_size,chunks",
+        [
+            (1, 1, 1),
+            (2, 1, 1),
+            (2, 2, 1),
+            pytest.param(
+                2,
+                2,
+                2,
+                marks=pytest.mark.skipif(
+                    'torch.cuda.is_available() and "GB200" in torch.cuda.get_device_name().upper()',
+                    reason="GB200 CUDA OOM followed by NCCL timeout",
+                ),
+            ),
+        ],
+    )
     def test_scheduler_thd_replay_preserves_pipeline_inputs(
         self, monkeypatch, pp_size, cp_size, chunks
     ):
         """Changing packed microbatch counts must preserve outputs and every gradient."""
+        from megatron.core.extensions.te_cuda_graphs import set_te_cuda_graph_current_microbatch
         from megatron.core.pipeline_parallel.schedules import (
             get_pp_rank_microbatches,
             get_schedule_table,
-            set_current_microbatch,
         )
-        from megatron.core.transformer.cuda_graphs import convert_schedule_table_to_order
+        from megatron.core.transformer.cuda_graphs import (
+            convert_te_cuda_graph_schedule_table_to_order,
+        )
 
         Utils.initialize_model_parallel(
             pipeline_model_parallel_size=pp_size,
@@ -1465,7 +1485,7 @@ class TestTECudaGraphHelper:
                     _, _, warmup, _ = get_pp_rank_microbatches(
                         count, chunks, 2, p2p_communicator=helper.p2p_communicator
                     )
-                    order = convert_schedule_table_to_order(
+                    order = convert_te_cuda_graph_schedule_table_to_order(
                         warmup, chunks, get_schedule_table(count, chunks, 2)
                     )
                     forwards, backwards, pending = [0] * chunks, [0] * chunks, {}
@@ -1475,7 +1495,7 @@ class TestTECudaGraphHelper:
                         if entry > 0:
                             mb = forwards[chunk]
                             forwards[chunk] += 1
-                            set_current_microbatch(models[chunk], mb)
+                            set_te_cuda_graph_current_microbatch(models[chunk], mb)
                             hidden = inputs[chunk, mb].clone().requires_grad_(True)
                             output, _ = layer(
                                 hidden,
@@ -1829,6 +1849,7 @@ class TestPartialCudaGraph:
         **config_kwargs,
     ):
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn(
             config,
@@ -1845,7 +1866,7 @@ class TestPartialCudaGraph:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg_container.tokenizer.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -1867,7 +1888,6 @@ class TestPartialCudaGraph:
         args = parse_args()
         args.num_layers = 4
         args.mtp_num_layers = 1
-        args.vocab_size = 1024
         args.hidden_size = 512
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
@@ -1919,7 +1939,9 @@ class TestPartialCudaGraph:
             setattr(args, key, value)
 
         validate_args(args)
-        set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=False)
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer.vocab_size = 1024
+        set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
     def get_batch(self, seq_length, micro_batch_size, cp_size):
@@ -1994,7 +2016,7 @@ class TestPartialCudaGraph:
                         expected_shape[1] //= args.tensor_model_parallel_size
                     for layer in get_attr_wrapped_model(gpt_model[0], "decoder").layers:
                         if layer._moe_router_in_cuda_graph():
-                            assert layer._cuda_graph_padding_mask_shape == tuple(
+                            assert layer._te_cuda_graph_padding_mask_shape == tuple(
                                 expected_shape
                             ), layer.layer_number
 

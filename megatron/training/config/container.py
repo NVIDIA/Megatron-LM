@@ -1,10 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
+import logging
 import os
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
-from dataclasses import is_dataclass
-from typing import Any, Type, TypeVar
+from dataclasses import is_dataclass, replace
+from typing import Any, Mapping, Type, TypeVar
 
 try:
     import yaml
@@ -15,18 +16,29 @@ except ImportError:
 
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.torch_fully_sharded_data_parallel_config import (
+    TorchFullyShardedDataParallelConfig,
+)
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
     update_num_microbatches,
 )
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
+from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
-from megatron.training.config.dataset_config import DataConfig
+from megatron.training.config.dataset_config import (
+    DataConfig,
+    dataset_family_from_type,
+    resolve_dataset_class,
+)
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
+from megatron.training.config.offline_distillation_config import OfflineDistillationConfig
 from megatron.training.config.resilience_config import (
+    FaultToleranceConfig,
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )
@@ -39,11 +51,31 @@ from megatron.training.config.training_config import (
     TrainingConfig,
     ValidationConfig,
 )
-from megatron.training.config.utils import sanitize_dataclass_config
+from megatron.training.config.utils import (
+    sanitize_dataclass_config,
+    serialize_dataclass,
+    serialize_value,
+)
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
+from megatron.training.datasets.sft_dataset import SFTDatasetConfig
+from megatron.training.models import (
+    BertModelConfig,
+    LLaVAModelConfig,
+    MimoBuildConfig,
+    T5ModelConfig,
+)
+from megatron.training.models.base import ModelConfig
+from megatron.training.models.distillation import DistillationConfig, validate_distillation_student
 
 T = TypeVar("T", bound="ConfigContainerBase")
+logger = logging.getLogger(__name__)
+
+_FROZEN_OPTIMIZER_FLAGS = (
+    "use_distributed_optimizer",
+    "overlap_param_gather",
+    "overlap_param_gather_with_optimizer_step",
+)
+
 
 @dataclass(kw_only=True)
 class ConfigContainerBase:
@@ -83,6 +115,9 @@ class ConfigContainerBase:
         rng = getattr(self, "rng", None)
         if rng is not None:
             rng.finalize_model_config(getattr(self, "model", None))
+        finalize_model = getattr(getattr(self, "model", None), "finalize", None)
+        if callable(finalize_model):
+            finalize_model()
 
     @classmethod
     def from_dict(
@@ -160,84 +195,61 @@ class ConfigContainerBase:
 
         return cls.from_dict(OmegaConf.to_container(conf, resolve=True), mode=mode)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, **section_overrides: Mapping[str, Any]) -> dict[str, Any]:
         """
         Convert the config container to a dictionary.
 
         Also converts any nested dataclasses (both ConfigContainer and regular dataclasses)
         to dictionaries recursively.
 
+        ``section_overrides`` map a section name to the fields whose values the result carries
+        in place of the section's (a checkpoint save records its own directory and format this
+        way). A shallow overlay of the section's own fields: the values are converted like the
+        rest, the section's ``_target_`` is kept, and neither the live config nor the mappings
+        are written. Unknown sections or fields and non-mapping overrides are rejected.
+
         Returns:
             Dictionary representation of this config
         """
-        result = {}
-        result["_target_"] = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
-
-        for f in dataclass_fields(self):
-            if f.name.startswith("_"):
-                continue
-
-            value = getattr(self, f.name)
-            result[f.name] = self._convert_value_to_dict(value)
-
+        sections = {f.name for f in dataclass_fields(self) if not f.name.startswith("_")}
+        unknown = set(section_overrides) - sections
+        if unknown:
+            raise ValueError(
+                f"{self.__class__.__qualname__} has no section named {sorted(unknown)}"
+            )
+        result = serialize_dataclass(self)
+        for name, overrides in section_overrides.items():
+            result[name] = self._overlay_section(name, getattr(self, name), overrides)
         return result
 
     @classmethod
-    def _convert_value_to_dict(cls, value: Any) -> Any:
-        """
-        Recursively convert a value to a dictionary representation.
+    def _overlay_section(cls, name: str, section: Any, overrides: Mapping[str, Any]) -> dict:
+        """The serialized ``section`` with ``overrides`` (field name to value) in place of its
+        own values."""
+        if not isinstance(overrides, Mapping):
+            raise TypeError(
+                f"overrides of section {name!r} must map field names to values, "
+                f"got {type(overrides).__name__}"
+            )
+        if not (is_dataclass(section) and not isinstance(section, type)):
+            raise TypeError(f"section {name!r} is not a dataclass; it takes no overrides")
+        unknown = set(overrides) - {item.name for item in dataclass_fields(section)}
+        if unknown:
+            raise ValueError(f"section {name!r} has no field named {sorted(unknown)}")
+        serialized = serialize_value(section)
+        return {
+            **serialized,
+            **{field: serialize_value(value) for field, value in overrides.items()},
+        }
 
-        Handles:
-        - ConfigContainer instances (using to_dict)
-        - Serializable instances (using as_dict)
-        - Classes which implement a to_cfg_dict method
-        - Regular dataclasses (converting each non-private field)
-        - Lists and tuples (converting each element)
-        - Dictionaries (converting each value)
-        - Other types (kept as-is)
-
-        Args:
-            value: The value to convert
-
-        Returns:
-            The converted value
-        """
-        if isinstance(value, ConfigContainerBase):
-            return value.to_dict()
-        elif isinstance(value, Serializable):
-            return value.as_dict()
-        elif hasattr(value, "to_cfg_dict"):
-            # Allow non-Container classes to implement own custom method
-            return value.to_cfg_dict()
-        elif is_dataclass(value) and not isinstance(value, type):
-            # Handle regular dataclasses
-            result = {}
-
-            # Add _target_ field for instantiation
-            result["_target_"] = f"{value.__class__.__module__}.{value.__class__.__qualname__}"
-
-            # Convert each field, handling nested dataclasses properly
-            for field in dataclass_fields(value):
-                if field.name.startswith("_"):
-                    continue
-
-                field_value = getattr(value, field.name)
-                result[field.name] = cls._convert_value_to_dict(field_value)
-
-            return result
-        elif isinstance(value, (list, tuple)):
-            return [cls._convert_value_to_dict(item) for item in value]
-        elif isinstance(value, dict):
-            return {k: cls._convert_value_to_dict(v) for k, v in value.items()}
-        else:
-            return value
-
-    def to_yaml(self, yaml_path: str) -> None:
+    def to_yaml(self, yaml_path: str, **section_overrides: Mapping[str, Any]) -> None:
         """
         Save the config container to a YAML file.
 
         Args:
             yaml_path: Path where to save the YAML file.
+            section_overrides: Passed to ``to_dict``: fields of the named sections whose values
+                the file carries in place of the section's.
         """
         if not HAVE_YAML:
             raise ImportError(
@@ -245,7 +257,7 @@ class ConfigContainerBase:
                 "Install via `pip install pyyaml`."
             )
 
-        config_dict = self.to_dict()
+        config_dict = self.to_dict(**section_overrides)
 
         with safe_yaml_representers():
             with maybe_msc.open(yaml_path, "w") as f:
@@ -276,13 +288,14 @@ class ConfigContainerBase:
 
         return result
 
+
 @dataclass(kw_only=True)
 class PretrainConfigContainer(ConfigContainerBase):
-    """Top-level container holding all configuration objects."""
+    """Training configuration; requires a model with a non-null transformer config."""
 
     train: TrainingConfig
     validation: ValidationConfig = field(default_factory=ValidationConfig)
-    model: HybridModelConfig | GPTModelConfig
+    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
     data: DataConfig = field(default_factory=DataConfig)
@@ -300,6 +313,68 @@ class PretrainConfigContainer(ConfigContainerBase):
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
+    fault_tolerance: FaultToleranceConfig = field(default_factory=FaultToleranceConfig)
+    distillation: DistillationConfig | None = None
+    """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
+
+    offline_distillation: OfflineDistillationConfig | None = None
+    """Offline logits KD: exactly one of teacher_save or student_load. None disables it."""
+
+    def get_model_world_size(self) -> int:
+        """Return ranks in the model grid, which may be a subset of the launch."""
+        launch_world_size = safe_get_world_size()
+        world_size = (
+            self.model.mimo_llm_world_size if isinstance(self.model, MimoBuildConfig) else None
+        )
+        if world_size is None:
+            world_size = launch_world_size
+        if not 0 < world_size <= launch_world_size:
+            raise ValueError("Training model world size must fit within the global launch")
+        return world_size
+
+    def get_parallel_layout(self, model_world_size: int) -> GTPParallelLayout:
+        """Build the model's parallel layout without discovering the launch environment.
+
+        ``model_world_size`` is the number of ranks assigned to this model, not
+        necessarily the global launch size. Runtime callers resolve it through
+        ``get_model_world_size()``; callers inspecting a hypothetical layout may
+        supply it directly. Transformer CP already includes GTP sequence shards,
+        whereas the layout's CP excludes them.
+        """
+        transformer = self.model.transformer
+        tp = transformer.tensor_model_parallel_size
+        pp = transformer.pipeline_model_parallel_size
+        cp = transformer.context_parallel_size
+        weight_size = transformer.gtp_weight_remat_size
+        if min(tp, pp, cp, weight_size) < 1:
+            raise ValueError("Parallel sizes must be positive")
+        sequence_shards = transformer.gtp_remat_num_sequence_shards
+        if cp % sequence_shards:
+            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
+        return GTPParallelLayout(
+            world_size=model_world_size,
+            tp=tp,
+            pp=pp,
+            cp=cp // sequence_shards,
+            weight_size=weight_size,
+            num_sequence_shards=sequence_shards,
+        )
+
+    def get_data_parallel_size(self) -> int:
+        """Return replica DP, excluding batch partitions within GTP weight groups."""
+        return self.get_parallel_layout(self.get_model_world_size()).dp
+
+    def get_batch_parallel_size(self) -> int:
+        """Return independent batch partitions, including GTP batch shards but not CP."""
+        return self.get_parallel_layout(self.get_model_world_size()).batch_parallel_size
+
+    def _optimizer_with_model_precision(self) -> OptimizerConfig:
+        """Return an optimizer copy with authoritative model precision, without mutation."""
+        precision = {
+            name: getattr(self.model.transformer, name)
+            for name in ("fp16", "bf16", "params_dtype", "fp8_recipe")
+        }
+        return replace(self.optimizer, **precision)
 
     def _resolve_batch_sizes(
         self, batch_parallel_size: int | None = None
@@ -360,10 +435,17 @@ class PretrainConfigContainer(ConfigContainerBase):
             return
         # Iteration-based training.
         if self.train.train_iters:
-            if self.scheduler.lr_decay_iters is None:
+            horizon = self.scheduler.max_steps
+            if horizon is not None:
+                self.scheduler.lr_decay_iters = horizon
+                if self.scheduler.lr_decay_style == "WSD" and self.scheduler.lr_wsd_decay_iters is None:
+                    self.scheduler.lr_wsd_decay_iters = horizon
+            elif self.scheduler.lr_decay_iters is None:
                 self.scheduler.lr_decay_iters = self.train.train_iters
             self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
-            self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
+            self.scheduler.wd_incr_steps = (
+                self.train.train_iters if horizon is None else horizon
+            ) * self.train.global_batch_size
             self.scheduler.wsd_decay_steps = None
             if self.scheduler.lr_wsd_decay_iters is not None:
                 self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
@@ -387,26 +469,72 @@ class PretrainConfigContainer(ConfigContainerBase):
             else:
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 
-
     def validate(self) -> None:
-        """Validate each section, then the RL section against the rest of the run."""
-        self.rl.validate_ddp_config(self.ddp)
-        super().validate()
+        """Validate each section and the cross-config GTP, batch-size, and RL policies."""
+        if self.model is None:
+            raise ValueError("Training requires a model config")
+        if getattr(self.model, "transformer", None) is None:
+            raise ValueError("Training requires model.transformer to be configured")
+        optimizer = self._optimizer_with_model_precision()
+        if self.train.freeze_all_layers:
+            # Resolve aliases on the private copy first: Muon derives its layer-wise path
+            # from use_distributed_optimizer, which the frozen policy then disables.
+            optimizer.finalize_optimizer_config()
+            optimizer = replace(optimizer, **dict.fromkeys(_FROZEN_OPTIMIZER_FLAGS, False))
+        # Every optimizer check sees the policy that will run; the live config stays unchanged.
+        effective = replace(self, optimizer=optimizer)
+        ConfigContainerBase.validate(effective)
+        # Config-only topology checks also run when validating a recipe off-cluster.
+        # Launch world-size checks remain in the runtime parallel-size helpers.
+        transformer = self.model.transformer
+        if (
+            transformer.max_seq_length_per_sample is not None
+            and transformer.max_seq_length_per_sample <= 0
+        ):
+            raise ValueError("model.transformer.max_seq_length_per_sample must be positive")
+        tp = transformer.tensor_model_parallel_size
+        pp = transformer.pipeline_model_parallel_size
+        cp = transformer.context_parallel_size
+        weight_size = transformer.gtp_weight_remat_size
+        if min(tp, pp, cp, weight_size) < 1:
+            raise ValueError("Parallel sizes must be positive")
+        sequence_shards = transformer.gtp_remat_num_sequence_shards
+        if cp % sequence_shards:
+            raise ValueError("Runtime context-parallel size must contain the GTP sequence shards")
+        if isinstance(self.model, MimoBuildConfig) and self.model.mimo_llm_world_size is not None:
+            world_size = self.model.mimo_llm_world_size
+            if world_size <= 0:
+                raise ValueError("MIMO language-model world size must be positive")
+            if world_size % (tp * pp * (cp // sequence_shards) * weight_size):
+                raise ValueError(
+                    "MIMO language-model world size must be divisible by its model parallel size"
+                )
+        if sequence_shards > 1:
+            if self.checkpoint.ckpt_format != "torch_dist":
+                raise ValueError("GTP sequence sharding requires torch_dist checkpoints")
+            if isinstance(self.ddp, TorchFullyShardedDataParallelConfig) or self.ddp.use_megatron_fsdp:
+                raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
+            if self.dist.use_tp_pp_dp_mapping:
+                raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
+        effective._validate_checkpoint()
+        if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
+            raise ValueError("checkpointing save dir must be set to enable fault tolerance")
+        self._validate_distillation()
+        self._validate_offline_distillation()
+        if self.train.freeze_all_layers and transformer.freeze_base_model_for_mtp:
+            raise ValueError("freeze_all_layers cannot be combined with freeze_base_model_for_mtp.")
         global_batch_size, _, _ = self._resolve_batch_sizes()
+        effective._validate_ddp_config()
         self._validate_rl_config(global_batch_size)
-        self.optimizer.validate_run(
+        optimizer.validate_run(
             ddp_config=self.ddp,
-            use_torch_fsdp2=self.dist.use_torch_fsdp2,
+            use_torch_fsdp2=isinstance(self.ddp, TorchFullyShardedDataParallelConfig),
             ckpt_format=self.checkpoint.ckpt_format,
         )
-        # Legacy providers have no model config; their model inputs are checked by the adapter.
-        if self.model is not None:
-            self.optimizer.validate_model(
-                moe_single_grouped_weight=getattr(self.model, "moe_single_grouped_weight", False),
-                virtual_pipeline_model_parallel_size=getattr(
-                    self.model, "virtual_pipeline_model_parallel_size", None
-                ),
-            )
+        optimizer.validate_model(
+            moe_single_grouped_weight=transformer.moe_single_grouped_weight,
+            virtual_pipeline_model_parallel_size=transformer.virtual_pipeline_model_parallel_size,
+        )
         self.scheduler.validate_run(
             train_iters=self.train.train_iters,
             train_samples=self.train.train_samples,
@@ -414,6 +542,152 @@ class PretrainConfigContainer(ConfigContainerBase):
             weight_decay=self.optimizer.weight_decay,
         )
         self._validate_data_section()
+
+    def _validate_distillation(self) -> None:
+        """Check distillation against the student model and training settings.
+
+        Runs after ``super().validate()``, so the teacher config is known to be resolved.
+        """
+        if self.distillation is None:
+            return
+        if self.model is not None:
+            validate_distillation_student(self.distillation, self.model)
+        if self.train.manual_gc:
+            raise ValueError("ModelOpt distillation is incompatible with manual_gc.")
+
+    def _validate_offline_distillation(self) -> None:
+        """Check offline KD against the training, checkpoint, distillation and data sections."""
+        offline_kd_cfg = self.offline_distillation
+        if offline_kd_cfg is None:
+            return
+        if (
+            self.train.rampup_batch_size is not None
+            or self.train.step_batch_size_schedule is not None
+        ):
+            raise ValueError("Offline distillation requires a fixed global batch size.")
+        if offline_kd_cfg.teacher_save is not None:
+            if not self.checkpoint.async_save or not self.checkpoint.use_persistent_ckpt_worker:
+                raise ValueError(
+                    "teacher_save requires checkpoint.async_save and use_persistent_ckpt_worker."
+                )
+        elif self.distillation is not None:
+            raise ValueError("student_load cannot be combined with online ModelOpt distillation.")
+        if self.data.dataset is None:
+            raise ValueError("Offline distillation requires cfg.data.dataset for cache identity.")
+
+    def _validate_checkpoint(self) -> None:
+        """Check the checkpoint format and optimizer policy against the sections that own the
+        other side (ddp, dist, optimizer). Read-only; the CLI runs the same checks from the
+        arguments in ``validate_args``."""
+        checkpoint, ddp, dist = self.checkpoint, self.ddp, self.dist
+        if isinstance(ddp, TorchFullyShardedDataParallelConfig):
+            assert checkpoint.ckpt_format in ('torch_dist', 'torch_dcp'), \
+                '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
+        if checkpoint.ckpt_format == "torch_dcp":
+            assert isinstance(ddp, TorchFullyShardedDataParallelConfig), "--ckpt-format torch_dcp is only tested with FSDP."
+        if ddp.use_megatron_fsdp:
+            assert checkpoint.ckpt_format == "fsdp_dtensor", \
+                "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
+        if checkpoint.ckpt_format == "fsdp_dtensor":
+            assert ddp.use_megatron_fsdp, \
+                "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
+        if (
+            not dist.use_gloo_process_groups
+            and self.optimizer.use_distributed_optimizer
+            and self.optimizer.optimizer in ("sgd", "adam")
+        ):
+            # Legacy checkpointing uses Gloo process groups to collect the full distributed
+            # optimizer state in the CPU memory of DP rank 0. Emerging optimizers resolve to
+            # the layer-wise path at finalize and save their state separately on each rank.
+            assert checkpoint.use_dist_ckpt, (
+                '--use-distributed-optimizer without Gloo process groups requires a distributed '
+                'checkpoint format (--ckpt-format torch_dist, torch_dcp or fsdp_dtensor): the legacy '
+                'torch format gathers the optimizer state through Gloo.'
+            )
+            if checkpoint.dist_ckpt_optim_fully_reshardable:
+                assert not checkpoint.distrib_optim_fully_reshardable_mem_efficient, \
+                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+        if self.optimizer.overlap_param_gather and checkpoint.save is not None:
+            assert checkpoint.save_params_interval is None, \
+                '--save-params-interval is not supported with --overlap-param-gather'
+
+    def _validate_ddp_config(self) -> None:
+        """Check wrapper requirements without deriving or mutating other configs."""
+        # DDP's copy is derived during finalization; recipes only set optimizer policy.
+        if self.optimizer.reuse_grad_buf_for_mxfp8_param_ag and not self.ddp.use_megatron_fsdp:
+            if self.ddp.grad_buffer_offload or self.rl.requires_grad_buffer_offload:
+                raise ValueError(
+                    "Gradient-buffer offload is incompatible with "
+                    "--reuse-grad-buf-for-mxfp8-param-ag: "
+                    "parameters share the gradient-buffer storage that offload releases."
+                )
+            assert self.ddp.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+        transformer = getattr(self.model, "transformer", None)
+        if isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
+            if self.ddp.use_megatron_fsdp:
+                raise ValueError("Torch FSDP2 and Megatron FSDP cannot be used together.")
+            if not is_torch_min_version("2.4.0"):
+                raise ValueError("Torch FSDP2 requires PyTorch >= 2.4.0.")
+            if self.optimizer.use_distributed_optimizer:
+                raise ValueError("Torch FSDP2 cannot use the distributed optimizer.")
+            if self.optimizer.optimizer not in ("sgd", "adam"):
+                raise ValueError("Torch FSDP2 requires the SGD or Adam optimizer.")
+        if self.ddp.use_megatron_fsdp:
+            if self.optimizer.optimizer not in ("sgd", "adam") and not (
+                self.ddp.megatron_fsdp_version == 2 and self.optimizer.optimizer == "muon"
+            ):
+                raise ValueError(
+                    "Megatron FSDP requires the SGD or Adam optimizer, or Muon with MFSDP v2."
+                )
+        if isinstance(self.ddp, TorchFullyShardedDataParallelConfig) or self.ddp.use_megatron_fsdp:
+            if os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS") == "1":
+                raise ValueError("FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.")
+            if transformer is not None and transformer.moe_shortcut_connection:
+                raise ValueError("FSDP does not support MoE shortcut connections.")
+            if transformer is not None and transformer.moe_megakernel_backend == "mok":
+                raise ValueError("MOK has not been validated with FSDP.")
+        if transformer is not None:
+            if self.ddp.fp8_param_gather and not transformer.fp8:
+                raise ValueError("FP8 parameter gathering requires FP8 compute.")
+            if self.ddp.fp4_param_gather and not transformer.fp4:
+                raise ValueError("FP4 parameter gathering requires FP4 compute.")
+            if isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
+                if transformer.pipeline_model_parallel_size != 1:
+                    raise ValueError("Torch FSDP2 does not support pipeline parallelism.")
+                if transformer.expert_model_parallel_size != 1:
+                    raise ValueError("Torch FSDP2 does not support expert parallelism.")
+                if transformer.gradient_accumulation_fusion or transformer.fp16:
+                    raise ValueError("Torch FSDP2 does not support fused accumulation or FP16.")
+                if self.model.share_embeddings_and_output_weights:
+                    raise ValueError("Torch FSDP2 requires untied embeddings and output weights.")
+            if self.ddp.use_megatron_fsdp:
+                if transformer.moe_single_grouped_weight or transformer.moe_single_grouped_bias:
+                    raise ValueError(
+                        "Megatron FSDP does not support single grouped MoE parameters."
+                    )
+                if transformer.dynamic_context_parallel:
+                    raise ValueError("Megatron FSDP does not support dynamic context parallelism.")
+                sharding = {
+                    self.ddp.data_parallel_sharding_strategy,
+                    self.ddp.expert_data_parallel_sharding_strategy
+                    or self.ddp.data_parallel_sharding_strategy,
+                }
+                if transformer.init_model_with_meta_device and sharding == {"no_shard"}:
+                    raise ValueError("Meta-device initialization requires a sharded FSDP strategy.")
+                if "optim_grads_params" in sharding and (
+                    self.train.check_weight_hash_across_dp_replicas_interval is not None
+                ):
+                    raise ValueError(
+                        "Fully sharded parameters do not support DP weight-hash checks."
+                    )
+        if self.ddp.fsdp_manual_registration and not (
+            self.ddp.use_megatron_fsdp
+            and self.ddp.megatron_fsdp_version == 1
+            and self.ddp.nccl_ub
+        ):
+            raise ValueError(
+                "Manual FSDP registration requires Megatron FSDP v1 with NCCL user buffers."
+            )
 
     def _validate_rl_config(self, global_batch_size: int | None) -> None:
         """Check RL policy against the supplied or resolved training batch size."""
@@ -434,54 +708,141 @@ class PretrainConfigContainer(ConfigContainerBase):
             separate_inference_model=None,
         )
 
-    def get_data_parallel_size(self, world_size: int) -> int | None:
-        """The data-parallel size of this run's model layout, or ``None`` without a model config.
+    def _validate_data_section(self) -> None:
+        """Cross-section checks for the data section, placed by their inputs.
 
-        The same quotient as ``validate_args``: ``world_size // (tp * pp * cp * weight-remat)`` with
-        the *configured* context-parallel size. The model config stores the resolved one (configured
-        CP times the GTP sequence shards), so the shards are divided out first; ``GTPParallelLayout``
-        checks the divisions.
+        With a model section, dataset or not: dynamic CP needs the single loader, and a packing
+        scheduler needs per-token loss and ``variable_seq_lengths`` (Core derives the latter at
+        construction; a scheduler selected afterwards must set it). With a dataset: the model capacity covers the sample
+        length, a value given for one of the fields other sections own
+        (``CONTAINER_WRITTEN_FIELDS``) must agree with that section (the container writes them at
+        ``finalize()``; the arguments and the saved file leave them at Megatron Core's defaults),
+        and ``max_seq_length_per_sample`` describes this run's physical input width, not model
+        capacity. Fixed GPT/FIM/SBHD rows must match it; the container fills an unset value from the
+        dataset at ``finalize()``. SFT's physical pack width is derived from that maximum;
+        real SFT retains pack-level truncation without a separate per-conversation limit.
+        With both: SBHD validation excludes a scheduler, a packed varlen dataset needs one, and the
+        sample length is a multiple of ``2 * cp`` under context parallelism. Each is the condition
+        ``validate_args`` enforces on the CLI; here it holds for a Python or YAML container too.
+        ``data_parallel_size`` and the packed-buffer budget need the world size and are checked at
+        ``finalize()``.
         """
         transformer = getattr(self.model, "transformer", None)
-        if transformer is None:
-            return None
-        shards = getattr(transformer, "gtp_remat_num_sequence_shards", 1) or 1
-        resolved_cp = transformer.context_parallel_size
-        if resolved_cp % shards:
-            raise ValueError(
-                f"context_parallel_size ({resolved_cp}) must be a multiple of the GTP sequence "
-                f"shards ({shards})."
-            )
-        layout = GTPParallelLayout(
-            world_size=world_size,
-            tp=transformer.tensor_model_parallel_size,
-            pp=transformer.pipeline_model_parallel_size,
-            cp=resolved_cp // shards,
-            weight_size=getattr(transformer, "gtp_weight_remat_size", 1) or 1,
-            num_sequence_shards=shards,
-        )
-        return layout.dp
-
-    def _validate_data_section(self) -> None:
-        """Cross-section checks for ``data.dataset``, one per field.
-
-        The model capacity covers the sample length. A value given on the dataset config for one
-        of the six fields other sections own (``CONTAINER_WRITTEN_FIELDS``) must agree with that
-        section: the container writes these fields at ``finalize()``, the arguments and the saved
-        file leave them at Megatron Core's defaults, so a differing explicit value is a mistake.
-        ``data_parallel_size`` needs the world size as well and is checked at ``finalize()``.
-        """
+        if transformer is not None:
+            loader_type = self.data.dataloader.dataloader_type
+            if getattr(transformer, "dynamic_context_parallel", False) and loader_type not in (
+                None,
+                "single",
+            ):
+                raise ValueError(
+                    "model.transformer.dynamic_context_parallel=True needs "
+                    f"data.dataloader.dataloader_type='single', got {loader_type!r}."
+                )
+            scheduler = getattr(transformer, "sequence_packing_scheduler", None)
+            if scheduler is not None and not getattr(
+                transformer, "calculate_per_token_loss", False
+            ):
+                raise ValueError(
+                    f"model.transformer.sequence_packing_scheduler={scheduler!r} needs "
+                    "model.transformer.calculate_per_token_loss=True: packed micro-batches carry "
+                    "different numbers of trainable tokens, so the per-microbatch mean weights "
+                    "them unevenly."
+                )
+            if scheduler is not None and not getattr(transformer, "variable_seq_lengths", False):
+                raise ValueError(
+                    f"model.transformer.sequence_packing_scheduler={scheduler!r} needs "
+                    "model.transformer.variable_seq_lengths=True: Megatron Core derives it at "
+                    "construction, so a scheduler selected afterwards leaves the pipeline on fixed "
+                    "shapes while the batch path packs; set both, or select the scheduler when the "
+                    "transformer config is constructed."
+                )
         dataset = self.data.dataset
         if dataset is None:
             return
+        execution_bound = self.model.transformer.max_seq_length_per_sample
+        if isinstance(dataset, SFTDatasetConfig) and dataset.packed_sequence_length not in (
+            None,
+            execution_bound,
+        ):
+            raise ValueError(
+                "data.dataset.packed_sequence_length is derived from "
+                "model.transformer.max_seq_length_per_sample; leave it unset"
+            )
+        dataset_type = resolve_dataset_class(dataset, self.data.dataset_type)
+        family = dataset_family_from_type(dataset_type)[0]
+        fixed_rows = family in ("gpt", "fim") or (
+            family == "varlen" and dataset.varlen_sbhd_validation
+        )
+        if (
+            fixed_rows
+            and not isinstance(self.model, (LLaVAModelConfig, T5ModelConfig, MimoBuildConfig))
+            and execution_bound is not None
+            and execution_bound != dataset.sequence_length
+        ):
+            raise ValueError(
+                "model.transformer.max_seq_length_per_sample must equal "
+                "data.dataset.sequence_length for fixed GPT/FIM/SBHD rows; it describes this run's "
+                "execution width, not the model's position capacity."
+            )
+        if dataset_family_from_type(dataset_type)[0] == "sft":
+            if (
+                not isinstance(dataset, SFTDatasetConfig)
+                and execution_bound is not None
+                and execution_bound != dataset.sequence_length
+            ):
+                raise ValueError(
+                    "Use SFTDatasetConfig for a model execution width distinct from "
+                    "dataset.sequence_length; GPTDatasetConfig emits sequence_length tokens."
+                )
+            pack_length = (
+                (execution_bound or dataset.sequence_length)
+                if isinstance(dataset, SFTDatasetConfig)
+                else dataset.sequence_length
+            )
+            transformer = self.model.transformer
+            cp_multiple = (
+                2 * transformer.context_parallel_size
+                if transformer.context_parallel_size > 1
+                else 1
+            )
+            sp_multiple = (
+                transformer.tensor_model_parallel_size if transformer.sequence_parallel else 1
+            )
+            if pack_length % (cp_multiple * sp_multiple):
+                raise ValueError(
+                    "SFT pack width must satisfy the dataset's CP/SP padding alignment"
+                )
+            if (
+                getattr(self.model, "position_embedding_type", "learned_absolute") == "learned_absolute"
+                and self.model.seq_length < pack_length
+            ):
+                raise ValueError(
+                    "Learned position capacity must cover the SFT pack's padded positions"
+                )
         capacity = getattr(self.model, "seq_length", None)
-        if isinstance(capacity, int) and isinstance(dataset.sequence_length, int):
+        if (
+            getattr(self.model, "position_embedding_type", "learned_absolute") == "learned_absolute"
+            and isinstance(capacity, int)
+            and isinstance(dataset.sequence_length, int)
+        ):
             if capacity < dataset.sequence_length:
                 raise ValueError(
                     f"model.seq_length ({capacity}, the position-embedding capacity, "
                     "--max-position-embeddings) must be greater than or equal to "
                     f"data.dataset.sequence_length ({dataset.sequence_length}, --seq-length)."
                 )
+        per_sample = getattr(transformer, "max_seq_length_per_sample", None)
+        if (
+            isinstance(per_sample, int)
+            and isinstance(dataset.sequence_length, int)
+            and per_sample < dataset.sequence_length
+        ):
+            raise ValueError(
+                f"model.transformer.max_seq_length_per_sample={per_sample} is smaller than "
+                f"data.dataset.sequence_length={dataset.sequence_length}: Megatron Core's "
+                "per-sample maximum must cover the dataset's samples (left unset, the container "
+                "fills it from the dataset at finalize())."
+            )
         validation = self.validation
         if (
             dataset.full_validation is not None
@@ -502,9 +863,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 f"validation.multiple_validation_sets={validation.multiple_validation_sets}; the "
                 "container writes this field at finalize(), leave it unset."
             )
-        transformer = getattr(self.model, "transformer", None)
-        if transformer is None:
-            return  # no model config (pretrain_hybrid_flex.py): the layout fields have no owner
+        transformer = self.model.transformer
         if (
             dataset.context_parallel_size is not None
             and dataset.context_parallel_size != transformer.context_parallel_size
@@ -526,28 +885,70 @@ class PretrainConfigContainer(ConfigContainerBase):
                 "it unset."
             )
         dynamic_context_parallel = bool(getattr(transformer, "dynamic_context_parallel", False))
-        # The deprecated hybrid_context_parallel alias counts as the canonical flag here (Core
-        # warns about it in validate_without_tokenizer()); finalize() folds it and clears it.
-        if (
-            dataset.dynamic_context_parallel or dataset.hybrid_context_parallel
-        ) and not dynamic_context_parallel:
+        if dataset.dynamic_context_parallel and not dynamic_context_parallel:
             raise ValueError(
                 "data.dataset.dynamic_context_parallel=True disagrees with "
                 "model.transformer.dynamic_context_parallel=False; the container writes this field "
                 "at finalize(), leave it unset."
             )
+        family, _mock = dataset_family_from_type(
+            resolve_dataset_class(dataset, self.data.dataset_type)
+        )
+        scheduler = getattr(transformer, "sequence_packing_scheduler", None)
+        if family == "varlen" and dataset.varlen_sbhd_validation and scheduler is not None:
+            raise ValueError(
+                "data.dataset.varlen_sbhd_validation=True does not use a packing scheduler; "
+                f"model.transformer.sequence_packing_scheduler={scheduler!r} must be unset."
+            )
+        if self.data.yields_unpacked_samples() and scheduler is None:
+            raise ValueError(
+                "A varlen dataset without SBHD validation emits one unpacked sample per item and "
+                "needs model.transformer.sequence_packing_scheduler ('dp_balanced', or "
+                "'default_dynamic_cp' under dynamic context parallelism); validate_args selects it "
+                "for --use-varlen-dataset, a Python or YAML container sets it explicitly."
+            )
+        context_parallel_size = transformer.context_parallel_size
+        if (
+            family != "sft"
+            and context_parallel_size > 1
+            and dataset.sequence_length % (2 * context_parallel_size)
+        ):
+            raise ValueError(
+                f"data.dataset.sequence_length ({dataset.sequence_length}) must be a multiple of "
+                f"2 * model.transformer.context_parallel_size ({context_parallel_size})."
+            )
 
     def _finalize(self) -> None:
-        from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
-        from megatron.training import get_args
+        # Checkpoint derivations first: the RL check below reads the derived load_optim. The
+        # conditions are validate_args', and the warning fires only when a value changes, so a CLI
+        # run, whose arguments validate_args already normalized, stays silent.
+        if self.checkpoint.ckpt_convert_format is not None:
+            # A conversion run exits instead of training from random weights.
+            self.checkpoint.exit_on_missing_checkpoint = True
+        if self.validation.skip_train and self.checkpoint.load_optim:
+            from megatron.training.utils import warn_rank_0
 
+            warn_rank_0('enabling --no-load-optim when skipping training.')
+            self.checkpoint.load_optim = False
         dataset = self.data.dataset
-        transformer = getattr(self.model, "transformer", None)
+        transformer = self.model.transformer
         data_parallel_size = None
-        if dataset is not None and transformer is not None:
+        if dataset is not None:
             # The world size is known here: data_parallel_size gets the agreement check the other
             # fields got at validation, before anything is written.
-            data_parallel_size = self.get_data_parallel_size(safe_get_world_size())
+            data_parallel_size = self.get_data_parallel_size()
+            if self.data.is_sft() and transformer.dynamic_context_parallel:
+                # SFT pads each document to DP*CP alignment, then truncates to the pack
+                # width. That final width must preserve the same alignment.
+                divisor = 2 * data_parallel_size * transformer.context_parallel_size
+                if transformer.sequence_parallel:
+                    divisor *= transformer.tensor_model_parallel_size
+                pack_length = transformer.max_seq_length_per_sample or dataset.sequence_length
+                if pack_length % divisor:
+                    raise ValueError(
+                        f"SFT pack width ({pack_length}) must be divisible by the dynamic "
+                        f"CP/SP padding alignment ({divisor})"
+                    )
             if dataset.data_parallel_size not in (1, data_parallel_size):
                 raise ValueError(
                     f"data.dataset.data_parallel_size={dataset.data_parallel_size} disagrees with "
@@ -555,40 +956,163 @@ class PretrainConfigContainer(ConfigContainerBase):
                     f"(data_parallel_size={data_parallel_size}); the container writes this field "
                     "at finalize(), leave it unset."
                 )
-        # TODO: Use get_batch_parallel_size(self) once topology inputs are config-owned.
-        # Keep this temporary args dependency in framework finalization, not validation.
-        batch_sizes = self._resolve_batch_sizes(get_batch_parallel_size(get_args()))
+            # The packed-sequence buffer covers one sample: cp ranks, times the data-parallel
+            # replicas under default_dynamic_cp (validate_args's rule, which needs the world size).
+            scheduler = getattr(transformer, "sequence_packing_scheduler", None)
+            budget = getattr(transformer, "max_seqlen_per_dp_cp_rank", None)
+            if scheduler is not None and budget is not None:
+                total_cp_ranks = transformer.context_parallel_size * (
+                    data_parallel_size if scheduler == "default_dynamic_cp" else 1
+                )
+                input_length = (
+                    transformer.max_seq_length_per_sample or dataset.sequence_length
+                    if self.data.is_sft()
+                    else dataset.sequence_length
+                )
+                if total_cp_ranks * budget < input_length:
+                    raise ValueError(
+                        f"The packed-sequence buffer ({total_cp_ranks} ranks * "
+                        f"max_seqlen_per_dp_cp_rank {budget} = {total_cp_ranks * budget}) must "
+                        f"cover one physical sample ({input_length})."
+                    )
+        batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
         self._validate_rl_config(batch_sizes[0])
+        # Resolve RNG and model settings before deriving optimizer precision.
+        super()._finalize()
+        optimizer = self._optimizer_with_model_precision()
+        changes = {
+            name: (getattr(self.optimizer, name), getattr(optimizer, name))
+            for name in ("fp16", "bf16", "params_dtype", "fp8_recipe")
+            if getattr(self.optimizer, name) != getattr(optimizer, name)
+            and not (name == "fp8_recipe" and self.optimizer.fp8_recipe is None)
+        }
+        if changes:
+            logger.warning("Overriding optimizer precision from model config (old, new): %s", changes)
         (
             self.train.global_batch_size,
             self.validation.eval_global_batch_size,
             self.validation.eval_micro_batch_size,
         ) = batch_sizes
-        super()._finalize()
+        self.optimizer = optimizer
         self.optimizer.finalize_optimizer_config()
-        if self.optimizer.use_layer_wise_distributed_optimizer:
-            self.ddp.use_distributed_optimizer = False
+        if isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
+            if self.ddp.fp8_param_gather and is_te_min_version("2.0.0"):
+                logger.warning(
+                    "Disabling ddp.fp8_param_gather: Torch FSDP2 does not support FP8 "
+                    "parameter gathering with Transformer Engine >= 2.0.0; "
+                    "falling back to unquantized parameter gathering."
+                )
+                self.ddp.fp8_param_gather = False
+            if self.ddp.fp4_param_gather and not is_te_min_version("2.7.0.dev0"):
+                logger.warning(
+                    "Disabling ddp.fp4_param_gather: Torch FSDP2 requires Transformer Engine "
+                    ">= 2.7.0.dev0 for FP4 parameter gathering; "
+                    "falling back to unquantized parameter gathering."
+                )
+                self.ddp.fp4_param_gather = False
+        if self.train.freeze_all_layers:
+            enabled = [name for name in _FROZEN_OPTIMIZER_FLAGS if getattr(self.optimizer, name)]
+            if enabled:
+                logger.warning(
+                    "train.freeze_all_layers: disabling incompatible optimizer settings %s.",
+                    enabled,
+                )
+            for name in enabled:
+                setattr(self.optimizer, name, False)
+        self.ddp.overlap_param_gather = self.optimizer.overlap_param_gather
+        self.ddp.reuse_grad_buf_for_mxfp8_param_ag = (
+            self.optimizer.reuse_grad_buf_for_mxfp8_param_ag
+        )
+        if self.ddp.grad_reduce_in_fp32:
+            self.ddp.reduce_scatter_with_fp32_accumulation = False
+            self.ddp.gtp_remat_reduce_scatter_with_fp32_accumulation = False
+        if self.ddp.use_megatron_fsdp:
+            self.ddp.reuse_grad_buf_for_mxfp8_param_ag = False
+            self.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
+            if self.ddp.megatron_fsdp_version == 1:
+                self.optimizer.use_distributed_optimizer = True
+                self.ddp.megatron_fsdp_use_decoupled_grad = (
+                    self.optimizer.use_precision_aware_optimizer
+                )
+                if not self.ddp.disable_symmetric_registration:
+                    self.ddp.average_in_collective = False
+                if self.ddp.nccl_ub:
+                    self.ddp.fsdp_manual_registration = True
+            else:
+                # V2 owns sharded storage and communication, not DDP's optimizer/overlap path.
+                self.optimizer.use_distributed_optimizer = False
+                self.optimizer.overlap_param_gather = False
+                self.optimizer.overlap_param_gather_with_optimizer_step = False
+                self.ddp.overlap_param_gather = False
+                self.ddp.overlap_grad_reduce = False
+                self.ddp.fsdp_all_gather_in_start_param_sync = False
+        # Optimizer selection is owned by OptimizerConfig; DDP needs its resolved layout.
+        self.ddp.use_distributed_optimizer = self.optimizer.use_distributed_optimizer or (
+            not isinstance(self.ddp, TorchFullyShardedDataParallelConfig)
+            and not self.ddp.use_megatron_fsdp
+            and self.optimizer.use_layer_wise_distributed_optimizer
+            and self.optimizer.use_layer_wise_param_layout
+        )
+        if transformer is not None:
+            transformer.fp8_param = self.ddp.fp8_param_gather
+            transformer.fp4_param = self.ddp.fp4_param_gather
+            if transformer.virtual_pipeline_model_parallel_size is None:
+                self.ddp.align_param_gather = False
+            if self.ddp.use_megatron_fsdp:
+                if self.ddp.megatron_fsdp_version == 2:
+                    if transformer.gradient_accumulation_fusion:
+                        logger.warning(
+                            "Disabling model.transformer.gradient_accumulation_fusion: "
+                            "Megatron FSDP v2 does not support gradient accumulation fusion."
+                        )
+                    transformer.gradient_accumulation_fusion = False
+                    if transformer.deallocate_pipeline_outputs:
+                        logger.warning(
+                            "Disabling model.transformer.deallocate_pipeline_outputs: "
+                            "Megatron FSDP v2 requires pipeline output storage for autograd."
+                        )
+                    transformer.deallocate_pipeline_outputs = False
+                if transformer.cuda_graph_impl != "none":
+                    self.ddp.megatron_fsdp_cuda_graph_mode = True
+                    if transformer.cuda_graph_impl == "full_iteration":
+                        self.ddp.fsdp_all_gather_in_start_param_sync = False
+        # NaNs signal overflow to FP16 dynamic loss scaling; fake groups cannot
+        # perform numerical validation. Loss and gradient checks otherwise remain independent.
+        fp16 = transformer.fp16 if transformer is not None else self.optimizer.fp16
+        if self.dist.fake_process_group or (fp16 and not self.optimizer.loss_scale):
+            self.rerun_state_machine.check_for_nan_in_loss = False
+            self.ddp.check_for_nan_in_grad = False
+        if self.rerun_state_machine.result_rejected_tracker_filename is not None:
+            skipped = RerunStateMachine.get_skipped_iterations_from_tracker_file(
+                self.rerun_state_machine.result_rejected_tracker_filename
+            )
+            # Assign a new list: the CLI adapter may still share its original list with args.
+            self.train.iterations_to_skip = self.train.iterations_to_skip + [
+                iteration for iteration in skipped if iteration not in self.train.iterations_to_skip
+            ]
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         self._resolve_scheduler_step_fields()
         if dataset is not None:
-            # The seven fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
-            # from the validation config, the layout from the model config when there is one (the
-            # deprecated hybrid_context_parallel alias is folded into dynamic_context_parallel).
+            # Fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
+            # from the validation config, the layout from the required model config.
+            if transformer.max_seq_length_per_sample is None:
+                transformer.max_seq_length_per_sample = dataset.sequence_length
+            if isinstance(dataset, SFTDatasetConfig):
+                dataset.packed_sequence_length = transformer.max_seq_length_per_sample
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets
-            if transformer is not None:
-                dataset.data_parallel_size = data_parallel_size
-                dataset.context_parallel_size = transformer.context_parallel_size
-                dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
-                    bool(transformer.sequence_parallel)
-                )
-                dataset.dynamic_context_parallel = bool(
-                    getattr(transformer, "dynamic_context_parallel", False)
-                )
-                dataset.hybrid_context_parallel = False
+            dataset.data_parallel_size = data_parallel_size
+            dataset.context_parallel_size = transformer.context_parallel_size
+            dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+                bool(transformer.sequence_parallel)
+            )
+            dataset.dynamic_context_parallel = bool(
+                getattr(transformer, "dynamic_context_parallel", False)
+            )
         self.data.finalize()
-        if self.rl.perform_rl_step:
-            self.rl.finalize_ddp_config(self.ddp)
+        if self.rl.requires_grad_buffer_offload:
+            self.ddp.grad_buffer_offload = True
+        self.ddp.finalize()
 
 
 def update_train_iters(train: TrainingConfig) -> None:
@@ -632,8 +1156,8 @@ class InferenceConfigContainer(ConfigContainerBase):
     ``DistributedDataParallelConfig``, ``RerunStateMachineConfig``, ``StragglerDetectionConfig``.
     """
 
-    model: HybridModelConfig | GPTModelConfig
-    """Which model to load for inference."""
+    model: ModelConfig | BertModelConfig | T5ModelConfig | LLaVAModelConfig | MimoBuildConfig | None
+    """Model to load, or None for args-only entrypoints without model inputs."""
 
     checkpoint: CheckpointConfig
     """Checkpoint configuration used to load model weights."""
@@ -648,3 +1172,10 @@ class InferenceConfigContainer(ConfigContainerBase):
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
     logger: LoggerConfig = field(default_factory=LoggerConfig)
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+
+    def _finalize(self) -> None:
+        super()._finalize()
+        if self.checkpoint.ckpt_convert_format is not None:
+            # A conversion run (the checkpoint converters bootstrap through this container) exits
+            # instead of loading random weights, as validate_args derives it.
+            self.checkpoint.exit_on_missing_checkpoint = True
