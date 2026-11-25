@@ -2936,6 +2936,18 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             tp_group_for_te = tp_group
             gtp_remat_group = pg_collection.expt_gtp_remat
 
+            if (
+                config.moe_single_grouped_weight
+                and gtp_remat_group is not None
+                and gtp_remat_group.size() > 1
+            ):
+                if config.use_transformer_engine_op_fuser:
+                    raise ValueError(
+                        "Packed GTP weights currently require use_transformer_engine_op_fuser=False"
+                    )
+                if config.cuda_graph_impl != "none":
+                    raise ValueError("Packed GTP weights currently require cuda_graph_impl='none'")
+
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
             # Save original parallel_mode before clearing it for explicit_expert_comm.
@@ -3162,6 +3174,8 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self, tensor: torch.Tensor, checkpoint_key: str
         ) -> list[torch.Tensor]:
             """Split grouped checkpoint tensor into one tensor per GEMM."""
+            if hasattr(tensor, "checkpoint_expert_views"):
+                return tensor.checkpoint_expert_views()
             if hasattr(tensor, "split_into_quantized_tensors") and callable(
                 tensor.split_into_quantized_tensors
             ):

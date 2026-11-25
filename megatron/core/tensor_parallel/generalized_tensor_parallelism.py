@@ -989,12 +989,12 @@ def attach_gtp_to_presharded_module(
     ``replica_group``: the caller's gtp_remat-excluded DP x CP group
     (see :func:`_gtp_attach_attrs`).
     """
-    # GTP shards per-expert weight0..weight{num_gemms-1}; a coalesced single weight has no sibling
-    # shards to attach, so reject it here (once, at setup) instead of silently attaching nothing.
-    if is_grouped:
-        assert not getattr(
-            module, "single_grouped_weight", False
-        ), f"GTP grouped module {type(module).__name__} requires single_grouped_weight=False."
+    if is_grouped and getattr(module, "single_grouped_weight", False):
+        from megatron.core.tensor_parallel.gtp_grouped_weight import attach_packed_gtp_weight
+
+        attach_packed_gtp_weight(module, gtp_remat_group, pad_length, replica_group)
+        _gtp_restore_replicated_bias(module, gtp_remat_group, pad_length, is_grouped=True)
+        return
     # Use the module's weight_names if it declares them; otherwise create them (grouped modules
     # expose per-expert weight0..weight{num_gemms-1}, non-grouped a single "weight").
     weight_names = getattr(module, "weight_names", None)

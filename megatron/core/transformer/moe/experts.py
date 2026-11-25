@@ -251,9 +251,13 @@ def _te_grouped_tensor_supports_sharded_weights() -> bool:
     and unfixed builds both report 2.20.0.dev0 today, so no version can distinguish them yet.
     """
     try:
-        from transformer_engine.pytorch.module.grouped_linear import _GroupedLinear
+        from transformer_engine.pytorch.module import grouped_linear
 
-        signature = inspect.signature(_GroupedLinear._forward_grouped_tensor)
+        # Newer TE moves the same protocol into a module-level graph-safe function.
+        backward_args = getattr(grouped_linear, "GroupedLinearBwdArgs", None)
+        if "is_dist_weight" in getattr(backward_args, "__dataclass_fields__", {}):
+            return True
+        signature = inspect.signature(grouped_linear._GroupedLinear._forward_grouped_tensor)
     except (ImportError, AttributeError, ValueError):
         return False
     return "is_dist_weight" in signature.parameters
@@ -445,9 +449,10 @@ class TEGroupedMLP(MegatronModule):
         # Imported lazily: a module-scope import can silently flip HAVE_GTP to False
         from megatron.core.tensor_parallel import gtp_api
 
-        # GTP wraps a grouped module's weight0..N as a set, so weight0 is representative -- the
-        # same assumption TE makes when it gates on weights[0].
-        fc1_weight0 = getattr(self.linear_fc1, "weight0", None)
+        # TE dispatches through the packed parent or the first separate expert weight.
+        fc1_weight0 = getattr(
+            self.linear_fc1, "weight" if self.config.moe_single_grouped_weight else "weight0", None
+        )
         has_gtp_sharded_weights = gtp_api.HAVE_GTP and gtp_api.is_gtp_param(fc1_weight0)
         # Two independent blockers keep a sharded layer off the grouped-tensor path:
         #   1. Older TE mishandles sharded weights there. Probed rather than version-gated:
@@ -462,6 +467,10 @@ class TEGroupedMLP(MegatronModule):
             and has_gtp_sharded_weights
             and (blocked_by_te or blocked_by_fp8_gather)
         ):
+            if self.config.moe_single_grouped_weight:
+                raise RuntimeError(
+                    "Packed GTP weights require TE's distributed-weight GroupedTensor module path"
+                )
             if self.config.moe_paged_stash:
                 raise RuntimeError(
                     "moe_paged_stash requires GroupedTensor execution, but these GTP-sharded "
@@ -1369,6 +1378,18 @@ class TEGroupedMLP(MegatronModule):
                                 tp_group=self.tp_group,
                                 dp_group=metadata['dp_cp_group'],
                             )
+            packed_weight = getattr(module, "weight", None)
+            if hasattr(packed_weight, "checkpoint_expert_views"):
+                from megatron.core.tensor_parallel.gtp_grouped_weight import (
+                    make_packed_checkpoint_factory,
+                )
+
+                expert_shards = [
+                    sub_sd.pop(f'{name}.weight{i}') for i in range(self.num_local_experts)
+                ]
+                sub_sd[f'{name}.weight'] = make_packed_checkpoint_factory(
+                    packed_weight, expert_shards
+                )
             if singleton_local_shards:
                 replace_prefix_for_sharding(sub_sd, '', f'{prefix}experts.')
             else:

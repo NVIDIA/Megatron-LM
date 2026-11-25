@@ -75,6 +75,35 @@ HIDDEN, FFN, TOKENS = 2048, 8192, 8192
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
 
+def test_packed_bf16_gtp_experts_replay(monkeypatch):
+    """Packed expert gathers, GGEMMs and FP32 reduced gradients replay bit-exactly."""
+    from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
+    from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import _requires_mxfp8
+    from tests.unit_tests.generalized_tensor_parallel.test_gtp_grouped_mlp_precision import (
+        _worker_mtp_bf16_numerics,
+    )
+
+    Utils.initialize_model_parallel()
+    _requires_mxfp8()
+    if torch.distributed.get_world_size() < 2 or torch.distributed.get_world_size() % 2:
+        pytest.skip("Requires an even number of ranks for EGTP=2")
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+
+    def run():
+        try:
+            return _worker_mtp_bf16_numerics(
+                torch.distributed.get_rank(), torch.distributed.get_world_size(), None, 2, True
+            )
+        finally:
+            gtp.reset_gtp_state()
+            gtp._GTP_PARAMS.clear()
+
+    try:
+        assert_replays_bit_exact(run, (), backward=False, replays=2, what="packed BF16 GTP experts")
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.fixture
 def aux_loss_capability_cache():
     """Keep mocked TE APIs from changing subsequent integration-test dispatch."""

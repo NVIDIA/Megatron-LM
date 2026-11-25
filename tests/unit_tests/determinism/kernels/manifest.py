@@ -474,6 +474,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
             K + "test_moe_kernels.py",
+            K + "test_te_wrappers.py",
             K + "test_inference_kernels.py",
         ),
         kind="te-wrapper",
@@ -1051,6 +1052,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         exempt_reason="TE gather_along_first_dim / reduce_scatter_along_first_dim of weights and "
         "wgrads in generalized tensor parallelism; multi-rank NCCL collectives pinned by "
         "NCCL_ALGO=Ring under --deterministic-mode, not exercised by the determinism model tests.",
+    ),
+    KernelEntry(
+        name="packed_gtp_experts",
+        sources=("megatron/core/tensor_parallel/gtp_grouped_weight.py",),
+        tests=(K + "test_te_wrappers.py", K + "test_tensor_parallel_kernels.py"),
+        kind="dispatch",
+        notes="Packed BF16 expert materialization and FP32 gradient reduction with TE GGEMMs; "
+        "prefetch buffer reuse, recompute and deferred gradient readiness replay.",
     ),
     KernelEntry(
         name="te_thd_partitioned_indices",

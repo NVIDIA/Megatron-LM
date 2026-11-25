@@ -98,6 +98,15 @@ class TestGtpLocalPadZeroCount:
         shard.pad_length = 3
         assert gtp_local_pad_zero_count(shard, 0, shard.numel()) == 0
 
+    def test_packed_experts_have_separate_padding_suffixes(self):
+        shard = torch.zeros(3, 4, 2)
+        shard.group = _FakeGroup(size=2, rank=1)
+        shard.pad_length = 2
+        # Each eight-element expert has four real and four padding elements.
+        assert gtp_local_pad_zero_count(shard, 0, 24) == 12
+        assert gtp_local_pad_zero_count(shard, 6, 14) == 4
+        assert gtp_local_pad_zero_count(shard, 8, 12) == 0
+
 
 class TestCopyGtpAttributes:
     """copy_gtp_attributes(destination, source) must carry pad_length/group onto any param

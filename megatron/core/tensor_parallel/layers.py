@@ -176,6 +176,22 @@ def gtp_local_pad_zero_count(gtp_shard, range_start, range_end):
     if group is None:
         return 0
 
+    if gtp_shard.ndim == 3:
+        # A packed grouped parameter contains an independent row shard per expert.
+        # Each expert therefore has its own padding suffix inside the flat DP shard.
+        experts, rows, columns = gtp_shard.shape
+        expert_size = rows * columns
+        real_rows = rows * group.size() - pad_length
+        local_pad_start = min(rows, max(0, real_rows - group.rank() * rows)) * columns
+        return sum(
+            max(
+                0,
+                min(range_end, (expert + 1) * expert_size)
+                - max(range_start, expert * expert_size + local_pad_start),
+            )
+            for expert in range(experts)
+        )
+
     # Reconstruct the *unsharded* padded buffer this shard came from, and where in it
     # the real (non-padding) data ends. Padding is always a contiguous suffix of this
     # buffer (see _gtp_slice_one_param), so everything from unsharded_real_dim0 onward

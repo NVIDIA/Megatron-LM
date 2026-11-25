@@ -175,6 +175,23 @@ NVFP4 GTP_remat keeps each shard as a native `NVFP4Tensor` and all-gathers it as
 
 - **SP** (sequence-parallel): transparent — GTP_remat operates at weight dim, SP at sequence dim.
 - **EP** (MoE): `GroupedLinear` with GTP_remat → each routed expert sharded across `EXPERT_GTP_WEIGHT_REMAT_GROUP`, independent of EP. MoE AllToAll (HybridEP/NVLink) runs independently of GTP_remat AG/RS (NCCL/IB).
+
+  **Single packed BF16 expert weights:** `moe_single_grouped_weight=True` with
+  `moe_use_grouped_tensor=True` retains one parameter per FC1/FC2, shaped
+  `[local experts, local output rows, input columns]`. GTP gathers and reduces
+  each expert's row shards while preserving the packed parameter for DDP and
+  distributed Adam. Checkpoints retain the canonical per-expert tensor layout.
+  This initial path requires `use_transformer_engine_op_fuser=False` and
+  `cuda_graph_impl="none"`. It uses GTP's prefetch chains and deferred gradient
+  reduction; packed layout conversion completes on the AG stream before the
+  readiness event that the consumer waits on. Chain-head gathers can still run
+  synchronously. Symmetric NCCL pools are not supported. With FP32 reduction
+  accumulation enabled, packed gradients use the all-to-all plus FP32 sum path. It requires TE's
+  grouped-tensor `DistributedWeight` support; some
+  development TE builds also require `NVTE_GROUPED_LINEAR_SINGLE_PARAM=1`.
+  Native FP8 packed storage is not yet supported. Existing GTP SwiGLU checkpoint
+  restrictions on padded FC1 shards still apply.
+
 - **DDP**: GTP_remat bypasses autograd's grad accumulator (async RS returns `None`; `_finalize_wgrad` accumulates directly into `main_grad`). DDP registers its grad-ready hook on GTP_remat params via `register_grad_accum_hook` (not autograd's `AccumulateGrad`); GTP_remat invokes it from `_finalize_wgrad` (eager path) and `_CudagraphReplayNode.backward` (captured path) **after** the wgrad lands in `main_grad`, so a bucket's DDP reduce-scatter runs strictly after every GTP_remat param's `{RS → main_grad add}` — never over a stale `main_grad` — and DDP↔GTP_remat NIC deadlock at IB scale is avoided. See §3.2.
 
 ### 1.5 Opt-in, minimally invasive integration
