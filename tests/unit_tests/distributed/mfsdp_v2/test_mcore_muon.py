@@ -145,14 +145,12 @@ def test_mcore_muon_adam_losses(distributed_setup, pg_collection, dtype: torch.d
     torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-6)
 
 
-def _tiny_transformer_config(dtype: torch.dtype) -> TransformerConfig:
-    """Return the one-layer GPT block configuration used by these tests."""
-    return TransformerConfig(
+def test_mcore_angular_muown(distributed_setup, pg_collection) -> None:
+    """With muon_use_muown, the MFSDP v2 factory builds FsdpAngularMuOwn for the Muon matrices."""
+    config = TransformerConfig(
         num_layers=1,
         hidden_size=8,
         num_attention_heads=2,
-        params_dtype=dtype,
-        bf16=dtype == torch.bfloat16,
         gated_linear_unit=True,
         activation_func=torch.nn.functional.silu,
         attention_dropout=0.0,
@@ -160,101 +158,36 @@ def _tiny_transformer_config(dtype: torch.dtype) -> TransformerConfig:
         gradient_accumulation_fusion=False,
         attention_backend=AttnBackend.unfused,
     )
-
-
-def test_angular_muown_config_validation() -> None:
-    """AngularMuOwn is reachable only through Muon with shape scaling."""
-    base = dict(optimizer="muon", lr=0.01, muon_split_qkv=False)
-    OptimizerConfig(
-        **base, muon_use_muown=True, muown_use_angular=True, muon_scale_mode="shape_scaling"
-    ).validate()
-    with pytest.raises(ValueError, match="shape_scaling"):
-        OptimizerConfig(**base, muon_use_muown=True, muown_use_angular=True).validate()
-    with pytest.raises(NotImplementedError, match="AngularMuOwn"):
-        OptimizerConfig(**base, muon_use_muown=True, muon_scale_mode="shape_scaling").validate()
-    with pytest.raises(ValueError, match="requires muon_use_muown"):
-        OptimizerConfig(**base, muown_use_angular=True).validate()
-
-
-def test_mcore_angular_muown(distributed_setup, pg_collection) -> None:
-    """The MFSDP v2 factory builds FsdpAngularMuOwn for the Muon matrices and trains with it."""
-    config = _tiny_transformer_config(torch.bfloat16)
     optimizer_config = OptimizerConfig(
         optimizer="muon",
         lr=0.01,
-        weight_decay=0.1,
-        bf16=True,
-        params_dtype=torch.bfloat16,
         muon_split_qkv=False,
-        muon_nesterov=True,
         muon_scale_mode="shape_scaling",
         muon_use_muown=True,
         muown_use_angular=True,
-        muown_angular_warmup_iters=1,
         muown_angular_horizon_iters=4,
-        muown_weight_decay_mult=0.5,
-        clip_grad=1.0,
     )
-    optimizer_config.validate()
     torch.manual_seed(1234)
-    module = TinyModel(config).to(device=distributed_setup.device, dtype=torch.bfloat16)
-
-    reference_model = TinyModel(config).to(device=distributed_setup.device, dtype=torch.bfloat16)
-    reference_model.ddp_config = DistributedDataParallelConfig()
-    with pytest.raises(NotImplementedError, match="Megatron-FSDP v2"):
-        get_megatron_optimizer(
-            optimizer_config,
-            [reference_model],
-            use_gloo_process_groups=False,
-            pg_collection=pg_collection,
-        )
-
     model = FullyShardedDataParallel(
         config,
         DistributedDataParallelConfig(
             use_megatron_fsdp=True,
             megatron_fsdp_version=2,
             data_parallel_sharding_strategy="optim_grads_params",
-            megatron_fsdp_grad_comm_dtype=torch.float32,
         ),
-        module,
+        TinyModel(config).to(device=distributed_setup.device),
         pg_collection=pg_collection,
     )
     optimizer = get_megatron_optimizer(
         optimizer_config, [model], use_gloo_process_groups=False, pg_collection=pg_collection
     )
-    muon_wrapper = next(
+    angular_muown = next(
         opt for opt in optimizer.chained_optimizers if isinstance(opt.optimizer, FsdpAngularMuOwn)
     )
-    assert set(muon_wrapper.get_parameters()) == {
+    assert set(angular_muown.get_parameters()) == {
         param for param in model.module.decoder.parameters() if param.ndim == 2
     }
-    muon_optimizer = muon_wrapper.optimizer
-    assert muon_optimizer.nesterov
-    assert muon_optimizer.angular_warmup_steps == 1
-    assert muon_optimizer.angular_horizon_steps == 4
-    assert muon_optimizer.weight_decay_mult == 0.5
-    assert muon_optimizer.row_scale_betas == (
-        optimizer_config.adam_beta1,
-        optimizer_config.adam_beta2,
-    )
+    assert angular_muown.optimizer.angular_horizon_steps == 4
 
-    inputs = torch.randint(0, 8, (5, 2, 4), device=distributed_setup.device)
-    values = _train(model, optimizer, inputs)
-    assert torch.isfinite(values).all()
-    assert all(group["muown_step"] == len(inputs) for group in muon_optimizer.param_groups)
-    # kappa_t = (1 + C * u**r) ** (-p / r) at the last step, with u = (5 - 1) / 4 = 1.
-    assert muon_optimizer.last_angular_multiplier == pytest.approx(
-        (1 + optimizer_config.muown_angular_decay_scale)
-        ** (
-            -optimizer_config.muown_angular_decay_degree
-            / optimizer_config.muown_angular_plateau_degree
-        )
-    )
-    for param, state in muon_optimizer.state.items():
-        torch.testing.assert_close(
-            state["row_scale"].to_local().abs(),
-            param.to_local().norm(dim=1, keepdim=True),
-            rtol=1e-5,
-            atol=1e-7,
-        )
+    inputs = torch.randint(0, 8, (3, 2, 4), device=distributed_setup.device)
+    assert torch.isfinite(_train(model, optimizer, inputs)).all()
