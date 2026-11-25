@@ -83,6 +83,8 @@ _TORCH_CONFIG_TARGETS = frozenset(
         "torch.device",
         "torch.Size",
         "torch.dtype",
+        "torch.nn.init.normal_",
+        "torch.nn.init.xavier_uniform_",
         *{
             f"torch.nn.functional.{name}"
             for name in (
@@ -123,6 +125,8 @@ _TORCH_CONFIG_TARGETS = frozenset(
 # Historical serialized model specs and the native GELU symbol remain readable.
 _ALLOWED_PRIVATE_TARGETS = frozenset(
     {
+        "megatron.core.extensions.te_batched_linear._TEBatchedLinear",
+        "megatron.core.models.gpt.moe_module_specs._build_shared_experts",
         "torch._C._nn.gelu",
         "torch._C._nn.softplus",
         "torch._VariableFunctionsClass.sigmoid",
@@ -199,9 +203,9 @@ class TargetAllowlist:
     packages and their constructors must be trusted: this is not a sandbox for
     arbitrary untrusted configurations. Known unsafe targets remain prohibited.
 
-    PyTorch targets are limited to dtype/device values, activation functions and
-    public ``torch.nn.Module`` constructors. Private targets and other PyTorch
-    APIs require trusted application code to register their exact names with
+    PyTorch targets are limited to dtype/device values, activation functions,
+    native initializers and public ``torch.nn.Module`` constructors. Private targets
+    and other PyTorch APIs require trusted registration of their exact names with
     ``add_exact`` (including the canonical name for an alias). ``add_prefix``
     alone does not expand these categories. Function references and partials
     follow the same policy as immediately called targets. Historical model-spec
