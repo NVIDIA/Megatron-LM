@@ -137,10 +137,14 @@ class TestTensorParallelLayers:
                 return self.embedding(ids) + self.embedding(mtp_ids)
 
         ids, mtp_ids = (torch.randint(0, 64, (1, 4096), device="cuda") * 100 for _ in range(2))
+        # Mixed-sign bf16 values: with all-ones gradients each row only counts its tokens, an
+        # exact sum that would replay bit-exact even if the order of the additions changed.
+        grad = torch.randn(1, 4096, 1024, device="cuda", dtype=torch.bfloat16)
         assert_module_replays_bit_exact(
             TwoUses(),
             (ids, mtp_ids),
             replays=4,
+            grad_output=grad,
             contention=True,
             what="VocabParallelEmbedding[gradient_accumulation_fusion, shared] x2",
         )

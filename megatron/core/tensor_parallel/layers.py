@@ -456,9 +456,10 @@ class VocabParallelEmbedding(torch.nn.Module):
         """Whether the backward adds the weight gradient into ``main_grad`` itself.
 
         With ``gradient_accumulation_fusion``, for a weight whose ``main_grad`` is owned by
-        Megatron's DDP (not Megatron-FSDP or GTP). This includes a ``zero_out_wgrad`` weight
-        shared on one stage: its DDP hook adds ``param.grad``, to which the ZeroTensor returned
-        here contributes nothing, so only the gradients of unfused uses are added there.
+        Megatron's DDP (not Megatron-FSDP or GTP). A ``zero_out_wgrad`` weight shared on one stage
+        is fused only with an fp32 ``main_grad`` (its DDP hook then adds just unfused uses); with
+        fp16/bf16 it keeps the dense path, so its uses are summed before one rounding into
+        ``main_grad``.
         """
         return (
             self.config.gradient_accumulation_fusion
@@ -468,6 +469,10 @@ class VocabParallelEmbedding(torch.nn.Module):
             and hasattr(weight, "main_grad")
             and hasattr(weight, "grad_added_to_main_grad")
             and not hasattr(weight, "__fsdp_param__")
+            and (
+                not getattr(weight, "zero_out_wgrad", False)
+                or weight.main_grad.dtype == torch.float32
+            )
         )
 
     def forward(self, input_):
@@ -899,7 +904,17 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # are all run on the main backprop thread to prevent deadlocks. Setup
                 # dummy grad_weight tensor to prevent backward hooks from being run
                 # in a background thread.
-                if getattr(weight, "zero_out_wgrad", False):
+                if getattr(weight, "zero_tensor_dummy_wgrad", False) and not hasattr(
+                    weight, "__fsdp_param__"
+                ):
+                    # A weight used more than once in one backward pass, such as an output weight
+                    # shared by the main and MTP heads, gets a ZeroTensor: autograd sums these
+                    # without storage or a kernel, unlike dense [vocab, hidden] dummies. It is
+                    # exactly zero, so it also serves a ``zero_out_wgrad`` weight.
+                    grad_weight = torch._efficientzerotensor(
+                        weight.shape, dtype=weight.dtype, device=weight.device
+                    )
+                elif getattr(weight, "zero_out_wgrad", False):
                     if HAVE_TE:
                         # get_dummy_wgrad function in TE enables reuse of single dummy wgrad buffer
                         # across different layers/microbatches. The function accepts shape as list.
@@ -913,15 +928,6 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                             device=torch.cuda.current_device(),
                             requires_grad=False,
                         )
-                elif getattr(weight, "zero_tensor_dummy_wgrad", False) and not hasattr(
-                    weight, "__fsdp_param__"
-                ):
-                    # A weight used more than once in one backward pass, such as an output layer
-                    # shared by the main and MTP heads, gets a ZeroTensor: autograd sums these
-                    # without storage or a kernel, unlike dense [vocab, hidden] dummies.
-                    grad_weight = torch._efficientzerotensor(
-                        weight.shape, dtype=weight.dtype, device=weight.device
-                    )
                 else:
                     if HAVE_TE:
                         grad_weight = get_dummy_wgrad(list(weight.main_grad.shape), input.dtype)

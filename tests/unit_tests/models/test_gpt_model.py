@@ -971,10 +971,14 @@ def test_word_embedding_marker_reaches_tied_copies_only(share_embeddings_and_out
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("share_embeddings_and_output_weights", [False, True])
 @pytest.mark.parametrize("mtp_num_layers", [None, 1])
-def test_mtp_output_layer_gets_zero_tensor_dummy_wgrad(mtp_num_layers):
-    """With MTP the main and MTP heads use the output layer in one backward pass, so its weight
-    asks for ZeroTensor dummy weight gradients, whose sum is free."""
+def test_mtp_output_layer_gets_zero_tensor_dummy_wgrad(
+    mtp_num_layers, share_embeddings_and_output_weights
+):
+    """With MTP the main and MTP heads use one output weight in one backward pass, so the weight
+    they receive asks for ZeroTensor dummy weight gradients, whose sum is free. With tied weights
+    at PP=1 that is the embedding weight (output_layer.weight is None)."""
     Utils.initialize_model_parallel()
     model_parallel_cuda_manual_seed(123)
     config = TransformerConfig(
@@ -992,10 +996,15 @@ def test_mtp_output_layer_gets_zero_tensor_dummy_wgrad(mtp_num_layers):
         mtp_block_spec=mtp_block_spec,
         vocab_size=128,
         max_sequence_length=8,
-        share_embeddings_and_output_weights=False,
+        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
     )
 
-    marked = getattr(model.output_layer.weight, "zero_tensor_dummy_wgrad", False)
+    if share_embeddings_and_output_weights:
+        assert model.output_layer.weight is None
+        head_weight = model.embedding.word_embeddings.weight
+    else:
+        head_weight = model.output_layer.weight
+    marked = getattr(head_weight, "zero_tensor_dummy_wgrad", False)
     assert marked == bool(mtp_num_layers)
 
     Utils.destroy_model_parallel()

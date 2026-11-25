@@ -551,11 +551,13 @@ class TestWgradGemmAccumulate:
 @pytest.mark.skipif(
     not tp_layers._grad_accum_fusion_available, reason="needs fused_weight_gradient_mlp_cuda"
 )
+@pytest.mark.parametrize("zero_out_wgrad", [False, True])
 @pytest.mark.parametrize("zero_tensor_dummy_wgrad", [False, True])
-def test_weight_used_twice_gets_zero_tensor_dummy_wgrad(zero_tensor_dummy_wgrad):
-    """An output layer shared by the main and MTP heads: with gradient_accumulation_fusion both
+def test_weight_used_twice_gets_zero_tensor_dummy_wgrad(zero_tensor_dummy_wgrad, zero_out_wgrad):
+    """An output weight shared by the main and MTP heads: with gradient_accumulation_fusion both
     uses accumulate into main_grad, and with ``zero_tensor_dummy_wgrad`` the dummy weight
-    gradients autograd sums are ZeroTensors. main_grad gets the same values either way."""
+    gradients autograd sums are ZeroTensors, also for a tied embedding weight that is marked
+    ``zero_out_wgrad`` at PP=1. main_grad gets the same values either way."""
     Utils.initialize_model_parallel(1, 1)
     torch.manual_seed(1234)
     weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -563,6 +565,8 @@ def test_weight_used_twice_gets_zero_tensor_dummy_wgrad(zero_tensor_dummy_wgrad)
     weight.grad_added_to_main_grad = False
     if zero_tensor_dummy_wgrad:
         weight.zero_tensor_dummy_wgrad = True
+    if zero_out_wgrad:
+        weight.zero_out_wgrad = True
     inputs = [torch.randn(8, 2, 32, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
     grads = [torch.randn(8, 2, 64, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
 
@@ -583,5 +587,7 @@ def test_weight_used_twice_gets_zero_tensor_dummy_wgrad(zero_tensor_dummy_wgrad)
     torch.testing.assert_close(weight.main_grad, expected)
     assert weight.grad_added_to_main_grad
     assert torch._is_zerotensor(weight.grad) == zero_tensor_dummy_wgrad
+    if zero_out_wgrad and not zero_tensor_dummy_wgrad:  # DDP's hook adds it: must be zero
+        assert not weight.grad.any()
 
     Utils.destroy_model_parallel()

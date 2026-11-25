@@ -3,6 +3,7 @@
 """The embedding weight gradient accumulated into main_grad gives main_grad the same bits as
 PyTorch's embedding backward followed by ``main_grad.add_`` (what Megatron's DDP hook does)."""
 
+import contextlib
 import dataclasses
 
 import pytest
@@ -241,8 +242,8 @@ class TestVocabParallelEmbeddingWgradFusion:
 
     def test_shared_weight_two_uses_return_zero_tensor(self):
         """A weight used twice on one stage, as by the main and MTP embeddings, is marked
-        ``zero_out_wgrad`` but still accumulates into main_grad; autograd sums two ZeroTensors
-        instead of two dense [vocab, hidden] gradients."""
+        ``zero_out_wgrad`` but with an fp32 main_grad still accumulates into it; autograd sums
+        two ZeroTensors instead of two dense [vocab, hidden] gradients."""
         Utils.initialize_model_parallel()
         model_parallel_cuda_manual_seed(123)
         config = TransformerConfig(
@@ -274,12 +275,54 @@ class TestVocabParallelEmbeddingWgradFusion:
             expected.add_(torch.ops.aten.embedding_dense_backward(g, i, VOCAB, -1, False))
         torch.testing.assert_close(weight.main_grad, expected)
 
+    @pytest.mark.parametrize(
+        "dtype, start, use", [(torch.float16, 65024.0, 2048.0), (torch.bfloat16, 256.0, 1.0)]
+    )
+    def test_shared_weight_low_precision_main_grad_sums_uses_first(self, dtype, start, use):
+        """With an fp16/bf16 main_grad, the +use and -use of a shared weight cancel before DDP's
+        hook adds them. Adding them one at a time would round ``start + use`` first: fp16
+        overflows to inf, and bf16 rounds 257 to 256 and ends at 255."""
+        Utils.initialize_model_parallel()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=8,
+            params_dtype=dtype,
+            fp16=dtype == torch.float16,
+            bf16=dtype == torch.bfloat16,
+            gradient_accumulation_fusion=True,
+        )
+        module = VocabParallelEmbedding(
+            VOCAB, HIDDEN, init_method=init_method_normal(0.02), config=config
+        )
+        module.weight.zero_out_wgrad = True
+        model = DistributedDataParallel(
+            config,
+            ddp_config=DistributedDataParallelConfig(grad_reduce_in_fp32=False, bucket_size=None),
+            module=module,
+        )
+        main_grad = module.weight.main_grad
+        assert main_grad.dtype == dtype
+
+        model.zero_grad_buffer()
+        token = 7
+        main_grad[token].fill_(start)
+        ids = torch.full((1, 1), token, device="cuda")
+        grads = [
+            torch.full((1, 1, HIDDEN), sign * use, device="cuda", dtype=dtype) for sign in (1, -1)
+        ]
+        with model.no_sync():
+            torch.autograd.backward([model(ids), model(ids)], grads)
+
+        assert torch.equal(main_grad[token], torch.full_like(main_grad[token], start))
+
     @pytest.mark.parametrize("overlap_grad_reduce", [False, True])
     @pytest.mark.parametrize("unfused_use", [False, True])
-    def test_shared_weight_under_ddp(self, overlap_grad_reduce, unfused_use):
+    def test_shared_weight_under_ddp(self, overlap_grad_reduce, unfused_use, monkeypatch):
         """Megatron DDP's hook on a ``zero_out_wgrad`` weight used by two fused embeddings and,
         optionally, an unfused consumer (a tied output layer computed outside the fusion): the
-        ZeroTensors add nothing and the unfused gradient lands in main_grad exactly once.
+        hook skips the ZeroTensors, the unfused gradient lands in main_grad exactly once, and
+        the last microbatch still marks the bucket ready for the data-parallel reduction.
         Measured against an fp64 oracle, with the dense (unfused) path as the error baseline."""
         Utils.initialize_model_parallel()
         model_parallel_cuda_manual_seed(123)
@@ -335,17 +378,34 @@ class TestVocabParallelEmbeddingWgradFusion:
         errors = {}
         for fused, model in models.items():
             weight = modules[fused].weight
-            model.zero_grad_buffer()
-            # no_sync: no data-parallel reduction, so main_grad holds exactly this rank's sum.
-            with model.no_sync():
-                for uses, grads, hidden, logits_grad in batches:
-                    outputs = [model(ids) for ids in uses]
-                    if unfused_use:
-                        outputs.append(torch.nn.functional.linear(hidden, weight))
-                        grads = grads + [logits_grad]
-                    torch.autograd.backward(outputs, grads)
-            assert weight.grad is None
+            zero_tensor_adds = []
+            add_ = weight.main_grad.add_
+
+            def recording_add_(other, *args, **kwargs):
+                if torch._is_zerotensor(other):
+                    zero_tensor_adds.append(other.shape)
+                return add_(other, *args, **kwargs)
+
+            monkeypatch.setattr(weight.main_grad, "add_", recording_add_)
+            # Two iterations: with overlap_grad_reduce, DDP launches the reduction from the hook
+            # only once the first iteration has recorded how often each param becomes ready, and
+            # finish_grad_sync() then fails unless the last microbatch marked the bucket ready.
+            for _ in range(2):
+                model.zero_grad_buffer()
+                for i, (uses, grads, hidden, logits_grad) in enumerate(batches):
+                    last = i == len(batches) - 1
+                    with contextlib.nullcontext() if last else model.no_sync():
+                        outputs = [model(ids) for ids in uses]
+                        if unfused_use:
+                            outputs.append(torch.nn.functional.linear(hidden, weight))
+                            grads = grads + [logits_grad]
+                        torch.autograd.backward(outputs, grads)
+                model.finish_grad_sync()
+                assert weight.grad is None
+            # Every rank saw the same batches, so the data-parallel mean is this rank's sum.
             errors[fused] = (weight.main_grad.double() - expected).abs().max().item()
+            # With only fused uses the hook's param.grad is a ZeroTensor: nothing to add.
+            assert not zero_tensor_adds, zero_tensor_adds
 
         # Dropping or double-counting any use would leave an error the size of that use.
         assert errors[True] <= 1.5 * errors[False] + 1e-6 * expected.abs().max().item(), errors
