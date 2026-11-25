@@ -605,6 +605,8 @@ class _CudagraphGlobalRecord:
     # Without a graph owner these references cannot be released safely before process exit.
     unowned_capture_constants: dict[int, torch.Tensor] = {}
     captured_runners: WeakSet["_CudaGraphRunner"] = WeakSet()
+    # Every live manager, so that 'delete_cuda_graphs()' can drop the runners they hold.
+    managers: WeakSet["CudaGraphManager"] = WeakSet()
 
     @classmethod
     def _enable_saved_tensors_observer(cls):
@@ -867,7 +869,14 @@ def release_capture_constants(owner_graph: torch.cuda.CUDAGraph) -> None:
 
 
 def delete_cuda_graphs():
-    """Delete all CUDA graphs."""
+    """Delete all CUDA graphs and drop their runners from every CudaGraphManager.
+
+    A reset runner still references what its graph was captured with: the arguments (for
+    dynamic inference the inference context and views of its buffers) and the graph outputs,
+    which live in the graph pool. Left in its manager it would keep them alive, and the next
+    capture would find it under its cache key and fail on arguments it was not created for.
+    So no manager holds a runner after this call: its next forward pass creates a new one.
+    """
 
     _CudagraphGlobalRecord._disable_saved_tensors_observer()
 
@@ -878,6 +887,10 @@ def delete_cuda_graphs():
         *_CudagraphGlobalRecord.cudagraph_inference_record,
     ]:
         runners.add(record[0])
+    # The records miss a runner whose first forward pass or capture raised before it was recorded.
+    managers = list(_CudagraphGlobalRecord.managers)
+    for manager in managers:
+        runners.update(manager.cudagraph_runners)
     if runners:
         # Replay can still be using external constants when graph destruction is requested.
         torch.cuda.synchronize()
@@ -898,12 +911,22 @@ def delete_cuda_graphs():
         runner.mempool = None
         runner._gtp_fwd_params_to_ensure_ready = ()
 
+    # Drop the reset runners from their managers.
+    for manager in managers:
+        manager.cudagraph_runners.clear()
+        manager.custom_cudagraphs_lookup_table.clear()
+
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
     _CudagraphGlobalRecord.captured_runners.clear()
     _GTP_RUNNER_STREAMS.clear()
+
+    # These names hold the last references to the runners and, through the last record,
+    # to its capture arguments. Release them first.
+    del runners, managers
+    record = runner = manager = None
 
     # TODO: Optional?: Force garbage collection to clean up memory
     gc.collect()
@@ -2070,6 +2093,7 @@ class CudaGraphManager(torch.nn.Module):
         assert config.cuda_graph_impl == "local", "Option cuda_graph_impl=local not enabled."
         self.cudagraph_runners: list[_CudaGraphRunner] = []
         self.custom_cudagraphs_lookup_table: dict = defaultdict(lambda: None)
+        _CudagraphGlobalRecord.managers.add(self)
         self.is_first_microbatch = False
 
         # Without pipeline parallelism, microbatches execute one at a time.
