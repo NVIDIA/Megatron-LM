@@ -44,12 +44,15 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import init_method_normal
+from megatron.core.utils import init_method_normal, is_te_min_version
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     bytes_equal,
     seeded,
+)
+from tests.unit_tests.determinism.kernels.softmax_offset import (
+    assert_softmax_offset_clipping_replays,
 )
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
@@ -73,6 +76,13 @@ if HAVE_TE:
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+
+
+def test_learnable_softmax_offset_clipping_replays():
+    """Every TE-attention head shard contributes to repeatable TP norm/clipping."""
+    if not is_te_min_version("2.8.0"):
+        pytest.skip("learnable softmax requires Transformer Engine >= 2.8")
+    assert_softmax_offset_clipping_replays(TEDotProductAttention)
 
 
 @pytest.fixture
