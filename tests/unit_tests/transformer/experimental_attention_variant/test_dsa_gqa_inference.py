@@ -429,6 +429,43 @@ def test_score_windows_match_one_window(monkeypatch):
     torch.testing.assert_close(attend(), one_window, atol=2e-2, rtol=2e-2)
 
 
+def test_deterministic_topk_selects_within_lengths(monkeypatch):
+    """Deterministic mode selects each row's exact top-k within its length, preferring smaller
+    positions among tied scores, and fills the remaining slots with -1."""
+    pytest.importorskip("flashinfer.topk")
+    monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
+    device = torch.device("cuda", torch.cuda.current_device())
+    torch.manual_seed(47)
+    page_size, max_pages, topk = 64, 16, 256
+    # Lengths below, at, and above the top-k; a chunked prefill; windows straddling rows.
+    query_lengths, kv_lengths = [1, 1, 1, 40], [7, 256, 900, 1000]
+    metadata = build_row_metadata(torch.tensor(query_lengths), torch.tensor(kv_lengths))
+    rows = [tensor.to(device) for tensor in metadata]
+    num_pages = len(query_lengths) * max_pages
+    table = torch.randperm(num_pages, device=device).view(-1, max_pages).to(torch.int32)
+    # Four distinct indexer keys: most scores tie at the cutoff.
+    distinct = torch.randn(4, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    index_keys = distinct[torch.randint(0, 4, (num_pages, page_size), device=device)]
+    index_query = torch.randn(rows[0].numel(), INDEX_DIM, device=device, dtype=torch.bfloat16)
+    plan = DSARowPlan(*rows, rows[1][:0], table, False)
+    width = max(kv_lengths)
+    monkeypatch.setattr(dsa_gqa, "SCORE_BUFFER_BYTES", 5 * width * 4)
+    selected = dsa_gqa._materialized_topk(
+        index_query=index_query,
+        index_key_cache=index_keys,
+        plan=plan,
+        max_context_length=width,
+        index_topk=topk,
+    )
+    scores = torch.empty(rows[0].numel(), width, device=device, dtype=torch.float32)
+    dsa_gqa_indexer_scores(index_query, index_keys, table, *rows[1:], out=scores, fill_invalid=True)
+    for row, length in enumerate(rows[1].tolist()):
+        expected = torch.argsort(-scores[row, :length].cpu(), stable=True)[:topk]
+        chosen = selected[row].cpu()
+        assert sorted(chosen[chosen >= 0].tolist()) == sorted(expected.tolist())
+        assert int((chosen == -1).sum()) == topk - expected.numel()
+
+
 @pytest.mark.parametrize(
     "cache_mode,static_pointers",
     [
@@ -565,15 +602,23 @@ def test_native_decode_suspend_resume(native_context_factory, cache_mode, static
         torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
 
 
+# Needs Blackwell; the GB200 lane selects only this test from the module.
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("deterministic", [False, True], ids=["native", "deterministic"])
 @pytest.mark.parametrize("decode_only", [True, False])
-@pytest.mark.usefixtures("nondeterministic_decode")
 def test_native_decode_and_mixed_batches_replay_in_cuda_graph(
-    decode_only, native_context_factory, monkeypatch
+    decode_only, deterministic, native_context_factory, monkeypatch
 ):
-    """Two captured layers use temporary activations and match eager rows as inputs change."""
+    """Two captured layers use temporary activations and match eager rows as inputs change.
+
+    Deterministic mode routes decode rows through the row path instead of FlashInfer GVR2
+    top-k; its eager runs and graph replays must then be bitwise repeatable.
+    """
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Native DSA decode requires Blackwell")
-    pytest.importorskip("cutlass.cute")
+    if not deterministic:
+        pytest.importorskip("cutlass.cute")
+    monkeypatch.setattr(tuning_policy, "_deterministic_override", deterministic)
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(71)
     num_layers, page_size, bound = 2, 256, 9216
@@ -690,14 +735,19 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(
             )
             torch.testing.assert_close(graph_output[:real], expected, atol=2e-2, rtol=2e-2)
             assert torch.count_nonzero(graph_output[real:]) == 0
-            if decode_only:
-                previous = graph_output.clone()
-                graph.replay()
-                torch.testing.assert_close(graph_output, previous, atol=2e-2, rtol=2e-2)
-
-    monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
-    with pytest.raises(RuntimeError, match="does not support deterministic mode"):
-        attend(1)
+        if deterministic:
+            previous = [output.clone() for output in graph_outputs]
+            graph.replay()
+            eager = [attend(layer_number) for layer_number in range(1, num_layers + 1)]
+            for layer_idx, output in enumerate(graph_outputs):
+                assert torch.equal(output, previous[layer_idx])
+                assert torch.equal(attend(layer_idx + 1), eager[layer_idx])
+        elif decode_only:
+            previous = [output.clone() for output in graph_outputs]
+            graph.replay()
+            for output, before in zip(graph_outputs, previous):
+                torch.testing.assert_close(output, before, atol=2e-2, rtol=2e-2)
+    assert (native_context.dsa_metadata.topk_workspace is None) == deterministic
 
 
 @pytest.mark.usefixtures("nondeterministic_decode")

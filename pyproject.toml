@@ -163,6 +163,12 @@ inference = [
     "flashinfer-jit-cache-sm110a==0.7.2.post1; sys_platform == 'linux' and platform_machine == 'aarch64'",
     "flashinfer-jit-cache-sm120f==0.7.2.post1; sys_platform == 'linux'",
     "flashinfer-jit-cache-sm121a==0.7.2.post1; sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "tilelang>=0.1.12; sys_platform == 'linux'",
+]
+
+nvshmem = [
+    "nvshmem4py-cu13>=0.4.1; sys_platform == 'linux'",
+    "cupy-cuda13x>=14.2.0; sys_platform == 'linux'",
 ]
 
 otel = [
@@ -253,6 +259,8 @@ override-dependencies = [
     "filelock>=4.2.1",  # CVE-2026-112940; multi-storage-client 0.51 caps filelock below 4
     "tilelang==0.1.13",
     "apache-tvm-ffi==0.1.12",
+    # Match the existing dev Dockerfile runtime; PyPI Torch otherwise selects 3.4.5.
+    "nvidia-nvshmem-cu13==3.7.1",
     # TorchX 0.7.0 caps urllib3 below 1.27; require the fix for GHSA-38jv-5279-wg99.
     "urllib3>=2.6.3",
 ]
