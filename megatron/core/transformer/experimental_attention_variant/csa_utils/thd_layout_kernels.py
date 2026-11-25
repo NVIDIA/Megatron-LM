@@ -174,7 +174,7 @@ if _CUTE_AVAILABLE:
 
             vec_col = tidx
             while vec_col < vec_cols:
-                dst_offset = row * row_width + vec_col * vec_elems
+                dst_offset = cutlass.Int64(row) * row_width + vec_col * vec_elems
                 if cutlass.const_expr(
                     hidden_compact.element_type.width == 16 and row_width % 4 == 0
                 ):
@@ -185,7 +185,7 @@ if _CUTE_AVAILABLE:
                     if src_global >= 0:
                         if src_global < range_start:
                             src_row = src_global - (range_start - d_window)
-                            src_offset = src_row * row_width + vec_col * vec_elems
+                            src_offset = cutlass.Int64(src_row) * row_width + vec_col * vec_elems
                             src_ptr = cute.recast_ptr(
                                 boundary_hidden.iterator + src_offset, dtype=cutlass.Int64
                             )
@@ -196,7 +196,7 @@ if _CUTE_AVAILABLE:
                             )
                         else:
                             src_row = src_global - range_start
-                            src_offset = src_row * row_width + vec_col * vec_elems
+                            src_offset = cutlass.Int64(src_row) * row_width + vec_col * vec_elems
                             src_ptr = cute.recast_ptr(
                                 hidden_local.iterator + src_offset, dtype=cutlass.Int64
                             )
@@ -432,13 +432,13 @@ if _CUTE_AVAILABLE:
 
         vec_col = tidx
         while vec_col < vec_cols:
-            dst_offset = dst_row * row_width + vec_col * vec_elems
+            dst_offset = cutlass.Int64(dst_row) * row_width + vec_col * vec_elems
             if cutlass.const_expr(
                 grad_hidden_compact.element_type.width == 16 and row_width % 4 == 0
             ):
                 value = cutlass.Int64(0)
                 if compact_row >= 0 and compact_row < compact_len:
-                    src_offset = compact_row * row_width + vec_col * vec_elems
+                    src_offset = cutlass.Int64(compact_row) * row_width + vec_col * vec_elems
                     src_ptr = cute.recast_ptr(
                         grad_hidden_compact.iterator + src_offset, dtype=cutlass.Int64
                     )
@@ -655,33 +655,40 @@ if _CUTE_AVAILABLE:
             if cutlass.const_expr(backward):
                 if mapped_row >= 0:
                     src = cute.recast_ptr(
-                        compact.iterator + mapped_row * row_width + offset, dtype=copy_type
+                        compact.iterator + cutlass.Int64(mapped_row) * row_width + offset,
+                        dtype=copy_type,
                     )
                     value = cute.arch.load(src.llvm_ptr, copy_type)
                 if row < boundary_rows:
                     dst = cute.recast_ptr(
-                        boundary.iterator + row * row_width + offset, dtype=copy_type
+                        boundary.iterator + cutlass.Int64(row) * row_width + offset, dtype=copy_type
                     )
                     cute.arch.store(dst.llvm_ptr, value)
                 else:
                     dst = cute.recast_ptr(
-                        local.iterator + (row - boundary_rows) * row_width + offset, dtype=copy_type
+                        local.iterator + cutlass.Int64(row - boundary_rows) * row_width + offset,
+                        dtype=copy_type,
                     )
                     cute.arch.store(dst.llvm_ptr, value)
             else:
                 if mapped_row >= 0:
                     if mapped_row < boundary_rows:
                         src = cute.recast_ptr(
-                            boundary.iterator + mapped_row * row_width + offset, dtype=copy_type
+                            boundary.iterator + cutlass.Int64(mapped_row) * row_width + offset,
+                            dtype=copy_type,
                         )
                         value = cute.arch.load(src.llvm_ptr, copy_type)
                     else:
                         src = cute.recast_ptr(
-                            local.iterator + (mapped_row - boundary_rows) * row_width + offset,
+                            local.iterator
+                            + cutlass.Int64(mapped_row - boundary_rows) * row_width
+                            + offset,
                             dtype=copy_type,
                         )
                         value = cute.arch.load(src.llvm_ptr, copy_type)
-                dst = cute.recast_ptr(compact.iterator + row * row_width + offset, dtype=copy_type)
+                dst = cute.recast_ptr(
+                    compact.iterator + cutlass.Int64(row) * row_width + offset, dtype=copy_type
+                )
                 cute.arch.store(dst.llvm_ptr, value)
 
     @cute.kernel
