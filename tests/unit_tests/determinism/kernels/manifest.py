@@ -553,6 +553,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="mok_runtime",
         sources=(
             "megatron/core/transformer/moe/megakernel/mok/backend.py",
+            "megatron/core/transformer/moe/megakernel/mok/package.py",
             "megatron/core/transformer/moe/megakernel/mok/runtime.py",
             "megatron/core/transformer/moe/megakernel/mok/weights.py",
         ),

@@ -984,6 +984,7 @@ class TestMoEModules:
         Utils.initialize_model_parallel(expert_model_parallel_size=ep)
         model_parallel_cuda_manual_seed(123)
 
+    @pytest.mark.parametrize("backend", ["mok", "cutemok"])
     @pytest.mark.parametrize(
         "tp,latent,shared,mxfp8,gated",
         [
@@ -994,15 +995,23 @@ class TestMoEModules:
             (1, None, 256, False, True),
         ],
     )
-    def test_mok_moe_layer_replays(self, tp, latent, shared, mxfp8, gated):
+    def test_mok_moe_layer_replays(self, tp, latent, shared, mxfp8, gated, backend, monkeypatch):
         """Replay real routed-only SiTU and legacy fused SwiGLU, including MXFP8 and dP."""
         if not HAVE_TE or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             pytest.skip("MOK requires Transformer Engine and SM100/SM103 GPUs")
         if Utils.world_size < 4 or Utils.world_size % 4:
             pytest.skip("MOK EP4 requires a world size divisible by four")
-        functional = pytest.importorskip("mok.functional")
-        if "situ_beta" not in inspect.signature(functional.forward).parameters:
-            pytest.skip("MOK build with routed-only and SiTU support is required")
+        from megatron.core.transformer.moe.megakernel.mok import package
+        from megatron.core.transformer.moe.megakernel.mok.package import clear_mok_caches
+
+        if backend == "cutemok":
+            pytest.importorskip("cudnn.moe_ep.cutemok")
+        else:
+            functional = pytest.importorskip("mok.functional")
+            # Deprecated "mok" runs the standalone package only where CuTe MoK is not available.
+            monkeypatch.setattr(package, "cutemok_available", lambda: False)
+            if "situ_beta" not in inspect.signature(functional.forward).parameters:
+                pytest.skip("MOK build with routed-only and SiTU support is required")
         if mxfp8 and te_post_all_gather_processing is None:
             pytest.skip("MOK MXFP8 requires TE post_all_gather_processing support")
         Utils.initialize_model_parallel(
@@ -1036,7 +1045,7 @@ class TestMoEModules:
             fp8="e4m3" if mxfp8 else None,
             fp8_recipe="mxfp8",
             fp8_param=mxfp8,
-            moe_megakernel_backend="mok",
+            moe_megakernel_backend=backend,
             moe_megakernel_backend_config=dict(
                 shared_expert_mode="fused" if fused else "native",
                 fwd_num_comm_sms=2,
@@ -1051,15 +1060,16 @@ class TestMoEModules:
         ).submodules.mlp
         with get_fp8_context(config, is_init=True):
             layer = MoELayer(config, get_submodules(spec)).cuda()
-        backend = layer.megakernel_experts
+        megakernel = layer.megakernel_experts
+        assert (megakernel.cutemok is None) == (backend == "mok")
         assert layer.token_dispatcher is None and layer.megakernel_fuses_shared_expert == fused
-        assert (backend.shared_fc1_weight is not None) == fused
-        assert (backend.shared_output_gate_weight is not None) == gated
-        assert backend.situ_beta == (None if fused else (2.0, 8.0))
-        assert backend.use_mxfp8_weights == mxfp8
+        assert (megakernel.shared_fc1_weight is not None) == fused
+        assert (megakernel.shared_output_gate_weight is not None) == gated
+        assert megakernel.situ_beta == (None if fused else (2.0, 8.0))
+        assert megakernel.use_mxfp8_weights == mxfp8
         assert all(
             is_mxfp8tensor(p) == mxfp8
-            for p in backend.routed_fc1_parameters + backend.routed_fc2_parameters
+            for p in megakernel.routed_fc1_parameters + megakernel.routed_fc2_parameters
         )
         model = DistributedDataParallel(
             config,
@@ -1109,7 +1119,7 @@ class TestMoEModules:
                 assert param.main_grad.dtype == torch.float32
         finally:
             handle.remove()
-            functional.clear_workspace_cache()
+            clear_mok_caches()
 
     @pytest.mark.parametrize("dispatcher", ["allgather", "alltoall"])
     @pytest.mark.parametrize("balancing", ["aux_loss", "seq_aux_loss"])

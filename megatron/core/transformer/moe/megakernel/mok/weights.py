@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from megatron.core.transformer.moe.megakernel.mok.package import mok_modules
+
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -258,11 +260,18 @@ def _parameter_storage_attr(param: nn.Parameter, name: str) -> torch.Tensor | No
 
 
 def _native_split_weight_view(
-    params: tuple[nn.Parameter, ...], *, rows: int, columns: int, use_mxfp8: bool, cached_view=None
+    params: tuple[nn.Parameter, ...],
+    *,
+    rows: int,
+    columns: int,
+    use_mxfp8: bool,
+    cached_view=None,
+    api=None,
 ):
-    """Build or refresh one MOK view over independent per-expert parameters."""
-    from mok import functional, ops
+    """Build or refresh one MOK view over independent per-expert parameters.
 
+    ``api`` is cuDNN frontend's CuTe MoK module (for ``CuteMoKSplitWeight``), or None for ``mok``.
+    """
     if not params:
         raise RuntimeError("MOK split routed weight list must not be empty")
     if cached_view is not None:
@@ -319,6 +328,9 @@ def _native_split_weight_view(
             payloads.append(
                 _storage_view(payload, shape, dtype=torch.bfloat16, name="split BF16 rowwise")
             )
+        if api is not None:
+            return api.CuteMoKSplitWeight.from_experts(payloads)
+        functional, ops = mok_modules()
         return functional.SplitRoutedWeight(
             data=payloads[0],  # Representative tensor for schema/device dispatch.
             storage_table=ops.make_routed_weight_storage_table_bf16(payloads),
@@ -395,6 +407,15 @@ def _native_split_weight_view(
         _swizzle_mxfp8_scale(scale.unsqueeze(0), rows=columns, columns=rows)
         for scale in column_scales
     ]
+    if api is not None:
+        return api.CuteMoKSplitWeight.from_experts(
+            row_payloads,
+            scales=row_scale_tensors,
+            transposed=column_payloads,
+            transposed_scales=column_scale_tensors,
+            native_columnwise=True,
+        )
+    functional, ops = mok_modules()
     row_storage_table = ops.make_routed_weight_storage_table_mxfp8(row_payloads)
     column_storage_table = ops.make_routed_weight_storage_table_mxfp8(column_payloads)
     return functional.SplitRoutedWeight(

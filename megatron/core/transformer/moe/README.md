@@ -623,7 +623,7 @@ moe_grouped_gemm: true
 moe_ffn_hidden_size: 3072
 gradient_accumulation_fusion: true
 moe_shared_expert_intermediate_size: 3072
-moe_megakernel_backend: mok
+moe_megakernel_backend: cutemok
 moe_megakernel_backend_config:
   fwd_num_comm_sms: 40
   bwd_num_comm_sms: 28
@@ -632,11 +632,15 @@ moe_megakernel_backend_config:
 The equivalent backend-specific CLI value is a JSON object:
 
 ```bash
---moe-megakernel-backend mok --moe-megakernel-backend-config '{"fwd_num_comm_sms": 40, "bwd_num_comm_sms": 28}'
+--moe-megakernel-backend cutemok --moe-megakernel-backend-config '{"fwd_num_comm_sms": 40, "bwd_num_comm_sms": 28}'
 ```
 
-MOK is an optional dependency, imported only when the backend is selected. The ARM64 development
-image already installs the supported
+`cutemok` runs cuDNN frontend's CuTe MoK (see [CuTe MoK](#cute-mok) below). The previous
+`moe_megakernel_backend: mok` is deprecated: it runs as `cutemok` when CuTe MoK is available and
+otherwise through the standalone MOK package, with a `FutureWarning` either way.
+
+The standalone MOK package is an optional dependency, imported only when it runs. The ARM64
+development image already installs the supported
 [MCore integration snapshot](https://github.com/QiZhangNV/mixture-of-kittens/tree/7a8cfb7fdd96a1cfba506caf4756c6c86073399a)
 through `docker/common/install_mok.sh`. Use that image or its installation helper to retain the
 supported dependency and Blackwell build targets. The AMD64 image skips MOK because its H100
@@ -689,6 +693,25 @@ recompute, GTP weight rematerialization, shortcut MoE, inference-optimized layer
 partial MoE CUDA Graph replay, MCore expert-input
 capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
 layouts.
+
+#### CuTe MoK
+
+`moe_megakernel_backend: cutemok` runs the same MOK adapter on cuDNN frontend's CuTe MoK
+(`cudnn.moe_ep.cutemok`), added in
+[NVIDIA/cudnn-frontend#2767](https://github.com/NVIDIA/cudnn-frontend/pull/2767). CuTe MoK is an
+optimized CuTe DSL version of MOK, so it is expected to outperform the standalone MOK package;
+MCore calls it through cuDNN frontend's public API (`cutemok_prepare` / `cutemok_forward` /
+`cutemok_backward`), shares one prepared plan among the layers of one configuration, and keeps
+everything else of the MOK integration: the constraints and support table above,
+`shared_expert_mode`, main-grad accumulation and checkpointing.
+
+The backend config is validated by `CuteMoKConfig`, which takes MOK's keys and CuTe MoK's own
+(for example `comm_tile_shape` and `gate_up_context`). CuTe MoK needs a cuDNN frontend that
+includes it (its `develop` branch since #2767), the cu13 build of CuTe DSL
+(`nvidia-cutlass-dsl[cu13]`) 4.8 or later, and PyTorch built for CUDA 13. If Transformer Engine's
+optional FlashAttention-4 and QuACK packages are installed, they must be versions built for that
+CuTe DSL (older ones fail to import under it). Unlike the table above, hidden and expert
+intermediate sizes need only be multiples of 128 (at least 256).
 
 
 ### GLU Checkpoint Layout
