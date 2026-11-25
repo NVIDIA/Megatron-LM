@@ -145,6 +145,7 @@ _cudnn_dsa: Optional[CudnnDsaInterface] = None
 _CLIP_PROB_MIN = torch.finfo(torch.float32).tiny
 _TOPK_TIE_BREAK_EPS = 1.0e-12
 _STABLE_INDEXER_TOPK = os.environ.get("MCORE_DSA_STABLE_INDEXER_TOPK") == "1"
+_PRESERVE_SELECTED_SLOT_ORDER = os.environ.get("MCORE_DSA_PRESERVE_SELECTED_SLOT_ORDER") == "1"
 _INDEXER_RATIO = 1
 _INDEXER_SOFTMAX_SCALE = 1.0
 _TOPK_WRAPPER_MAX_SCRATCH_BYTES = 2 * 1024 * 1024 * 1024
@@ -1006,7 +1007,7 @@ def _indexer_topk_packed_thd(
     )["scores"]
 
     score_topk = min(topk_k, max_score_k)
-    if score_topk == max_score_k:
+    if score_topk == max_score_k and not (_PRESERVE_SELECTED_SLOT_ORDER and _STABLE_INDEXER_TOPK):
         # Ranking is unnecessary when K covers every score column. This also
         # avoids cuDNN FE's vectorized-output restriction for large odd K.
         topk_indices = torch.arange(score_topk, dtype=torch.int32, device=device).view(
@@ -1287,9 +1288,14 @@ def _compact_valid_topk_indices_and_scores(
 
 
 def _sort_valid_topk_indices_by_index(topk_indices: Tensor, topk_length: Tensor, sk: int) -> Tensor:
-    """Canonicalize consumed top-K indices while keeping ignored suffix slots invalid."""
+    """Order attention slots independently of the score payload consumed by the indexer loss."""
     positions = _trailing_positions(topk_indices)
     valid = positions < topk_length.unsqueeze(-1)
+    if _PRESERVE_SELECTED_SLOT_ORDER:
+        # Both attention callers have already compacted valid slots to the front.
+        # Preserve the selector's order for kernels whose finite-precision reduction
+        # follows the physical slot order. The stable selector ranks by raw score.
+        return topk_indices.masked_fill(~valid, -1)
     sorted_indices, _ = dsa_masking.sort_topk_by_index(topk_indices, valid, sk=sk)
     return sorted_indices
 
