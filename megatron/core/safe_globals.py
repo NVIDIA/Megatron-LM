@@ -148,6 +148,7 @@ class SafeDCPUnpickler(SafeUnpickler):
             ("multistorageclient.pathlib", "MultiStoragePath"),
             ("torch.serialization", "_get_layout"),
             ("torch.distributed.checkpoint.filesystem", "_StorageInfo"),
+            ("torch.distributed.checkpoint.filesystem", "_StoragePrefix"),
             ("torch.distributed.checkpoint.metadata", "Metadata"),
             ("torch.distributed.checkpoint.metadata", "MetadataIndex"),
             ("torch.distributed.checkpoint.metadata", "StorageMeta"),
@@ -158,6 +159,10 @@ class SafeDCPUnpickler(SafeUnpickler):
             ("torch.distributed.checkpoint.metadata", "ChunkStorageMetadata"),
             ("torch.distributed.checkpoint.metadata", "BytesStorageMetadata"),
             ("torch.distributed.checkpoint.metadata", "_MEM_FORMAT_ENCODING"),
+            ("torch.distributed.checkpoint.metadata", "MEM_FORMAT_ENCODING"),
+            # Legacy location (and name) of the memory-format enum used by TensorProperties.
+            ("torch.distributed._shard.sharded_tensor.metadata", "MEM_FORMAT_ENCODING"),
+            ("torch.distributed._shard.sharded_tensor.metadata", "_MEM_FORMAT_ENCODING"),
             # Recent torch versions embed the save plan (and its write items) in the
             # metadata (e.g. under ``planner_data``); these are plain dataclasses/enums.
             ("torch.distributed.checkpoint.planner", "SavePlan"),
