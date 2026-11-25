@@ -4,6 +4,7 @@ import gc
 import inspect
 import os
 import sys
+import weakref
 
 import pytest
 import torch
@@ -45,6 +46,7 @@ from megatron.core.transformer.cuda_graphs import (
     create_cudagraphs,
     delete_cuda_graphs,
     is_graph_warmup,
+    release_all_cuda_graphs,
 )
 from megatron.core.transformer.enums import (
     AttnBackend,
@@ -99,6 +101,106 @@ def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
     assert len(created_streams) == pool_size
     assert len({stream.cuda_stream for stream in created_streams}) == pool_size
     assert assigned[:pool_size] == assigned[pool_size:]
+
+
+@pytest.fixture
+def isolated_cuda_graph_record(monkeypatch):
+    """Give each test its own runner registry and global capture state."""
+    monkeypatch.setattr(_CudagraphGlobalRecord, "captured_runners", weakref.WeakSet())
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_created", False)
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_record", [])
+    monkeypatch.setattr(_CudagraphGlobalRecord, "cudagraph_inference_record", [])
+    monkeypatch.setattr(_CudagraphGlobalRecord, "_saved_tensors_observer", None)
+    monkeypatch.setattr(cuda_graphs_module, "_GTP_RUNNER_STREAMS", [])
+    monkeypatch.setattr(CudaGraphManager, "global_mempool", object())
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+
+
+class _Graph:
+    def reset(self):
+        pass
+
+
+def _new_runner(*, need_backward):
+    return _CudaGraphRunner(
+        MegatronModule(config=None),
+        CudaGraphManager.global_mempool,
+        [],
+        {},
+        func=None,
+        need_backward=need_backward,
+    )
+
+
+def _assert_runner_released(runner, graph_refs):
+    assert all(graph_ref() is None for graph_ref in graph_refs)
+    assert not runner.cudagraph_created
+    assert not runner.fwd_graph_recorded
+    assert not runner.bwd_graph_recorded
+    assert runner.mempool is None
+    assert runner._gtp_fwd_params_to_ensure_ready == ()
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("recorded_for_training", [False, True], ids=["inline", "recorded"])
+def test_release_all_cuda_graphs_synchronizes_before_releasing_graphs(
+    isolated_cuda_graph_record, monkeypatch, recorded_for_training
+):
+    events = []
+    runner = _new_runner(need_backward=recorded_for_training)
+    if recorded_for_training:
+        _CudagraphGlobalRecord.record_fwd_graph(runner, (), {}, ())
+        runner.fwd_graph_recorded = True
+    else:
+        runner.eval()
+
+    def fail_capture_setup():
+        raise RuntimeError("interrupted capture setup")
+
+    # Inline inference appends its execution record only after create_fwd_graph returns.
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", _Graph)
+    monkeypatch.setattr(cuda_graphs_module, "get_all_rng_states", fail_capture_setup)
+    with pytest.raises(RuntimeError, match="interrupted capture setup"):
+        runner.create_fwd_graph((), {})
+    graph_ref = weakref.ref(runner.fwd_graph)
+    monkeypatch.setattr(_Graph, "reset", lambda self: events.append("reset"))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: events.append("synchronize"))
+
+    # A replay may still read the graph's external constants until the device is idle.
+    release_all_cuda_graphs()
+
+    assert events == ["synchronize", "reset"]
+    _assert_runner_released(runner, (graph_ref,))
+
+
+@pytest.mark.internal
+@pytest.mark.launch_on_gb200
+def test_delete_cuda_graphs_releases_created_training_graphs(isolated_cuda_graph_record):
+    # An inference engine's suspend calls delete_cuda_graphs(). Capture added the
+    # training runner to 'captured_runners', so its created graphs are released too.
+    training_runner = _new_runner(need_backward=True)
+    training_runner.cudagraph_created = True
+    training_runner.fwd_graph_recorded = True
+    training_runner.bwd_graph_recorded = True
+    training_runner.fwd_graph = _Graph()
+    training_runner.bwd_graph = _Graph()
+    training_runner._gtp_fwd_params_to_ensure_ready = (object(),)
+    training_graph_refs = (
+        weakref.ref(training_runner.fwd_graph),
+        weakref.ref(training_runner.bwd_graph),
+    )
+    _CudagraphGlobalRecord.captured_runners.add(training_runner)
+    _CudagraphGlobalRecord.cudagraph_created = True
+
+    delete_cuda_graphs()
+
+    _assert_runner_released(training_runner, training_graph_refs)
+    assert len(_CudagraphGlobalRecord.captured_runners) == 0
+    assert not _CudagraphGlobalRecord.cudagraph_created
+    assert CudaGraphManager.global_mempool is None
 
 
 @pytest.mark.parametrize("has_te_modules", [False, True])

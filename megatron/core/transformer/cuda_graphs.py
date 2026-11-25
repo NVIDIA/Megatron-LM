@@ -26,6 +26,7 @@ from torch.utils._pytree import tree_map as tree_map_pyt
 from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
@@ -910,6 +911,24 @@ def delete_cuda_graphs():
     torch.cuda.empty_cache()
 
     CudaGraphManager.global_mempool = None
+
+
+def release_all_cuda_graphs() -> None:
+    """Release local CUDA graphs before destroying their communicators.
+
+    Forward capture registers its runner before recording any CUDA work, so
+    ``captured_runners`` also covers interrupted captures.
+    """
+    if (
+        _CudagraphGlobalRecord.captured_runners
+        or _CudagraphGlobalRecord.cudagraph_record
+        or _CudagraphGlobalRecord.cudagraph_inference_record
+        or CudaGraphManager.global_mempool is not None
+    ):
+        delete_cuda_graphs()
+
+
+register_model_parallel_teardown(TeardownStage.RELEASE_CUDA_GRAPHS, release_all_cuda_graphs)
 
 
 class _GraphStatus(Enum):

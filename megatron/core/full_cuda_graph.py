@@ -9,6 +9,7 @@ from typing import Optional
 
 import torch
 
+from megatron.core.parallel_state import TeardownStage, register_model_parallel_teardown
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tensor_parallel.gtp_symmetric_memory import symmetric_wgrad_pool
 from megatron.core.tensor_parallel.random import (
@@ -16,7 +17,7 @@ from megatron.core.tensor_parallel.random import (
     get_all_rng_states,
     prime_cuda_rng_states_for_graph_capture,
 )
-from megatron.core.transformer.cuda_graphs import capture_constants
+from megatron.core.transformer.cuda_graphs import capture_constants, release_capture_constants
 
 logger = logging.getLogger(__name__)
 
@@ -369,25 +370,42 @@ class FullCudaGraphWrapper:
         """Increment current training/validation iteration."""
         FullCudaGraphWrapper.curr_iteration[stage] += 1
 
-    def reset_cuda_graph(self, stage=None):
+    @classmethod
+    def reset_cuda_graph(cls, stage=None):
         """Reset CUDA graph."""
-        captured = any(graph is not None for graph in FullCudaGraphWrapper.cuda_graph.values())
+        captured = any(graph is not None for graph in cls.cuda_graph.values())
         if captured:
             torch.cuda.synchronize()
-        if stage is None or stage == 'training':
-            if FullCudaGraphWrapper.cuda_graph['training'] is not None:
-                del FullCudaGraphWrapper.cuda_graph['training']
-                FullCudaGraphWrapper.cuda_graph['training'] = None
-            FullCudaGraphWrapper.result['training'] = None
-            FullCudaGraphWrapper.curr_iteration['training'] = 0
-            get_rerun_state_machine().clear_deferred_validations("training")
-        if stage is None or stage == 'validation':
-            if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
-                del FullCudaGraphWrapper.cuda_graph['validation']
-                FullCudaGraphWrapper.cuda_graph['validation'] = None
-            FullCudaGraphWrapper.result['validation'] = None
-            FullCudaGraphWrapper.curr_iteration['validation'] = 0
-            get_rerun_state_machine().clear_deferred_validations("validation")
+        for graph_stage, graph in cls.cuda_graph.items():
+            if stage is not None and graph_stage != stage:
+                continue
+            if graph is not None:
+                # FullIterationGradCopy can still hold the training graph after reset.
+                graph.reset()
+                release_capture_constants(graph)
+                cls.cuda_graph[graph_stage] = None
+            cls.result[graph_stage] = None
+            cls.curr_iteration[graph_stage] = 0
+            get_rerun_state_machine().clear_deferred_validations(graph_stage)
         if captured:
             symmetric_wgrad_pool.reset_completed_reuse_events()
-        gc.collect()
+            gc.collect()
+
+
+def _release_full_cuda_graphs() -> None:
+    """Release the full-iteration graphs, which keep their captured communicators alive.
+
+    The next model-parallel lifetime warms up and captures again. Deferred validations
+    are recorded only while a graph is captured, so without a graph this resets the
+    iteration state directly: reset_cuda_graph() would initialize the rerun state machine
+    implicitly, and a later explicit initialization would then fail.
+    """
+    if any(graph is not None for graph in FullCudaGraphWrapper.cuda_graph.values()):
+        FullCudaGraphWrapper.reset_cuda_graph()
+        return
+    for stage in FullCudaGraphWrapper.cuda_graph:
+        FullCudaGraphWrapper.result[stage] = None
+        FullCudaGraphWrapper.curr_iteration[stage] = 0
+
+
+register_model_parallel_teardown(TeardownStage.RELEASE_CUDA_GRAPHS, _release_full_cuda_graphs)
