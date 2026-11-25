@@ -350,8 +350,10 @@ class FsdpAngularMuOwn(FsdpMuon):
                 alpha=lr,
             )
 
-            # W = g * U_new with the retracted unit rows U_new = U+ / rho_den.
-            torch.mul(direction, row_scale / denominator, out=weight)
+            # W = g * U_new with the retracted unit rows U_new = U+ / rho_den. |g| is floored at
+            # norm_eps as for U = W / g, so a row whose g lands on zero keeps its direction.
+            floored_scale = torch.copysign(row_scale.abs().clamp_min(self.norm_eps), row_scale)
+            torch.mul(direction, floored_scale / denominator, out=weight)
             # g <- g * rho / rho_den: a no-op unless the clamp fired, where it keeps
             # |g_i| = ||W_i||.
             row_scale.mul_(row_norm / denominator)

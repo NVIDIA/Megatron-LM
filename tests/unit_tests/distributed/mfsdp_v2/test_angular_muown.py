@@ -39,7 +39,7 @@ class ReferenceAngularMuOwn(Muon):
     It reuses EO Muon's orthogonalize(), with FsdpAngularMuOwn's default hyperparameters.
     """
 
-    def __init__(self, params, *, angular_warmup_steps, angular_horizon_steps, **kwargs):
+    def __init__(self, params, *, angular_warmup_steps, angular_horizon_steps, **kwargs) -> None:
         super().__init__(params, scale_mode="shape_scaling", **kwargs)
         self.warmup_steps = angular_warmup_steps
         self.horizon_steps = angular_horizon_steps
