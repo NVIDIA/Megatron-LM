@@ -368,6 +368,88 @@ def test_kda_selective_recompute(recompute_module, two_stage_gates):
         Utils.destroy_model_parallel()
 
 
+# Under a custom recipe, GDN recompute reproduces the non-recompute results bit for bit on
+# B200; replaying the projections without the recipe shifts gradients by several percent.
+_KDA_RECOMPUTE_REL_L2_TOL = 1e-3
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_kda_gdn_recompute_replays_custom_recipe():
+    """Selective GDN recompute must replay the projections under the forward's custom recipe.
+
+    With only ``custom_recipe`` set, ``config.fp8`` and ``config.fp4`` are unset. If the
+    recompute path selected ``tensor_parallel.checkpoint`` from those flags, backward would
+    replay the projections without the recipe and differ from the non-recompute gradients.
+    """
+    from megatron.core.quantization.te_recipe import get_quantization_context
+    from tests.unit_tests.test_custom_recipe import TEST_FACTORY_PATH, _skip_unless_fp8_available
+
+    _skip_unless_fp8_available()
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        # FP8 GEMMs need dimensions divisible by 16; beta_proj's width is the key-head count.
+        quantizable = dict(
+            custom_recipe=TEST_FACTORY_PATH,
+            num_attention_heads=16,
+            num_query_groups=16,
+            linear_num_key_heads=16,
+            linear_num_value_heads=16,
+        )
+        base_config = _make_config(**quantizable)
+        recompute_config = _make_config(
+            **quantizable, recompute_granularity="selective", recompute_modules=["gdn"]
+        )
+
+        def run(module, config, hidden_states):
+            # KDA's enclosing layer supplies the forward quantization context.
+            with get_quantization_context(config):
+                output, _ = module(hidden_states, None)
+            output.float().sum().backward()
+            grads = {
+                name: parameter.grad.detach().clone()
+                for name, parameter in module.named_parameters()
+                if parameter.grad is not None
+            }
+            return output.detach(), hidden_states.grad.detach().clone(), grads
+
+        model_parallel_cuda_manual_seed(42)
+        base_kda = _build_kda(base_config)
+        model_parallel_cuda_manual_seed(42)
+        recompute_kda = _build_kda(recompute_config)
+        recompute_kda.load_state_dict(base_kda.state_dict())
+        assert recompute_kda.recompute_gdn is True
+
+        torch.manual_seed(42)
+        hidden_states = torch.randn(
+            (64, 2, base_config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        base_output, base_input_grad, base_grads = run(
+            base_kda, base_config, hidden_states.detach().clone().requires_grad_(True)
+        )
+        recompute_output, recompute_input_grad, recompute_grads = run(
+            recompute_kda, recompute_config, hidden_states.detach().clone().requires_grad_(True)
+        )
+
+        # Recompute may only change kernel and reduction order. Replaying without the recipe
+        # changes the projections, and with them every gradient that flows through them.
+        def rel_l2(actual, expected):
+            return ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
+
+        errors = {"output": rel_l2(recompute_output, base_output)}
+        errors["input_grad"] = rel_l2(recompute_input_grad, base_input_grad)
+        assert recompute_grads.keys() == base_grads.keys()
+        for name in base_grads:
+            errors[name] = rel_l2(recompute_grads[name], base_grads[name])
+        mismatched = {name: err for name, err in errors.items() if err > _KDA_RECOMPUTE_REL_L2_TOL}
+        assert not mismatched, f"GDN recompute changed results under a custom recipe: {mismatched}"
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
 @pytest.mark.parametrize("two_stage_gates", [False, True])

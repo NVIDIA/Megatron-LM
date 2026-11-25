@@ -738,6 +738,79 @@ class TestDSv4HybridAttentionForwardBackward:
             assert output.shape == (seq_len, batch_size, self.config.hidden_size)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+@pytest.mark.parametrize("layer_number", [1, 2])
+def test_mla_up_proj_recompute_replays_custom_recipe(layer_number):
+    """mla_up_proj recompute must replay the up-projections under the forward's custom recipe.
+
+    With only ``custom_recipe`` set, ``config.fp8`` and ``config.fp4`` are unset. If the
+    up-projection checkpoint were configured from those flags, backward would replay the
+    projections without the recipe, so the recomputed query/key/value would differ from the
+    ones the forward pass used. Enabling mla_up_proj also changes the core-attention path,
+    so instead of comparing against a model without recompute, compare each checkpointed
+    projection's backward replay with its own forward output.
+    """
+    from megatron.core.quantization.te_recipe import get_quantization_context
+    from tests.unit_tests.test_custom_recipe import TEST_FACTORY_PATH, _skip_unless_fp8_available
+
+    _skip_unless_fp8_available()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    try:
+        config = _make_config(
+            custom_recipe=TEST_FACTORY_PATH,
+            recompute_granularity="selective",
+            recompute_modules=["mla_up_proj"],
+        )
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+        attn = _build_attention(
+            config,
+            layer_number=layer_number,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
+        attn = attn.cuda().train()
+        assert attn.recompute_up_proj is True
+
+        # These projections run inside the up-projection checkpoint: once in forward and
+        # once more when backward rebuilds the discarded query/key/value.
+        replayed = {"linear_q_up_proj": [], "linear_kv_proj": []}
+        handles = [
+            getattr(attn, name).register_forward_hook(
+                lambda module, args, output, calls=calls: calls.append(
+                    (output[0] if isinstance(output, tuple) else output).detach().clone()
+                )
+            )
+            for name, calls in replayed.items()
+        ]
+        try:
+            hidden = torch.randn(
+                128, 2, config.hidden_size, dtype=torch.bfloat16, device="cuda"
+            ).requires_grad_(True)
+            # The enclosing transformer layer supplies the forward quantization context.
+            with get_quantization_context(config):
+                output, _ = attn(hidden_states=hidden, attention_mask=None)
+            output.float().sum().backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+        for name, calls in replayed.items():
+            assert len(calls) == 2, f"{name} ran {len(calls)} times; expected forward + recompute"
+            forward_output, recomputed_output = calls
+            # Same inputs and the same quantizers, so the replay must be bitwise identical.
+            torch.testing.assert_close(
+                recomputed_output,
+                forward_output,
+                atol=0,
+                rtol=0,
+                msg=f"{name} was recomputed without the forward's custom recipe",
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 # ===========================================================================
 # get_query_key_value_tensors tests
 # ===========================================================================
