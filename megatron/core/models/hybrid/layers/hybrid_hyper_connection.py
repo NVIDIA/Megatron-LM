@@ -152,6 +152,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             output_with_bias = layer._group_offload_output_with_bias(
                 output_with_bias, attn_norm_manager, forced_released_tensors=[residual]
             )
+            layer.attn_norm_manager = None
             return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
 
         output_with_bias, residual = layer._forward_mlp_output_with_bias(
