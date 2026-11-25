@@ -724,6 +724,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/distributed/param_and_grad_buffer.py",),
         tests=(
             C + "test_gpt_model.py",
+            "tests/unit_tests/distributed/test_ddp_cpu_staging.py",
             "tests/unit_tests/distributed/test_param_storage_copyback.py",
             "tests/unit_tests/distributed/test_gradient_scaling.py",
             "tests/unit_tests/rl/test_rl_utils.py",
@@ -733,7 +734,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay; "
         "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration. "
         "Token scaling is compared exactly with FP32 multiplication in eager and CUDA graph "
-        "replay, including changing factors and low-precision gradient buffers.",
+        "replay, including changing factors and low-precision gradient buffers. "
+        "DDP CPU staging is checked against unstaged initialization for exact parameter and "
+        "gradient parity through two distributed Adam steps, with overlap on and off.",
     ),
     KernelEntry(
         name="nccl_allocator",
