@@ -37,6 +37,7 @@ _GLOBAL_ENERGY_MONITOR = None
 _GLOBAL_SIGNAL_HANDLER = None
 _GLOBAL_TELEMETRY_HANDLE = None
 
+
 def get_args():
     """Return arguments."""
     _ensure_var_is_initialized(_GLOBAL_ARGS, 'args')
@@ -88,6 +89,7 @@ def get_one_logger():
     to check if it is initialized."""
     return _GLOBAL_ONE_LOGGER
 
+
 def get_adlr_autoresume():
     """ADLR autoresume object. It can be None so no need
     to check if it is initialized."""
@@ -99,10 +101,12 @@ def get_timers():
     _ensure_var_is_initialized(_GLOBAL_TIMERS, 'timers')
     return _GLOBAL_TIMERS
 
+
 def get_energy_monitor():
     """Return energy monitor."""
     _ensure_var_is_initialized(_GLOBAL_ENERGY_MONITOR, 'energy monitor')
     return _GLOBAL_ENERGY_MONITOR
+
 
 def get_signal_handler():
     _ensure_var_is_initialized(_GLOBAL_SIGNAL_HANDLER, 'signal handler')
@@ -133,6 +137,7 @@ def _graceful_shutdown(signum, frame):
       - Exits the process cleanly
     """
     from megatron.training.utils import print_rank_0
+
     print_rank_0("\nTermination requested. Performing orderly shutdown.")
 
     try:
@@ -182,11 +187,7 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
     # too, and the checkpoint converters bootstrap through this function without reaching
     # initialize_megatron. Finalizing constructs no runtime service.
     cfg_container.finalize()
-    initialize_runtime_services(
-        args,
-        build_tokenizer=build_tokenizer,
-        training=training,
-    )
+    initialize_runtime_services(args, build_tokenizer=build_tokenizer, training=training)
     if not training:
         # Legacy checkpoint converters preserve progress without training services.
         _set_train_state()
@@ -226,6 +227,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
         # into megatron.training, which imports this module.
         from megatron.training.utils import print_rank_0
+
         print_rank_0(f'> using step batch size schedule: {cfg.train.step_batch_size_schedule}')
 
     init_num_microbatches_calculator(
@@ -328,7 +330,9 @@ def _build_tokenizer(cfg, args):
         make_vocab_size_divisible_by = args.make_vocab_size_divisible_by
         tp_size = args.tensor_model_parallel_size
 
-    _GLOBAL_TOKENIZER = build_tokenizer_and_pad_vocab_size(cfg.tokenizer, make_vocab_size_divisible_by, tp_size)
+    _GLOBAL_TOKENIZER = build_tokenizer_and_pad_vocab_size(
+        cfg.tokenizer, make_vocab_size_divisible_by, tp_size
+    )
     # Resolve the declared model field once, before any args-to-config conversion.
     # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.
     if (
@@ -372,20 +376,23 @@ def _set_tensorboard_writer(args):
     """Set tensorboard writer."""
     cfg = get_run_config()
     global _GLOBAL_TENSORBOARD_WRITER
-    _ensure_var_is_not_initialized(_GLOBAL_TENSORBOARD_WRITER,
-                                   'tensorboard writer')
+    _ensure_var_is_not_initialized(_GLOBAL_TENSORBOARD_WRITER, 'tensorboard writer')
 
     if cfg.logger.tensorboard_dir and args.rank == (safe_get_world_size() - 1):
         try:
             from torch.utils.tensorboard import SummaryWriter
+
             print('> setting tensorboard ...')
             _GLOBAL_TENSORBOARD_WRITER = SummaryWriter(
-                log_dir=cfg.logger.tensorboard_dir,
-                max_queue=cfg.logger.tensorboard_queue_size)
+                log_dir=cfg.logger.tensorboard_dir, max_queue=cfg.logger.tensorboard_queue_size
+            )
         except ModuleNotFoundError:
-            print('WARNING: TensorBoard writing requested but is not '
-                  'available (are you using PyTorch 1.1.0 or later?), '
-                  'no TensorBoard logs will be written.', flush=True)
+            print(
+                'WARNING: TensorBoard writing requested but is not '
+                'available (are you using PyTorch 1.1.0 or later?), '
+                'no TensorBoard logs will be written.',
+                flush=True,
+            )
 
 
 def _wandb_run_id(exp_name: str) -> str:
@@ -401,13 +408,13 @@ def _wandb_run_id(exp_name: str) -> str:
 def _set_wandb_writer(args):
     cfg = get_run_config()
     global _GLOBAL_WANDB_WRITER
-    _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
-                                   'wandb writer')
+    _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER, 'wandb writer')
     if cfg.logger.wandb_project and args.rank == (safe_get_world_size() - 1):
         if cfg.logger.wandb_exp_name == '':
             raise ValueError("Please specify the wandb experiment name!")
 
         import wandb
+
         if cfg.logger.wandb_save_dir:
             save_dir = cfg.logger.wandb_save_dir
         else:
@@ -416,7 +423,10 @@ def _set_wandb_writer(args):
         # Private attributes are runtime state rather than configuration and can be large; keep
         # them out of the wandb config. Copy so the kitchen contents added below stay off args.
         wandb_config = {k: v for k, v in vars(args).items() if not k.startswith('_')}
-        if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
+        if (
+            'kitchen_config_file' in wandb_config
+            and wandb_config['kitchen_config_file'] is not None
+        ):
             # Log the contents of the config for discovery of what the quantization
             # settings were.
             with open(wandb_config['kitchen_config_file'], "r") as f:
@@ -437,7 +447,8 @@ def _set_wandb_writer(args):
             'name': cfg.logger.wandb_exp_name,
             'project': cfg.logger.wandb_project,
             'config': wandb_config,
-            "resume": "allow"}
+            "resume": "allow",
+        }
         if cfg.logger.wandb_entity:
             wandb_kwargs['entity'] = cfg.logger.wandb_entity
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
@@ -457,18 +468,22 @@ def _set_one_logger(args):
             one_logger_async = False
         try:
             from one_logger import OneLogger
+
             config = {
-               'project': cfg.logger.one_logger_project,
-               'name': cfg.logger.one_logger_run_name,
-               'async': one_logger_async,
+                'project': cfg.logger.one_logger_project,
+                'name': cfg.logger.one_logger_run_name,
+                'async': one_logger_async,
             }
             one_logger = OneLogger(config=config)
             _GLOBAL_ONE_LOGGER = one_logger
         except Exception:
-            print('WARNING: one_logger package is required to enable e2e metrics '
-                  'tracking. please go to '
-                  'https://confluence.nvidia.com/display/MLWFO/Package+Repositories'
-                  ' for details to install it')
+            print(
+                'WARNING: one_logger package is required to enable e2e metrics '
+                'tracking. please go to '
+                'https://confluence.nvidia.com/display/MLWFO/Package+Repositories'
+                ' for details to install it'
+            )
+
 
 def _set_adlr_autoresume():
     """Initialize ADLR autoresume."""
@@ -478,6 +493,7 @@ def _set_adlr_autoresume():
     cfg = get_run_config()
     if cfg.fault_tolerance.adlr_autoresume:
         from megatron.training.utils import print_rank_0
+
         print_rank_0('enabling autoresume ...')
         sys.path.append(os.environ.get('SUBMIT_SCRIPTS', '.'))
         try:
@@ -496,6 +512,7 @@ def _set_timers(args):
     _ensure_var_is_not_initialized(_GLOBAL_TIMERS, 'timers')
     _GLOBAL_TIMERS = Timers(cfg.logger.timing_log_level, cfg.logger.timing_log_option)
 
+
 def _set_energy_monitor(args):
     """Initialize energy monitor."""
     global _GLOBAL_ENERGY_MONITOR
@@ -511,6 +528,7 @@ def _ensure_var_is_initialized(var, name):
 def _ensure_var_is_not_initialized(var, name):
     """Make sure the input variable is not None."""
     assert var is None, '{} is already initialized.'.format(name)
+
 
 def _detect_gpu_identity(local_rank):
     """Best-effort physical GPU identity for this rank: index/name/UUID/serial/PCI.
@@ -538,6 +556,7 @@ def _detect_gpu_identity(local_rank):
 
     try:
         import pynvml
+
         pynvml.nvmlInit()
         try:
             handle = pynvml.nvmlDeviceGetHandleByIndex(physical_index)
@@ -554,9 +573,7 @@ def _detect_gpu_identity(local_rank):
                 attrs['dl.gpu.pci_bus_id'] = pynvml.nvmlDeviceGetPciInfo(handle).busId
             except Exception:
                 pass
-            return {
-                k: (v.decode() if isinstance(v, bytes) else v) for k, v in attrs.items()
-            }
+            return {k: (v.decode() if isinstance(v, bytes) else v) for k, v in attrs.items()}
         finally:
             pynvml.nvmlShutdown()
     except Exception:
@@ -576,9 +593,7 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     # Process tags in Jaeger, making it easy to identify and compare runs.
     cfg = get_run_config()
     resource_attrs = {'dl.local_rank': cfg.dist.local_rank}
-    fields = [
-        ('megatron.ckpt_format', 'ckpt_format'),
-    ]
+    fields = [('megatron.ckpt_format', 'ckpt_format')]
     if include_training:
         resource_attrs['dl.data_parallel.size'] = cfg.get_data_parallel_size()
         for attr, name in (
@@ -635,17 +650,20 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     # assigned at submit) and exports it as LENS_SLURM_SLUID; the rest are standard env vars.
     # SLUID is unique per (array element x requeue attempt) -- the finest execution-episode key.
     # array.job_id/task_id (empty on non-array jobs -> self-skip) reconstruct the array structure.
-    for attr, env in (('slurm.job.id', 'SLURM_JOB_ID'), ('slurm.sluid', 'LENS_SLURM_SLUID'),
-                      ('slurm.cluster', 'SLURM_CLUSTER_NAME'),
-                      ('slurm.array.job_id', 'SLURM_ARRAY_JOB_ID'),
-                      ('slurm.array.task_id', 'SLURM_ARRAY_TASK_ID'),
-                      ('slurm.array.sluid', 'LENS_SLURM_ARRAY_SLUID'),
-                      ('slurm.restart_count', 'SLURM_RESTART_COUNT'),
-                      # NVRx cycle identity (per-cohort from the ft_launcher agent) -> trainer AND
-                      # async-ckpt spans self-locate to a restart cycle + physical node.
-                      ('nvrx.cycle', 'NVRX_CYCLE'),
-                      ('nvrx.infra_rank', 'NVRX_INFRA_RANK'),
-                      ('nvrx.membership', 'NVRX_MEMBERSHIP')):
+    for attr, env in (
+        ('slurm.job.id', 'SLURM_JOB_ID'),
+        ('slurm.sluid', 'LENS_SLURM_SLUID'),
+        ('slurm.cluster', 'SLURM_CLUSTER_NAME'),
+        ('slurm.array.job_id', 'SLURM_ARRAY_JOB_ID'),
+        ('slurm.array.task_id', 'SLURM_ARRAY_TASK_ID'),
+        ('slurm.array.sluid', 'LENS_SLURM_ARRAY_SLUID'),
+        ('slurm.restart_count', 'SLURM_RESTART_COUNT'),
+        # NVRx cycle identity (per-cohort from the ft_launcher agent) -> trainer AND
+        # async-ckpt spans self-locate to a restart cycle + physical node.
+        ('nvrx.cycle', 'NVRX_CYCLE'),
+        ('nvrx.infra_rank', 'NVRX_INFRA_RANK'),
+        ('nvrx.membership', 'NVRX_MEMBERSHIP'),
+    ):
         val = os.environ.get(env)
         if val:
             resource_attrs[attr] = val
@@ -662,10 +680,12 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     #   Cases: A plain / B plain+requeue / C nvrx+plain+requeue / D nvrx+array. For arrays the
     #   anchor is the BASE array job id (SLURM_ARRAY_JOB_ID), never the per-element SLURM_JOB_ID.
     import uuid
+
     cluster = os.environ.get('SLURM_CLUSTER_NAME', 'nocluster')
     is_array = 'SLURM_ARRAY_TASK_ID' in os.environ
-    job_key = (os.environ.get('SLURM_ARRAY_JOB_ID') if is_array
-               else os.environ.get('SLURM_JOB_ID')) or 'nojob'
+    job_key = (
+        os.environ.get('SLURM_ARRAY_JOB_ID') if is_array else os.environ.get('SLURM_JOB_ID')
+    ) or 'nojob'
     run_parts = [cluster, job_key]
     if not is_array:  # SLURM requeue is global (rank-invariant) only for non-array jobs
         run_parts.append('sr' + os.environ.get('SLURM_RESTART_COUNT', '0'))
@@ -674,9 +694,11 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         run_parts.append('te' + te)
         resource_attrs['slurm.torchelastic.restart_count'] = te
     resource_attrs['nemo.lens.job_uuid'] = str(
-        uuid.uuid5(uuid.NAMESPACE_URL, 'nemo.lens.job/' + f'{cluster}/{job_key}'))
+        uuid.uuid5(uuid.NAMESPACE_URL, 'nemo.lens.job/' + f'{cluster}/{job_key}')
+    )
     resource_attrs['nemo.lens.run_uuid'] = str(
-        uuid.uuid5(uuid.NAMESPACE_URL, 'nemo.lens.run/' + '/'.join(run_parts)))
+        uuid.uuid5(uuid.NAMESPACE_URL, 'nemo.lens.run/' + '/'.join(run_parts))
+    )
     return resource_attrs
 
 
@@ -694,8 +716,7 @@ def _set_telemetry(args, *, include_training: bool = True):
     from megatron.core.telemetry.span_groups import MegatronSpanGroup
 
     config = NemoLensConfig.from_env(
-        prefix='MEGATRON_OTEL', fallback_prefix='NEMO_LENS',
-        span_group_cls=MegatronSpanGroup,
+        prefix='MEGATRON_OTEL', fallback_prefix='NEMO_LENS', span_group_cls=MegatronSpanGroup
     )
     if not os.environ.get('OTEL_SERVICE_NAME', '').strip():
         config.service_name = 'megatron-lm'
@@ -712,17 +733,18 @@ def _set_telemetry(args, *, include_training: bool = True):
     # setup_telemetry() ignores resource_attributes for a disabled config, so {} is equivalent.
     resource_attrs = (
         build_telemetry_resource_attrs(args, include_training=include_training)
-        if config.enabled else {}
+        if config.enabled
+        else {}
     )
 
     _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
-        config, rank=args.rank, world_size=safe_get_world_size(),
-        resource_attributes=resource_attrs,
+        config, rank=args.rank, world_size=safe_get_world_size(), resource_attributes=resource_attrs
     )
 
     # Bridge Python logging to OTel so logs get exported with trace correlation.
     if config.enabled and config.logs_enabled and _GLOBAL_TELEMETRY_HANDLE.is_exporting:
         from nemo.lens.logging_bridge import setup_logging_bridge
+
         setup_logging_bridge()
 
 
