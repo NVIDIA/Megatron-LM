@@ -11,6 +11,7 @@ from megatron.post_training import utils as modelopt_utils
 from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
+    root_cfg_container_from_args,
 )
 from megatron.training.config.instantiate_utils import InstantiationMode
 from megatron.training.models.gpt import GPTModelBuilder
@@ -78,29 +79,32 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
     # The transform config must preserve every setting needed to rebuild the specs.
     model = mc.modelopt_model_config_from_args(args)
     if training:
-        cfg = pretrain_cfg_container_from_args(args, model)
-        cfg.distillation = mc.distillation_config_from_args(args, model)
+        # The training run's whole document is its root container's.
+        cfg = root_cfg_container_from_args(
+            args,
+            pretrain_cfg_container_from_args(args, model),
+            distillation=mc.distillation_config_from_args(args, model),
+        )
     else:
         cfg = mc.modelopt_inference_config_from_args(args)
     path = tmp_path / "run.yaml"
     cfg.to_yaml(str(path))
     assert "modelopt_gpt_layer_spec" not in path.read_text()
     assert "modelopt_mtp_layer_spec" not in path.read_text()
-    restored = type(cfg).from_yaml(str(path), mode=InstantiationMode.STRICT)
-    restored.validate()
+    restored_run = type(cfg).from_yaml(str(path), mode=InstantiationMode.STRICT)
+    restored_run.validate()
+    restored = restored_run.training if training else restored_run
     assert restored.model.get_builder_cls() is (HybridModelBuilder if hybrid else GPTModelBuilder)
     assert restored.checkpoint.load == "/student"
     assert restored.model.transformations == model.transformations
     assert not hasattr(restored.model.transformations, "load")
     if training and kd:
-        assert restored.distillation.teacher_load == str(tmp_path)
-        assert (
-            restored.distillation.teacher_model.get_builder_cls()
-            is restored.model.get_builder_cls()
-        )
-        assert restored.distillation.loss == cfg.distillation.loss
+        distillation = restored_run.algorithm.distillation
+        assert distillation.teacher_load == str(tmp_path)
+        assert distillation.teacher_model.get_builder_cls() is restored.model.get_builder_cls()
+        assert distillation.loss == cfg.algorithm.distillation.loss
     elif training:
-        assert restored.distillation is None
+        assert restored_run.algorithm is None
     else:
         assert "distillation" not in cfg.to_dict()  # inference never distills
     # Changing the only student checkpoint reference must affect transformation restoration.
@@ -129,37 +133,39 @@ def test_tokenizer_finalizes_same_model_used_for_build():
     build.assert_called_once()
 
 
+def _kd_run(tmp_path):
+    """A distillation run's root container, as the entry points compose it from the CLI."""
+    args = make_modelopt_test_args(export_kd_teacher_load=str(tmp_path))
+    model = mc.modelopt_model_config_from_args(args)
+    return root_cfg_container_from_args(
+        args,
+        pretrain_cfg_container_from_args(args, model),
+        distillation=mc.distillation_config_from_args(args, model),
+    )
+
+
 @pytest.mark.parametrize(
     "field,value", [("tp_comm_overlap", True), ("cross_entropy_fusion_impl", "te")]
 )
 def test_direct_config_validates_kd_incompatibilities(tmp_path, field, value):
-    args = make_modelopt_test_args(export_kd_teacher_load=str(tmp_path))
-    model = mc.modelopt_model_config_from_args(args)
-    cfg = pretrain_cfg_container_from_args(args, model)
-    cfg.distillation = mc.distillation_config_from_args(args, model)
-    setattr(cfg.model.transformer, field, value)
+    root = _kd_run(tmp_path)
+    setattr(root.training.model.transformer, field, value)
     with pytest.raises(ValueError, match="incompatible"):
-        cfg.validate()
+        root.validate()
 
 
 def test_container_rejects_unresolved_teacher_before_checking_student(tmp_path):
-    args = make_modelopt_test_args(export_kd_teacher_load=str(tmp_path))
-    model = mc.modelopt_model_config_from_args(args)
-    cfg = pretrain_cfg_container_from_args(args, model)
-    cfg.distillation = mc.distillation_config_from_args(args, model)
-    cfg.distillation.teacher_model = None
+    root = _kd_run(tmp_path)
+    root.algorithm.distillation.teacher_model = None
     with pytest.raises(ValueError, match="resolved teacher_model"):
-        cfg.validate()
+        root.validate()
 
 
 def test_direct_training_config_rejects_manual_gc(tmp_path):
-    args = make_modelopt_test_args(export_kd_teacher_load=str(tmp_path))
-    model = mc.modelopt_model_config_from_args(args)
-    cfg = pretrain_cfg_container_from_args(args, model)
-    cfg.distillation = mc.distillation_config_from_args(args, model)
-    cfg.train.manual_gc = True
+    root = _kd_run(tmp_path)
+    root.training.train.manual_gc = True
     with pytest.raises(ValueError, match="manual_gc"):
-        cfg.validate()
+        root.validate()
 
 
 def test_inference_uses_config_without_cli_enable_flag():

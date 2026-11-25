@@ -36,6 +36,7 @@ from megatron.core.utils import unwrap_model
 from megatron.training.argument_utils import (
     model_config_from_args,
     pretrain_cfg_container_from_args,
+    root_cfg_container_from_args,
 )
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import set_args, set_run_config
@@ -98,7 +99,7 @@ def main() -> None:
 
     model_cfg = model_config_from_args(args, model_config_cls=MimoBuildConfig)
     cfg = pretrain_cfg_container_from_args(args, model_cfg)
-    set_run_config(cfg)
+    set_run_config(root_cfg_container_from_args(args, cfg))
     provider = resolve_provider(args)
 
     prefetch_loader = None

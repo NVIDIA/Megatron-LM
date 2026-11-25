@@ -8,13 +8,14 @@ import pytest
 import yaml
 
 from megatron.training.config import (
+    AlgorithmConfigContainer,
     CheckpointConfig,
     InferenceConfigContainer,
     InferenceSetupConfig,
     LogitsLoadConfig,
     LogitsSaveConfig,
     OfflineDistillationConfig,
-    PretrainConfigContainer,
+    RootConfigContainer,
 )
 
 
@@ -28,15 +29,19 @@ def _container():
 
 @pytest.mark.parametrize("saving", [False, True])
 def test_offline_distillation_survives_a_training_run_round_trip(run_config, saving):
-    run_config.offline_distillation = OfflineDistillationConfig(
+    offline_distillation = OfflineDistillationConfig(
         teacher_save=LogitsSaveConfig(directory="/out", top_k=32) if saving else None,
         student_load=None if saving else LogitsLoadConfig(directory="/in", loss_alpha=0.5),
     )
     run_config.train.freeze_all_layers = saving
-    restored = PretrainConfigContainer.from_dict(run_config.to_dict())
-    restored.offline_distillation.validate()
-    assert restored.offline_distillation == run_config.offline_distillation
-    assert restored.train.freeze_all_layers is saving
+    root = RootConfigContainer(
+        training=run_config,
+        algorithm=AlgorithmConfigContainer(offline_distillation=offline_distillation),
+    )
+    restored = RootConfigContainer.from_dict(root.to_dict())
+    restored.algorithm.offline_distillation.validate()
+    assert restored.algorithm.offline_distillation == offline_distillation
+    assert restored.training.train.freeze_all_layers is saving
 
 
 def test_no_override_is_the_plain_serialization():

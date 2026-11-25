@@ -33,6 +33,7 @@ from megatron.training.argument_utils import (
     _default_config_from_args,
     gpt_config_from_args,
     hybrid_config_from_args,
+    offline_distillation_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
@@ -450,7 +451,10 @@ def main():
         inference=rollout_inference_container_from_args(
             args, pretrain_container, model_cfg=model_cfg
         ),
-        algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
+        algorithm=AlgorithmConfigContainer(
+            rl=_default_config_from_args(RLConfig, args),
+            offline_distillation=offline_distillation_config_from_args(args),
+        ),
     )
     root.finalize()
     set_rl_run_config(root)

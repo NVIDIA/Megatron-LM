@@ -53,11 +53,16 @@ from megatron.training.argument_utils import (
     gpt_data_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
+    root_cfg_container_from_args,
 )
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.datasets.utils import get_dataset_input_length
-from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.global_vars import (
+    get_offline_distillation_config,
+    get_run_config,
+    set_run_config,
+)
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
@@ -264,7 +269,7 @@ def loss_func(
             the data parallel ranks
     """
     cfg = get_run_config()
-    offline_kd_cfg = cfg.offline_distillation
+    offline_kd_cfg = get_offline_distillation_config()
     if offline_kd_cfg is not None and offline_kd_cfg.student_load is not None:
         student_load_cfg = offline_kd_cfg.student_load
         # Offline knowledge distillation loss using cached teacher log-probabilities.
@@ -491,10 +496,11 @@ if __name__ == "__main__":
     full_config = pretrain_cfg_container_from_args(
         args, model_cfg, data_cfg=gpt_data_config_from_args(args)
     )
+    distillation = None
     if has_nvidia_modelopt and should_use_modelopt_config(args):
         apply_modelopt_model_config(full_config.model, args)
-        full_config.distillation = distillation_config_from_args(args, full_config.model)
-    set_run_config(full_config)
+        distillation = distillation_config_from_args(args, full_config.model)
+    set_run_config(root_cfg_container_from_args(args, full_config, distillation=distillation))
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

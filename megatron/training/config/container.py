@@ -319,11 +319,6 @@ class PretrainConfigContainer(ConfigContainerBase):
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
     fault_tolerance: FaultToleranceConfig = field(default_factory=FaultToleranceConfig)
-    distillation: DistillationConfig | None = None
-    """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
-
-    offline_distillation: OfflineDistillationConfig | None = None
-    """Offline logits KD: exactly one of teacher_save or student_load. None disables it."""
 
     @classmethod
     def from_dict(
@@ -534,8 +529,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         effective._validate_checkpoint()
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
-        self._validate_distillation()
-        self._validate_offline_distillation()
         if self.train.freeze_all_layers and transformer.freeze_base_model_for_mtp:
             raise ValueError("freeze_all_layers cannot be combined with freeze_base_model_for_mtp.")
         self._resolve_batch_sizes()
@@ -559,38 +552,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             weight_decay=self.optimizer.weight_decay,
         )
         self._validate_data_section()
-
-    def _validate_distillation(self) -> None:
-        """Check distillation against the student model and training settings.
-
-        Runs after ``super().validate()``, so the teacher config is known to be resolved.
-        """
-        if self.distillation is None:
-            return
-        if self.model is not None:
-            validate_distillation_student(self.distillation, self.model)
-        if self.train.manual_gc:
-            raise ValueError("ModelOpt distillation is incompatible with manual_gc.")
-
-    def _validate_offline_distillation(self) -> None:
-        """Check offline KD against the training, checkpoint, distillation and data sections."""
-        offline_kd_cfg = self.offline_distillation
-        if offline_kd_cfg is None:
-            return
-        if (
-            self.train.rampup_batch_size is not None
-            or self.train.step_batch_size_schedule is not None
-        ):
-            raise ValueError("Offline distillation requires a fixed global batch size.")
-        if offline_kd_cfg.teacher_save is not None:
-            if not self.checkpoint.async_save or not self.checkpoint.use_persistent_ckpt_worker:
-                raise ValueError(
-                    "teacher_save requires checkpoint.async_save and use_persistent_ckpt_worker."
-                )
-        elif self.distillation is not None:
-            raise ValueError("student_load cannot be combined with online ModelOpt distillation.")
-        if self.data.dataset is None:
-            raise ValueError("Offline distillation requires cfg.data.dataset for cache identity.")
 
     def _validate_checkpoint(self) -> None:
         """Check the checkpoint format and optimizer policy against the sections that own the
@@ -1218,6 +1179,12 @@ class AlgorithmConfigContainer(ConfigContainerBase):
     rl: RLConfig | None = None
     """The RL loop's section; `None` for a run without RL."""
 
+    distillation: DistillationConfig | None = None
+    """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
+
+    offline_distillation: OfflineDistillationConfig | None = None
+    """Offline logits KD: exactly one of teacher_save or student_load. None disables it."""
+
 
 @dataclass(kw_only=True)
 class RootConfigContainer(ConfigContainerBase):
@@ -1225,7 +1192,8 @@ class RootConfigContainer(ConfigContainerBase):
 
     Each member is itself a container (the other containers hold config sections).
     A training run sets `training`, an inference run sets `inference`,
-    an RL run sets `training`, `inference`, and `algorithm`.
+    an RL run sets `training`, `inference`, and `algorithm`,
+    a distillation run sets `training` and `algorithm`.
 
     A run config saved before this type, one container serialized flat, still loads through
     `megatron.training.utils.checkpoint_utils.run_config_sections` (backwards compatibility).
@@ -1238,12 +1206,15 @@ class RootConfigContainer(ConfigContainerBase):
     """An inference or converter process's sections, or an RL run's rollout engine deployment."""
 
     algorithm: AlgorithmConfigContainer | None = None
-    """The algorithm sections a run adds on top of `training` (the RL section)."""
+    """The algorithm sections a run adds on top of `training` (RL, distillation)."""
 
     def validate(self) -> None:
-        """Check the rules between the members, then validate every member."""
+        """Validate every member and check the rules between them."""
         self._validate_rl()
         super().validate()
+        # After the members: the distillation section's own validation resolves the teacher.
+        self._validate_distillation()
+        self._validate_offline_distillation()
 
     def _finalize(self) -> None:
         """Apply the derivations between the members, then finalize the members."""
@@ -1311,6 +1282,40 @@ class RootConfigContainer(ConfigContainerBase):
         if rl.requires_grad_buffer_offload:
             # Applied before the training container finalizes its DDP section.
             training.ddp.grad_buffer_offload = True
+
+    def _validate_distillation(self) -> None:
+        """Check distillation against the student model and training settings."""
+        distillation = None if self.algorithm is None else self.algorithm.distillation
+        if distillation is None:
+            return
+        training = self.training
+        if training.model is not None:
+            validate_distillation_student(distillation, training.model)
+        if training.train.manual_gc:
+            raise ValueError("ModelOpt distillation is incompatible with manual_gc.")
+
+    def _validate_offline_distillation(self) -> None:
+        """Check offline KD against the training, checkpoint, distillation and data sections."""
+        algorithm = self.algorithm
+        offline_kd_cfg = None if algorithm is None else algorithm.offline_distillation
+        if offline_kd_cfg is None:
+            return
+        training = self.training
+        if (
+            training.train.rampup_batch_size is not None
+            or training.train.step_batch_size_schedule is not None
+        ):
+            raise ValueError("Offline distillation requires a fixed global batch size.")
+        if offline_kd_cfg.teacher_save is not None:
+            checkpoint = training.checkpoint
+            if not checkpoint.async_save or not checkpoint.use_persistent_ckpt_worker:
+                raise ValueError(
+                    "teacher_save requires checkpoint.async_save and use_persistent_ckpt_worker."
+                )
+        elif algorithm.distillation is not None:
+            raise ValueError("student_load cannot be combined with online ModelOpt distillation.")
+        if training.data.dataset is None:
+            raise ValueError("Offline distillation requires cfg.data.dataset for cache identity.")
 
     @classmethod
     def wrap(cls, run_config: ConfigContainerBase) -> "RootConfigContainer":

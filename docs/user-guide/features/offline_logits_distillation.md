@@ -31,50 +31,54 @@ Implemented in [`megatron/training/distillation/`](https://github.com/NVIDIA/Meg
 
 ## Run Configuration
 
-Offline KD is configured on `PretrainConfigContainer.offline_distillation`, independently
-of the online ModelOpt `distillation` section. Omit it (or set it to `null`) to disable
+Offline KD is configured on `AlgorithmConfigContainer.offline_distillation`, an algorithm
+section of the run's root container, independently of the online ModelOpt `distillation`
+section. Omit it (or set it to `null`) to disable
 offline KD. When present, **exactly one** of `teacher_save` or `student_load` must be set;
 an empty section or a run that both saves and loads logits is rejected before runtime
 initialization. `student_load` also cannot be combined with online `distillation`.
 
-The following are sections of a teacher run config:
+The following are sections of a teacher run's root config:
 
 ```yaml
-train:
-  _target_: megatron.training.config.training_config.TrainingConfig
-  # Other training settings omitted.
-  freeze_all_layers: true
-checkpoint:
-  _target_: megatron.training.config.training_config.CheckpointConfig
-  # The checkpoint output directory and save interval also determine when logits flush.
-  save: /teacher-dump-progress
-  save_interval: 100
-  async_save: true
-  use_persistent_ckpt_worker: true
-offline_distillation:
-  _target_: megatron.training.config.offline_distillation_config.OfflineDistillationConfig
-  teacher_save:
-    _target_: megatron.training.config.offline_distillation_config.LogitsSaveConfig
-    directory: /teacher-cache
-    top_k: 128
-    top_p: null
-    min_k: 1
-    dtype: fp16
+training:
+  train:
+    _target_: megatron.training.config.training_config.TrainingConfig
+    # Other training settings omitted.
+    freeze_all_layers: true
+  checkpoint:
+    _target_: megatron.training.config.training_config.CheckpointConfig
+    # The checkpoint output directory and save interval also determine when logits flush.
+    save: /teacher-dump-progress
+    save_interval: 100
+    async_save: true
+    use_persistent_ckpt_worker: true
+algorithm:
+  offline_distillation:
+    _target_: megatron.training.config.offline_distillation_config.OfflineDistillationConfig
+    teacher_save:
+      _target_: megatron.training.config.offline_distillation_config.LogitsSaveConfig
+      directory: /teacher-cache
+      top_k: 128
+      top_p: null
+      min_k: 1
+      dtype: fp16
 ```
 
 A student run instead uses:
 
 ```yaml
-offline_distillation:
-  _target_: megatron.training.config.offline_distillation_config.OfflineDistillationConfig
-  student_load:
-    _target_: megatron.training.config.offline_distillation_config.LogitsLoadConfig
-    directory: /teacher-cache
-    loss_alpha: 1.0
-    decode_threads: 4
-    msc_prefetch_depth: 2
-    ignore_errors: false
-    ignore_hash: false
+algorithm:
+  offline_distillation:
+    _target_: megatron.training.config.offline_distillation_config.OfflineDistillationConfig
+    student_load:
+      _target_: megatron.training.config.offline_distillation_config.LogitsLoadConfig
+      directory: /teacher-cache
+      loss_alpha: 1.0
+      decode_threads: 4
+      msc_prefetch_depth: 2
+      ignore_errors: false
+      ignore_hash: false
 ```
 
 Batch sizes stay in `train`, dataset and packing settings in `data`, and progress in

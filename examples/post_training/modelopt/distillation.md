@@ -50,7 +50,7 @@ logit_kl_temperature: 1.0
 Without this configuration file, the default logits-only distillation with `kd_loss_alpha` and temperature of 1.0 will be performed.
 
 The YAML is read once, when the CLI is translated, into `DistillationConfig.loss` on the run's
-`PretrainConfigContainer.distillation`. Its keys are passed through to ModelOpt's `DistillationConfig`
+`AlgorithmConfigContainer.distillation`. Its keys are passed through to ModelOpt's `DistillationConfig`
 unchanged, so they follow the installed ModelOpt version. A run config built directly sets `loss` itself.
 
 ### Training
@@ -98,8 +98,8 @@ without a teacher model. This means the total time per iteration may be up to 40
 
 ### Configuration-based construction
 
-Distillation is a run-level setting: `PretrainConfigContainer.distillation`, next to the
-student's `checkpoint`, rather than part of the student's model config.
+Distillation is a run-level setting: `AlgorithmConfigContainer.distillation`, an algorithm
+section of the run's root container, rather than part of the student's model config.
 `distillation_config_from_args(args, model_config)` resolves the teacher architecture into
 `DistillationConfig.teacher_model` and reads the loss settings, at CLI translation time.
 The teacher, its checkpoint path/format, and the loss are serialized with the run config;
@@ -118,9 +118,10 @@ training, `build_inference_models` for inference). They run in this order: resto
 state, apply QAD freezing and LSQ setup, register checkpoint key remapping
 (`modelopt_setup_hooks(model_config, cfg.checkpoint)`), run the config's own pre-wrap hooks
 (including training freezes), then convert for KD (`distillation_hooks(model_config,
-cfg.distillation)`). A custom runner using the builders directly must assemble the same
-`pre_wrap_hooks` list. Teacher weights are loaded after wrapping by
-`load_kd_teacher_checkpoint(models, cfg.distillation)`, which such a runner must also call.
+get_distillation_config())`). A custom runner using the builders directly must assemble the
+same `pre_wrap_hooks` list. Teacher weights are loaded after wrapping by
+`load_kd_teacher_checkpoint(models, get_distillation_config())`, which such a runner must
+also call.
 
 The run container owns the stock model config and student checkpoint.
 `model.transformations` contains only `ModelTransformConfig` options (QAD, LSQ,

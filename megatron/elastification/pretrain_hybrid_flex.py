@@ -51,11 +51,16 @@ from megatron.training.argument_utils import (
     gpt_data_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
+    root_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets
 from megatron.training.datasets.utils import get_dataset_input_length
-from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.global_vars import (
+    get_distillation_config,
+    get_run_config,
+    set_run_config,
+)
 from megatron.training.models.base import compose_hooks
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
@@ -107,7 +112,7 @@ def _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collecti
         [
             *modelopt_setup_hooks(model_config, run_config.checkpoint),
             *model_config.pre_wrap_hooks,
-            *distillation_hooks(model_config, run_config.distillation),
+            *distillation_hooks(model_config, get_distillation_config()),
         ]
     )
     return pre_wrap_hook(models)[0]
@@ -584,11 +589,12 @@ if __name__ == "__main__":
     full_config = pretrain_cfg_container_from_args(
         args, data_cfg=flex_data_config_from_args(args)
     )
+    distillation = None
     if has_nvidia_modelopt and getattr(args, "export_kd_teacher_load", None):
-        full_config.distillation = distillation_config_from_args(
+        distillation = distillation_config_from_args(
             args, apply_modelopt_model_config(hybrid_config_from_args(args), args)
         )
-    set_run_config(full_config)
+    set_run_config(root_cfg_container_from_args(args, full_config, distillation=distillation))
     pretrain(full_config,
              train_valid_test_datasets_provider,
              ModelType.encoder_or_decoder,

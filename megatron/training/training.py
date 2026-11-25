@@ -192,7 +192,9 @@ from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgr
 from .global_vars import (
     destroy_global_vars,
     get_args,
+    get_distillation_config,
     get_energy_monitor,
+    get_offline_distillation_config,
     get_one_logger,
     get_root_config_container,
     get_run_config,
@@ -2501,6 +2503,7 @@ def setup_model_and_optimizer(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use cfg_container; remaining settings still use legacy args.
     cfg = cfg_container if cfg_container is not None else get_run_config()
+    distillation = get_distillation_config()
     args = get_args()
     train_state = get_train_state()
     timers = get_timers()
@@ -2538,7 +2541,7 @@ def setup_model_and_optimizer(
             # They go on a copy, so cfg.model keeps only its own hooks across repeated builds.
             # Only GPT/Hybrid configs have ModelOpt transformations.
             transformations = getattr(model_config, "transformations", None)
-            if transformations is not None or cfg.distillation is not None:
+            if transformations is not None or distillation is not None:
                 from megatron.post_training.model_hooks import (
                     distillation_hooks,
                     modelopt_setup_hooks,
@@ -2549,7 +2552,7 @@ def setup_model_and_optimizer(
                     pre_wrap_hooks=[
                         *modelopt_setup_hooks(model_config, cfg.checkpoint),
                         *model_config.pre_wrap_hooks,
-                        *distillation_hooks(model_config, cfg.distillation),
+                        *distillation_hooks(model_config, distillation),
                     ],
                 )
 
@@ -2625,7 +2628,7 @@ def setup_model_and_optimizer(
             cuda_graph_impl=cfg.model.transformer.cuda_graph_impl,
         )
 
-    offline_kd_cfg = cfg.offline_distillation
+    offline_kd_cfg = get_offline_distillation_config()
     if (
         offline_kd_cfg is not None
         and offline_kd_cfg.teacher_save is not None
@@ -2831,7 +2834,7 @@ def setup_model_and_optimizer(
 
         load_kd_teacher_checkpoint(
             model,
-            getattr(cfg_container, "distillation", None),
+            distillation,
             student_checkpoint=getattr(cfg_container, "checkpoint", None),
         )
 
@@ -4547,6 +4550,7 @@ def train(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
+    offline_kd_cfg = get_offline_distillation_config()
     sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     train_state = get_train_state()
@@ -5332,10 +5336,7 @@ def train(
         # uncaught exception there would otherwise stall silently (both future
         # logits and regular checkpoint saves for that rank) rather than
         # surfacing until a much later blocking checkpoint finalize hangs.
-        if (
-            cfg.offline_distillation is not None
-            and cfg.offline_distillation.teacher_save is not None
-        ):
+        if offline_kd_cfg is not None and offline_kd_cfg.teacher_save is not None:
             from megatron.training.distillation import check_logits_saver_failure
 
             check_logits_saver_failure()

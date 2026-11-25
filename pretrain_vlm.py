@@ -37,7 +37,10 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import (
+    pretrain_cfg_container_from_args,
+    root_cfg_container_from_args,
+)
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.config.container import InferenceConfigContainer
 from megatron.training.global_vars import get_run_config, set_run_config
@@ -569,7 +572,7 @@ if __name__ == "__main__":
     )
     train_valid_test_datasets_provider.is_distributed = True
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
-    set_run_config(full_config)
+    set_run_config(root_cfg_container_from_args(args, full_config))
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterator
 from megatron.training.argument_utils import (
     model_config_from_args,
     pretrain_cfg_container_from_args,
+    root_cfg_container_from_args,
 )
 from megatron.training.arguments import parse_and_validate_args
 import torch
@@ -313,7 +314,7 @@ if __name__ == "__main__":
     if args.max_seq_length_per_sample is None:
         model_cfg.transformer.max_seq_length_per_sample = args.total_seq_length
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
-    set_run_config(full_config)
+    set_run_config(root_cfg_container_from_args(args, full_config))
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

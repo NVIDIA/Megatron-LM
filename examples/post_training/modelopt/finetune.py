@@ -589,7 +589,10 @@ def forward_step(data_iterator, model: GPTModel):
 
 
 if __name__ == "__main__":
-    from megatron.training.argument_utils import pretrain_cfg_container_from_args
+    from megatron.training.argument_utils import (
+        pretrain_cfg_container_from_args,
+        root_cfg_container_from_args,
+    )
     from megatron.training.arguments import parse_and_validate_args
 
     args = parse_and_validate_args(
@@ -598,12 +601,12 @@ if __name__ == "__main__":
     )
     model_cfg = modelopt_model_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
-    full_config.distillation = distillation_config_from_args(args, model_cfg)
+    distillation = distillation_config_from_args(args, model_cfg)
     if full_config.model.transformer.max_seq_length_per_sample != args.seq_length:
         raise ValueError(
             "ModelOpt's fixed-width dataset requires max_seq_length_per_sample == seq_length"
         )
-    set_run_config(full_config)
+    set_run_config(root_cfg_container_from_args(args, full_config, distillation=distillation))
     pretrain(
         full_config,
         partial(

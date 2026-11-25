@@ -31,6 +31,7 @@ from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
 from megatron.training.config import (
+    AlgorithmConfigContainer,
     CheckpointConfig,
     DataConfig,
     DataloaderConfig,
@@ -48,6 +49,7 @@ from megatron.training.config import (
     ProfilingConfig,
     RerunStateMachineConfig,
     RNGConfig,
+    RootConfigContainer,
     SchedulerConfig,
     StragglerDetectionConfig,
     TokenizerConfig,
@@ -58,6 +60,7 @@ from megatron.training.config.dataset_config import dataset_type_from_family
 from megatron.training.datasets.sft_dataset import SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
+    DistillationConfig,
     GPTModelConfig,
     HybridModelConfig,
     LLaVAModelConfig,
@@ -1295,10 +1298,26 @@ def pretrain_cfg_container_from_args(
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
         fault_tolerance=fault_tolerance_config_from_args(args),
-        offline_distillation=offline_distillation_config_from_args(args),
     )
 
     return cfg
+
+
+def root_cfg_container_from_args(
+    args: Namespace,
+    pretrain: PretrainConfigContainer,
+    *,
+    distillation: DistillationConfig | None = None,
+) -> RootConfigContainer:
+    """Compose a training run's root container: `pretrain` and its algorithm sections, the
+    offline distillation the common arguments configure and the entry point's `distillation`."""
+    offline_distillation = offline_distillation_config_from_args(args)
+    algorithm = None
+    if distillation is not None or offline_distillation is not None:
+        algorithm = AlgorithmConfigContainer(
+            distillation=distillation, offline_distillation=offline_distillation
+        )
+    return RootConfigContainer(training=pretrain, algorithm=algorithm)
 
 
 def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:

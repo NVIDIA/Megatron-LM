@@ -54,6 +54,18 @@ def get_root_config_container():
     return _GLOBAL_ROOT_CONFIG_CONTAINER
 
 
+def get_distillation_config():
+    """Return the run's ModelOpt distillation section, or None for a run without it."""
+    algorithm = get_root_config_container().algorithm
+    return None if algorithm is None else algorithm.distillation
+
+
+def get_offline_distillation_config():
+    """Return the run's offline distillation section, or None for a run without it."""
+    algorithm = get_root_config_container().algorithm
+    return None if algorithm is None else algorithm.offline_distillation
+
+
 def is_run_config_initialized() -> bool:
     """Whether argument adapters have a run-owned config available yet."""
     return _GLOBAL_ROOT_CONFIG_CONTAINER is not None
@@ -311,7 +323,7 @@ def set_args(args):
 
 
 def set_run_config(cfg_container):
-    """Register a run by its run config, wrapped in the run's root container."""
+    """Register a run by its root container, or by its run config wrapped in one."""
     from megatron.training.config import RootConfigContainer
 
     set_root_config_container(RootConfigContainer.wrap(cfg_container))
