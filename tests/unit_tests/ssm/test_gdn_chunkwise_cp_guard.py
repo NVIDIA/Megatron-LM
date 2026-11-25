@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""GDN/GDN2 must reject unsupported chunkwise CP at construction."""
+"""GDN/GDN2 must reject unsupported chunkwise CP at construction and runtime."""
 
 from types import SimpleNamespace
 
@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net import common, gdn, gdn2
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.transformer import TransformerConfig
@@ -104,9 +105,19 @@ def test_dynamic_cp_singleton_still_accepted(mocked_projections, monkeypatch):
     assert mixer.cp_size == 1
 
 
+@pytest.mark.parametrize("mixer_cls", [gdn.GatedDeltaNet, gdn2.GatedDeltaNet2])
+def test_runtime_cp_rejected_before_projection(mocked_projections, monkeypatch, mixer_cls):
+    monkeypatch.setattr(gdn, "get_pg_size", lambda group: group.size())
+    monkeypatch.setattr(gdn2, "get_pg_size", lambda group: group.size())
+    mixer = _build(_stub_class(mixer_cls), _config(), cp_size=1)
+    packed = PackedSeqParams(local_cp_size=2, cp_group=_group(2))
+    with pytest.raises(ValueError, match="linear_cp_layout='zigzag'"):
+        mixer.forward_pre_attn_and_core_attn(torch.empty(4, 1, 32), None, packed_seq_params=packed)
+
+
 def test_headwise_cp_still_accepted(mocked_projections):
     stub = _stub_class(gdn.GatedDeltaNet)
-    mixer = _build(stub, _config(linear_cp_mode="headwise"), cp_size=2)
+    mixer = _build(stub, _config(linear_cp_mode="headwise", linear_cp_layout="zigzag"), cp_size=2)
     assert mixer.cp_size == 2
 
 
@@ -116,9 +127,11 @@ def test_chunkwise_cp_with_cp1_is_not_gated(mocked_projections):
     assert mixer.cp_size == 1
 
 
-def test_kda_config_bypasses_guard(mocked_projections):
+def test_kda_config_bypasses_guard(mocked_projections, monkeypatch):
     from megatron.core.ssm.gated_delta_net import kda
 
+    monkeypatch.setattr(kda, "HAVE_FLA", True)
+    monkeypatch.setattr(kda, "HAVE_FLA_KDA", True)
     stub = _stub_class(kda.KimiDeltaAttention)
     kda_config = KDALayerConfig(
         num_layers=1,

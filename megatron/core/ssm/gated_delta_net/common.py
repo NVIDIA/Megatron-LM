@@ -300,17 +300,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                         self.pg_collection.dp_cp.size()
                     )
                 )
-            if self.cp_size > 1 or any(
-                size >= max(2, config.min_dynamic_context_parallel_size)
-                for size in dynamic_cp_sizes
-            ):
-                raise ValueError(
-                    f"linear_cp_mode='chunkwise' is not implemented for "
-                    f"{type(config).__name__}: only headwise linear CP is "
-                    "supported. Keep sequence-sharded inputs; the mixer gathers "
-                    "sequence shards and partitions heads internally (see #9731). "
-                    "Use linear_cp_mode='headwise', or KDA for chunkwise CP."
-                )
+            self._validate_chunkwise_cp_size(self.cp_size)
+            for size in dynamic_cp_sizes:
+                if size >= max(2, config.min_dynamic_context_parallel_size):
+                    self._validate_chunkwise_cp_size(size)
 
         attrs_to_check = (
             "dt_bias_dim",
@@ -461,6 +454,22 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                     f"GDN TP-local {name} head count {count} must be positive and "
                     f"divisible by runtime CP size {cp_size}"
                 )
+
+    def _validate_chunkwise_cp_size(self, cp_size: int) -> None:
+        """Reject unsupported chunkwise CP for the resolved GDN/GDN2 group."""
+        if (
+            cp_size > 1
+            and self.config.linear_cp_mode == "chunkwise"
+            and not isinstance(self.config, KDALayerConfig)
+        ):
+            raise ValueError(
+                f"linear_cp_mode='chunkwise' is not implemented for "
+                f"{type(self.config).__name__}: only headwise linear CP is "
+                "supported. Keep sequence-sharded inputs; the mixer gathers "
+                "sequence shards and partitions heads internally (see #9731). "
+                "Use linear_cp_mode='headwise' with linear_cp_layout='zigzag', "
+                "or KDA for chunkwise CP."
+            )
 
     def _setup_variant_attrs(self):
         """Set variant specifics on the module. Called once from ``__init__``.
