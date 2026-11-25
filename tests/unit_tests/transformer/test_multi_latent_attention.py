@@ -4,6 +4,7 @@ import contextlib
 import os
 import warnings
 from inspect import signature
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -2248,6 +2249,35 @@ def test_fused_qkv_rope_quant_config_requires_kv_rope_quant():
         )
 
 
+def test_fused_qkv_rope_quant_kv_size_limit(monkeypatch):
+    """TE's query RoPE + MXFP8 kernel rejects a BF16 key/value up-projection output of 2 GiB or
+    more; such shapes are not selected for it, with one warning."""
+    monkeypatch.setattr(mla_module, "_warned_fused_mla_qkv_rope_quant_size", False)
+    # 8192 tokens, batch size 4, 128 heads: exactly 2 GiB.
+    at_limit = torch.empty(8192, 4, 128, 256, dtype=torch.bfloat16, device="meta")
+    below_limit = torch.empty(8191, 4, 128, 256, dtype=torch.bfloat16, device="meta")
+    assert mla_module._fits_fused_mla_qkv_rope_quant_kernels(below_limit)
+    with pytest.warns(UserWarning, match="2 GiB limit"):
+        assert not mla_module._fits_fused_mla_qkv_rope_quant_kernels(at_limit)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert not mla_module._fits_fused_mla_qkv_rope_quant_kernels(at_limit)
+        assert mla_module._fits_fused_mla_qkv_rope_quant_kernels(below_limit)
+
+
+def test_up_proj_grad_quant_not_used_in_te_debug_iterations():
+    """When TE's debug tools are enabled for a projection in this iteration (e.g.
+    DisableQuantizationGEMM requesting a high-precision backward), the projection keeps its BF16
+    grad_output."""
+    recipe = pytest.importorskip("transformer_engine.common.recipe")
+    projection = SimpleNamespace(fp8=True, fp8_meta={"recipe": recipe.MXFP8BlockScaling()})
+    assert mla_module._quantizes_grad_output_to_mxfp8_e4m3(projection)
+    projection.debug_enabled_in_this_iteration = True
+    assert not mla_module._quantizes_grad_output_to_mxfp8_e4m3(projection)
+    projection.debug_enabled_in_this_iteration = False
+    assert mla_module._quantizes_grad_output_to_mxfp8_e4m3(projection)
+
+
 @pytest.mark.parametrize("dpa_option", ["fp8_dot_product_attention", "attention_dropout"])
 def test_fused_kv_rope_quant_config_requires_mxfp8_attention(dpa_option):
     overrides = (
@@ -2567,6 +2597,47 @@ class TestFusedMLAQKVRoPEQuant:
             )
         assert calls == [0, 1]
 
+    @pytest.mark.parametrize("over_limit", [False, True])
+    def test_kv_size_limit_uses_kv_rope_quant_path(self, monkeypatch, over_limit):
+        """At or above the query kernel's key/value size limit (lowered here to the test shape)
+        the module keeps the use_fused_mla_kv_rope_quant path."""
+        if mla_module.fused_mla_q_rope_mxfp8 is None:
+            pytest.skip("Transformer Engine lacks fused_mla_q_rope_mxfp8")
+        config = _fused_kv_rope_quant_config(use_fused_mla_qkv_rope_quant=True)
+        attention = (
+            MLASelfAttention(
+                config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+            .cuda()
+            .bfloat16()
+        )
+        s, b = 256, 2
+        kv_bytes = s * b * attention.num_attention_heads_per_partition * 256 * 2
+        limit = kv_bytes if over_limit else kv_bytes + 1
+        monkeypatch.setattr(mla_module, "_FUSED_MLA_QKV_ROPE_QUANT_MAX_KV_BYTES", limit)
+        monkeypatch.setattr(mla_module, "_warned_fused_mla_qkv_rope_quant_size", False)
+        hidden_states = torch.randn(s, b, 512, dtype=torch.bfloat16, device="cuda")
+        with (
+            mock.patch.dict(
+                os.environ, {"NVTE_FUSED_ATTN": "1", "NVTE_FLASH_ATTN": "0"}, clear=False
+            ),
+            warnings.catch_warnings(record=True) as caught,
+        ):
+            warnings.simplefilter("always")
+            _, _, _, calls = _run_mla_fwd_bwd(
+                attention,
+                config,
+                hidden_states,
+                torch.randn_like(hidden_states),
+                ("fused_mla_q_rope_mxfp8", "fused_mla_kv_rope_mxfp8", "mxfp8_transpose_swizzle"),
+            )
+        warned = any("2 GiB limit" in str(w.message) for w in caught)
+        assert warned == over_limit
+        assert calls == ([0, 1, 1] if over_limit else [1, 1, 0])
+
     def test_cuda_graph_replay(self):
         """The query and key/value autograd functions, forward and backward, captured in a CUDA
         graph and replayed on new inputs give the eager results."""
@@ -2657,7 +2728,7 @@ class TestFusedMLAUpProjGradQuant:
         "fused_mla_q_rope_mxfp8",
     )
 
-    def _compare(self, variant, batch_size, fp8="e4m3"):
+    def _compare(self, variant, batch_size, fp8="e4m3", setup_fused=None):
         if mla_module.fused_mla_q_rope_backward_mxfp8 is None:
             pytest.skip("Transformer Engine lacks fused_mla_q_rope_backward_mxfp8")
         env = {
@@ -2692,6 +2763,8 @@ class TestFusedMLAUpProjGradQuant:
             for module in modules[1:]:
                 module.load_state_dict(modules[0].state_dict())
             assert [m._use_fused_up_proj_grad_quant for m in modules] == [False, False, True]
+            if setup_fused is not None:
+                setup_fused(modules[2])
 
             torch.manual_seed(0)
             hidden_states = torch.randn(256, batch_size, 512, dtype=torch.bfloat16, device="cuda")
@@ -2722,6 +2795,19 @@ class TestFusedMLAUpProjGradQuant:
         """With E5M2 gradients (fp8='hybrid') the projections do not quantize grad_output to
         E4M3, so the fused backward kernels do not run; results still match."""
         calls = self._compare("mla", 2, fp8="hybrid")
+        assert calls == [[0, 0, 0], [0, 0, 1], [0, 0, 1]]
+
+    @pytest.mark.parametrize("projection", ["linear_q_up_proj", "linear_kv_up_proj"])
+    def test_te_debug_iteration_keeps_bf16_grad_output(self, projection):
+        """In an iteration where TE's debug tools are enabled for an up-projection (they may ask
+        for a high-precision backward, e.g. DisableQuantizationGEMM), the RoPE backward gives it
+        the BF16 gradient; results still match."""
+
+        def enable_debug(module):
+            # What TE's is_debug_iter() records on the module for this iteration.
+            getattr(module, projection).debug_enabled_in_this_iteration = True
+
+        calls = self._compare("mla", 2, setup_fused=enable_debug)
         assert calls == [[0, 0, 0], [0, 0, 1], [0, 0, 1]]
 
     def test_cuda_graph_replay(self):

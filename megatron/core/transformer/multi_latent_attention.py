@@ -308,7 +308,9 @@ def _quantizes_grad_output_to_mxfp8_e4m3(projection: torch.nn.Module) -> bool:
     fp8_meta = getattr(projection, "fp8_meta", None)
     if not getattr(projection, "fp8", False) or not isinstance(fp8_meta, dict):
         return False
-    if getattr(projection, "debug", False):
+    # TE's debug tools (e.g. DisableQuantizationGEMM) may run this iteration's backward in high
+    # precision or through debug quantizers, which need the BF16 grad_output.
+    if getattr(projection, "debug_enabled_in_this_iteration", False):
         return False
     recipe = fp8_meta.get("recipe")
     return (
@@ -317,6 +319,30 @@ def _quantizes_grad_output_to_mxfp8_e4m3(projection: torch.nn.Module) -> bool:
         and recipe.fp8_format == Format.E4M3
         and getattr(recipe, "backward_override", None) is None
     )
+
+
+# TE's query RoPE + MXFP8 kernel and the key/value kernel writing attention's scale layout use
+# 32-bit offsets: they reject a BF16 key/value up-projection output [s, b, h, 256] of 2 GiB or more.
+_FUSED_MLA_QKV_ROPE_QUANT_MAX_KV_BYTES = 2**31
+_warned_fused_mla_qkv_rope_quant_size = False
+
+
+def _fits_fused_mla_qkv_rope_quant_kernels(kv: torch.Tensor) -> bool:
+    """Whether TE's fused query (and attention-layout key/value) RoPE + MXFP8 kernels accept the
+    key/value up-projection output ``kv`` [s, b, h, 256]; warns once when it is too large."""
+    global _warned_fused_mla_qkv_rope_quant_size
+    if kv.shape[2] % 2 != 0:
+        return False
+    if kv.numel() * kv.element_size() < _FUSED_MLA_QKV_ROPE_QUANT_MAX_KV_BYTES:
+        return True
+    if not _warned_fused_mla_qkv_rope_quant_size:
+        _warned_fused_mla_qkv_rope_quant_size = True
+        warnings.warn(
+            f"use_fused_mla_qkv_rope_quant: the key/value up-projection output {tuple(kv.shape)} "
+            "is at or above the 2 GiB limit of the fused MLA query RoPE + MXFP8 kernel; running "
+            "the use_fused_mla_kv_rope_quant path."
+        )
+    return False
 
 
 def _is_mxfp8_attention_active() -> bool:
@@ -1307,6 +1333,7 @@ class MLASelfAttention(MultiLatentAttention):
                 and q.dtype == torch.bfloat16
                 and rotary_pos_cos.dtype == torch.bfloat16
                 and rotary_pos_sin.dtype == torch.bfloat16
+                and _fits_fused_mla_qkv_rope_quant_kernels(kv)
             )
             q_projection = (
                 self.linear_q_up_proj if self.config.q_lora_rank is not None else self.linear_q_proj
