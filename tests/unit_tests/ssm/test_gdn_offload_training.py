@@ -60,6 +60,7 @@ def _training_config(
     recompute_norm: bool,
     *,
     fused_pre_gdr: bool = False,
+    native_hybrid: bool = False,
 ) -> TransformerConfig:
     """Configure the reduced-size complete decoder and its parallel topology."""
     return TransformerConfig(
@@ -91,8 +92,9 @@ def _training_config(
         # PP=2/VPP requires the native ordering for both directions to the same peer.
         batch_p2p_comm=False,
         attention_backend=AttnBackend.auto if cp > 1 else AttnBackend.unfused,
-        experimental_attention_variant="gdn",
-        linear_attention_freq=4,
+        is_hybrid_model=native_hybrid,
+        experimental_attention_variant=None if native_hybrid else "gdn",
+        linear_attention_freq=None if native_hybrid else 4,
         linear_conv_kernel_dim=4,
         linear_key_head_dim=64,
         linear_value_head_dim=64,
@@ -113,17 +115,20 @@ def _build_training_model(
     config: TransformerConfig, groups: ProcessGroupCollection
 ) -> tuple[list[DistributedDataParallel], MegatronOptimizer]:
     """Construct full decoder blocks, DDP gradient buffers and the BF16 Adam optimizer."""
-    # Both recipes include MLPs, so this fixture exercises complete decoder blocks.
-    layer_specs = get_transformer_layer_with_experimental_attention_variant_spec(config)
-    stack_spec = ModuleSpec(
-        module=HybridStack,
-        submodules=HybridStackSubmodules(gdn_layer=layer_specs[0], attention_layer=layer_specs[3]),
-    )
+    stack_spec = None
+    if not config.is_hybrid_model:
+        layer_specs = get_transformer_layer_with_experimental_attention_variant_spec(config)
+        stack_spec = ModuleSpec(
+            module=HybridStack,
+            submodules=HybridStackSubmodules(
+                gdn_layer=layer_specs[0], attention_layer=layer_specs[3]
+            ),
+        )
     torch.manual_seed(31)
     model_parallel_cuda_manual_seed(31)
     models = []
     vp = config.virtual_pipeline_model_parallel_size
-    pattern = "GGG*GGG*"
+    pattern = "G-G*G-G*" if config.is_hybrid_model else "GGG*GGG*"
     chunk_size = len(pattern) // (config.pipeline_model_parallel_size * (vp or 1))
     pattern = "|".join(
         pattern[start : start + chunk_size] for start in range(0, len(pattern), chunk_size)
@@ -185,15 +190,16 @@ def _snapshot_leaf(value: Any) -> Any:
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.parametrize(
-    "tp,sp,cp,pp,vp,fraction,recompute_norm,fused_pre_gdr",
+    "tp,sp,cp,pp,vp,fraction,recompute_norm,fused_pre_gdr,native_hybrid",
     [
-        pytest.param(1, False, 1, 1, None, 1.0, False, False, id="decoder"),
-        pytest.param(1, False, 1, 1, None, 0.0, False, False, id="resident"),
-        pytest.param(1, False, 1, 1, None, 0.5, True, True, id="fused-norm"),
-        pytest.param(2, True, 1, 1, None, 1.0, False, False, id="tp-sp"),
-        pytest.param(1, False, 2, 1, None, 1.0, False, False, id="cp"),
-        pytest.param(1, False, 1, 2, None, 1.0, False, False, id="pp"),
-        pytest.param(1, False, 1, 2, 2, 1.0, False, False, id="pp-vpp"),
+        pytest.param(1, False, 1, 1, None, 1.0, False, False, False, id="decoder"),
+        pytest.param(1, False, 1, 1, None, 1.0, False, False, True, id="hybrid-gdn"),
+        pytest.param(1, False, 1, 1, None, 0.0, False, False, False, id="resident"),
+        pytest.param(1, False, 1, 1, None, 0.5, True, True, False, id="fused-norm"),
+        pytest.param(2, True, 1, 1, None, 1.0, False, False, False, id="tp-sp"),
+        pytest.param(1, False, 2, 1, None, 1.0, False, False, False, id="cp"),
+        pytest.param(1, False, 1, 2, None, 1.0, False, False, False, id="pp"),
+        pytest.param(1, False, 1, 2, 2, 1.0, False, False, False, id="pp-vpp"),
     ],
 )
 def test_gdn_offload_training(
@@ -205,6 +211,7 @@ def test_gdn_offload_training(
     fraction: float,
     recompute_norm: bool,
     fused_pre_gdr: bool,
+    native_hybrid: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Match losses, accumulated gradients, updated weights and Adam states on every rank."""
@@ -221,7 +228,15 @@ def test_gdn_offload_training(
     try:
         groups = ProcessGroupCollection.use_mpu_process_groups()
         config = _training_config(
-            tp, sp, cp, pp, vp, fraction, recompute_norm, fused_pre_gdr=fused_pre_gdr
+            tp,
+            sp,
+            cp,
+            pp,
+            vp,
+            fraction,
+            recompute_norm,
+            fused_pre_gdr=fused_pre_gdr,
+            native_hybrid=native_hybrid,
         )
         baseline_config = replace(
             config, fine_grained_activation_offloading=False, offload_modules=[]

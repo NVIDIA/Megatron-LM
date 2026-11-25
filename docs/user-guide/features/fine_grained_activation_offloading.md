@@ -43,7 +43,7 @@ Each scope offloads saved activations to CPU during forward and reloads them bef
 | `moe_act` | Activation function in MoE experts | MoE models only |
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
 | `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
-| `gdn_core_attn` | Tensors saved inside the FLA GDN recurrence | BF16 GDN only; no full recomputation or CUDA graphs |
+| `gdn_core_attn` | Tensors saved inside the FLA GDN recurrence | BF16 GDN only. See the recomputation and CUDA graph restrictions below. |
 
 When selective `residual_stream` replay is active, its shared checkpoint manager owns the
 connected ShortcutMoE post-norm. In that case `shortcut_post_norm` offloading is skipped for the
@@ -56,9 +56,11 @@ of standard attention's `core_attn` scope. It commits before output normalizatio
 and anchors backward prefetch on a differentiable recurrence input. Shared inputs
 are not force-released; evaluation and no-grad execution bypass the scope.
 
+Enable this scope with `--fine-grained-activation-offloading --offload-modules gdn_core_attn`.
+For HybridModel, select GDN with `G` in `--hybrid-layer-pattern`.
 Selective `gdn_norm_out` recomputation and native pre-GDR fusion are supported.
-GDN2, FP8/NVFP4, other recurrence backends, full recomputation and CUDA graphs are
-rejected. Enable this scope with `--fine-grained-activation-offloading --offload-modules gdn_core_attn`.
+Whole-GDN selective recomputation (`--recompute-modules gdn`), full recomputation,
+GDN2, FP8/NVFP4, other recurrence backends, and CUDA graphs are rejected.
 Set `NVTE_CPU_OFFLOAD_V1=1` with Transformer Engine 2.10 or newer.
 
 ### Tuning Parameters

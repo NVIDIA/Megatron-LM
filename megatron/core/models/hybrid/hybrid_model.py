@@ -341,6 +341,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 for entry in parsed_config_list.main_layer_config_list
                 if entry is not PipelineSplit
             ) + (self.mtp_layer_config_list or ())
+            layer_utils.validate_layer_offloading(self.config, architecture_layer_configs)
             layer_utils.validate_shared_rotary_config(
                 architecture_layer_configs, self.config.kv_channels, self.position_embedding_type
             )
@@ -385,6 +386,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
         else:
             parsed_pattern = parse_hybrid_pattern(self.hybrid_layer_pattern)
+            layer_utils.validate_layer_offloading(self.config, self.hybrid_layer_pattern or "")
             self.mtp_pattern = parsed_pattern.mtp_pattern
             self.mtp_num_depths = parsed_pattern.mtp_num_depths
             hash_moe_layer_threshold = _get_hash_moe_layer_threshold(

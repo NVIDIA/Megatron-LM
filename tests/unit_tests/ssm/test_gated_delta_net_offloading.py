@@ -8,6 +8,8 @@ import torch
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_gated_delta_net_module_spec,
 )
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.hybrid.layers.utils import create_layer_config
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -29,6 +31,10 @@ def _config(**overrides):
     "kwargs,match",
     [
         ({"experimental_attention_variant": None}, "only supports GDN"),
+        (
+            {"recompute_granularity": "selective", "recompute_modules": ["gdn"]},
+            "whole-GDN recomputation",
+        ),
         ({"bf16": False}, "BF16"),
         ({"gdn_kernel_backend": "torch"}, "FLA"),
         ({"cuda_graph_impl": "local"}, "CUDA graphs"),
@@ -52,6 +58,23 @@ def gdn_groups():
         torch.cuda.synchronize()
         off_interface.reset_instance()
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("use_config_list", [False, True], ids=["pattern", "config-list"])
+def test_hybrid_offload_requires_gdn(gdn_groups, use_config_list):
+    config = _training_config(1, False, 1, 1, None, 1.0, False, native_hybrid=True)
+    if use_config_list:
+        architecture = {"hybrid_layer_config_list": [create_layer_config(config, "*")] * 8}
+    else:
+        architecture = {"hybrid_layer_pattern": "********"}
+    with pytest.raises(ValueError, match="requires a GDN layer"):
+        HybridModel(
+            config=config,
+            vocab_size=512,
+            max_sequence_length=128,
+            pg_collection=gdn_groups,
+            **architecture,
+        )
 
 
 def _model(config, groups):

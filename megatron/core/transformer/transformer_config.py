@@ -1780,8 +1780,8 @@ class TransformerConfig(ModelParallelConfig):
     "shortcut_post_norm": offload the input of the shortcut output normalization.
             Requires moe_shortcut_connection=True.
     "gdn_core_attn": offload tensors saved by the FLA GatedDeltaNet recurrence.
-            Requires BF16 GDN and gdn_kernel_backend="fla", with no CUDA graphs
-            or full recomputation.
+            Requires BF16 GDN and gdn_kernel_backend="fla", with no CUDA graphs,
+            full recomputation, or selective recomputation of the whole GDN layer.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -3497,7 +3497,7 @@ class TransformerConfig(ModelParallelConfig):
                 f'Allowed modules are: {allowed_modules}'
             )
             if "gdn_core_attn" in self.offload_modules:
-                if self.experimental_attention_variant != "gdn":
+                if not self.is_hybrid_model and self.experimental_attention_variant != "gdn":
                     raise ValueError("gdn_core_attn offloading only supports GDN (gdn).")
                 if not self.bf16 or self.fp8 or self.fp4:
                     raise ValueError("gdn_core_attn offloading requires BF16 without FP8 or FP4.")
@@ -3506,6 +3506,11 @@ class TransformerConfig(ModelParallelConfig):
                 if self.recompute_granularity == "full":
                     raise ValueError(
                         "gdn_core_attn offloading does not support full recomputation."
+                    )
+                if self.recompute_granularity == "selective" and "gdn" in self.recompute_modules:
+                    raise ValueError(
+                        "gdn_core_attn offloading does not support whole-GDN recomputation "
+                        "('gdn' in recompute_modules)."
                     )
                 if (
                     self.cuda_graph_impl != "none"
