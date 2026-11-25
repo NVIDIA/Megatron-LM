@@ -9,11 +9,14 @@ Owner-compute P2P gather/scatter for MFSDP v2.
 
 The sharded side is a `DBuffer`, which supplies the data, mesh, layout, and placements.
 `tensor_to_owner` selects participating tensors and maps their indices to owner global ranks.
-Both operations support one-dimensional meshes with sharded placements.
+Peers are the ranks that shard the buffer together with this rank; see `get_shard_ranks`.
+P2P uses the default process group, because HFSDP peers span several mesh axes.
 Each tensor's owner holds a shard, so any peer pair shares at most one tensor across their
 disjoint buffer ranges. Tensor traversal order therefore need not match across ranks.
 
-Operations run on the current CUDA stream. Multiple parameter groups can be pipelined by
+Operations are posted on the current CUDA stream and return their P2P works without waiting.
+Waiting on a work orders the stream it is called on after the transfer, so the caller decides
+when to wait. Multiple parameter groups can be pipelined by posting several before waiting, or by
 executing the functions in different streams. Callers explicitly wait for inputs to be ready on
 each stream and for results to be ready before consuming them on another stream.
 """
@@ -26,21 +29,43 @@ from .dbuffer import DBuffer
 from .range import Range, intersect_ranges
 
 
-def _get_sorted_rank_ranges(buffer: DBuffer) -> dict[int, Range]:
-    """Return sharded buffer ranges keyed by global rank, in buffer offset order."""
+def get_shard_ranks(buffer: DBuffer) -> list[int]:
+    """Return the global ranks that shard ``buffer`` together with this rank.
+
+    Take every rank along the sharded mesh axes and only this rank's position along the
+    replicated ones: HSDP gives this rank's replica, HFSDP the whole mesh.
+    """
+    coordinate = buffer.mesh.get_coordinate()
+    index = []
+    for axis, placement in enumerate(buffer.placements):
+        if isinstance(placement, Shard):
+            index.append(slice(None))  # Every rank along a sharded axis holds a piece.
+        else:
+            index.append(coordinate[axis])  # Stay in this rank's replica.
+    return buffer.mesh.mesh[tuple(index)].flatten().tolist()
+
+
+def get_sorted_rank_ranges(buffer: DBuffer) -> dict[int, Range]:
+    """Return sharded buffer ranges keyed by global rank, in buffer offset order.
+
+    They depend only on the buffer's mesh, placements, and layout, so a caller that gathers or
+    scatters the same buffers every step computes them once and passes them as `rank_ranges`.
+    """
     mesh = buffer.mesh
-    if mesh.ndim != 1 or not isinstance(buffer.placements[0], Shard):
-        raise NotImplementedError("Owner gather/scatter requires a 1-D sharded DBuffer.")
     rank_ranges = [
         (rank, buffer.layout.get_rank_range(mesh, buffer.placements, rank))
-        for rank in mesh.mesh.tolist()
+        for rank in get_shard_ranks(buffer)
     ]
     return dict(sorted(rank_ranges, key=lambda item: item[1].start))
 
 
 def gather(
-    source: DBuffer, destination: dict[int, torch.Tensor], *, tensor_to_owner: dict[int, int]
-) -> None:
+    source: DBuffer,
+    destination: dict[int, torch.Tensor],
+    *,
+    tensor_to_owner: dict[int, int],
+    rank_ranges: dict[int, Range],
+) -> list[dist.Work]:
     """Gather full tensors from local chunks to their owners via P2P.
 
     The source buffers must share dtype and device type across ranks.
@@ -60,12 +85,15 @@ def gather(
             does not own are never written to.
         tensor_to_owner: Participating tensor index to owner global rank. Each owner must
             hold a nonempty shard of its tensor; see `assign_owner_work`.
+        rank_ranges: `get_sorted_rank_ranges(source)`.
+
+    Returns:
+        The posted P2P works, empty if this rank has none. Wait on each before using the
+        destination, and keep the buffers alive until then.
     """
     mesh = source.mesh
     this_rank = mesh.get_rank()
     layout = source.layout
-    rank_ranges = _get_sorted_rank_ranges(source)
-    group = mesh.get_group()
 
     # Build the P2P ops: send non-owned chunks to their owners, receive owned ones.
     ops: list[dist.P2POp] = []
@@ -74,7 +102,7 @@ def gather(
         if owner_rank != this_rank:
             if intersect_ranges(tensor_range, rank_ranges[this_rank]).numel > 0:
                 chunk = source.get_tensor_view(i).flatten()
-                ops.append(dist.P2POp(dist.isend, chunk, peer=owner_rank, group=group))
+                ops.append(dist.P2POp(dist.isend, chunk, peer=owner_rank))
             continue
 
         target = destination[i]
@@ -97,16 +125,18 @@ def gather(
             if src_rank == this_rank:
                 chunk.copy_(source.get_tensor_view(i).flatten())
             else:
-                ops.append(dist.P2POp(dist.irecv, chunk, peer=src_rank, group=group))
+                ops.append(dist.P2POp(dist.irecv, chunk, peer=src_rank))
 
-    works = dist.batch_isend_irecv(ops) if ops else []
-    for work in works:
-        work.wait()
+    return dist.batch_isend_irecv(ops) if ops else []
 
 
 def scatter(
-    source: dict[int, torch.Tensor], destination: DBuffer, *, tensor_to_owner: dict[int, int]
-) -> None:
+    source: dict[int, torch.Tensor],
+    destination: DBuffer,
+    *,
+    tensor_to_owner: dict[int, int],
+    rank_ranges: dict[int, Range],
+) -> list[dist.Work]:
     """Scatter full result tensors from the owners to the other ranks via P2P.
 
     All source tensors and destination buffers must share dtype and device type across ranks.
@@ -127,12 +157,15 @@ def scatter(
             be a separate scratch DBuffer for updates the caller will apply later.
         tensor_to_owner: Participating tensor index to owner global rank. Each owner must
             hold a nonempty shard of its tensor; see `assign_owner_work`.
+        rank_ranges: `get_sorted_rank_ranges(destination)`.
+
+    Returns:
+        The posted P2P works, empty if this rank has none. Wait on each before using the
+        destination, and keep the buffers alive until then.
     """
     mesh = destination.mesh
     this_rank = mesh.get_rank()
     layout = destination.layout
-    rank_ranges = _get_sorted_rank_ranges(destination)
-    group = mesh.get_group()
 
     # Build the P2P ops: send owned result chunks, receive the ones held here.
     ops: list[dist.P2POp] = []
@@ -141,7 +174,7 @@ def scatter(
         if owner != this_rank:
             if intersect_ranges(tensor_range, rank_ranges[this_rank]).numel > 0:
                 chunk = destination.get_tensor_view(i).flatten()
-                ops.append(dist.P2POp(dist.irecv, chunk, peer=owner, group=group))
+                ops.append(dist.P2POp(dist.irecv, chunk, peer=owner))
             continue
 
         tensor = source[i]
@@ -162,10 +195,6 @@ def scatter(
             offset = shard_range.start - tensor_range.start
             if numel == 0:
                 continue
-            ops.append(
-                dist.P2POp(dist.isend, flat[offset : offset + numel], peer=dest, group=group)
-            )
+            ops.append(dist.P2POp(dist.isend, flat[offset : offset + numel], peer=dest))
 
-    works = dist.batch_isend_irecv(ops) if ops else []
-    for work in works:
-        work.wait()
+    return dist.batch_isend_irecv(ops) if ops else []

@@ -8,11 +8,13 @@ computed inputs from a separate DBuffer, then scatter results into remote-owned 
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import DBuffer, layout_builder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.gather_scatter import (
     gather,
+    get_sorted_rank_ranges,
     scatter,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
@@ -48,6 +50,12 @@ def _known_full_tensors(dbuffer: DBuffer) -> list[torch.Tensor]:
     return full_tensors
 
 
+def _wait(works: list[dist.Work]) -> None:
+    """Order the current stream after the posted transfers."""
+    for work in works:
+        work.wait()
+
+
 @pytest.mark.parametrize("subgroup", [False, True])
 @pytest.mark.parametrize("placement", [RowAtomic(), BlockAtomic(2), TensorAtomic()])
 def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
@@ -60,6 +68,7 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
             pytest.skip("Needs four ranks to test the noncontiguous subgroup [1, 3].")
         mesh = DeviceMesh(device.type, [1, 3])
         if mesh.get_coordinate() is None:
+            assign_owner_work([])  # Planning is collective over all ranks.
             pytest.skip("Rank is outside the test subgroup [1, 3].")
     else:
         mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -87,15 +96,16 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
 
     # Momentum/Nesterov-style computed inputs can use separate storage with the same layout.
     source = DBuffer.from_local(dbuffer.local_buffer + 2, mesh, [placement], layout)
-    gather(source, {}, tensor_to_owner={})
-    scatter({}, dbuffer, tensor_to_owner={})
+    rank_ranges = get_sorted_rank_ranges(dbuffer)
+    _wait(gather(source, {}, tensor_to_owner={}, rank_ranges=rank_ranges))
+    _wait(scatter({}, dbuffer, tensor_to_owner={}, rank_ranges=rank_ranges))
     torch.testing.assert_close(dbuffer.local_buffer, original, atol=0, rtol=0)
 
     owned = {i for i, owner in tensor_to_owner.items() if owner == this_rank}
     destination = {
         i: torch.empty(full_tensors[i].shape, dtype=dbuffer.dtype, device=device) for i in owned
     }
-    gather(source, destination, tensor_to_owner=tensor_to_owner)
+    _wait(gather(source, destination, tensor_to_owner=tensor_to_owner, rank_ranges=rank_ranges))
     for i in owned:
         torch.testing.assert_close(destination[i], full_tensors[i] + 2, atol=0, rtol=0)
     assert set(destination) == owned
@@ -103,7 +113,7 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
 
     for tensor in destination.values():
         tensor.add_(1)
-    scatter(destination, dbuffer, tensor_to_owner=tensor_to_owner)
+    _wait(scatter(destination, dbuffer, tensor_to_owner=tensor_to_owner, rank_ranges=rank_ranges))
 
     expected_buffer = original.clone()
     for i in tensor_to_owner:
@@ -138,11 +148,16 @@ def test_gather_scatter_with_stream(distributed_setup):
         torch.full_like(dbuffer.local_buffer, -1), mesh, dbuffer.placements, dbuffer.layout
     )
 
+    rank_ranges = get_sorted_rank_ranges(dbuffer)
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        gather(dbuffer, destination, tensor_to_owner=tensor_to_owner)
-        scatter(destination, scratch, tensor_to_owner=tensor_to_owner)
+        _wait(
+            gather(dbuffer, destination, tensor_to_owner=tensor_to_owner, rank_ranges=rank_ranges)
+        )
+        _wait(
+            scatter(destination, scratch, tensor_to_owner=tensor_to_owner, rank_ranges=rank_ranges)
+        )
     stream.synchronize()
 
     for i in owned:
