@@ -13,7 +13,7 @@
 # Examples:
 #   ./run_batch_ci_tests.sh test_cases/moe/gpt_grpo_tp4tp2_pp1_ep4ep2_dp8_throughputtest.sh
 #   ./run_batch_ci_tests.sh test_cases/gpt/gpt3_mcore_te_tp2_pp2.sh 5
-#   ./run_batch_ci_tests.sh test_cases/bert/bert_mcore_tp2_pp2.sh 10 batch_block1
+#   ./run_batch_ci_tests.sh test_cases/gpt/gpt3_mcore_te_tp2_pp2.sh 10 batch_block1
 #
 # To list available test scripts:
 #   ./run_batch_ci_tests.sh --list
