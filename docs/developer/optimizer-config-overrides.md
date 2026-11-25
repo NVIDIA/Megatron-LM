@@ -36,6 +36,19 @@ serializer/target allowlist; static selectors are encoded as entries because dat
 objects cannot be YAML mapping keys. This is configuration serialization, not a new
 optimizer checkpoint format. Opaque lambdas are unsuitable for serialized recipes.
 
+`megatron.post_training.optimizer.get_lsq_config_overrides` builds shared LSQ
+contributions. In addition to the peak LR, callers can supply `scale_min_lr`,
+`base_min_lr`, and `scale_wd_mult`. Unset bounds inherit the base schedule; the
+default multiplier of 1.0 preserves the existing weight-decay policy. Only fields
+that differ from the base settings are emitted, keeping equal parameter groups
+from acquiring duplicate checkpoint identities. Standard rules are composed by
+the training setup, not by this helper.
+
+Bridge's `LSQOptimizerConfigOverrides` callable uses this helper and retains its
+ModelOpt gradient-support check. New Bridge recipes assign that callable to
+`optimizer_config_overrides`; the old LSQ provider remains a compatibility wrapper
+for existing configurations. Bridge retains the provider API for downstream integrations.
+
 LSQ's model hook records the actual scale LR on the constructed model; setup consumes
 it per run. Flextron's router LR now uses the recipe mapping. Neither operation patches
 a process-global training function. Standard rules remain Core-owned.

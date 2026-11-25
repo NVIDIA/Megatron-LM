@@ -13,6 +13,7 @@ from megatron.core.optimizer import (
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.optimizer.optimizer_config import ParamKey
 from megatron.post_training.model_hooks import _propagate_expert_allreduce_to_lsq_params, lsq_hook
 from megatron.post_training.optimizer import get_lsq_config_overrides
 from megatron.training.config.optimizer_config import build_optimizer_config_overrides
@@ -57,6 +58,30 @@ def test_override_when_set():
     assert override == {"max_lr": 1e-4}
 
 
+@pytest.mark.parametrize(
+    "scale_lr,scale_min_lr,scale_wd_mult,expected",
+    [
+        (3e-5, 3e-6, 1.0, {}),  # Equal settings must not create a duplicate group.
+        (None, None, 1.0, {}),
+        (None, 1e-6, 1.0, {"min_lr": 1e-6}),
+        (3e-5, None, 0.0, {"wd_mult": 0.0}),
+        (1e-4, 0.0, 0.0, {"max_lr": 1e-4, "min_lr": 0.0, "wd_mult": 0.0}),
+    ],
+)
+def test_shared_scale_policy_only_emits_differences(
+    scale_lr, scale_min_lr, scale_wd_mult, expected
+):
+    overrides = get_lsq_config_overrides(
+        scale_lr,
+        base_lr=3e-5,
+        base_min_lr=3e-6,
+        scale_min_lr=scale_min_lr,
+        scale_wd_mult=scale_wd_mult,
+    )
+    scale_key = ParamKey(name=("*_amax_pre", "*_amax_post"))
+    assert overrides == ({scale_key: expected} if expected else {})
+
+
 @pytest.mark.parametrize("scale_lr", [1e-4, 3e-5])
 def test_lsq_hook_uses_model_settings_without_leaking_to_another_run(scale_lr):
     config = OptimizerConfig(lr=3e-5, min_lr=0.0)
@@ -92,6 +117,30 @@ class TestLSQParamGroups:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_minimum_rate_and_weight_decay_reach_scale_groups(self):
+        config = OptimizerConfig(lr=3e-5, min_lr=3e-6, weight_decay=0.1)
+        model = _toy_model()
+        scales = get_lsq_config_overrides(
+            config.lr,
+            base_lr=config.lr,
+            scale_min_lr=1e-6,
+            base_min_lr=config.min_lr,
+            scale_wd_mult=0.0,
+        )
+        overrides = build_optimizer_config_overrides(config, [model], scales)
+        groups = _get_param_groups([model], config, overrides)
+        by_param = {id(param): group for group in groups for param in group["params"]}
+        weight_group = by_param[id(model.linear.weight)]
+        scale_group = by_param[id(model.linear.weight_quantizer._amax_pre)]
+        assert (weight_group["min_lr"], weight_group["wd_mult"]) == (3e-6, 1.0)
+        assert (scale_group["max_lr"], scale_group["min_lr"], scale_group["wd_mult"]) == (
+            3e-5,
+            1e-6,
+            0.0,
+        )
+        identities = [tuple(g.get(k) for k in param_group_identifier_keys) for g in groups]
+        assert len(set(identities)) == len(identities)
 
     @pytest.mark.parametrize("lsq_scale_lr", [1e-4, 3e-5])
     def test_scale_params_get_own_group(self, lsq_scale_lr):
