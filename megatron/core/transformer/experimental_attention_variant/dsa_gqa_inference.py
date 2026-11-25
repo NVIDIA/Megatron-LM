@@ -63,9 +63,16 @@ def _materialized_topk(
     max_context_length: int,
     index_topk: int,
 ) -> torch.Tensor:
-    """Each row's top-k by scoring its keys into a buffer and selecting from it."""
+    """Each row's top-k by scoring its keys into a buffer and selecting from it.
+
+    In deterministic mode the selection is FlashInfer's deterministic ragged top-k, which reads
+    only each row's ``[0, row_lengths[t])`` scores, fills slots past the length with -1, and
+    breaks ties at the cutoff toward smaller positions. Otherwise it is torch.topk over the
+    whole row, with positions past the length scored -inf.
+    """
     from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference_kernels
 
+    deterministic = use_deterministic_mode()
     num_rows = plan.row_requests.numel()
     width = max_context_length
     # Score and select in windows of rows so the score buffer stays bounded at long context;
@@ -73,6 +80,10 @@ def _materialized_topk(
     window = max(1, min(num_rows, SCORE_BUFFER_BYTES // (width * torch.float32.itemsize)))
     scores = torch.empty((window, width), dtype=torch.float32, device=index_query.device)
     topk_indices = torch.empty((num_rows, index_topk), dtype=torch.int32, device=index_query.device)
+    if deterministic:
+        from flashinfer.topk import TopKTieBreak, top_k_ragged_transform
+
+        offsets = torch.zeros(window, dtype=torch.int32, device=index_query.device)
     for start in range(0, num_rows, window):
         stop = min(start + window, num_rows)
         window_scores = scores[: stop - start]
@@ -85,9 +96,22 @@ def _materialized_topk(
             plan.block_rows,
             plan.block_requests,
             out=window_scores,
-            fill_invalid=True,
+            # The length-bounded top-k never reads past a row's length, so the -inf tail
+            # (the whole static bound in graphs) need not be written.
+            fill_invalid=not deterministic,
             row_offset=start,
         )
+        if deterministic:
+            topk_indices[start:stop] = top_k_ragged_transform(
+                window_scores,
+                offsets[: stop - start],
+                plan.row_lengths[start:stop],
+                index_topk,
+                deterministic=True,
+                tie_break=TopKTieBreak.SMALL,
+                dsa_graph_safe=True,
+            )
+            continue
         selected = window_scores.topk(min(index_topk, width), dim=-1).indices.to(torch.int32)
         topk_indices[start:stop] = F.pad(selected, (0, index_topk - selected.size(1)), value=-1)
     return topk_indices
@@ -110,7 +134,9 @@ def dynamic_sparse_attention(
     Every token is a row that routes to the top-k of its causal prefix
     (``DSAMetadata.plan``), so all step types share one path with
     launch sizes fixed by the padded batch and can run as CUDA graphs. The caches already
-    hold this step's keys, values, and indexer keys.
+    hold this step's keys, values, and indexer keys. Decode rows use native decode with
+    FlashInfer GVR2 top-k, except in deterministic mode, where they take the prefill row
+    path and its deterministic top-k.
 
     Args:
         query: Query ``[T,1,Hq,D]`` or ``[T,Hq,D]`` for the padded active tokens.
@@ -175,6 +201,22 @@ def _native_sparse_attention(
     index_topk: int,
     softmax_scale: float,
 ) -> torch.Tensor:
+    if use_deterministic_mode():
+        # FlashInfer's GVR2 top-k may select different keys among equal scores from run to
+        # run. In deterministic mode every row, decode included, takes the row path instead:
+        # Triton scores (no atomics) into a bounded buffer and FlashInfer's deterministic
+        # ragged top-k, so outputs are bitwise repeatable, eager and in CUDA graphs.
+        return _sparse_attention_rows(
+            query=query,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            index_query=index_query,
+            index_key_cache=index_key_cache,
+            plan=plan,
+            max_context_length=max_context_length,
+            index_topk=index_topk,
+            softmax_scale=softmax_scale,
+        )
     rows = plan.decode_lengths.numel()
     max_context = inference_context.max_sequence_length
     metadata = inference_context.dsa_metadata
@@ -268,7 +310,10 @@ def dsa_gqa_decode(
     from . import dsa_gqa_inference_kernels as kernels
 
     if use_deterministic_mode():
-        raise RuntimeError("FlashInfer GVR2 top-k does not support deterministic mode")
+        raise RuntimeError(
+            "FlashInfer GVR2 top-k does not support deterministic mode; "
+            "dynamic_sparse_attention selects decode keys with the deterministic row path"
+        )
 
     device = query.device
     if device.type != "cuda" or torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
