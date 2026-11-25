@@ -1154,9 +1154,14 @@ def validate_args(args, defaults={}):
         assert args.hidden_size % args.num_attention_heads == 0
         args.kv_channels = args.hidden_size // args.num_attention_heads
 
-    if args.seq_length is not None and args.context_parallel_size > 1:
-        assert args.seq_length % (args.context_parallel_size * 2) == 0, \
-            f"seq-length ({args.seq_length}) must be a multiple of 2 * the resolved " \
+    # SFT alignment applies to the physical pack, which can override --seq-length.
+    input_length = args.max_seq_length_per_sample if args.sft else None
+    input_length = input_length if input_length is not None else args.seq_length
+    if input_length is None:
+        input_length = args.encoder_seq_length
+    if input_length is not None and args.context_parallel_size > 1:
+        assert input_length % (args.context_parallel_size * 2) == 0, \
+            f"input sequence length ({input_length}) must be a multiple of 2 * the resolved " \
             f"context-parallel group size ({args.context_parallel_size}), " \
             "including GTP sequence shards."
 
@@ -1173,12 +1178,27 @@ def validate_args(args, defaults={}):
         assert args.encoder_seq_length is not None
         args.seq_length = args.encoder_seq_length
 
-    if args.seq_length is not None:
-        assert args.max_position_embeddings >= args.seq_length, \
-            f"max_position_embeddings ({args.max_position_embeddings}) must be greater than " \
-            f"or equal to seq_length ({args.seq_length})."
-    if args.decoder_seq_length is not None:
-        assert args.max_position_embeddings >= args.decoder_seq_length
+    # Only learned position tables impose this capacity limit. The legacy RoPE
+    # flag is normalized below and also overrides position_embedding_type.
+    if args.position_embedding_type == 'learned_absolute' and not args.use_rotary_position_embeddings:
+        if args.seq_length is not None:
+            assert args.max_position_embeddings >= args.seq_length, \
+                f"max_position_embeddings ({args.max_position_embeddings}) must be greater than " \
+                f"or equal to seq_length ({args.seq_length})."
+        if args.decoder_seq_length is not None:
+            assert args.max_position_embeddings >= args.decoder_seq_length
+        if args.max_seq_length_per_sample is not None:
+            assert args.max_position_embeddings >= args.max_seq_length_per_sample, \
+                f"max_position_embeddings ({args.max_position_embeddings}) must be greater than " \
+                f"or equal to max_seq_length_per_sample ({args.max_seq_length_per_sample})."
+    elif args.max_position_embeddings < max(
+        args.seq_length or 0, args.decoder_seq_length or 0, args.max_seq_length_per_sample or 0
+    ):
+        warn_rank_0(
+            "--max-position-embeddings is smaller than the run sequence length. RoPE/YaRN "
+            "does not require a learned position table, but checkpoint/export context-length "
+            "metadata retains --max-position-embeddings; set it explicitly for the intended export."
+        )
     if args.save is not None and args.save_params_interval is not None:
         assert not args.overlap_param_gather, \
             '--save-params-interval is not supported with --overlap-param-gather'
@@ -1552,9 +1572,9 @@ def validate_args(args, defaults={}):
             total_cp_ranks = args.context_parallel_size
             if args.sequence_packing_scheduler == 'default_dynamic_cp':
                 total_cp_ranks *= args.data_parallel_size
-            assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
+            assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= input_length, (
                 f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
-                f'must be >= single sequence max length ({args.seq_length})'
+                f'must be >= physical sample length ({input_length})'
             )
 
     if args.sequence_packing_scheduler == "dp_balanced" and args.cuda_graph_impl == "transformer_engine":
@@ -1689,11 +1709,8 @@ def validate_args(args, defaults={}):
             'restored by load_state_dict); use tensorwise, mxfp8, blockwise or nvfp4.'
         )
 
+    # The other --logits-save-dir/--logits-load-dir rules live in OfflineDistillationConfig.
     if args.logits_save_dir is not None:
-        assert args.async_save, (
-            '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
-            'Logits are flushed as an async request in the checkpoint queue.'
-        )
         if not args.freeze_all_layers:
             warn_rank_0(
                 '--logits-save-dir without --freeze-all-layers: the LM loss is still computed and '
@@ -1701,10 +1718,6 @@ def validate_args(args, defaults={}):
                 'when dumping logits during active training; for a frozen-teacher dump pass '
                 '--freeze-all-layers.'
             )
-        assert args.rampup_batch_size is None, (
-            '--logits-save-dir does not support --rampup-batch-size: the sample<->iteration '
-            'mapping assumes a fixed global batch size.'
-        )
 
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
@@ -2321,8 +2334,6 @@ def _add_network_size_args(parser):
         "hash_moe_vocab_size",
         "fp8_param",
         "fp4_param",
-        # filled from the explicit --seq-length argument below
-        "max_seq_length_per_sample",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",
@@ -2799,9 +2810,6 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
-    group.add_argument('--dataloader-type', type=str, default=None,
-                       choices=['single', 'cyclic', 'external'],
-                       help='Single pass vs multiple pass data loader')
     group.add_argument('--no-persist-layer-norm', action='store_true',
                        help='Disable using persistent fused layer norm kernel. '
                        'This kernel supports only a set of hidden sizes. Please '
@@ -2862,8 +2870,6 @@ def _add_learning_rate_args(parser):
     group.add_argument('--decoupled-min-lr', type=float, default=None,
                        help='Minimum value for learning rate for the input and output layer. The scheduler'
                        'clip values below this threshold')
-    group.add_argument('--freeze-all-layers', action='store_true',
-                       help='Freeze all layers of the model.')
 
     return parser
 
@@ -3131,6 +3137,13 @@ def _add_tokenizer_args(parser):
 
 
 def _add_data_args(parser):
+    from megatron.training.config import DataloaderConfig
+
+    # The loader options (--dataloader-type, --num-workers, --no-data-sharding, --no-pin-memory,
+    # --no-persistent-workers) come from DataloaderConfig's fields; drop_last stays config-only
+    # until the loader consumers read it.
+    ArgumentGroupFactory(DataloaderConfig, exclude=["drop_last"]).build_group(parser, "dataloader")
+
     group = parser.add_argument_group(title='data and dataloader')
 
     group.add_argument('--data-path', nargs='*', default=None,
@@ -3197,8 +3210,6 @@ def _add_data_args(parser):
                        help='Probability of replacing a token with mask.')
     group.add_argument('--short-seq-prob', type=float, default=0.1,
                        help='Probability of producing a short sequence.')
-    group.add_argument('--num-workers', type=int, default=2,
-                       help="Dataloader number of workers.")
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
@@ -3275,9 +3286,6 @@ def _add_vision_args(parser):
                        help='training with fraction of classes.')
     group.add_argument('--data-per-class-fraction', type=float, default=1.0,
                        help='training with fraction of data per class.')
-    group.add_argument('--no-data-sharding', action='store_false',
-                       help='Disable data sharding.',
-                       dest='data_sharding')
     group.add_argument('--head-lr-mult', type=float, default=1.0,
                        help='learning rate multiplier for head during finetuning')
 
