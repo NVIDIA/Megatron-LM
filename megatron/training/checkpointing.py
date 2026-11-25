@@ -1794,20 +1794,8 @@ def maybe_save_dataloader_state(
     state_file_rank = 0 if is_save_state_rank_independent else dp_rank
     if dp_rank == 0:
         print(f'saving dataloader checkpoint at iteration {iteration} to {dataloader_save_path}')
-    data_state_save_path = get_checkpoint_name(
-        dataloader_save_path,
-        iteration,
-        pipeline_parallel=(
-            get_pg_size(pp_group) > 1
-            if pp_group is not None
-            else mpu.get_pipeline_model_parallel_world_size() > 1
-        ),
-        # Dataloader state is sharded only by DP rank. Keep it in the canonical TP0/PP0 directory.
-        tensor_rank=0,
-        pipeline_rank=0,
-        expert_parallel=False,
-        expert_rank=0,
-        basename=f'train_dataloader_dprank{state_file_rank:03d}.pt',
+    data_state_save_path = _dataloader_state_file_name(
+        dataloader_save_path, iteration, pp_group, state_file_rank
     )
 
     data_parallel_group = dp_group if dp_group is not None else mpu.get_data_parallel_group()
@@ -1824,6 +1812,95 @@ def maybe_save_dataloader_state(
     dataloader_save_dict = {}
     dataloader_save_dict['dataloader_state_dict'] = train_dataloader_state_dict
     torch.save(dataloader_save_dict, data_state_save_path)
+
+
+def _dataloader_state_file_name(dataloader_path, iteration, pp_group, state_file_rank):
+    """Path of one data-parallel rank's dataloader state file, in the canonical TP0/PP0 directory."""
+    return get_checkpoint_name(
+        dataloader_path,
+        iteration,
+        pipeline_parallel=(
+            get_pg_size(pp_group) > 1
+            if pp_group is not None
+            else mpu.get_pipeline_model_parallel_world_size() > 1
+        ),
+        # Dataloader state is sharded only by DP rank. Keep it in the canonical TP0/PP0 directory.
+        tensor_rank=0,
+        pipeline_rank=0,
+        expert_parallel=False,
+        expert_rank=0,
+        basename=f'train_dataloader_dprank{state_file_rank:03d}.pt',
+    )
+
+
+def maybe_load_dataloader_state(
+    train_iterator,
+    iteration,
+    dataloader_load_path,
+    *,
+    pp_group=None,
+    dp_group=None,
+    strict=False,
+):
+    """Restores dataloader state written by `maybe_save_dataloader_state`, if there is any.
+
+    Mirrors the save side: reads `train_dataloader_dprank{rank}.pt` from the canonical TP0/PP0
+    directory of `iteration`, or `train_dataloader_dprank000.pt` if the dataloader declares
+    `is_save_state_rank_independent`. Must be called before the iterator is consumed.
+
+    Does nothing if there is no iterator, no path, or the iterable has no `restore_state`.
+    Missing or unreadable state is reported and training continues from the start of the
+    dataloader, unless `strict` is set, in which case it raises.
+
+    Args:
+        train_iterator (iterable): Train dataloader iterator.
+        iteration (int): Iteration the model checkpoint was loaded at.
+        dataloader_load_path (str): Root directory holding the dataloader state.
+        pp_group (ProcessGroup): Pipeline-parallel group, or MPU fallback when unset.
+        dp_group (ProcessGroup): Full data-distribution group (dp x gtp_remat), matching the
+            one used on save, or MPU fallback when unset.
+        strict (bool): Raise instead of continuing when state is missing or cannot be restored.
+    """
+    if train_iterator is None or not dataloader_load_path:
+        return
+    iterable = getattr(train_iterator, 'iterable', train_iterator)
+    if not hasattr(iterable, 'restore_state'):
+        if strict:
+            raise RuntimeError(
+                f'Could not find a restore_state for the train_iterator of type '
+                f'{type(train_iterator)}'
+            )
+        return
+
+    dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
+    state_file_rank = (
+        0 if getattr(iterable, 'is_save_state_rank_independent', False) else dp_rank
+    )
+    state_path = _dataloader_state_file_name(
+        dataloader_load_path, iteration, pp_group, state_file_rank
+    )
+
+    if not os.path.exists(state_path):
+        message = f'Dataloader state {state_path} does not exist'
+        if strict:
+            raise FileNotFoundError(f'{message}; refusing to resume without dataloader state.')
+        if dp_rank == 0:
+            print_rank_0(f'{message}; continuing without restoring dataloader state.')
+        return
+
+    try:
+        state = torch.load(state_path, map_location='cpu', weights_only=False)
+        iterable.restore_state(state['dataloader_state_dict'])
+    except Exception as e:
+        if strict:
+            raise RuntimeError(f'Failed to restore dataloader state from {state_path}') from e
+        if dp_rank == 0:
+            print_rank_0(
+                f'Failed to restore dataloader state from {state_path}: {e}. '
+                'Continuing without restoring dataloader state.'
+            )
+        return
+    print_rank_0(f'restored dataloader state from {state_path}')
 
 
 def generate_state_dict(

@@ -1,13 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-import os
 from typing import Any
 
-import torch
 from data_loading.task_encoder import MultiModalTaskEncoder
-from dataloader_resume import (
-    is_initial_checkpoint_load_without_dataloader_state,
-    should_strictly_load_dataloader_state,
-)
 from dataset_helpers import TaskEncoder
 
 from megatron.core import parallel_state
@@ -30,8 +24,7 @@ from megatron.energon import (
     get_val_datasets,
 )
 from megatron.energon.errors import log_exception
-from megatron.training import get_args, get_run_config, get_train_state
-from megatron.training.checkpointing import get_checkpoint_name
+from megatron.training import get_args
 
 
 def use_new_dataloader_path():
@@ -229,57 +222,8 @@ def train_valid_test_dataloaders_provider(
     else:
         train_dataloader = get_savable_loader(train_ds, worker_config=worker_config)
 
-    # The full-dataset length probe runs before model checkpoint loading. Its
-    # temporary loader must not restore state; the real loader below model setup
-    # uses the checkpoint's resolved iteration and retains strict restore checks.
-    checkpoint = get_run_config().checkpoint
-    if restore_dataloader_state and checkpoint.load is not None:
-        if getattr(args, "dataloader_save", None):
-            train_state = get_train_state()
-            iteration = train_state.iteration
-            dp_rank = parallel_state.get_data_parallel_rank()
-            strict_load = should_strictly_load_dataloader_state(args)
-            data_save_name = get_checkpoint_name(
-                args.dataloader_save,
-                iteration,
-                expert_parallel=False,
-                pipeline_rank=0,  # Only the first pipeline parallel rank stores the dataloader checkpoint.
-                basename=f"train_dataloader_dprank{dp_rank:03d}.pt",
-            )
-            if not os.path.exists(data_save_name):
-                if is_initial_checkpoint_load_without_dataloader_state(train_state, checkpoint):
-                    if dp_rank == 0:
-                        print(
-                            f"Dataset state {data_save_name} does not exist for the initial "
-                            "checkpoint load; starting the dataloader from the beginning."
-                        )
-                elif strict_load:
-                    raise FileNotFoundError(
-                        f"Dataset state {data_save_name} does not exist; refusing to resume "
-                        "without dataloader state."
-                    )
-                elif dp_rank == 0:
-                    print(
-                        f"Dataset state {data_save_name} does not exist; continuing without "
-                        "restoring dataloader state."
-                    )
-            else:
-                try:
-                    dataset_state_dict = torch.load(
-                        data_save_name, map_location="cpu", weights_only=False
-                    )
-                    train_dataloader.restore_state_rank(dataset_state_dict["dataloader_state_dict"])
-                    print(f"restored dataset state from {data_save_name}")
-                except Exception as e:
-                    if strict_load:
-                        raise RuntimeError(
-                            f"Failed to restore dataloader state from {data_save_name}"
-                        ) from e
-                    if dp_rank == 0:
-                        print(
-                            f"Failed to restore dataloader state from {data_save_name}: {e}. "
-                            "Continuing without restoring dataloader state."
-                        )
+    # Dataloader state is restored by the training loop (maybe_load_dataloader_state) after the
+    # model checkpoint loads, through EnergonDataloader.restore_state.
 
     valid_dataloader = None
     if valid_ds1 is not None:
@@ -322,6 +266,9 @@ class EnergonDataloader:
 
     def save_state(self):
         return self._dataloader.save_state_rank()
+
+    def restore_state(self, state):
+        self._dataloader.restore_state_rank(state)
 
 
 def cyclic_iter(iter):

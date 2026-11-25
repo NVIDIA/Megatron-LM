@@ -155,6 +155,7 @@ from megatron.training.checkpointing import (
     checkpoint_exists,
     get_loaded_iteration,
     load_checkpoint,
+    maybe_load_dataloader_state,
     save_checkpoint,
     save_grads,
 )
@@ -6023,6 +6024,20 @@ def build_train_valid_test_data_iterators(
         train_data_iterator = _get_iterator(dl_type, train_dataloader)
     else:
         train_data_iterator = None
+
+    # Resume external-dataloader state saved by save_checkpoint. The model checkpoint has been
+    # loaded by now, so train_state.iteration is the iteration whose state we need.
+    train_state = get_train_state()
+    if train_data_iterator is not None and train_state.iteration > 0:
+        dataloader_state_path = getattr(args, 'dataloader_load', None) or getattr(
+            args, 'dataloader_save', None
+        )
+        maybe_load_dataloader_state(
+            train_data_iterator,
+            train_state.iteration,
+            dataloader_state_path,
+            strict=getattr(args, 'strict_dataloader_state_load', False),
+        )
 
     if valid_dataloaders is not None:
         # when using full validation, we need to override eval iters with the

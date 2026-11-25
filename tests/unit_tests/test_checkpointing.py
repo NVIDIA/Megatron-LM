@@ -38,6 +38,7 @@ from megatron.training.checkpointing import (
     get_checkpoint_version,
     load_args_from_checkpoint,
     load_checkpoint,
+    maybe_load_dataloader_state,
     maybe_save_dataloader_state,
     read_metadata,
     save_checkpoint,
@@ -2317,3 +2318,117 @@ def test_the_fsdp_dtensor_reader_follows_the_train_state_tracker(
     with pytest.raises(StopAtTheReader):
         load_checkpoint([object()], None, None, restore_training_state=True)
     assert readers == [wanted]
+
+
+_LOAD_GROUPS = {
+    "tp": SimpleNamespace(rank=0, size=1),
+    "pp": SimpleNamespace(rank=0, size=1),
+}
+
+
+def _dp_group(rank):
+    return SimpleNamespace(rank=rank, size=4)
+
+
+def _save_loader_state(path, iteration, dp_rank, iterable):
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_rank", side_effect=lambda group: group.rank
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_size", side_effect=lambda group: group.size
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.mpu.get_context_parallel_group", return_value=None
+        ),
+        mock.patch("megatron.training.checkpointing.torch.distributed.barrier"),
+    ):
+        maybe_save_dataloader_state(
+            SimpleNamespace(iterable=iterable),
+            iteration,
+            str(path),
+            tp_group=_LOAD_GROUPS["tp"],
+            pp_group=_LOAD_GROUPS["pp"],
+            dp_group=_dp_group(dp_rank),
+        )
+
+
+def _load_loader_state(path, iteration, dp_rank, iterable, **kwargs):
+    with mock.patch(
+        "megatron.training.checkpointing.get_pg_rank", side_effect=lambda group: group.rank
+    ), mock.patch(
+        "megatron.training.checkpointing.get_pg_size", side_effect=lambda group: group.size
+    ):
+        maybe_load_dataloader_state(
+            SimpleNamespace(iterable=iterable),
+            iteration,
+            None if path is None else str(path),
+            pp_group=_LOAD_GROUPS["pp"],
+            dp_group=_dp_group(dp_rank),
+            **kwargs,
+        )
+
+
+class _StatefulLoader:
+    def __init__(self, state=None, rank_independent=False):
+        self.state = state
+        self.restored = None
+        if rank_independent:
+            self.is_save_state_rank_independent = True
+
+    def save_state(self):
+        return self.state
+
+    def restore_state(self, state):
+        self.restored = state
+
+
+def test_maybe_load_dataloader_state_round_trips_per_rank_state(tmp_path):
+    for dp_rank in range(4):
+        _save_loader_state(tmp_path, 7, dp_rank, _StatefulLoader({"cursor": 10 + dp_rank}))
+
+    for dp_rank in range(4):
+        loader = _StatefulLoader()
+        _load_loader_state(tmp_path, 7, dp_rank, loader)
+        assert loader.restored == {"cursor": 10 + dp_rank}
+
+
+def test_maybe_load_dataloader_state_rank_independent_reads_single_file(tmp_path):
+    _save_loader_state(tmp_path, 3, 0, _StatefulLoader({"cursor": 99}, rank_independent=True))
+    assert [p.name for p in tmp_path.rglob("*.pt")] == ["train_dataloader_dprank000.pt"]
+
+    for dp_rank in range(4):
+        loader = _StatefulLoader(rank_independent=True)
+        _load_loader_state(tmp_path, 3, dp_rank, loader)
+        assert loader.restored == {"cursor": 99}
+
+
+def test_maybe_load_dataloader_state_missing_state(tmp_path):
+    loader = _StatefulLoader()
+    _load_loader_state(tmp_path, 5, 0, loader)
+    assert loader.restored is None
+
+    with pytest.raises(FileNotFoundError):
+        _load_loader_state(tmp_path, 5, 0, loader, strict=True)
+
+
+def test_maybe_load_dataloader_state_unreadable_state(tmp_path):
+    _save_loader_state(tmp_path, 5, 0, _StatefulLoader({"cursor": 1}))
+    loader = _StatefulLoader()
+    loader.restore_state = mock.Mock(side_effect=ValueError("bad state"))
+
+    _load_loader_state(tmp_path, 5, 0, loader)  # tolerated by default
+    with pytest.raises(RuntimeError, match="Failed to restore"):
+        _load_loader_state(tmp_path, 5, 0, loader, strict=True)
+
+
+def test_maybe_load_dataloader_state_disabled_cases(tmp_path):
+    loader = _StatefulLoader()
+    _load_loader_state(None, 5, 0, loader)  # no path
+    _load_loader_state("", 5, 0, loader)
+    maybe_load_dataloader_state(None, 5, str(tmp_path))  # no iterator
+    _load_loader_state(tmp_path, 5, 0, SimpleNamespace())  # loader cannot restore
+    assert loader.restored is None
+
+    with pytest.raises(RuntimeError, match="restore_state"):
+        _load_loader_state(tmp_path, 5, 0, SimpleNamespace(), strict=True)
