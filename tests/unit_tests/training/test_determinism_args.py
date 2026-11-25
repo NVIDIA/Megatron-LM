@@ -251,8 +251,9 @@ def test_each_required_arg_is_rejected_when_enabled(name):
 
 
 @pytest.mark.internal
-def test_all_incompatible_args_are_reported_together():
+def test_all_incompatible_args_are_reported_together(monkeypatch):
     """One failure lists every incompatible option, so users fix them in a single pass."""
+    monkeypatch.setattr(te_extensions, "te_supports_deterministic_moe_aux_loss", lambda: False)
     incompatible = {
         name: not required for name, required in ARG_VALUES_REQUIRED_FOR_DETERMINISM.items()
     }

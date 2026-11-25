@@ -70,6 +70,8 @@ def _model_config(**overrides) -> Qwen35VLModelConfig:
         ),
     )
     model_config = Qwen35VLMoEBridge().hf_config_to_model_config(hf_config)
+    # GDN's FLA kernels are rejected by the default deterministic_mode.
+    overrides.setdefault("deterministic_mode", False)
     for name, value in overrides.items():
         setattr(model_config, name, value)
     return model_config
@@ -140,10 +142,7 @@ class TestQwen35VLModelConfig:
     def test_finalize_computes_per_token_loss_for_context_parallelism(
         self, context_parallel_size, per_token_loss
     ):
-        # GDN's FLA kernels are rejected by the default deterministic_mode.
-        config = _model_config(
-            context_parallel_size=context_parallel_size, deterministic_mode=False
-        )
+        config = _model_config(context_parallel_size=context_parallel_size)
 
         config.finalize()
 
