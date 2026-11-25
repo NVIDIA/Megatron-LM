@@ -280,7 +280,7 @@ def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
         output, node.chunk_state.packed_seq_params, node.layer_state.moe_unflatten_mbs
     )
     node.layer_state.moe_unflatten_mbs = None
-    # Inline bda instead of calling ``layer._forward_post_mlp``, which would register
+    # Inline BDA instead of calling ``layer._apply_mlp_bda_step``, which would register
     # a second pre_mlp_layernorm recompute hook on the combine output. The hook is
     # already registered on ``expert_output`` in ``_run_moe_experts``. A second one
     # would run the layernorm recompute before attention's backward in the same

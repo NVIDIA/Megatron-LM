@@ -218,8 +218,10 @@ class TransformerLayerSchedulePlan:
         """Initializes a transformer layer schedule plan.
 
         Args:
-            layer (TransformerLayer):
-                split a transformer layer into multiple nodes for fine-grained scheduling.
+            layer (TransformerLayer | MultiTokenPredictionLayer | LayerScheduleGroup):
+                Layer or group of physical layers to split into schedule nodes. A group
+                supplies its own callables and MoE metadata. Its terminal layer's config
+                controls dispatch and activation storage for the group's nodes.
             event (torch.cuda.Event):
                 record CUDA event across multiple nodes on different streams for synchronization.
             chunk_state (ModelChunkState): model state shared in the model chunk.
