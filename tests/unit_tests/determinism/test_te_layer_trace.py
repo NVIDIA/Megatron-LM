@@ -293,10 +293,21 @@ def test_production_evaluate_suspends_l1_and_restores(tmp_path, mode, non_loss, 
             return []
 
         cfg = SimpleNamespace(
+            model=SimpleNamespace(
+                transformer=SimpleNamespace(
+                    max_seq_length_per_sample=1,
+                    cuda_graph_impl="none",
+                    moe_expert_rank_capacity_factor=None,
+                )
+            ),
             validation=SimpleNamespace(
-                eval_global_batch_size=1, eval_micro_batch_size=1, eval_iters=1
+                eval_global_batch_size=1,
+                eval_micro_batch_size=1,
+                eval_iters=1,
+                eval_empty_cuda_cache=False,
             ),
             train=SimpleNamespace(empty_unused_memory_level=0, exit_duration_in_mins=None),
+            get_batch_parallel_size=lambda: 1,
         )
         args = SimpleNamespace(
             cuda_graph_impl="none",
@@ -367,6 +378,7 @@ def test_production_forward_step_sets_microbatch_and_restores_on_failure(trace):
         get_determinism_context=get_determinism_context,
         determinism_context=determinism_context,
         set_current_microbatch=lambda *args: None,
+        set_te_cuda_graph_current_microbatch=lambda *args: None,
         get_attr_wrapped_model=lambda *args: lambda tensor: None,
         forward_step_calc_loss=lambda model, output, *args: (output, 0),
     )
