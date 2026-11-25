@@ -29,7 +29,7 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .context import FsdpContext
+from .context import FsdpContext, GradientFinalizationMode
 from .countdown import Countdown
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .module_utils import get_parameter_owner, is_in_backward
@@ -41,6 +41,7 @@ from .parameter_group import (
 )
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout
+from .runtime_policy import PrefetchOrder
 from .schedule_policy import SchedulePolicy
 
 
@@ -218,10 +219,6 @@ class FsdpModule:
                         "Transformer Engine does not accumulate their gradients. See "
                         "https://github.com/NVIDIA/TransformerEngine/issues/3437"
                     )
-                if not self.context.caller_managed_grad_sync:
-                    raise ValueError(
-                        "Delayed weight gradients require caller_managed_grad_sync=True."
-                    )
                 parameter_module, _ = get_parameter_owner(module, fsdp_parameter.fqns[0])
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
                     lambda parameter=parameter: post_accumulate_grad_hook_per_parameter(parameter)
@@ -233,6 +230,13 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
             yield from group.fsdp_parameters
+
+    def _has_delayed_weight_gradients(self) -> bool:
+        """Whether any owned trainable parameter computes its gradient in backward_dw()."""
+        return any(
+            getattr(parameter.unsharded, "skip_backward_post_hook", False)
+            for parameter in self._trainable_fsdp_parameters()
+        )
 
     @staticmethod
     def _pre_load_state_dict(
@@ -277,13 +281,27 @@ class FsdpModule:
         if self.is_root():
             context.allgather_stream.wait_stream(context.current_stream())
 
-        # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
-        # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        if context.is_recording_execution_order and not is_recomputing:
+        if context.is_recording_execution_order:
+            # The first iteration is training. Include recomputation so replay
+            # prefetches its forward weight planes.
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
-        self.unshard(
-            Phase.FORWARD, prefetch=not is_recomputing and not context.is_recording_execution_order
-        )
+
+        def should_prefetch() -> bool:
+            """Whether this call can prefetch using the established training trace."""
+            if context.is_recording_execution_order:
+                return False
+            # Evaluation usually runs forward only, so it needs a different execution
+            # order from the training trace, which includes backward events.
+            # Disabling prefetch may slow evaluation by losing all-gather/compute overlap.
+            # TODO: Use a separate forward-only execution order to restore that overlap.
+            if not cast(nn.Module, self).training:
+                return False
+            if context.prefetch_order is PrefetchOrder.RECORDED:
+                return True
+            # A REGISTRATION order has no recomputation events.
+            return not is_recomputing
+
+        self.unshard(Phase.FORWARD, prefetch=should_prefetch())
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
         """Unshard this FsdpModule's parameter groups immediately.
@@ -311,29 +329,26 @@ class FsdpModule:
 
             if not prefetch:
                 return
-            context = self.context
             match phase:
                 case Phase.FORWARD:
-                    self._prefetch_parameter_groups(
-                        context.execution_order, self._schedule_policy.forward_prefetch_size
-                    )
+                    prefetch_size = self._schedule_policy.forward_prefetch_size
                 case Phase.BACKWARD:
-                    self._prefetch_parameter_groups(
-                        context.execution_order, self._schedule_policy.backward_prefetch_size
-                    )
+                    prefetch_size = self._schedule_policy.backward_prefetch_size
                 case _:
                     raise ValueError(
                         f"Prefetching requires a FORWARD or BACKWARD phase, got {phase!r}."
                     )
+            order = self.context.execution_order
+            event = ExecutionEvent(cast(nn.Module, self), phase)
+            if order.peek() != event:
+                raise RuntimeError(
+                    "FSDP module calls diverged from the expected execution order "
+                    f"at position {order.position}: expected {order.peek()}, got {event}."
+                )
+            self._prefetch_parameter_groups(order, prefetch_size)
 
     def _prefetch_parameter_groups(self, order: ExecutionOrder, prefetch_size: int | None) -> None:
-        """Validate the current event, prefetch successors, and advance once."""
-        event = ExecutionEvent(cast(nn.Module, self), self.phase)
-        if order.peek() != event:
-            raise RuntimeError(
-                "FSDP module calls diverged from the expected execution order "
-                f"at position {order.position}: expected {order.peek()}, got {event}."
-            )
+        """Prefetch successors of the current event and advance once."""
         prefetched_size = 0
         for next_event in order.successors():
             if prefetch_size is not None and prefetched_size >= prefetch_size:
@@ -410,6 +425,17 @@ class FsdpModule:
         if self.phase is Phase.BACKWARD:
             # A shared invocation may still be awaiting the final callback.
             return
+        if (
+            self.context.gradient_finalization_mode
+            is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+            and self._has_delayed_weight_gradients()
+        ):
+            raise RuntimeError(
+                "Delayed weight gradients require "
+                "context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER) "
+                "around backward and backward_dw(), then finish_grad_sync() before "
+                "the optimizer step. Use SKIP_OUTER for earlier accumulation calls."
+            )
         self.phase = Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
@@ -454,7 +480,7 @@ class FsdpModule:
                 else:
                     self._accumulate_local_gradients(group)
 
-                if not context.finalize_gradients:
+                if context.gradient_finalization_mode is GradientFinalizationMode.SKIP_OUTER:
                     continue
                 # Finalize the DP-outer reduction. When overlap is enabled its stream is
                 # distinct, so it overlaps the following group's DP-inner reduce; the

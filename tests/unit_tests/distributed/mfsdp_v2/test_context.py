@@ -18,11 +18,11 @@ from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     Placements,
     PrefetchOrder,
     RuntimePolicy,
     SchedulePolicy,
-    finalize_gradients,
     fully_shard,
     fully_shard_context,
 )
@@ -135,6 +135,34 @@ def test_recorded_execution_order(distributed_setup):
         layer.register_full_backward_pre_hook(check_prefetched, prepend=True)
     model.zero_grad(set_to_none=True)
     model(inputs).sum().backward()
+
+
+@pytest.mark.parametrize("prefetch_order", [PrefetchOrder.REGISTRATION, PrefetchOrder.RECORDED])
+def test_repeated_evaluation_between_training_steps(distributed_setup, prefetch_order):
+    """Repeated evaluation must leave the training execution order ready for backward."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=16, num_children=2).to(device)
+    with fully_shard_context(
+        FsdpContext(device=device, runtime_policy=RuntimePolicy(prefetch_order=prefetch_order))
+    ):
+        for layer in model.layers:
+            fully_shard(layer, mesh, _default_placements())
+        fully_shard(model, mesh, _default_placements())
+
+    inputs = torch.ones(2, 16, device=device)
+    model(inputs).sum().backward()
+
+    model.eval()
+    # Evaluation must leave the trace untouched with or without autograd enabled.
+    with torch.no_grad():
+        model(inputs)
+    model(inputs)
+
+    model.train()
+    model.zero_grad(set_to_none=True)
+    model(inputs).sum().backward()
+    assert all(parameter.grad is not None for parameter in model.parameters())
 
 
 def test_registration_order_rejects_reordered_execution(distributed_setup):
@@ -262,34 +290,33 @@ def test_sibling_roots_share_context_and_cross_root_orders(distributed_setup):
     ] + [ExecutionEvent(module, Phase.BACKWARD) for module in [model.layers[1], model.layers[0]]]
 
 
-@pytest.mark.parametrize("caller_managed_grad_sync", [False, True])
+@pytest.mark.parametrize(
+    "gradient_finalization_mode",
+    [GradientFinalizationMode.REDUCE_OUTER_AND_WAIT, GradientFinalizationMode.REDUCE_OUTER],
+)
 def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
-    distributed_setup, monkeypatch, caller_managed_grad_sync
+    distributed_setup, monkeypatch, gradient_finalization_mode
 ):
     """Sibling roots should share one final wait across accumulated microbatches."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=4, num_children=2).to(device)
 
-    with fully_shard_context(
-        FsdpContext(
-            device=device,
-            runtime_policy=RuntimePolicy(caller_managed_grad_sync=caller_managed_grad_sync),
-        )
-    ) as context:
+    with fully_shard_context(FsdpContext(device=device)) as context:
         fully_shard(model.layers[0], mesh=mesh, placements=_default_placements())
         fully_shard(model.layers[1], mesh=mesh, placements=_default_placements())
 
     finish_grad_sync = Mock(wraps=context.finish_grad_sync)
     monkeypatch.setattr(context, "finish_grad_sync", finish_grad_sync)
 
-    with finalize_gradients(context, enabled=False):
+    with context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER):
         model(torch.ones(2, 4, device=device)).sum().backward()
     finish_grad_sync.assert_not_called()
 
-    model(torch.ones(2, 4, device=device)).sum().backward()
+    with context.finalize_gradients(mode=gradient_finalization_mode):
+        model(torch.ones(2, 4, device=device)).sum().backward()
 
-    if caller_managed_grad_sync:
+    if gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER:
         finish_grad_sync.assert_not_called()
         context.finish_grad_sync()
     finish_grad_sync.assert_called_once_with()
@@ -425,24 +452,26 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
     assert model.inner.context is first_context
 
 
-def test_finalize_gradients_scopes_context(distributed_setup):
-    """Finalization is enabled by default and scoped to the supplied context."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = nn.Sequential(nn.Linear(1, 1, bias=False), nn.Linear(1, 1, bias=False)).to(device)
-    with fully_shard_context(FsdpContext(device=device)) as context:
-        for layer in model:
-            fully_shard(layer, mesh=mesh, placements=_default_placements())
-
-    with finalize_gradients(context, enabled=False):
-        assert not context.finalize_gradients
-        with finalize_gradients(context):
-            assert context.finalize_gradients
-        assert not context.finalize_gradients
-
-    assert context.finalize_gradients
+@pytest.mark.parametrize(
+    "mode", [GradientFinalizationMode.SKIP_OUTER, GradientFinalizationMode.REDUCE_OUTER]
+)
+@pytest.mark.parametrize("initial_mode", list(GradientFinalizationMode))
+def test_finalize_gradients_scopes_context(distributed_setup, mode, initial_mode):
+    """Nested scopes restore the previous mode, including after an exception."""
+    context = FsdpContext(device=distributed_setup.device, gradient_finalization_mode=initial_mode)
+    context.finalize()
+    assert context.gradient_finalization_mode is initial_mode
+    with context.finalize_gradients(mode=mode):
+        assert context.gradient_finalization_mode is mode
+        with context.finalize_gradients():
+            assert (
+                context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+            )
+        assert context.gradient_finalization_mode is mode
+        with pytest.raises(RuntimeError, match="step failed"), context.finalize_gradients():
+            raise RuntimeError("step failed")
+        assert context.gradient_finalization_mode is mode
+    assert context.gradient_finalization_mode is initial_mode
 
 
 @pytest.mark.parametrize("overlap_allgather_reduction", [False, True])
@@ -467,13 +496,13 @@ def test_communication_stream_assignment(
         assert context.outer_reduction_stream != context.allgather_stream
 
 
-def test_delayed_wgrad_requires_caller_managed_sync(distributed_setup):
+def test_delayed_wgrad_requires_explicit_grad_wait(distributed_setup):
     """Delayed weight gradients require explicit gradient synchronization."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = te.Linear(16, 16, device=device, delay_wgrad_compute=True)
-    with (
-        fully_shard_context(FsdpContext(device=device)),
-        pytest.raises(ValueError, match="caller_managed_grad_sync=True"),
-    ):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    with pytest.raises(RuntimeError, match="Delayed weight gradients require"):
+        model(torch.ones(2, 16, device=device, requires_grad=True)).sum().backward()

@@ -141,8 +141,8 @@ workload rather than generalizing from any single comparison.
 > Enable it with `batch_invariant_mode` on the model's `TransformerConfig` — it
 > is *not* an `InferenceConfig` field, so it must be set when you build the
 > model, not on the engine config. Two companion fields tune it:
-> `batch_invariant_backend` (`te_native` by default, or `deepgemm` / `triton`)
-> selects the GEMM backend, and `batch_invariant_collective` (`ordered` by
+> `batch_invariant_backend` (`te_native` by default, or `triton`; `deepgemm` is
+> deprecated and runs as `te_native`) selects the GEMM backend, and `batch_invariant_collective` (`ordered` by
 > default, or `multimem`) selects the cross-rank expert-combine reduction.
 >
 > Both dense and MoE models are supported. Batch-invariant MoE supports BF16 and
@@ -152,9 +152,11 @@ workload rather than generalizing from any single comparison.
 > `nvls` token dispatcher when `EP > 1`). FlashInfer supports MXFP8 non-gated
 > squared-ReLU experts, including selective BF16 layers, but its batch invariance
 > does not imply bitwise parity with TE training. Use Torch/vLLM for exact
-> training-policy comparisons. Some backend combinations additionally need DeepGEMM
-> bf16 bindings: `uv pip install -e .[batch_invariant]`. Context parallelism and
-> attention dropout are not supported in either case. MXFP8 training uses
+> training-policy comparisons. Batch invariance needs no extra dependency: training
+> experts use TE's native grouped GEMM under the starved cuBLASLt workspace with
+> either backend, and the `torch` inference backend's BF16 experts use
+> `torch._grouped_mm`. Context parallelism and attention dropout are not supported
+> in either case. MXFP8 training uses
 > `batch_invariant_backend="te_native"`. Legacy TE GroupedLinear remains the
 > default. On SM100 with cuBLASLt 13.5.1, `moe_use_grouped_tensor=True` opts into
 > TE device-metadata grouped GEMM and its required 256-row expert padding.
@@ -315,6 +317,7 @@ with MegatronLLM(
 | HTTP `serve()` | ❌ | ✅ |
 | Expert parallelism (EP > 1) | ❌ | ✅ |
 | `pause`/`suspend`/`resume` | ❌ | ✅ |
+| `InferenceConfig(start_suspended=True)` | ❌ | ✅ |
 | `submit` / `run_sync` | ❌ | ✅ |
 | Streaming | ❌ | ✅ |
 | `multi_modal_data` | ❌ | ✅ |
@@ -496,6 +499,7 @@ used fields:
 | `materialize_only_last_token_logits` | Set `False` when returning *prompt* log-probs |
 | `mamba_inference_state_config`, `mamba_memory_ratio` | Hybrid, Mamba, GDN, or GDP model state. The state config also carries the conv and SSM state dtypes |
 | `kv_cache_management_mode`, `unified_memory_level`, `static_kv_memory_pointers` | Suspend or resume memory handling (`persist` / `offload` / `recompute`). `static_kv_memory_pointers` keeps captured CUDA graphs valid across a suspend/resume cycle so they do not need recapture |
+| `start_suspended` | Construct the engine `SUSPENDED` instead of `RUNNING`, so it can be built before its weights are in place; CUDA-graph capture waits for the first `resume()`, while the inference-state buffers are allocated at construction and follow `kv_cache_management_mode`. Coordinator mode only. Refer to [Lifecycle Controls](#lifecycle-controls) |
 | `offset_sampling_seed_by_dp_rank` | Give each DP rank a distinct sampling seed (default `True`), so the same prompt routed to different replicas produces different samples |
 | `image_preprocessing_config` | Image preprocessing for vision-language models |
 | `use_flashinfer_fused_rope` | Use FlashInfer's fused RoPE kernel |
@@ -567,6 +571,36 @@ then resume. This is what enables both *colocated* (training and inference on
 the same GPUs) and *non-colocated* (separate resources) RL deployments. Refer to
 [Weight Refit and Resharding for RL](#weight-refit-and-resharding-for-rl) for the
 refit call itself.
+
+#### Starting Suspended: Serving Before the Weights Are Final
+
+`InferenceConfig(start_suspended=True)` builds the engine in the `SUSPENDED`
+state. The coordinator, the engine loop, and the `serve()` frontends come up
+immediately and submitted requests are queued rather than failed, while
+CUDA-graph capture waits for the first `resume()`. The inference-state buffers
+are allocated at construction and are then held or released according to
+`kv_cache_management_mode`, as after a regular `suspend()`. Use it when the
+weights the engine will run with are not in place at construction, for example
+an RL rollout engine that receives them through a refit:
+
+```python
+from megatron.core.inference.config import InferenceConfig
+
+llm = MegatronAsyncLLM(
+    model=model,
+    tokenizer=tokenizer,
+    inference_config=InferenceConfig(start_suspended=True),
+)
+await llm.serve(ServeConfig(port=5000), blocking=False)  # the endpoint answers from here on
+load_weights_in_place(model)                             # e.g. the first refit
+await llm.resume()                                       # capture CUDA graphs
+await llm.unpause()                                      # start serving
+```
+
+Call `resume()` and then `unpause()` once the weights are in place; until then
+submitted requests wait, and `pause()` and `shutdown()` behave as on a regularly
+suspended engine. Coordinator mode only: direct mode has no `resume()`, so
+`start_suspended` raises `ValueError` at `__init__`.
 
 ---
 
