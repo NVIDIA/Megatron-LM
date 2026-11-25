@@ -543,8 +543,10 @@ def _check_training_parity(model_kind, dtype, dropout):
         pytest.param("hybrid_moe_mtp", torch.bfloat16, id="hybrid_moe_mtp-bf16"),
     ],
 )
-def test_mhc_full_iteration_training_parity(model_kind, dtype):
+def test_mhc_full_iteration_training_parity(model_kind, dtype, monkeypatch):
     """Changed batches, all synchronized gradients, and optimizer updates match eager."""
+    if model_kind == "hybrid_gdn_mtp":
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
     _check_training_parity(model_kind, dtype, dropout=0.0)
 
 
