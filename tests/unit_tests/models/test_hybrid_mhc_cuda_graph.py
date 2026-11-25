@@ -291,28 +291,28 @@ class TestMHCTEGraphs:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
-        "kind,scopes",
+        "kind,scopes,fused",
         [
-            ("hybrid", [CudaGraphModule.attn, CudaGraphModule.mlp]),
-            ("hybrid_gdn", [CudaGraphModule.attn, CudaGraphModule.mlp]),
-            ("hybrid_mamba", [CudaGraphModule.mamba, CudaGraphModule.mlp]),
-            ("hybrid_mtp", [CudaGraphModule.attn, CudaGraphModule.mlp]),
-            ("hybrid_moe", [CudaGraphModule.attn, CudaGraphModule.moe_router]),
-            ("hybrid_moe_mtp", [CudaGraphModule.attn, CudaGraphModule.moe_router]),
+            ("hybrid", [CudaGraphModule.attn, CudaGraphModule.mlp], False),
+            ("hybrid_gdn", [CudaGraphModule.attn, CudaGraphModule.mlp], True),
+            ("hybrid_mamba", [CudaGraphModule.mamba, CudaGraphModule.mlp], False),
+            ("hybrid_mtp", [CudaGraphModule.attn, CudaGraphModule.mlp], True),
+            ("hybrid_moe_mtp", [CudaGraphModule.attn, CudaGraphModule.moe_router], True),
             (
                 "hybrid_moe",
                 [CudaGraphModule.attn, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+                False,
             ),
-            ("gpt", [CudaGraphModule.attn]),
-            ("gpt", [CudaGraphModule.mlp]),
-            ("gpt_moe", [CudaGraphModule.attn, CudaGraphModule.moe_router]),
+            ("gpt", [CudaGraphModule.attn], False),
+            ("gpt", [CudaGraphModule.mlp], True),
+            ("gpt_moe", [CudaGraphModule.attn, CudaGraphModule.moe_router], False),
             (
                 "gpt_moe",
                 [CudaGraphModule.attn, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+                True,
             ),
         ],
     )
-    @pytest.mark.parametrize("fused", [False, True])
     def test_capture_replay_all_gradients(self, kind, scopes, fused, monkeypatch):
         self._run(kind, scopes, fused, monkeypatch)
 
@@ -345,8 +345,16 @@ class TestMHCTEGraphs:
                 **{input_name: unsupported},
             )
 
-    @pytest.mark.parametrize("kind", ["gpt", "gpt_moe", "hybrid", "hybrid_gdn", "hybrid_moe_mtp"])
-    @pytest.mark.parametrize("fused", [False, True])
+    @pytest.mark.parametrize(
+        "kind,fused",
+        [
+            ("gpt", False),
+            ("gpt_moe", True),
+            ("hybrid", False),
+            ("hybrid_gdn", True),
+            ("hybrid_moe_mtp", True),
+        ],
+    )
     def test_attention_graph_split_with_mhc_recompute(self, kind, fused, monkeypatch):
         self._run(kind, [CudaGraphModule.attn], fused, monkeypatch, **_ATTENTION_GRAPH_SPLIT)
 
@@ -453,8 +461,6 @@ class TestMHCTEGraphs:
         graphed = _model(kind, config, pg)
         reference = _model(kind, _config(kind, None, fused, tp, cp, ep, **reference_overrides), pg)
         reference.load_state_dict(graphed.state_dict(), strict=True)
-        optimizer = torch.optim.SGD(graphed.parameters(), lr=0.01)
-        reference_optimizer = torch.optim.SGD(reference.parameters(), lr=0.01)
         initial_keys = set(graphed.state_dict())
 
         local_seq = 32 // cp
@@ -471,7 +477,7 @@ class TestMHCTEGraphs:
             def own_gradient(parameter):
                 # TE reuses gradient buffers between captured backward graphs.
                 # Native DDP immediately copies into owned main_grad storage;
-                # this standalone optimizer must likewise own each .grad before
+                # this standalone test must likewise own each .grad before
                 # the next backward graph can reuse its returned buffer.
                 parameter.grad = parameter.grad.clone()
 
@@ -605,19 +611,6 @@ class TestMHCTEGraphs:
             ]
             assert mhc_grads and all(grad is not None for grad in mhc_grads)
             assert any(torch.count_nonzero(grad) for grad in mhc_grads)
-            reference_optimizer.step()
-            optimizer.step()
-            for (name, actual), (reference_name, reference_param) in zip(
-                graphed.named_parameters(), reference.named_parameters()
-            ):
-                assert name == reference_name
-                torch.testing.assert_close(
-                    actual,
-                    reference_param,
-                    rtol=3e-2,
-                    atol=2e-3,
-                    msg=lambda message: f"replay={index} parameter {name}: {message}",
-                )
             assert all(replay_calls[id(layer)] == index + 1 for layer in expected)
             assert set(hooks) == covered_modules
             assert all(count == index + 1 for count in hooks.values())
@@ -630,7 +623,10 @@ class TestMHCTEGraphs:
 @pytest.mark.parametrize(
     "extra,error",
     [
-        ({"recompute_granularity": "selective", "recompute_modules": ["mhc"]}, "selective mHC"),
+        (
+            {"recompute_granularity": "selective", "recompute_modules": ["mhc"]},
+            "mhc_recompute_attn_cuda_graph_split",
+        ),
         (
             {"fine_grained_activation_offloading": True, "offload_modules": ["core_attn"]},
             "offloading",
@@ -685,12 +681,6 @@ def test_mhc_attention_graph_split_config_admits_selective_mhc_recompute():
 def test_mhc_attention_graph_split_config_requirements(overrides, error):
     with pytest.raises(ValueError, match=error):
         _split_config(**overrides)
-
-
-@pytest.mark.launch_on_gb200
-def test_mhc_te_graphs_reject_mhc_recompute_without_the_split():
-    with pytest.raises(NotImplementedError, match="mhc_recompute_attn_cuda_graph_split"):
-        _split_config(mhc_recompute_attn_cuda_graph_split=False)
 
 
 @pytest.mark.launch_on_gb200

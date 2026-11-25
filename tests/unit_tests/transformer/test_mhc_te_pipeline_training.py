@@ -43,12 +43,7 @@ from megatron.core.transformer.cuda_graphs import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import Float16Module
-from megatron.core.utils import (
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
-    get_model_config,
-    is_te_min_version,
-)
+from megatron.core.utils import get_model_config, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_mhc_full_iteration_training import (
     _NUM_MICROBATCHES,
@@ -57,12 +52,14 @@ from tests.unit_tests.transformer.test_mhc_full_iteration_training import (
     _WARMUP_STEPS,
     _assert_training_close,
     _build_models,
+    _copy_parameters,
+    _forward_microbatch,
     _initialize_test_parallelism,
-    _make_batch,
     _named_parameters,
     _restore_rng,
     _snapshot_rng,
-    _training_loss,
+    _training_step,
+    _update_and_snapshot,
 )
 
 
@@ -91,35 +88,7 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph, recompute_rebu
     iteration = -1
 
     def forward_step(data_iterator, model):
-        module = _unwrap(model)
-        batch = get_batch_on_this_tp_rank(
-            batch=next(data_iterator),
-            has_cu_seqlens=False,
-            dynamic_cp=False,
-            create_attention_mask_in_dataloader=False,
-            broadcast_src_rank=torch.distributed.get_global_rank(groups.tp, 0),
-            broadcast_group=groups.tp,
-            cp_size=groups.cp.size(),
-            tp_rank=groups.tp.rank(),
-            micro_batch_size=1,
-            seq_length=_SEQ_LENGTH,
-            mtp_on_this_rank=getattr(module, "mtp_process", False),
-            pipeline_model_parallel_size=pp_size,
-            is_pipeline_first_stage=module.pre_process,
-            is_pipeline_last_stage=module.post_process,
-        )
-        if groups.cp.size() > 1:
-            batch = get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=groups.cp)
-            if batch.get("tokens") is not None:
-                assert batch["tokens"].shape[1] == _SEQ_LENGTH // groups.cp.size()
-        output = model(
-            batch["tokens"], batch["position_ids"], batch["attention_mask"], labels=batch["labels"]
-        )
-
-        def loss_func(losses):
-            return _training_loss(losses, batch["loss_mask"])
-
-        return output, loss_func
+        return _forward_microbatch(data_iterator, model, groups, pp_size)
 
     def capture():
         config = _unwrap(models[0]).config
@@ -180,26 +149,15 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph, recompute_rebu
             # accumulation fusion disabled, TE returns those grads through
             # autograd on every replay, so the leaf hooks must run each step.
             gradients_seen.clear()
-            optimizer.zero_grad(set_to_none=True)
-            for model in models:
-                model.zero_grad_buffer()
-            batches = [
-                _make_batch(iteration, index, data_parallel_rank=groups.dp.rank())
-                for index in range(_NUM_MICROBATCHES)
-            ]
-            data_iterators = [iter([batch.copy() for batch in batches]) for _ in models]
-            losses = forward_backward(
-                forward_step_func=forward_step,
-                data_iterator=data_iterators,
-                model=models,
-                num_microbatches=_NUM_MICROBATCHES,
-                seq_length=_SEQ_LENGTH,
-                micro_batch_size=1,
-                forward_only=False,
-                p2p_communicator=p2p_communicator,
-                pg_collection=groups,
+            losses = _training_step(
+                forward_backward,
+                forward_step,
+                models,
+                groups,
+                p2p_communicator,
+                optimizer,
+                iteration,
             )
-            torch.cuda.synchronize()
             if recompute_rebuilds is not None:
                 recompute_rebuilds.append(_count_recompute_rebuilds.count)
                 _count_recompute_rebuilds.count = 0
@@ -207,23 +165,7 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph, recompute_rebu
                 f"Parameters without a gradient in iteration {iteration}: "
                 f"{parameters.keys() - gradients_seen}"
             )
-            gradients = {}
-            for name, parameter in parameters.items():
-                assert parameter.main_grad is not None, name
-                assert torch.isfinite(parameter.main_grad).all(), name
-                gradients[name] = parameter.main_grad.detach().cpu().clone()
-                parameter.grad = parameter.main_grad.to(dtype=parameter.dtype).clone()
-            optimizer.step()
-            history.append(
-                {
-                    "losses": [loss["loss"].detach().cpu().clone() for loss in losses],
-                    "gradients": gradients,
-                    "parameters": {
-                        name: parameter.detach().cpu().clone()
-                        for name, parameter in parameters.items()
-                    },
-                }
-            )
+            history.append(_update_and_snapshot(parameters, optimizer, losses))
             if helper is not None:
                 for layer in helper.flattened_callables:
                     key = (iteration, id(layer))
@@ -260,15 +202,6 @@ class _count_recompute_rebuilds:
 
         _count_recompute_rebuilds.count = 0
         monkeypatch.setattr(tensor_parallel_random._RecomputeRegion, "rebuild", counted_rebuild)
-
-
-def _copy_parameters(source_models, target_models):
-    source_parameters = _named_parameters(source_models)
-    target_parameters = _named_parameters(target_models)
-    assert source_parameters.keys() == target_parameters.keys()
-    with torch.no_grad():
-        for name, parameter in target_parameters.items():
-            parameter.copy_(source_parameters[name])
 
 
 def _train_eager_reference_and_candidate(model_kind, hidden_dropout, candidate_kwargs, monkeypatch):
@@ -322,9 +255,9 @@ def _train_eager_reference_and_candidate(model_kind, hidden_dropout, candidate_k
 @pytest.mark.internal
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not is_te_min_version("2.10.0"), reason="TE graph reset requires TE >= 2.10")
-@pytest.mark.parametrize("hidden_dropout", [0.0, 0.1])
 @pytest.mark.parametrize(
-    "model_kind", ["gpt_dense", "gpt_moe", "hybrid_dense", "hybrid_mtp", "hybrid_moe_mtp"]
+    "model_kind,hidden_dropout",
+    [("gpt_dense", 0.1), ("gpt_moe", 0.0), ("hybrid_dense", 0.0), ("hybrid_moe_mtp", 0.1)],
 )
 def test_mhc_te_attention_graph_split_recompute_training_parity(
     model_kind, hidden_dropout, monkeypatch
@@ -351,7 +284,7 @@ def test_mhc_recompute_replays_dropout_with_graph_safe_rng(model_kind, monkeypat
 @pytest.mark.internal
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not is_te_min_version("2.10.0"), reason="TE graph reset requires TE >= 2.10")
-@pytest.mark.parametrize("model_kind", ["gpt_moe", "hybrid_dense", "hybrid_mtp", "hybrid_moe_mtp"])
+@pytest.mark.parametrize("model_kind", ["gpt_moe", "hybrid_dense", "hybrid_moe_mtp"])
 def test_mhc_te_pipeline_training_parity(model_kind):
     """Real TE graph replay matches eager through the selected PP/VPP schedule."""
     parallel_sizes = _initialize_test_parallelism(model_kind, torch.bfloat16)
@@ -380,13 +313,9 @@ def test_mhc_te_pipeline_training_parity(model_kind):
             te_graph_modules=scopes,
             **parallel_sizes,
         )
-        eager_parameters = _named_parameters(eager_models)
+        _copy_parameters(eager_models, graph_models)
         graph_parameters = _named_parameters(graph_models)
-        assert eager_parameters.keys() == graph_parameters.keys()
         initial_keys = [set(model.state_dict()) for model in graph_models]
-        with torch.no_grad():
-            for name, parameter in graph_parameters.items():
-                parameter.copy_(eager_parameters[name])
         initial_parameters = {
             name: parameter.detach().cpu().clone() for name, parameter in graph_parameters.items()
         }

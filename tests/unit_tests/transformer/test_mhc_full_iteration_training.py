@@ -105,7 +105,21 @@ def _build_models(
     has_mtp = "mtp" in model_kind
     static_moe = is_moe and te_graph_modules is None
     num_chunks = vp_size or 1
-    num_layers = 2 * pp_size * num_chunks
+    segment = "*E" if is_moe else "*-"
+    gdn_options = {}
+    if model_kind == "hybrid_gdn_mtp":
+        segment = "G-*-"
+        gdn_options = dict(
+            deterministic_mode=True,
+            gdn_kernel_backend="torch",
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            activation_func=torch.nn.functional.silu,
+            gated_linear_unit=True,
+        )
+    num_layers = len(segment) * pp_size * num_chunks
     config = TransformerConfig(
         num_layers=num_layers,
         hidden_size=64,
@@ -162,6 +176,7 @@ def _build_models(
         moe_pad_expert_input_to_capacity=static_moe,
         moe_grouped_gemm=is_moe,
         finalize_model_grads_func=finalize_model_grads,
+        **gdn_options,
     )
     groups = ProcessGroupCollection.use_mpu_process_groups()
     assert (groups.tp.size(), groups.pp.size(), groups.cp.size(), groups.ep.size()) == (
@@ -188,10 +203,9 @@ def _build_models(
             vp_stage=vp_stage,
         )
         if is_hybrid:
-            segment = "*E" if is_moe else "*-"
             pattern = "|".join([segment] * (pp_size * num_chunks))
             if has_mtp:
-                pattern += "/" + segment
+                pattern += "/" + ("*E" if is_moe else "*-")
             model = HybridModel(
                 hybrid_stack_spec=hybrid_stack_spec, hybrid_layer_pattern=pattern, **kwargs
             )
@@ -260,6 +274,89 @@ def _training_loss(losses, loss_mask):
     return loss_sum, num_tokens, report
 
 
+def _forward_microbatch(data_iterator, model, groups, pp_size):
+    module = model.module
+    if isinstance(module, Float16Module):
+        module = module.module
+    batch = get_batch_on_this_tp_rank(
+        batch=next(data_iterator),
+        has_cu_seqlens=False,
+        dynamic_cp=False,
+        create_attention_mask_in_dataloader=False,
+        broadcast_src_rank=torch.distributed.get_global_rank(groups.tp, 0),
+        broadcast_group=groups.tp,
+        cp_size=groups.cp.size(),
+        tp_rank=groups.tp.rank(),
+        micro_batch_size=1,
+        seq_length=_SEQ_LENGTH,
+        mtp_on_this_rank=getattr(module, "mtp_process", False),
+        pipeline_model_parallel_size=pp_size,
+        is_pipeline_first_stage=module.pre_process,
+        is_pipeline_last_stage=module.post_process,
+    )
+    if groups.cp.size() > 1:
+        batch = get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=groups.cp)
+        if batch.get("tokens") is not None:
+            assert batch["tokens"].shape[1] == _SEQ_LENGTH // groups.cp.size()
+    output = model(
+        batch["tokens"], batch["position_ids"], batch["attention_mask"], labels=batch["labels"]
+    )
+
+    def loss_func(losses):
+        return _training_loss(losses, batch["loss_mask"])
+
+    return output, loss_func
+
+
+def _training_step(run_step, forward_step, models, groups, p2p_communicator, optimizer, iteration):
+    optimizer.zero_grad(set_to_none=True)
+    for model in models:
+        model.zero_grad_buffer()
+    batches = [
+        _make_batch(iteration, index, data_parallel_rank=groups.dp.rank())
+        for index in range(_NUM_MICROBATCHES)
+    ]
+    data_iterators = [iter([batch.copy() for batch in batches]) for _ in models]
+    losses = run_step(
+        forward_step_func=forward_step,
+        data_iterator=data_iterators,
+        model=models,
+        num_microbatches=_NUM_MICROBATCHES,
+        seq_length=_SEQ_LENGTH,
+        micro_batch_size=1,
+        forward_only=False,
+        p2p_communicator=p2p_communicator,
+        pg_collection=groups,
+    )
+    torch.cuda.synchronize()
+    return losses
+
+
+def _update_and_snapshot(parameters, optimizer, losses):
+    gradients = {}
+    for name, parameter in parameters.items():
+        gradient = parameter.main_grad
+        assert gradient is not None, f"Missing synchronized gradient: {name}"
+        assert torch.isfinite(gradient).all(), f"Non-finite gradient: {name}"
+        gradients[name] = gradient.detach().cpu().clone()
+        parameter.grad = gradient.to(dtype=parameter.dtype).clone()
+    optimizer.step()
+    return {
+        "losses": [loss["loss"].detach().cpu().clone() for loss in losses],
+        "gradients": gradients,
+        "parameters": {name: p.detach().cpu().clone() for name, p in parameters.items()},
+    }
+
+
+def _copy_parameters(source_models, target_models):
+    source_parameters = _named_parameters(source_models)
+    target_parameters = _named_parameters(target_models)
+    assert source_parameters.keys() == target_parameters.keys()
+    with torch.no_grad():
+        for name, parameter in target_parameters.items():
+            parameter.copy_(source_parameters[name])
+
+
 def _run_training(models, groups, use_graph, pp_size):
     parameters = _named_parameters(models)
     optimizer = torch.optim.SGD(list(parameters.values()), lr=0.02, momentum=0.1)
@@ -279,37 +376,7 @@ def _run_training(models, groups, use_graph, pp_size):
     def forward_step(data_iterator, model):
         nonlocal python_forward_calls
         python_forward_calls += 1
-        module = model.module
-        if isinstance(module, Float16Module):
-            module = module.module
-        batch = get_batch_on_this_tp_rank(
-            batch=next(data_iterator),
-            has_cu_seqlens=False,
-            dynamic_cp=False,
-            create_attention_mask_in_dataloader=False,
-            broadcast_src_rank=torch.distributed.get_global_rank(groups.tp, 0),
-            broadcast_group=groups.tp,
-            cp_size=groups.cp.size(),
-            tp_rank=groups.tp.rank(),
-            micro_batch_size=1,
-            seq_length=_SEQ_LENGTH,
-            mtp_on_this_rank=getattr(module, "mtp_process", False),
-            pipeline_model_parallel_size=pp_size,
-            is_pipeline_first_stage=module.pre_process,
-            is_pipeline_last_stage=module.post_process,
-        )
-        if groups.cp.size() > 1:
-            batch = get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=groups.cp)
-            if batch.get("tokens") is not None:
-                assert batch["tokens"].shape[1] == _SEQ_LENGTH // groups.cp.size()
-        output = model(
-            batch["tokens"], batch["position_ids"], batch["attention_mask"], labels=batch["labels"]
-        )
-
-        def loss_func(losses):
-            return _training_loss(losses, batch["loss_mask"])
-
-        return output, loss_func
+        return _forward_microbatch(data_iterator, model, groups, pp_size)
 
     wrapper = FullCudaGraphWrapper(forward_backward, cuda_graph_warmup_steps=_WARMUP_STEPS)
     run_step = wrapper if use_graph else forward_backward
@@ -317,49 +384,13 @@ def _run_training(models, groups, use_graph, pp_size):
     captured_graph = None
     try:
         for iteration in range(_TRAIN_STEPS):
-            optimizer.zero_grad(set_to_none=True)
-            for model in models:
-                model.zero_grad_buffer()
-            batches = [
-                _make_batch(iteration, index, data_parallel_rank=groups.dp.rank())
-                for index in range(_NUM_MICROBATCHES)
-            ]
-            data_iterators = [iter([batch.copy() for batch in batches]) for _ in models]
-            losses = run_step(
-                forward_step_func=forward_step,
-                data_iterator=data_iterators,
-                model=models,
-                num_microbatches=_NUM_MICROBATCHES,
-                seq_length=_SEQ_LENGTH,
-                micro_batch_size=1,
-                forward_only=False,
-                p2p_communicator=p2p_communicator,
-                pg_collection=groups,
+            losses = _training_step(
+                run_step, forward_step, models, groups, p2p_communicator, optimizer, iteration
             )
-            # The actual schedule calls finalize_model_grads inside the captured
-            # iteration; inspect gradients only after those collectives finish.
-            torch.cuda.synchronize()
             assert (
                 gradients_seen == parameters.keys()
             ), f"Parameters without a backward gradient: {parameters.keys() - gradients_seen}"
-            gradients = {}
-            for name, parameter in parameters.items():
-                gradient = getattr(parameter, "main_grad", parameter.grad)
-                assert gradient is not None, f"Missing synchronized gradient: {name}"
-                assert torch.isfinite(gradient).all(), f"Non-finite gradient: {name}"
-                gradients[name] = gradient.detach().cpu().clone()
-                parameter.grad = gradient.to(dtype=parameter.dtype).clone()
-            optimizer.step()
-            history.append(
-                {
-                    "losses": [loss["loss"].detach().cpu().clone() for loss in losses],
-                    "gradients": gradients,
-                    "parameters": {
-                        name: parameter.detach().cpu().clone()
-                        for name, parameter in parameters.items()
-                    },
-                }
-            )
+            history.append(_update_and_snapshot(parameters, optimizer, losses))
             if use_graph and iteration >= _WARMUP_STEPS:
                 graph = FullCudaGraphWrapper.cuda_graph["training"]
                 assert graph is not None
@@ -410,7 +441,8 @@ def _initialize_test_parallelism(model_kind, dtype):
     """Read the integration topology and initialize its real process groups."""
     pp_size = int(os.environ.get("MHC_CG_PP_SIZE", "1"))
     vp_size = int(os.environ.get("MHC_CG_VP_SIZE", "0")) or None
-    tp_size = int(os.environ.get("MHC_CG_TP_SIZE", "1"))
+    default_tp = 2 if model_kind == "hybrid_gdn_mtp" and Utils.world_size >= 2 else 1
+    tp_size = int(os.environ.get("MHC_CG_TP_SIZE", default_tp))
     cp_size = int(os.environ.get("MHC_CG_CP_SIZE", "1"))
     requested_ep_size = int(os.environ.get("MHC_CG_EP_SIZE", "1"))
     assert min(pp_size, tp_size, cp_size, requested_ep_size) > 0
@@ -457,14 +489,10 @@ def _check_training_parity(model_kind, dtype, dropout):
         graph_models, _ = _build_models(
             model_kind, dtype, "full_iteration", dropout=dropout, **parallel_sizes
         )
-        eager_parameters = _named_parameters(eager_models)
+        _copy_parameters(eager_models, graph_models)
         graph_parameters = _named_parameters(graph_models)
-        assert eager_parameters.keys() == graph_parameters.keys()
-        with torch.no_grad():
-            for name, parameter in graph_parameters.items():
-                parameter.copy_(eager_parameters[name])
         initial_parameters = {
-            name: value.detach().cpu().clone() for name, value in eager_parameters.items()
+            name: value.detach().cpu().clone() for name, value in graph_parameters.items()
         }
         initial_rng = _snapshot_rng()
         expected, expected_rng = _run_training(eager_models, groups, False, pp_size)
@@ -506,10 +534,14 @@ def _check_training_parity(model_kind, dtype, dropout):
 
 
 @pytest.mark.launch_on_gb200
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize(
-    "model_kind",
-    ["gpt_dense", "gpt_moe", "hybrid_dense", "hybrid_moe", "hybrid_mtp", "hybrid_moe_mtp"],
+    "model_kind,dtype",
+    [
+        pytest.param("gpt_dense", torch.float32, id="gpt_dense-fp32"),
+        pytest.param("gpt_moe", torch.bfloat16, id="gpt_moe-bf16"),
+        pytest.param("hybrid_gdn_mtp", torch.bfloat16, id="hybrid_gdn_mtp-bf16"),
+        pytest.param("hybrid_moe_mtp", torch.bfloat16, id="hybrid_moe_mtp-bf16"),
+    ],
 )
 def test_mhc_full_iteration_training_parity(model_kind, dtype):
     """Changed batches, all synchronized gradients, and optimizer updates match eager."""

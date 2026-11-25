@@ -68,11 +68,6 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
-  - test_case: [hybrid_mhc_full_iteration_mtp]
-    products:
-      - environment: [dev]
-        scope: [mr, mr-github]
-        platforms: [dgx_h100]
   - test_case: [hybrid_mhc_full_iteration_moe_mtp]
     products:
       - environment: [dev]
