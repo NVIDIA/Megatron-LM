@@ -3,6 +3,7 @@
 """CUDA graph tests for Megatron-FSDP."""
 
 import logging
+from copy import deepcopy
 
 import pytest
 import torch
@@ -13,6 +14,7 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     Placements,
     PrefetchOrder,
     RuntimePolicy,
@@ -21,6 +23,12 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionAction,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.weight_retention import (
+    build_weight_plan,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    uneven_dtensor_to_full_tensor,
 )
 
 logger = logging.getLogger(__name__)
@@ -264,3 +272,103 @@ def test_local_accumulation_captures_full_iteration(distributed_setup):
     torch.testing.assert_close(torch.stack(losses), torch.stack(reference_losses))
     for parameter, reference_parameter in zip(model.parameters(), reference_model.parameters()):
         torch.testing.assert_close(parameter.to_local(), reference_parameter.to_local())
+
+
+def test_weight_retention_eager_and_capture_match_baseline(distributed_setup):
+    """Keep losses, gradients and updates correct through retained eager and graph reuse."""
+    device, world_size = distributed_setup.device, distributed_setup.world_size
+    if world_size < 2:
+        pytest.skip("Weight-retention coverage requires a nontrivial data-parallel axis.")
+    mesh = init_device_mesh(device.type, (world_size,))
+    sharded = _default_placements()
+    replicated = Placements([0], [Replicate()], [Replicate()], [Replicate()])
+    torch.manual_seed(1234)
+    initial = NestedModel(dim=8, num_children=2).to(device)
+    models, contexts, optimizers = [], [], []
+    for retained in (False, True, True):
+        model = deepcopy(initial)
+        with fully_shard_context(
+            FsdpContext(
+                device=device,
+                runtime_policy=RuntimePolicy(
+                    prefetch_order=(
+                        PrefetchOrder.RECORDED if retained else PrefetchOrder.REGISTRATION
+                    ),
+                    autograd_completes_execution=False,
+                ),
+                gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
+            )
+        ) as context:
+            fully_shard(model.layers[0], mesh=mesh, placements=sharded)
+            # This child's full weights alias persistent storage instead of a gather buffer.
+            fully_shard(model.layers[1], mesh=mesh, placements=replicated)
+            fully_shard(model, mesh=mesh, placements=sharded)
+        models.append(model)
+        contexts.append(context)
+        optimizers.append(torch.optim.SGD(model.parameters(), lr=0.01, foreach=False))
+    inputs = torch.ones(2, 8, device=device)
+
+    def step(index):
+        model, context, optimizer = models[index], contexts[index], optimizers[index]
+        optimizer.zero_grad(set_to_none=False)
+        losses = []
+        for microbatch in range(2):
+            mode = (
+                GradientFinalizationMode.SKIP_OUTER
+                if microbatch == 0
+                else GradientFinalizationMode.REDUCE_OUTER
+            )
+            with context.finalize_gradients(mode):
+                loss = model(inputs).square().mean()
+                loss.backward()
+                losses.append(loss.detach())
+        was_recording = context.is_recording_execution_order
+        context.post_backward()
+        if was_recording:
+            context.retain_mask, context.prefetch_at = build_weight_plan(
+                context.execution_order, dist.group.WORLD, device=device
+            )
+        context.finish_grad_sync()
+        optimizer.step()
+        return torch.stack(losses).sum()
+
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    graph = torch.cuda.CUDAGraph()
+    try:
+        for iteration in range(6):
+            inputs.fill_((iteration + 1) * (distributed_setup.rank + 1) / world_size)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            with torch.cuda.stream(stream):
+                expected, eager = step(0), step(1)
+                # Record once, then warm the planned prefetch/reuse path before capture.
+                if iteration < 2:
+                    actual = step(2)
+                else:
+                    if iteration == 2:
+                        with torch.cuda.graph(graph, stream=stream):
+                            actual = step(2)
+                    graph.replay()
+            torch.cuda.current_stream(device).wait_stream(stream)
+            torch.testing.assert_close(eager, expected)
+            torch.testing.assert_close(actual, expected)
+            for model in models[1:]:
+                for parameter, reference in zip(model.parameters(), models[0].parameters()):
+                    torch.testing.assert_close(
+                        uneven_dtensor_to_full_tensor(parameter.grad),
+                        uneven_dtensor_to_full_tensor(reference.grad),
+                    )
+                    torch.testing.assert_close(
+                        uneven_dtensor_to_full_tensor(parameter),
+                        uneven_dtensor_to_full_tensor(reference),
+                    )
+            for model, context in zip(models[1:], contexts[1:]):
+                assert any(context.retain_mask.values())
+                for module in (*model.layers, model):
+                    for group in module.parameter_groups:
+                        assert not group._unshard_events
+                        if group.unsharded_storage_bytes:
+                            assert not group._unsharded_model_weight.is_allocated
+    finally:
+        torch.cuda.synchronize(device)
+        graph.reset()

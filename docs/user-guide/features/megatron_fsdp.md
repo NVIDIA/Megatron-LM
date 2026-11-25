@@ -225,6 +225,30 @@ def load_model_and_optimizer_state_dict(state_dict):
     optimizer.load_state_dict(state_dict["optimizer"])
 ```
 
+### Weight retention in MFSDP v2
+
+With `--use-megatron-fsdp --megatron-fsdp-version 2`, enable
+`--megatron-fsdp-weight-retention` to reuse gathered weights between module calls.
+The first eager iteration records the complete schedule. M-LM uses that trace to
+plan retained releases and prefetches before the next iteration or CUDA graph capture.
+
+Compute, prefetched weights, and retained weights share a window of two gathered
+FSDP owners. The planner reserves the standard single-successor prefetch slots
+before retaining weights between uses. It can move prefetches earlier when the
+reserved space permits it. A prefetch starts at an existing unshard and can target
+a later microbatch. Nested root/layer/expert execution keeps the standard schedule's
+owner limit, which can exceed two. Replicated weights that alias persistent storage
+use no gathered-buffer slot.
+
+All recorded FSDP modules can participate; no layer-type registry or byte budget
+is needed. This is a module-slot policy, not a bound on allocated bytes when owners
+have different sizes. Every iteration releases gathered weights before optimizer
+updates. Recording and planning happen once, before CUDA graph capture.
+
+Retention defaults to off and requires a fixed module/microbatch schedule.
+When enabled, the joint plan controls prefetch for ordinary hooks and Combined 1F1B.
+NCCL user buffers are unsupported.
+
 ### 🔁 Checkpoint Conversion
 
 Megatron-FSDP checkpointing supports [PyTorch Distributed Checkpoint (DCP)](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html). In Megatron-LM, this is the `--ckpt-format fsdp_dtensor` checkpointing format.
@@ -645,9 +669,10 @@ Completion force-releases any remaining gathered weights before optimizer update
 
 Replay validates the complete U/R sequence before each operation and rejects
 missing, extra or reordered calls. The full cursor does not wrap until successful
-`post_backward()` completion. Prefetch uses an independent filtered `UNSHARD`
-view; speculative gathers do not consume logical events. Evaluation preserves
+`post_backward()` completion. Ordinary prefetch uses an independent filtered
+`UNSHARD` view, and the weight-retention plan indexes the full trace. Speculative
+gathers do not consume logical events. Evaluation preserves
 recording state and training cursors. Changing the schedule requires a new
-context. Recorded execution requires ordinary hooks; combined EP-overlap
-scheduling is unsupported. Recording and byte sampling must finish before
+context. The combined EP-overlap schedule uses explicit completion and records its
+demand gathers and layer releases. Recording and byte sampling must finish before
 CUDA Graph capture; capture executes the replay operations.

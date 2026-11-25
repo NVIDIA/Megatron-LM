@@ -60,6 +60,9 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
         sync_model_weights_from_main_weights,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.weight_retention import (
+        build_weight_plan,
+    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import get_sharding_strategy
 
     HAVE_MEGATRON_FSDP = True
@@ -282,7 +285,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
         active_context = current_fully_shard_context()
-        prefetch_order = self.prefetch_order_for(config)
+        prefetch_order = self.prefetch_order_for(config, ddp_config)
         if active_context is None:
             construction_context = fully_shard_context(
                 FsdpContext(
@@ -291,7 +294,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     runtime_policy=RuntimePolicy(
                         prefetch_order=prefetch_order,
                         autograd_completes_execution=not (
-                            config.pipeline_model_parallel_size > 1
+                            ddp_config.megatron_fsdp_weight_retention
+                            or config.pipeline_model_parallel_size > 1
                             or config.virtual_pipeline_model_parallel_size is not None
                         ),
                         use_symmetric_memory=ddp_config.nccl_ub,
@@ -300,19 +304,21 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             )
         else:
+            if ddp_config.megatron_fsdp_weight_retention and active_context.use_symmetric_memory:
+                raise ValueError("MFSDP v2 weight retention does not support NCCL user buffers.")
             if (
                 prefetch_order is PrefetchOrder.RECORDED
                 and active_context.prefetch_order is not PrefetchOrder.RECORDED
             ):
                 raise ValueError(
-                    "Ordinary PP/VPP MFSDP v2 schedules require "
+                    "Recorded MFSDP v2 schedules require "
                     "RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)."
                 )
             if (
                 prefetch_order is PrefetchOrder.RECORDED
                 and active_context.autograd_completes_execution
             ):
-                raise ValueError("Ordinary PP/VPP requires autograd_completes_execution=False.")
+                raise ValueError("Recorded schedules require autograd_completes_execution=False.")
             construction_context = nullcontext(active_context)
         with construction_context:
             collector = FsdpUnitCollector(fsdp_unit_modules)
@@ -331,17 +337,30 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         super().__init__(config=config, module=module)
 
         if config.overlap_moe_expert_parallel_comm:
-            register_combined_1f1b_hooks(self.module)
+            register_combined_1f1b_hooks(
+                self.module, recompute=config.recompute_granularity is not None
+            )
 
     @staticmethod
-    def prefetch_order_for(config: TransformerConfig) -> "PrefetchOrder":
-        """Record ordinary pipeline schedules; combined 1F1B gathers only on demand."""
-        if not config.overlap_moe_expert_parallel_comm and (
-            config.pipeline_model_parallel_size > 1
+    def prefetch_order_for(
+        config: TransformerConfig, ddp_config: DistributedDataParallelConfig
+    ) -> "PrefetchOrder":
+        """Record FSDP weight requests for pipeline schedules and weight planning."""
+        if (
+            ddp_config.megatron_fsdp_weight_retention
+            or config.pipeline_model_parallel_size > 1
             or config.virtual_pipeline_model_parallel_size is not None
         ):
             return PrefetchOrder.RECORDED
         return PrefetchOrder.REGISTRATION
+
+    @staticmethod
+    def compile_weight_retention(model, agreement_group) -> None:
+        """Plan once from the complete eager trace, before any CUDA graph capture."""
+        context = model[0].module.context
+        context.retain_mask, context.prefetch_at = build_weight_plan(
+            context.execution_order, agreement_group, device=context.allgather_stream.device
+        )
 
     def load_state_dict(self, state_dict, strict=True):
         """Load main weights and refresh the buffers used for forward compute."""
@@ -373,6 +392,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ValueError: If a required process group is missing or the model,
                 topology, or data-parallel configuration uses an unsupported feature.
         """
+        if ddp_config.megatron_fsdp_weight_retention and ddp_config.nccl_ub:
+            raise ValueError("MFSDP v2 weight retention does not support nccl_ub.")
         if config.moe_virtual_expert_load_balance:
             raise ValueError(
                 "MoonEP is not yet integrated with Megatron-FSDP v2. Supporting it requires "

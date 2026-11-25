@@ -330,7 +330,9 @@ class TransformerLayerNode(ScheduleNode):
         """Execute forward and fire the per-layer post-forward hook on the last slot."""
         output = super().forward(*inputs)
         if self.is_layer_last_node:
-            self._post_forward_hook()
+            # Order the weight release after the node's forward stream.
+            with torch.cuda.stream(self.stream):
+                self._post_forward_hook()
         return output
 
     def backward(self, *output_grad):
