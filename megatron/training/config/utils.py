@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
-import importlib
 import inspect
 import logging
 from dataclasses import fields as dataclass_fields
@@ -17,8 +16,14 @@ logger = logging.getLogger(__name__)
 # Runtime services attached after construction are not checkpoint configuration.
 _TRANSFORMER_RUNTIME_FIELDS = frozenset(
     {
-        "timers", "finalize_model_grads_func", "grad_scale_func", "moe_grad_scale_func",
-        "mtp_grad_scale_func", "no_sync_func", "grad_sync_func", "param_sync_func",
+        "timers",
+        "finalize_model_grads_func",
+        "grad_scale_func",
+        "moe_grad_scale_func",
+        "mtp_grad_scale_func",
+        "no_sync_func",
+        "grad_sync_func",
+        "param_sync_func",
         "experimental_attention_variant_loss_scale_func",
     }
 )
@@ -53,8 +58,10 @@ def serialize_dataclass(
         if field.name.startswith("_") or field.name in skip_fields:
             continue
         value = getattr(config, field.name)
-        if encode_callables and callable(value) and (
-            isinstance(value, type) or not is_dataclass(value)
+        if (
+            encode_callables
+            and callable(value)
+            and (isinstance(value, type) or not is_dataclass(value))
         ):
             encoded = _encode_callable(value, convert)
             if encoded is not None:
@@ -121,7 +128,9 @@ def _encode_callable(value, convert):
     return {"_target_": f"{module.__name__}.{qualname}", "_call_": False}
 
 
-def sanitize_dataclass_config(config: dict[str, Any], _visited: set | None = None) -> dict[str, Any]:
+def sanitize_dataclass_config(
+    config: dict[str, Any], _visited: set | None = None
+) -> dict[str, Any]:
     """Remove init=False fields from a dataclass config dict for backward compatibility.
 
     This function automatically detects fields with init=False by inspecting the
@@ -174,7 +183,10 @@ def sanitize_dataclass_config(config: dict[str, Any], _visited: set | None = Non
         if isinstance(value, dict):
             value = sanitize_dataclass_config(value, _visited)
         elif isinstance(value, list):
-            value = [sanitize_dataclass_config(item, _visited) if isinstance(item, dict) else item for item in value]
+            value = [
+                sanitize_dataclass_config(item, _visited) if isinstance(item, dict) else item
+                for item in value
+            ]
 
         sanitized[key] = value
 
@@ -190,19 +202,27 @@ def _resolve_target_class(target: str) -> type | None:
     Returns:
         The resolved class, or None if resolution fails.
     """
-    from megatron.training.config.instantiate_utils import target_allowlist
+    from megatron.training.config.instantiate_utils import (
+        InstantiationException,
+        _resolve_target,
+        _validate_target_name,
+        target_allowlist,
+    )
 
+    # Keep legacy handling for absent optional packages, but never suppress a
+    # policy rejection or import a target outside the shared resolver.
     if not target_allowlist.is_allowed(target):
         logger.warning(f"Target '{target}' is not in the allowlist. Skipping resolution.")
         return None
-
+    _validate_target_name(target=target, full_key="")
     try:
-        module_path, class_name = target.rsplit(".", 1)
-        module = importlib.import_module(module_path)
-        return getattr(module, class_name, None)
-    except (ValueError, ImportError, AttributeError) as e:
-        logger.warning(f"Could not resolve target '{target}': {e}")
-        return None
+        resolved = _resolve_target(target, full_key="", check_callable=False)
+    except InstantiationException as exc:
+        if isinstance(exc.__cause__, (ImportError, ValueError)):
+            logger.warning(f"Could not resolve target '{target}': {exc}")
+            return None
+        raise
+    return resolved if isinstance(resolved, type) else None
 
 
 @lru_cache(maxsize=128)
@@ -222,7 +242,9 @@ def _get_init_false_fields(target_class: type) -> frozenset[str]:
         return frozenset()
 
     properties = {
-        name for name in dir(target_class) if isinstance(getattr(target_class, name, None), property)
+        name
+        for name in dir(target_class)
+        if isinstance(getattr(target_class, name, None), property)
     }
     return frozenset(f.name for f in dataclass_fields(target_class) if not f.init) | frozenset(
         properties
