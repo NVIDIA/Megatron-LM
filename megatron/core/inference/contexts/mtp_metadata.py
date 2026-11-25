@@ -7,6 +7,10 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
+    HAVE_TRITON,
+    mtp_draft_step_metadata,
+)
 from megatron.core.inference.utils import tensor_swap
 
 from .gpu_view import ContextGPUView
@@ -331,6 +335,50 @@ class MTPMetadata:
         kv_lengths = self.kv_lengths[:n]
         torch.add(self.active_offsets, 1, out=kv_lengths)
         return query_lengths, kv_lengths
+
+    def write_draft_step_metadata(self, gpu_view: ContextGPUView) -> Tensor:
+        """Write one draft depth's KV write maps and MHA read metadata.
+
+        Equivalent to `stage_decode_lengths` followed by `write_token_maps` and
+        `write_mha_metadata` over the active requests, but issued as a single Triton launch with
+        no host syncs, so the host can enqueue the next depth while the previous one runs.
+
+        Args:
+            gpu_view (ContextGPUView): Destination bookkeeping views.
+
+        Returns:
+            (Tensor): The staged per-request KV lengths, `active_request_count` long.
+        """
+        n = self.active_request_count
+        if not HAVE_TRITON:
+            query_lengths, kv_lengths = self.stage_decode_lengths()
+            self.write_token_maps(
+                gpu_view=gpu_view,
+                rows=self.row_ids[:n],
+                positions=self.active_offsets,
+                block_table=self.active_block_table,
+                padded_token_count=self.padded_count,
+            )
+            self.write_mha_metadata(
+                gpu_view=gpu_view,
+                query_lengths=query_lengths,
+                kv_lengths=kv_lengths,
+                block_table=self.active_block_table,
+                padded_request_count=self.padded_count,
+            )
+            return kv_lengths
+        mtp_draft_step_metadata(
+            gpu_view=gpu_view,
+            offsets=self.offsets,
+            block_table=self.block_table,
+            staged_query_lengths=self.query_lengths,
+            staged_kv_lengths=self.kv_lengths,
+            active_request_count=n,
+            padded_count=self.padded_count,
+            block_size_tokens=self.block_size_tokens,
+            dummy_block_idx=self.dummy_block_idx,
+        )
+        return self.kv_lengths[:n]
 
     def stage_prefill_lengths(self, append_counts: Tensor, pad_tokens: int) -> Tensor:
         """Stage the MHA lengths for a varlen commit pass, absorbing the padded query rows.
