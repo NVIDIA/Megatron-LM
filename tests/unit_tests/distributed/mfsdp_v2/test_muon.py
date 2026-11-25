@@ -7,7 +7,7 @@ import copy
 import pytest
 import torch
 from torch import nn
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
@@ -45,41 +45,6 @@ class TinyModel(nn.Module):
         return self.block2(self.block1(x))
 
 
-def _mlp(*widths: int) -> nn.Sequential:
-    """Bias-free linear layers of the given widths with ReLU in between."""
-    layers: list[nn.Module] = []
-    for fan_in, fan_out in zip(widths, widths[1:]):
-        layers += [nn.Linear(fan_in, fan_out, bias=False), nn.ReLU()]
-    return nn.Sequential(*layers[:-1])
-
-
-def _mesh_and_placements(dp_mode: str, world_size: int) -> tuple[DeviceMesh, Placements]:
-    """Build the DP mesh and placements of an FSDP, HSDP, or HFSDP run."""
-    if dp_mode == "fsdp":
-        if world_size < 2 or world_size % 2:
-            pytest.skip("Requires an even number of ranks for two-rank DP meshes.")
-        # With more than two GPUs, also exercise meshes whose global ranks do not start at zero.
-        mesh = init_device_mesh("cuda", (world_size // 2, 2), mesh_dim_names=("replica", "dp"))
-        placements = Placements(
-            dp_axes=[0], parameter=[RowAtomic()], gradient=[RowAtomic()], optimizer=[RowAtomic()]
-        )
-        return mesh["dp"], placements
-    if world_size < 4 or world_size % 4:
-        pytest.skip("Requires a multiple of four ranks for (2, 2) DP meshes.")
-    mesh = init_device_mesh(
-        "cuda", (world_size // 4, 2, 2), mesh_dim_names=("replica", "dp_outer", "dp_shard")
-    )
-    # HSDP replicates the optimizer state across dp_outer; HFSDP also shards it there.
-    outer_optimizer = Replicate() if dp_mode == "hsdp" else RowAtomic()
-    placements = Placements(
-        dp_axes=[0, 1],
-        parameter=[Replicate(), RowAtomic()],
-        gradient=[Partial("avg"), RowAtomic()],
-        optimizer=[outer_optimizer, RowAtomic()],
-    )
-    return mesh["dp_outer", "dp_shard"], placements
-
-
 def _train(
     model: nn.Module, optimizers: tuple[torch.optim.Optimizer, ...], inputs: torch.Tensor
 ) -> torch.Tensor:
@@ -94,55 +59,6 @@ def _train(
         for optimizer in optimizers:
             optimizer.step()
     return torch.stack(losses)
-
-
-def _param_groups(groups: list[dict], module: nn.Module) -> list[dict]:
-    """Replace the parameter names in ``groups`` with ``module``'s parameters."""
-    params = dict(module.named_parameters())
-    return [{**group, "params": [params[name] for name in group["params"]]} for group in groups]
-
-
-def _assert_matches_reference(
-    model: nn.Module,
-    muon_groups: list[dict],
-    kwargs: dict,
-    *,
-    mesh: DeviceMesh,
-    placements: Placements,
-    shard_units: list[nn.Module],
-    sgd_names: list[str] | None = None,
-    num_groups_in_flight: int = 2,
-) -> None:
-    """Train ``model`` sharded with FsdpMuon and unsharded with Muon; the losses must match.
-
-    Each of ``shard_units`` becomes one FSDP group. ``muon_groups`` are Muon parameter groups
-    whose "params" are parameter names; the parameters named in ``sgd_names`` use SGD instead.
-    """
-    weight = next(model.parameters())
-    # Match FSDP's FP32 optimizer weights; autocast handles BF16 computation.
-    reference = copy.deepcopy(model).float()
-    with fully_shard_context(FsdpContext(device=weight.device)):
-        for unit in shard_units:
-            fully_shard(unit, mesh=mesh, placements=placements)
-
-    optimizer = muon.FsdpMuon(
-        _param_groups(muon_groups, model), num_groups_in_flight=num_groups_in_flight, **kwargs
-    )
-    fully_shard_optimizer(optimizer, precision_aware=True)
-    optimizers = [optimizer]
-    reference_optimizers = [Muon(_param_groups(muon_groups, reference), **kwargs)]
-    if sgd_names:
-        sgd_group = [{"params": sgd_names}]
-        other_optimizer = torch.optim.SGD(_param_groups(sgd_group, model), lr=0.01, foreach=False)
-        fully_shard_optimizer(other_optimizer)
-        optimizers.append(other_optimizer)
-        reference_optimizers.append(torch.optim.SGD(_param_groups(sgd_group, reference), lr=0.01))
-
-    # Every rank uses identical batches, so the reference needs no gradient reduction.
-    inputs = torch.randn(5, 4, 8, device=weight.device, dtype=weight.dtype)
-    reference_losses = _train(reference, tuple(reference_optimizers), inputs)
-    losses = _train(model, tuple(optimizers), inputs)
-    torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("dp_mode", ["fsdp", "hsdp", "hfsdp"])
@@ -179,60 +95,118 @@ def test_muon_matches_reference(
     Each linear layer is its own FSDP group, so several groups' communication is in flight at once;
     with 8, all four Muon groups are.
     """
-    mesh, placements = _mesh_and_placements(dp_mode, distributed_setup.world_size)
+    world_size = distributed_setup.world_size
+    if dp_mode == "fsdp":
+        if world_size < 2 or world_size % 2:
+            pytest.skip("Requires an even number of ranks for two-rank DP meshes.")
+        # With more than two GPUs, also exercise meshes whose global ranks do not start at zero.
+        mesh = init_device_mesh("cuda", (world_size // 2, 2), mesh_dim_names=("replica", "dp"))
+        mesh = mesh["dp"]
+        placements = Placements(
+            dp_axes=[0], parameter=[RowAtomic()], gradient=[RowAtomic()], optimizer=[RowAtomic()]
+        )
+    else:
+        if world_size < 4 or world_size % 4:
+            pytest.skip("Requires a multiple of four ranks for (2, 2) DP meshes.")
+        mesh = init_device_mesh(
+            "cuda", (world_size // 4, 2, 2), mesh_dim_names=("replica", "dp_outer", "dp_shard")
+        )
+        mesh = mesh["dp_outer", "dp_shard"]
+        # HSDP replicates the optimizer state across dp_outer; HFSDP also shards it there.
+        outer_optimizer = Replicate() if dp_mode == "hsdp" else RowAtomic()
+        placements = Placements(
+            dp_axes=[0, 1],
+            parameter=[Replicate(), RowAtomic()],
+            gradient=[Partial("avg"), RowAtomic()],
+            optimizer=[outer_optimizer, RowAtomic()],
+        )
+    device = distributed_setup.device
     torch.manual_seed(1234)
-    model = TinyModel().to(device=distributed_setup.device, dtype=dtype)
-    sgd_names = ["block2.3.weight", "block2.3.bias"]
-    muon_names = [name for name, _ in model.named_parameters() if name not in sgd_names]
-    _assert_matches_reference(
-        model,
-        [{"params": muon_names}],
-        dict(
-            lr=0.05,
-            momentum=0.9,
-            nesterov=nesterov,
-            weight_decay_method=weight_decay_method,
-            **kernel_options,
-        ),
-        mesh=mesh,
-        placements=placements,
-        shard_units=[layer for layer in model.modules() if isinstance(layer, nn.Linear)],
-        sgd_names=sgd_names,
-        num_groups_in_flight=num_groups_in_flight,
+    model = TinyModel().to(device=device, dtype=dtype)
+    # Match FSDP's FP32 optimizer weights; autocast handles BF16 computation.
+    reference = copy.deepcopy(model).float()
+    reference_params = dict(reference.named_parameters())
+    with fully_shard_context(FsdpContext(device=device)):
+        for layer in model.modules():
+            if isinstance(layer, nn.Linear):
+                fully_shard(layer, mesh=mesh, placements=placements)
+    params = dict(model.named_parameters())
+    kwargs = dict(
+        lr=0.05,
+        momentum=0.9,
+        nesterov=nesterov,
+        weight_decay_method=weight_decay_method,
+        **kernel_options,
     )
+    excluded_names = ["block2.3.weight", "block2.3.bias"]
+    muon_names = [name for name in params if name not in excluded_names]
+    optimizer = muon.FsdpMuon(
+        [params[name] for name in muon_names], num_groups_in_flight=num_groups_in_flight, **kwargs
+    )
+    fully_shard_optimizer(optimizer, precision_aware=True)
+    reference_optimizer = Muon([reference_params[name] for name in muon_names], **kwargs)
+    other_optimizer = torch.optim.SGD([params[n] for n in excluded_names], lr=0.01, foreach=False)
+    fully_shard_optimizer(other_optimizer)
+    reference_other = torch.optim.SGD([reference_params[n] for n in excluded_names], lr=0.01)
+
+    # Every rank uses identical batches, so the reference needs no gradient reduction.
+    inputs = torch.randn(5, 4, 8, device=device, dtype=dtype)
+    reference_losses = _train(reference, (reference_optimizer, reference_other), inputs)
+    losses = _train(model, (optimizer, other_optimizer), inputs)
+    torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)
+
+
+def _assert_one_fsdp_group_matches_reference(
+    distributed_setup, layer_groups: list[list[int]], weight_decay_method: str, nesterov: bool
+) -> None:
+    """Shard four linear layers as one FSDP group; FsdpMuon must match unsharded Muon.
+
+    layer_groups lists the layers of each optimizer group; group k uses its own learning rate
+    and weight decay, so a batch that mixed groups would change the losses.
+    """
+    mesh = init_device_mesh("cuda", (distributed_setup.world_size,))
+    placements = Placements(
+        dp_axes=[0], parameter=[RowAtomic()], gradient=[RowAtomic()], optimizer=[RowAtomic()]
+    )
+    torch.manual_seed(1234)
+    model = nn.Sequential(*(nn.Linear(8, 8, bias=False) for _ in range(4)))
+    model = model.to(distributed_setup.device)
+    reference = copy.deepcopy(model)
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)):
+        fully_shard(model, mesh=mesh, placements=placements)
+    kwargs = dict(momentum=0.9, nesterov=nesterov, weight_decay_method=weight_decay_method)
+    groups = [
+        {
+            "params": [model[i].weight for i in layers],
+            "lr": 0.05 / (k + 1),
+            "weight_decay": 0.1 * (k + 1),
+        }
+        for k, layers in enumerate(layer_groups)
+    ]
+    reference_groups = [
+        {**group, "params": [reference[i].weight for i in layers]}
+        for group, layers in zip(groups, layer_groups)
+    ]
+    optimizer = muon.FsdpMuon(groups, **kwargs)
+    fully_shard_optimizer(optimizer, precision_aware=True)
+    inputs = torch.randn(5, 4, 8, device=distributed_setup.device)
+    reference_losses = _train(reference, (Muon(reference_groups, **kwargs),), inputs)
+    losses = _train(model, (optimizer,), inputs)
+    torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
 @pytest.mark.parametrize("nesterov", [False, True], ids=["momentum", "nesterov"])
-def test_muon_batches_matrices_in_one_fsdp_group(distributed_setup, weight_decay_method, nesterov):
-    """The Muon matrices of one FSDP group and optimizer group are updated as one batch."""
-    mesh, placements = _mesh_and_placements("fsdp", distributed_setup.world_size)
-    torch.manual_seed(1234)
-    model = _mlp(8, 16, 16, 4).to(distributed_setup.device)
-    _assert_matches_reference(
-        model,
-        [{"params": ["0.weight", "2.weight", "4.weight"]}],
-        dict(lr=0.05, momentum=0.9, nesterov=nesterov, weight_decay_method=weight_decay_method),
-        mesh=mesh,
-        placements=placements,
-        shard_units=[model],
+def test_muon_batches_one_fsdp_group(distributed_setup, weight_decay_method, nesterov):
+    """Four matrices in one FSDP group and one optimizer group are updated as one batch."""
+    _assert_one_fsdp_group_matches_reference(
+        distributed_setup, [[0, 1, 2, 3]], weight_decay_method, nesterov
     )
 
 
 @pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
 def test_muon_keeps_optimizer_groups_apart(distributed_setup, weight_decay_method):
-    """In one FSDP group, each optimizer group's matrices use that group's hyperparameters."""
-    mesh, placements = _mesh_and_placements("fsdp", distributed_setup.world_size)
-    torch.manual_seed(1234)
-    model = _mlp(8, 16, 16, 16, 4).to(distributed_setup.device)
-    _assert_matches_reference(
-        model,
-        [
-            {"params": ["0.weight", "4.weight"]},
-            {"params": ["2.weight", "6.weight"], "lr": 0.02, "weight_decay": 0.3},
-        ],
-        dict(lr=0.05, momentum=0.9, weight_decay=0.1, weight_decay_method=weight_decay_method),
-        mesh=mesh,
-        placements=placements,
-        shard_units=[model],
+    """Two optimizer groups in one FSDP group keep their own learning rate and weight decay."""
+    _assert_one_fsdp_group_matches_reference(
+        distributed_setup, [[0, 2], [1, 3]], weight_decay_method, nesterov=False
     )
