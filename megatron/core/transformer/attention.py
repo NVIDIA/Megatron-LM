@@ -1996,6 +1996,13 @@ class SelfAttention(Attention):
             else None
         )
 
+        # Norm parameters are replicated across TP ranks, while attention heads are partitioned.
+        # The model-level config may not enable Q/K norms when a layer-specific config does.
+        for norm in (self.q_layernorm, self.k_layernorm):
+            if norm is not None:
+                for param in norm.parameters():
+                    setattr(param, "sum_gradients_across_tp_domain", True)
+
     def _realtime_test_dp_group(self) -> torch.distributed.ProcessGroup | None:
         """Return the data-parallel group that run_realtime_tests compares over.
 

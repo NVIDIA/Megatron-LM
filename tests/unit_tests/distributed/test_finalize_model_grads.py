@@ -20,10 +20,13 @@ from megatron.core.distributed.finalize_model_grads import (
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -345,6 +348,43 @@ class TestSumGradientsAcrossTPDomain:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_qk_layernorm_grads_with_layer_config(self):
+        """Sum Q/K norm gradients even when only the per-layer config enables the norms."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        model_parallel_cuda_manual_seed(123)
+        root_config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=2,
+            tensor_model_parallel_size=2,
+            sequence_parallel=False,
+            qk_layernorm=False,
+            use_cpu_initialization=True,
+        )
+        layer_config = AttentionLayerConfig.from_config(root_config)
+        layer_config.qk_layernorm = True
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        model = SelfAttention(
+            layer_config,
+            get_gpt_layer_with_transformer_engine_submodules(
+                qk_layernorm=True
+            ).self_attention.submodules,
+            layer_number=1,
+            pg_collection=pg_collection,
+        ).cuda()
+        model.ddp_config = DistributedDataParallelConfig()
+        params = [
+            param for norm in (model.q_layernorm, model.k_layernorm) for param in norm.parameters()
+        ]
+        assert len(params) == 4  # Both weight and bias for each LayerNorm.
+        for param in params:
+            param.main_grad = torch.full_like(param, float(pg_collection.tp.rank() + 1))
+
+        _allreduce_non_tensor_model_parallel_grads([model], root_config, pg_collection.tp)
+
+        for param in params:
+            torch.testing.assert_close(param.main_grad, torch.full_like(param, 3.0))
 
     @pytest.mark.parametrize("sequence_parallel", [False, True])
     def test_tagged_grads_are_summed_exactly_once(self, sequence_parallel):
