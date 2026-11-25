@@ -375,7 +375,10 @@ def check_checkpoint_args(
                 f'the input argument value ({args_value}).'
             )
     if cfg.tokenizer.vocab_file:
-        _compare('max_position_embeddings', config_section='model', config_name='seq_length')
+        # This is a parameter-shape constraint for learned position tables, not
+        # a context-length restriction on RoPE/YaRN checkpoint reuse.
+        if getattr(cfg.model, 'position_embedding_type', 'learned_absolute') == 'learned_absolute':
+            _compare('max_position_embeddings', config_section='model', config_name='seq_length')
         _compare('make_vocab_size_divisible_by', config_section='model')
         if not use_dist_ckpt:
             _compare('padded_vocab_size', config_section='tokenizer')
@@ -862,7 +865,7 @@ def save_checkpoint(
 
     # --freeze-all-layers: weights are frozen, so skip the weight write and its finalizers; dump
     # progress is recorded separately via the post-logits finalize (see the async block below).
-    skip_weight_ckpt = getattr(args, 'freeze_all_layers', False)
+    skip_weight_ckpt = getattr(getattr(cfg, "train", None), "freeze_all_layers", False)
 
     # Handle non_persistent_ckpt flag. Besides overwriting the save directory and the checkpoint
     # type, non-persistent global ckpt requires no additional logic
@@ -1040,17 +1043,18 @@ def save_checkpoint(
                 save_strategy = TorchDistSaveShardedStrategy(
                     cpu_shm_mode=checkpoint.async_ckpt_use_cpu_shm
                 )
+                # Writers per rank. Independent of ckpt_assume_constant_structure.
+                if checkpoint.async_save:
+                    save_strategy.thread_count = checkpoint.dist_ckpt_workers
+                elif checkpoint.dist_ckpt_workers != 1:
+                    # We don't allow per-rank parallel save for sync save
+                    logger.warning(
+                        'Per-rank parallel save is not supported for sync save. '
+                        'Setting checkpoint.dist_ckpt_workers to 1'
+                    )
+                    save_strategy.thread_count = 1
                 if checkpoint.ckpt_assume_constant_structure and save_format == 'torch_dist':
                     save_strategy.use_cached_ckpt_structure = checkpoint.ckpt_assume_constant_structure
-                    if checkpoint.async_save:
-                        save_strategy.thread_count = checkpoint.dist_ckpt_workers
-                    else:
-                        # We don't allow per-rank parallel save for sync save
-                        logger.warning(
-                            'Per-rank parallel save is not supported for sync save. '
-                            'Setting checkpoint.dist_ckpt_workers to 1'
-                        )
-                        save_strategy.thread_count = 1
                     if (
                         checkpointing_context is not None
                         and 'load_strategy' in checkpointing_context
@@ -2957,7 +2961,7 @@ def load_checkpoint(
     # progress from --save (this job's output) rather than --load lets --load stay pinned to a
     # fixed checkpoint across resubmits. An explicit --override-ckpt-iteration wins. (The main use
     # today is offline-KD teacher-logit dumps.)
-    if restore_training_state and getattr(args, 'freeze_all_layers', False):
+    if restore_training_state and getattr(getattr(cfg, "train", None), "freeze_all_layers", False):
         # Weights only: don't adopt the loaded checkpoint's optimizer / LR-scheduler / rng, or run
         # check_checkpoint_args against a checkpoint from a different run (finetune gates all of
         # those; --freeze-all-layers alone would still load the scheduler and assert on arg drift).

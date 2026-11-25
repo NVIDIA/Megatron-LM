@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Tests for LogitsSaverHooks' cu_seqlens capture/persist plumbing (CP+packing fix).
 
@@ -16,11 +16,27 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+from megatron.training.config import DataConfig
+from megatron.training.datasets.sft_dataset import MockSFTDataset
 from megatron.training.distillation import logits_saver
-from megatron.training.distillation import utils as distillation_utils
 from megatron.training.distillation.logits_saver import LogitsSaverHooks
 
 zstandard = pytest.importorskip("zstandard")
+
+
+def _run_config_for(sft: bool):
+    """A run config whose data section has the family of the run (what is_packed_sequence_run
+    reads: the SFT family packs documents, plain GPT does not)."""
+    dataset = GPTDatasetConfig(
+        sequence_length=16,
+        random_seed=1,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    dataset_type = MockSFTDataset if sft else MockGPTDataset
+    return SimpleNamespace(data=DataConfig(dataset=dataset, dataset_type=dataset_type))
 
 
 def _bare_saver(cp_size=1, tp_rank=0, tp_size=1, dp_rank=0, dp_size=1):
@@ -31,6 +47,7 @@ def _bare_saver(cp_size=1, tp_rank=0, tp_size=1, dp_rank=0, dp_size=1):
     saver.cp_size = cp_size
     saver.dp_rank = dp_rank
     saver.dp_size = dp_size
+    saver._micro_batch_size = 1
     saver._save_dtype = torch.float16
     saver.k = 4
     saver.p = None
@@ -43,14 +60,9 @@ def _bare_saver(cp_size=1, tp_rank=0, tp_size=1, dp_rank=0, dp_size=1):
     return saver
 
 
-def _patch_buffer_deps(monkeypatch, *, consumed_samples=0, num_microbatches=1, mbs=1):
+def _patch_buffer_deps(monkeypatch, *, consumed_samples=0, num_microbatches=1):
     monkeypatch.setattr(logits_saver, "get_consumed_train_samples", lambda: consumed_samples)
     monkeypatch.setattr(logits_saver, "get_num_microbatches", lambda: num_microbatches)
-
-    class _Args:
-        micro_batch_size = mbs
-
-    monkeypatch.setattr(logits_saver, "get_args", lambda: _Args())
 
 
 def _decode_buffered_payload(saver):
@@ -189,12 +201,13 @@ def _patch_init_deps(monkeypatch, *, cp_size, sft):
         dataloader_inter_document_masking=False,
         freeze_all_layers=False,
     )
-    monkeypatch.setattr(logits_saver, "get_args", lambda: args)
-    # is_packed_sequence_run() reads get_args() bound inside utils.py itself,
-    # not logits_saver's binding -- patch both so LogitsSaverHooks.__init__
-    # sees the same args.
-    monkeypatch.setattr(distillation_utils, "get_args", lambda: args)
-    monkeypatch.setattr(logits_saver, "compute_dataset_hash", lambda: ("hash", {}))
+    cfg = SimpleNamespace(
+        train=args,
+        model=SimpleNamespace(transformer=SimpleNamespace(mtp_num_layers=0)),
+        data=_run_config_for(sft).data,
+    )
+    monkeypatch.setattr(logits_saver, "get_run_config", lambda: cfg)
+    monkeypatch.setattr(logits_saver, "compute_dataset_hash", lambda cfg: ("hash", {}))
     monkeypatch.setattr(logits_saver, "storage_makedirs", lambda *a, **k: None)
 
 
