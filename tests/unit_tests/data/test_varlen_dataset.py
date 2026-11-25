@@ -572,6 +572,40 @@ def test_getitem_sbhd_pads_to_seq_length_and_masks_tail():
     assert all(v == 0.0 for v in loss_mask[3:])
 
 
+def test_getitem_thd_boundary_length_does_not_exceed_sequence_length():
+    """Regression: a sample tokenizing to exactly ``sequence_length + 1``
+    tokens (with no trailing EOD) must stay within ``sequence_length``.
+
+    The truncation branch only fires for lengths *strictly greater* than
+    ``max_len + 1``, so a boundary-length sample used to skip truncation and
+    then grow by one when the EOD was appended, emitting a sample longer than
+    ``sequence_length`` and crashing the downstream packing scheduler whose
+    per-rank capacity derives from ``sequence_length``.
+    """
+    tok = _FakeTokenizer(eod=0, pad=7)
+    # 9 chars -> 9 tokens with sequence_length 8, i.e. exactly max_len + 1.
+    ds = _make_varlen(["abcdefghi"], _make_config(tok, seq_length=8))
+    out = ds[0]
+    assert int(out["original_seq_len"].item()) <= 8
+    # The sample must still terminate in EOD so the turn has a stop token.
+    assert int(out["labels"][int(out["original_seq_len"].item()) - 1].item()) == tok.eod
+
+
+def test_getitem_sbhd_boundary_length_does_not_crash():
+    """Regression: boundary-length samples must not trip the fixed-shape
+    assertion in SBHD validation mode."""
+    tok = _FakeTokenizer(eod=0, pad=None)
+    ds = _make_varlen(["abcdefghi"], _make_config(tok, seq_length=8, sbhd=True))
+    out = ds[0]
+    assert out["tokens"].numel() == 8
+    assert out["labels"].numel() == 8
+    # The real end-of-document EOD target stays in the loss.
+    loss_mask = out["loss_mask"].tolist()
+    labels = out["labels"].tolist()
+    eod_positions = [i for i, v in enumerate(labels) if v == tok.eod]
+    assert eod_positions and loss_mask[eod_positions[0]] == 1.0
+
+
 def test_mock_getitem_thd_keys_and_pad_fallback():
     tok = _FakeTokenizer(eod=0, pad=None)  # exercise the eod fallback (no crash)
     ds = _make_mock_varlen([np.array([1, 2, 3, 4], dtype=np.int64)], _make_config(tok, cp=2))
