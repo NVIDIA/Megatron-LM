@@ -35,7 +35,7 @@ class FakeResponse:
 
 class FakeRequests:
     def __init__(self, pr_data):
-        self.pr_data = pr_data
+        self.pr_data = {"state": "open", "draft": False, **pr_data}
         self.posts = []
 
     def get(self, url, headers=None):
@@ -70,6 +70,8 @@ def oncall_manager(monkeypatch):
 @pytest.mark.parametrize(
     "pr_data",
     [
+        {"draft": True},
+        {"state": "closed"},
         {
             "user": {"login": "maintainer"},
             "requested_reviewers": [{"login": "alice"}],
