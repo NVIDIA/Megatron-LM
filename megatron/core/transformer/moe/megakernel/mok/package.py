@@ -79,10 +79,10 @@ def resolve_mok_backend(backend: str) -> str:
         )
         return "cutemok"
     warnings.warn(
-        'moe_megakernel_backend="mok" is deprecated: cuDNN frontend\'s CuTe MoK '
-        "(cudnn.moe_ep.cutemok, which needs an SM100/SM103 GPU and its CuTe DSL) cannot run here, "
-        "so it runs the standalone mok package; install cuDNN frontend with CuTe MoK and use "
-        '"cutemok" instead.',
+        'moe_megakernel_backend="mok" is deprecated while cuDNN frontend\'s CuTe MoK '
+        "(cudnn.moe_ep.cutemok, which needs an SM100/SM103 GPU and its CuTe DSL) is not "
+        "available here, so it falls back to the standalone mok package; "
+        'Suggest installing cuDNN frontend with CuTe MoK and use "cutemok" instead.',
         FutureWarning,
         stacklevel=2,
     )
