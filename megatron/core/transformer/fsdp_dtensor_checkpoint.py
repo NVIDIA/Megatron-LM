@@ -1101,24 +1101,88 @@ def validate_loaded_state_dict(state_dict, checkpoint_path):
             ), f"key: {key}; {value} {load_item_dict[key]}"
 
 
-def handle_pipeline_layers_in_state_dict(model, model_state_dict):
-    """Rename this pipeline stage's transformer layers to their global layer indices.
-
-    Every stage numbers its layers from zero, so without this the stages' layers would share
-    names in one checkpoint. The optimizer state already uses the global names; see
-    :func:`get_global_unique_param_name`.
-    """
+def _global_layer_prefixes(model):
+    """Map each transformer layer's local module path to its path with the global layer index."""
     prefixes = {}
     for name, module in model.named_modules():
         name = _strip_wrapper_prefixes(name)
         match = re.fullmatch(r"(.*layers)\.(\d+)", name)
         if match and isinstance(module, TransformerLayer) and "mtp" not in name:
             prefixes[f"{name}."] = f"{match.group(1)}.{module.layer_number - 1}."
+    return prefixes
+
+
+def _layer_prefix(key, prefixes):
+    """The prefix in ``prefixes`` that starts ``key`` once wrapper prefixes are stripped."""
+    path = _strip_wrapper_prefixes(key)
+    return next((prefix for prefix in prefixes if path.startswith(prefix)), None)
+
+
+def _rename_layers(state_dict, prefixes):
+    """Replace the layer prefixes of ``state_dict``'s keys by their values in ``prefixes``."""
     renamed = {}
-    for key, value in model_state_dict.items():
-        prefix = next((p for p in prefixes if key.startswith(p)), None)
-        renamed[key if prefix is None else prefixes[prefix] + key[len(prefix) :]] = value
+    for key, value in state_dict.items():
+        prefix = _layer_prefix(key, prefixes)
+        if prefix is not None:
+            path = _strip_wrapper_prefixes(key)
+            key = key[: len(key) - len(path)] + prefixes[prefix] + path[len(prefix) :]
+        renamed[key] = value
     return renamed
+
+
+def handle_pipeline_chunks_in_state_dict(
+    model_chunks, model_state_dicts, optimizer_state_dict, handlers
+):
+    """Run the state dict handlers per model chunk and give pipeline layers global names.
+
+    Every pipeline stage and virtual stage numbers its layers from zero, while the optimizer
+    state names them globally (see :func:`get_global_unique_param_name`). Each chunk's
+    handlers therefore see that chunk's layers under their local names, as without pipeline
+    parallelism, together with its optimizer state; parameters outside the layers go with the
+    last chunk, which holds the MTP layers. Afterwards every layer takes its global name, so the
+    chunks' model states merge into one.
+
+    Args:
+        model_chunks: This rank's model chunks.
+        model_state_dicts: Their model state dicts, in the same order.
+        optimizer_state_dict: The ``fsdp_dtensor`` optimizer state of all chunks, or None.
+        handlers: Callables ``(model, model_state_dict, optimizer_state_dict)`` returning both
+            state dicts, such as :func:`handle_swiglu_in_state_dict`.
+
+    Returns:
+        The merged model state dict and the optimizer state dict.
+    """
+    global_prefixes = [_global_layer_prefixes(chunk) for chunk in model_chunks]
+    local_prefixes = [{new: old for old, new in prefixes.items()} for prefixes in global_prefixes]
+
+    def chunk_of(key):
+        for index, prefixes in enumerate(local_prefixes):
+            if _layer_prefix(key, prefixes) is not None:
+                return index
+        return len(model_chunks) - 1
+
+    model_state_dict = {}
+    merged_optimizer = None
+    if optimizer_state_dict is not None:
+        merged_optimizer = {key: {} for key in optimizer_state_dict}
+    for index, chunk in enumerate(model_chunks):
+        chunk_optimizer = None
+        if optimizer_state_dict is not None:
+            chunk_optimizer = {
+                section: _rename_layers(
+                    {k: v for k, v in entries.items() if chunk_of(k) == index},
+                    local_prefixes[index],
+                )
+                for section, entries in optimizer_state_dict.items()
+            }
+        chunk_model = model_state_dicts[index]
+        for handler in handlers:
+            chunk_model, chunk_optimizer = handler(chunk, chunk_model, chunk_optimizer)
+        model_state_dict.update(_rename_layers(chunk_model, global_prefixes[index]))
+        if chunk_optimizer is not None:
+            for section, entries in chunk_optimizer.items():
+                merged_optimizer[section].update(_rename_layers(entries, global_prefixes[index]))
+    return model_state_dict, merged_optimizer
 
 
 def get_global_unique_param_name(model_chunks, param):
@@ -1138,6 +1202,9 @@ def get_global_unique_param_name(model_chunks, param):
             if p is param:
                 param_name = name
                 break
+        if param_name is not None:
+            # Look the layer up in the chunk that holds the parameter.
+            break
     if param_name is None:
         raise ValueError("Parameter not found in model chunks")
 
