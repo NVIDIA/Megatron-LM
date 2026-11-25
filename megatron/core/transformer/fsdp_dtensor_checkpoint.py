@@ -74,12 +74,8 @@ _FUSED_PARAM_STATE_KEYS = (
 )
 
 
-def _global_layer_prefixes(model):
-    """Map each transformer layer's local module path to its path with the global layer index.
-
-    Every pipeline stage and virtual stage numbers its layers from zero; checkpoints name them by
-    ``layer_number`` instead, as ``TransformerBlock.sharded_state_dict`` does for torch_dist.
-    """
+def _pipeline_layer_prefixes(model):
+    """Map each pipeline layer's local path prefix to its global one, for ``_checkpoint_path``."""
     prefixes = {}
     for name, module in model.named_modules():
         name = _strip_wrapper_prefixes(name)
@@ -89,37 +85,23 @@ def _global_layer_prefixes(model):
     return prefixes
 
 
-def _checkpoint_name(name, layer_prefixes):
-    """``name`` with its pipeline layer index made global; wrapper prefixes are kept."""
+def _checkpoint_path(name, layer_prefixes):
+    """``name`` without wrapper prefixes and with its pipeline layer index made global.
+
+    Every pipeline stage and virtual stage numbers its layers from zero; checkpoints use the
+    global index ``layer_number - 1``, as ``TransformerBlock.sharded_state_dict`` does.
+    """
     path = _strip_wrapper_prefixes(name)
     for local, global_ in layer_prefixes.items():
         if f"{path}.".startswith(local):
-            return name[: len(name) - len(path)] + f"{global_}{path[len(local):]}".rstrip(".")
-    return name
-
-
-def _checkpoint_named_modules(model):
-    """``model.named_modules()`` under checkpoint names, with global layer indices."""
-    layer_prefixes = _global_layer_prefixes(model)
-    for name, module in model.named_modules():
-        yield _checkpoint_name(name, layer_prefixes), module
-
-
-def _checkpoint_named_parameters(model):
-    """``model.named_parameters()`` under checkpoint names, with global layer indices."""
-    layer_prefixes = _global_layer_prefixes(model)
-    for name, param in model.named_parameters():
-        yield _checkpoint_name(name, layer_prefixes), param
+            return f"{global_}{path[len(local):]}".rstrip(".")
+    return path
 
 
 def handle_pipeline_layers_in_state_dict(model, model_state_dict):
-    """Name the pipeline layers of ``model``'s state dict by their global layer indices.
-
-    Run it first: the other handlers resolve keys under these checkpoint names, which the
-    optimizer state uses too (see :func:`get_global_unique_param_name`).
-    """
-    layer_prefixes = _global_layer_prefixes(model)
-    return {_checkpoint_name(key, layer_prefixes): value for key, value in model_state_dict.items()}
+    """Name the pipeline layers in ``model``'s state dict by their global index."""
+    layer_prefixes = _pipeline_layer_prefixes(model)
+    return {_checkpoint_path(key, layer_prefixes): value for key, value in model_state_dict.items()}
 
 
 def _is_mfsdp_v2_param(param):
@@ -305,10 +287,11 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     # layers have gated_linear_unit=False while language decoder layers
     # have gated_linear_unit=True.
     # ------------------------------------------------------------------
+    layer_prefixes = _pipeline_layer_prefixes(model)
     _layer_glu = {}
-    for name, module in _checkpoint_named_modules(model):
+    for name, module in model.named_modules():
         if isinstance(module, TransformerLayer):
-            _layer_glu[_strip_wrapper_prefixes(name)] = getattr(
+            _layer_glu[_checkpoint_path(name, layer_prefixes)] = getattr(
                 module.config, 'gated_linear_unit', False
             )
 
@@ -417,7 +400,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         return weight_w, weight_v
 
     parameters = {
-        _strip_wrapper_prefixes(name): param for name, param in _checkpoint_named_parameters(model)
+        _checkpoint_path(name, layer_prefixes): param for name, param in model.named_parameters()
     }
     model_state_dict = model_state_dict.copy()
     _swiglu_split_count = 0
@@ -511,14 +494,15 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
     # in_proj_dim attributes (set in GatedDeltaNet.__init__).
     # ------------------------------------------------------------------
     _gdn_info = {}  # normalized_path → {in_proj_sizes, conv1d_sizes}
-    for name, mod in _checkpoint_named_modules(model):
+    layer_prefixes = _pipeline_layer_prefixes(model)
+    for name, mod in model.named_modules():
         if not (hasattr(mod, 'qk_dim') and hasattr(mod, 'v_dim') and hasattr(mod, 'in_proj_dim')):
             continue
         tp = getattr(mod, 'tp_size', 1)
         qk = mod.qk_dim // tp
         v = mod.v_dim // tp
         nvh = mod.num_value_heads // tp
-        _gdn_info[_strip_wrapper_prefixes(name)] = {
+        _gdn_info[_checkpoint_path(name, layer_prefixes)] = {
             'in_proj_sizes': [qk, qk, v, v, nvh, nvh],
             'conv1d_sizes': [qk, qk, v],
         }
@@ -599,7 +583,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
     # ---- Model state dict ------------------------------------------------
     parameters = {
-        _strip_wrapper_prefixes(name): param for name, param in _checkpoint_named_parameters(model)
+        _checkpoint_path(name, layer_prefixes): param for name, param in model.named_parameters()
     }
     model_state_dict = model_state_dict.copy()
     _gdn_split_count = 0
@@ -745,11 +729,12 @@ def get_mla_fused_down_proj_splits(model):
     tensor-parallel-unsharded units. Returns an empty dict for unfused models.
     """
     splits = {}
-    for name, mod in _checkpoint_named_modules(model):
+    layer_prefixes = _pipeline_layer_prefixes(model)
+    for name, mod in model.named_modules():
         if not hasattr(mod, MLA_FUSED_DOWN_PROJ):
             continue
         config = mod.config
-        splits[_strip_wrapper_prefixes(name)] = [
+        splits[_checkpoint_path(name, layer_prefixes)] = [
             config.q_lora_rank,
             config.kv_lora_rank + config.qk_pos_emb_head_dim,
         ]
@@ -810,8 +795,9 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
 
     rewritten = 0
 
+    layer_prefixes = _pipeline_layer_prefixes(model)
     parameters = {
-        _strip_wrapper_prefixes(name): param for name, param in _checkpoint_named_parameters(model)
+        _checkpoint_path(name, layer_prefixes): param for name, param in model.named_parameters()
     }
     model_state_dict = model_state_dict.copy()
     for key in list(model_state_dict.keys()):
@@ -1173,9 +1159,11 @@ def get_global_unique_param_name(model_chunks, param):
     """
     param_name = None
     for model in model_chunks:
-        for name, p in _checkpoint_named_parameters(model):
+        for name, p in model.named_parameters():
             if p is param:
-                param_name = name
+                # Keep the wrapper prefix; give the pipeline layer its global index.
+                wrapper = name[: len(name) - len(_strip_wrapper_prefixes(name))]
+                param_name = wrapper + _checkpoint_path(name, _pipeline_layer_prefixes(model))
                 break
         if param_name is not None:
             break
