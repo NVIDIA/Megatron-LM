@@ -68,7 +68,8 @@ def _pipeline_layer_prefixes(model):
     for name, module in model.named_modules():
         name = _strip_wrapper_prefixes(name)
         match = re.fullmatch(r"(.*layers)\.(\d+)", name)
-        if match and isinstance(module, TransformerLayer) and "mtp" not in name:
+        # Wrappers such as HyperConnectionHybridLayer carry the layer_number of the layer inside.
+        if match and hasattr(module, "layer_number") and "mtp" not in name:
             prefixes[f"{name}."] = f"{match.group(1)}.{module.layer_number - 1}."
     return prefixes
 
@@ -87,9 +88,16 @@ def _checkpoint_path(name, layer_prefixes):
 
 
 def handle_pipeline_layers_in_state_dict(model, model_state_dict):
-    """Name the pipeline layers in ``model``'s state dict by their global index."""
+    """Name the pipeline layers in ``model``'s state dict by their global index.
+
+    Keys keep their wrapper prefixes, so checkpoints saved without pipeline stages still load.
+    """
     layer_prefixes = _pipeline_layer_prefixes(model)
-    return {_checkpoint_path(key, layer_prefixes): value for key, value in model_state_dict.items()}
+    return {
+        key[: len(key) - len(_strip_wrapper_prefixes(key))]
+        + _checkpoint_path(key, layer_prefixes): value
+        for key, value in model_state_dict.items()
+    }
 
 
 def _is_mfsdp_v2_param(param):

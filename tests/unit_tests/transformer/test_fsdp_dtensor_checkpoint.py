@@ -54,11 +54,13 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     absorbed_input_layernorm_key,
     flatten_state_dict,
     get_expert_index_from_key,
+    get_global_unique_param_name,
     get_mla_fused_down_proj_splits,
     get_mtp_inner_layer_paths,
     get_unexpected_model_keys,
     handle_mla_down_proj_in_state_dict,
     handle_mtp_in_state_dict,
+    handle_pipeline_layers_in_state_dict,
     match_mla_fused_down_proj_key,
     rename_mtp_inner_layer_keys,
     validate_fsdp_dtensor_model_load,
@@ -1379,3 +1381,46 @@ class TestMCoreDataGuard:
         m = FakeMetadata()
         assert hasattr(m, "mcore_data")
         assert "key" in m.mcore_data
+
+
+# ============================================================================
+# Test global pipeline layer names
+# ============================================================================
+def _wrapped_chunk(layer_number):
+    """A DDP-wrapped chunk whose local layer 0 is a hyper-connection-style wrapper."""
+    layer = torch.nn.Module()
+    layer.layer_number = layer_number
+    layer.inner_layer = torch.nn.Linear(2, 2)
+    model = torch.nn.Module()
+    model.decoder = torch.nn.Module()
+    model.decoder.layers = torch.nn.ModuleList([layer])
+    chunk = torch.nn.Module()
+    chunk.module = model
+    chunk.config = SimpleNamespace(num_moe_experts=None)
+    return chunk
+
+
+class TestPipelineLayerNames:
+
+    def test_wrapper_prefix_kept_and_layer_globalized(self):
+        state_dict = {"module.decoder.layers.0.inner_layer.weight": 0, "module.embedding.weight": 1}
+        assert handle_pipeline_layers_in_state_dict(_wrapped_chunk(5), state_dict) == {
+            "module.decoder.layers.4.inner_layer.weight": 0,
+            "module.embedding.weight": 1,
+        }
+
+    def test_first_stage_keys_unchanged(self):
+        state_dict = {"module.decoder.layers.0.inner_layer.weight": 0}
+        assert handle_pipeline_layers_in_state_dict(_wrapped_chunk(1), state_dict) == state_dict
+
+    def test_virtual_chunks_get_distinct_param_names(self, monkeypatch):
+        monkeypatch.setattr(fsdp_dtensor_checkpoint, "get_ep_layer_offset", lambda num_experts: 0)
+        chunks = [_wrapped_chunk(1), _wrapped_chunk(5)]
+        names = [
+            get_global_unique_param_name(chunks, chunk.module.decoder.layers[0].inner_layer.weight)
+            for chunk in chunks
+        ]
+        assert names == [
+            "module.decoder.layers.0.inner_layer.weight",
+            "module.decoder.layers.4.inner_layer.weight",
+        ]
