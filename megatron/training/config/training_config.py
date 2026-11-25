@@ -779,6 +779,13 @@ class CheckpointConfig:
     by using Gloo (instead of NCCL) and only one rank for saving. Turn on only if experiencing host or device memory
     issues. Has affect only with `dist_ckpt_optim_fully_reshardable` flag."""
 
+    stage_precision_aware_optimizer_state_on_cpu: bool = False
+    """Stage expanded precision-aware optimizer state on CPU during distributed optimizer
+    checkpoint save and load. Enable this when reduced-precision optimizer state fits during
+    training but its FP32 checkpoint representation would exceed available GPU memory. Trades
+    host memory and checkpoint time for GPU memory; the checkpoint content is unchanged. Supported
+    only for the torch_dist format."""
+
     save_tokenizer_assets: bool = True
     """Save tokenizer files to checkpoint directory. When enabled, saves all tokenizer artifacts
     (vocab files, special tokens, tokenizer config) to make checkpoints self-contained and portable.
@@ -872,6 +879,10 @@ class CheckpointConfig:
         if self.verify_integrity:
             assert self.ckpt_format == "torch_dist", \
                 f"`verify_integrity` is only supported with torch_dist checkpoint format."
+
+        if self.stage_precision_aware_optimizer_state_on_cpu:
+            assert self.ckpt_format == "torch_dist", \
+                "--stage-precision-aware-optimizer-state-on-cpu requires --ckpt-format torch_dist."
 
         if self.ckpt_convert_format is not None:
             assert self.ckpt_convert_save is not None

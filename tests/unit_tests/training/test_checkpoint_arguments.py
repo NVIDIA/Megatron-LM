@@ -20,7 +20,10 @@ from megatron.training.config import CheckpointConfig
 LEGACY = json.loads((Path(__file__).parent / "legacy_checkpoint_arguments.json").read_text())
 
 # Arguments added after the legacy snapshot: they are not in the JSON, with their expected defaults.
-ADDED_AFTER_SNAPSHOT = {"async_write_results_mp_mode": "fork"}
+ADDED_AFTER_SNAPSHOT = {
+    "async_write_results_mp_mode": "fork",
+    "stage_precision_aware_optimizer_state_on_cpu": False,
+}
 PROMOTED = ("dist_ckpt_workers", "override_ckpt_iteration", "ckpt_drop_redundant_extra_state")
 DEPRECATED = (
     "use_dist_ckpt_deprecated",

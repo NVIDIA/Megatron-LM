@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -94,6 +95,85 @@ def test_mixed_precision_checkpoint_state_roundtrip(low_precision_dtype, fp32_bu
             ):
                 for key, expected in saved[parameter].items():
                     torch.testing.assert_close(state[key], expected)
+
+
+@pytest.mark.internal
+def test_precision_aware_checkpoint_state_cpu_staging():
+    """Only FP32 expansions of reduced-precision states move to CPU, with unchanged values."""
+    te_optimizers = pytest.importorskip("transformer_engine.pytorch.optimizers")
+    parameter = torch.nn.Parameter(torch.randn(16, dtype=torch.bfloat16, device='cuda'))
+    fused_adam = te_optimizers.FusedAdam(
+        [parameter],
+        lr=1e-3,
+        master_weights=True,
+        master_weight_dtype=torch.float32,
+        exp_avg_dtype=torch.bfloat16,
+        exp_avg_sq_dtype=torch.float32,
+        use_decoupled_grad=True,
+    )
+    parameter.decoupled_grad = torch.randn(16, dtype=torch.float32, device='cuda')
+    fused_adam.step()
+    optimizer = SimpleNamespace(
+        config=SimpleNamespace(use_precision_aware_optimizer_no_fp8_or_ds_fp8=True),
+        model_param_group_index_map={parameter: (0, 0)},
+        optimizer=fused_adam,
+    )
+
+    on_gpu = DistributedOptimizer._get_main_param_and_optimizer_states(optimizer, parameter)
+    staged = DistributedOptimizer._get_main_param_and_optimizer_states(
+        optimizer, parameter, stage_expanded_state_on_cpu=True
+    )
+
+    assert on_gpu.keys() == staged.keys() == {'param', 'exp_avg', 'exp_avg_sq'}
+    assert on_gpu['exp_avg'].is_cuda
+    assert staged['exp_avg'].device.type == 'cpu'
+    assert staged['exp_avg'].dtype == torch.float32
+    torch.testing.assert_close(staged['exp_avg'], on_gpu['exp_avg'].cpu(), rtol=0, atol=0)
+    # States kept in FP32 are the optimizer's own tensors, which cost no extra GPU memory.
+    state = fused_adam.state[parameter]
+    assert staged['exp_avg_sq'] is state['exp_avg_sq']
+    assert staged['param'] is state['master_param']
+
+
+@pytest.mark.internal
+def test_precision_aware_state_dict_round_trip_keeps_compact_state():
+    """Group state round-trips without TE expanding (and re-quantizing) every optimizer state."""
+    te_optimizers = pytest.importorskip("transformer_engine.pytorch.optimizers")
+    parameter = torch.nn.Parameter(torch.randn(16, dtype=torch.bfloat16, device='cuda'))
+    fused_adam = te_optimizers.FusedAdam(
+        [parameter],
+        lr=1e-3,
+        master_weights=True,
+        master_weight_dtype=torch.float32,
+        exp_avg_dtype=torch.bfloat16,
+        exp_avg_sq_dtype=torch.float32,
+        use_decoupled_grad=True,
+    )
+    parameter.decoupled_grad = torch.randn(16, dtype=torch.float32, device='cuda')
+    fused_adam.step()
+    optimizer = DistributedOptimizer.__new__(DistributedOptimizer)
+    optimizer.config = SimpleNamespace(
+        use_precision_aware_optimizer_no_fp8_or_ds_fp8=True, fp16=False
+    )
+    optimizer.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
+    optimizer.grad_scaler = None
+    optimizer.optimizer = fused_adam
+    existing_state = dict(fused_adam.state[parameter])
+
+    expanding = AssertionError('expands every optimizer state to FP32')
+    with (
+        mock.patch.object(type(fused_adam), 'state_dict', side_effect=expanding),
+        mock.patch.object(type(fused_adam), 'load_state_dict', side_effect=expanding),
+    ):
+        state_dict = optimizer.state_dict()
+        state_dict['optimizer']['param_groups'][0]['lr'] = 0.5
+        optimizer.load_state_dict(state_dict)
+
+    assert 'state' not in state_dict['optimizer']
+    assert fused_adam.param_groups[0]['lr'] == 0.5
+    assert fused_adam.param_groups[0]['params'] == [parameter]
+    assert fused_adam.state[parameter].keys() == existing_state.keys()
+    assert all(fused_adam.state[parameter][k] is v for k, v in existing_state.items())
 
 
 @pytest.mark.internal

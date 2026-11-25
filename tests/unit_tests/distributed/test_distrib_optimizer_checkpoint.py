@@ -63,6 +63,24 @@ def test_save_skips_trailing_padding_only_shard():
     assert state[0][torch.float32][0] == []
 
 
+@pytest.mark.parametrize(
+    ('metadata', 'expected'),
+    [
+        (None, False),
+        ({}, False),
+        ({'distrib_optim_stage_precision_aware_state_on_cpu': True}, True),
+    ],
+)
+def test_dp_reshardable_forwards_cpu_staging_request(metadata, expected):
+    optimizer = _make_optimizer_for_empty_shard_save(data_parallel_rank=1, numel_unpadded=1024)
+
+    DistributedOptimizer.sharded_param_state_dp_reshardable(optimizer, {}, metadata=metadata)
+
+    optimizer.get_parameter_state_dp_reshardable.assert_called_once_with(
+        stage_expanded_state_on_cpu=expected
+    )
+
+
 def test_save_rejects_empty_shard_that_intersects_optimizer_state():
     optimizer = _make_optimizer_for_empty_shard_save(data_parallel_rank=1, numel_unpadded=1500)
 

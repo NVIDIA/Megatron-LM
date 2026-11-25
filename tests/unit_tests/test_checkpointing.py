@@ -32,6 +32,7 @@ from megatron.training.checkpointing import (
     _build_sharded_state_dict_metadata,
     _load_base_checkpoint,
     _maybe_setup_gpt_to_hybrid_load,
+    _optimizer_sharded_state_dict_metadata,
     _read_checkpoint_run_config,
     check_checkpoint_args,
     get_checkpoint_tracker_filename,
@@ -1794,6 +1795,26 @@ class TestBuildShardedStateDictMetadata:
         _describe_metadata_run(run_config)
         metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert 'distrib_optim_sharding_type' not in metadata
+
+
+class TestOptimizerShardedStateDictMetadata:
+    """The CPU staging request reaches the optimizer but not the persisted content metadata."""
+
+    CPU_STAGING_KEY = 'distrib_optim_stage_precision_aware_state_on_cpu'
+
+    def test_disabled_keeps_the_content_metadata(self, run_config):
+        run_config.checkpoint = CheckpointConfig()
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+        assert _optimizer_sharded_state_dict_metadata(metadata) is metadata
+        assert _optimizer_sharded_state_dict_metadata(None) is None
+
+    def test_enabled_adds_the_request_to_a_copy(self, run_config):
+        run_config.checkpoint = CheckpointConfig(stage_precision_aware_optimizer_state_on_cpu=True)
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+        optimizer_metadata = _optimizer_sharded_state_dict_metadata(metadata)
+        assert optimizer_metadata == {**metadata, self.CPU_STAGING_KEY: True}
+        assert self.CPU_STAGING_KEY not in metadata
+        assert _optimizer_sharded_state_dict_metadata(None) is None
 
 
 def test_save_follows_the_section_not_the_namespace(

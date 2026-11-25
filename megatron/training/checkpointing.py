@@ -739,6 +739,18 @@ def _build_sharded_state_dict_metadata(
     return metadata
 
 
+def _optimizer_sharded_state_dict_metadata(metadata: Optional[dict]) -> Optional[dict]:
+    """Adds the optimizer ``sharded_state_dict`` options that describe this run, not the content.
+
+    They are kept out of the persisted content metadata, so a load follows the loading run's
+    configuration rather than the one of the run that saved the checkpoint.
+    """
+    checkpoint = get_run_config().checkpoint
+    if metadata is None or not checkpoint.stage_precision_aware_optimizer_state_on_cpu:
+        return metadata
+    return {**metadata, 'distrib_optim_stage_precision_aware_state_on_cpu': True}
+
+
 def save_grads(save_dir, state_dict, iteration, grad_label):
     """Persist state_dict of grads onto disk. In case of wgrads, this collection should
     be performed before the grads are cleared but after they are reduced.
@@ -1020,7 +1032,9 @@ def save_checkpoint(
                 opt_param_scheduler,
                 rng_state,
                 iteration=iteration,
-                optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                optim_sd_kwargs=dict(
+                    metadata=_optimizer_sharded_state_dict_metadata(sharded_sd_metadata)
+                ),
                 model_sd_kwargs=dict(metadata=sharded_sd_metadata),
                 rerun_state=rerun_state,
                 ckpt_format=save_format,
@@ -3294,7 +3308,9 @@ def load_checkpoint(
         if loading_pretrained_checkpoint and getattr(args, 'allow_llm_only_checkpoint', False):
             sharded_sd_metadata['load_from_llm_only_checkpoint'] = True
 
-        optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
+        optim_sd_kwargs = dict(
+            metadata=_optimizer_sharded_state_dict_metadata(sharded_sd_metadata), is_loading=True
+        )
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)
 
         # Determine if rerun state will be loaded
