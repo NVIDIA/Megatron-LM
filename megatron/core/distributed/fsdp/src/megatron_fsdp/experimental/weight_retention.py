@@ -33,9 +33,9 @@ def build_weight_plan(
 ) -> tuple[Mapping[int, bool], Mapping[int, int]]:
     """Return a retain mask and a mapping from unshard anchors to prefetch targets.
 
-    Retention gets first use of the buffer window. Prefetch fills the remaining
-    space between successive misses. Nested execution can require more than two
-    owners, and neither optimization enlarges that demand envelope.
+    Reserve the standard single-successor prefetch window before retaining
+    weights. Prefetches can move earlier within that window. Nested execution
+    can have more than two resident owners including the prefetched successor.
     """
     if agreement_group is None:
         raise ValueError("Weight retention requires an explicit agreement group.")
@@ -78,19 +78,26 @@ def build_weight_plan(
             raise RuntimeError("A weight owner's recorded unsharded_bytes changed.")
         sizes[event.module] = event.unsharded_bytes
 
-    next_uses, reuse_ends = {}, {}
+    next_uses, reuse_ends, successors = {}, {}, {}
+    successor = None
     for index in reversed(range(len(records))):
         event = records[index]
         if event.action is ExecutionAction.UNSHARD:
             next_uses[event.module] = index
+            successors[index] = successor
+            successor = event.module
         elif event.module in next_uses:
             reuse_ends[index] = next_uses[event.module]
 
     # A rowwise release can leave columnwise storage resident. An alias uses no buffer.
     live, usage, limits = set(), [], []
-    for event in records:
-        if event.action is ExecutionAction.UNSHARD and sizes[event.module] != 0:
-            live.add(event.module)
+    for index, event in enumerate(records):
+        if event.action is ExecutionAction.UNSHARD:
+            if sizes[event.module] != 0:
+                live.add(event.module)
+            successor = successors[index]
+            if successor is not None and sizes[successor] != 0:
+                live.add(successor)
         elif event.action is ExecutionAction.RESHARD and not event.rowwise_only:
             live.discard(event.module)
         usage.append(live.copy())

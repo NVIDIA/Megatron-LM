@@ -58,8 +58,8 @@ class TestWeightRetention(unittest.TestCase):
             ("ABAB", {"A": 10, "B": 20}, {1, 3}, {0: 2}),
             ("ABAB", {"A": 1000000, "B": 1}, {1, 3}, {0: 2}),
             ("ABAB", {"A": None, "B": None}, {1, 3}, {0: 2}),
-            # Retaining A leaves B's unshard without a slot to prefetch C.
-            ("ABCABC", {"A": 10, "B": 20, "C": 30}, {1, 5}, {0: 2}),
+            # B's prefetch of C uses the slot A would need for retention.
+            ("ABCABC", {"A": 10, "B": 20, "C": 30}, set(), {0: 2, 2: 4, 4: 6, 6: 8, 8: 10}),
             ("ABCABC", {"A": 0, "B": 20, "C": 30}, {1, 3, 5}, {0: 2, 2: 4}),
         ):
             owners = {letter: torch.nn.Identity() for letter in sizes}
@@ -73,9 +73,17 @@ class TestWeightRetention(unittest.TestCase):
             owners = tuple(torch.nn.Identity() for _ in range(depth))
             events = [self._event(owner, u, 10) for owner in owners]
             events += [self._event(owner, r, 10) for owner in reversed(owners)]
-            # Root/layer/expert nesting can necessarily exceed two resident owners.
+            # Each enclosing module can still prefetch its child.
+            prefetch = {index: index + 1 for index in range(depth - 1)}
+            prefetch.update({index: index + 1 for index in range(2 * depth + 1, 3 * depth - 1)})
             cases.append(
-                (ExecutionOrder(events * 2), owners, {2 * depth - 2, 2 * depth - 1}, {0: 1}, depth)
+                (
+                    ExecutionOrder(events * 2),
+                    owners,
+                    {2 * depth - 2, 2 * depth - 1},
+                    prefetch,
+                    depth,
+                )
             )
         first, second = torch.nn.Identity(), torch.nn.Identity()
         rowwise = ExecutionOrder(
@@ -99,7 +107,8 @@ class TestWeightRetention(unittest.TestCase):
                 self.assertEqual(tuple(source), before)
                 with self.assertRaises(TypeError):
                     mask[0] = True
-                baseline = self._residency(source, {}, {})
+                unshards = [event.event_id for event in source if event.action is u]
+                baseline = self._residency(source, {}, dict(zip(unshards, unshards[1:])))
                 retained = self._residency(source, mask, prefetch_at)
                 self.assertLessEqual(max(retained), peak_limit)
                 self.assertTrue(

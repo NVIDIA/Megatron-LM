@@ -233,11 +233,12 @@ The first eager iteration records the complete schedule. M-LM uses that trace to
 plan retained releases and prefetches before the next iteration or CUDA graph capture.
 
 Compute, prefetched weights, and retained weights share a window of two gathered
-FSDP owners. The planner first admits release-to-next-use intervals that fit and
-then uses the remaining slots to prefetch upcoming misses. A prefetch starts at an
-existing unshard and can target a later microbatch. Nested root/layer/expert execution
-can use as many slots as its demand schedule requires. Replicated weights that alias
-persistent storage use no gathered-buffer slot.
+FSDP owners. The planner reserves the standard single-successor prefetch slots
+before retaining weights between uses. It can move prefetches earlier when the
+reserved space permits it. A prefetch starts at an existing unshard and can target
+a later microbatch. Nested root/layer/expert execution keeps the standard schedule's
+owner limit, which can exceed two. Replicated weights that alias persistent storage
+use no gathered-buffer slot.
 
 All recorded FSDP modules can participate; no layer-type registry or byte budget
 is needed. This is a module-slot policy, not a bound on allocated bytes when owners
