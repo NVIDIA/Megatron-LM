@@ -1,7 +1,8 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from math import ceil, lcm, log2
-from typing import Dict, List, Literal, Optional, Sequence, Tuple, TypeVar
+from collections import Counter
+from math import ceil, fsum, lcm, log2
+from typing import Dict, List, Literal, Mapping, Optional, Sequence, Tuple, TypeVar
 
 import torch
 
@@ -26,6 +27,49 @@ _REROUTE_KEY_ORDER = (
 _REROUTE_KEY_SET = frozenset(_REROUTE_KEY_ORDER)
 _REROUTE_SCALAR_KEYS = frozenset(("original_seq_len", "padded_seq_len"))
 _SequenceLength = TypeVar('_SequenceLength', int, torch.Tensor)
+
+
+def compute_schedule_stats(
+    sample_id_groups: Sequence[Sequence[Sequence[int]]],
+    global_id_seqlens: Mapping[int, int] | Sequence[Tuple[int, int]],
+) -> Dict:
+    """Estimate attention work from the final, VPP-aligned packed schedule on CPU.
+
+    Args:
+        sample_id_groups: Microbatch x DP*CP rank x sample ID schedule.
+        global_id_seqlens: Mapping or iterable of (ID, padded_seq_len) pairs.
+            These lengths include dataset padding, not just valid tokens.
+
+    Returns:
+        A dict containing additive ``balance_numerator`` and
+        ``balance_denominator``, and
+        ``cp_sample_counts``. Each logical ID is counted once per microbatch.
+        A zero denominator represents undefined efficiency, not perfect balance.
+
+    Work is sum(L**2 / actual CP size), using the scheduler's attention-work
+    model. This excludes communication, MLP, pipeline bubbles and later THD
+    padding. Inputs are not modified; no tensors or collectives are used.
+    """
+    lengths = dict(global_id_seqlens)
+    total_work = critical_path_work = 0.0
+    cp_sample_counts: Counter[int] = Counter()
+    num_ranks = len(sample_id_groups[0]) if sample_id_groups else 0
+    for microbatch in sample_id_groups:
+        if len(microbatch) != num_ranks:
+            raise ValueError("All microbatches must have the same DP*CP rank count")
+        cp_sizes = Counter(sid for rank_ids in microbatch for sid in set(rank_ids))
+        cp_sample_counts.update(cp_sizes.values())
+        rank_work = [
+            fsum(int(lengths[sid]) ** 2 / cp_sizes[sid] for sid in rank_ids)
+            for rank_ids in microbatch
+        ]
+        total_work += fsum(rank_work)
+        critical_path_work += max(rank_work, default=0.0)
+    return {
+        'balance_numerator': total_work,
+        'balance_denominator': num_ranks * critical_path_work,
+        'cp_sample_counts': dict(cp_sample_counts),
+    }
 
 
 def get_cp_slice_for_thd(

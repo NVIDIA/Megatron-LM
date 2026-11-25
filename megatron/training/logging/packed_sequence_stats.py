@@ -2,6 +2,7 @@
 
 """Per-iteration packed SFT statistics shared by training and multimodal callers."""
 
+from collections import Counter
 from typing import Dict, Optional
 
 import torch
@@ -13,6 +14,53 @@ from megatron.core import mpu
 _packed_sequence_lengths_in_iteration: list[torch.Tensor] = []
 _packed_sequence_trained_tokens_in_iteration: Optional[torch.Tensor] = None
 _packed_sequence_stats_active: bool = False
+
+
+class DcpStatsAccumulator:
+    """CPU-only logging window for already-global schedule summaries.
+
+    Each rank holds a replica, never a contribution to all-reduce. The existing
+    rank-last stdout / writer ownership emits one copy. The training caller
+    submits once after train_step succeeds; reruns reuse that step's schedule,
+    evaluation never submits, and skipped or aborted steps contribute nothing.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Discard the completed logging window."""
+        self.numerator = 0.0
+        self.denominator = 0.0
+        self.cp_sample_counts: Counter[int] = Counter()
+
+    def update(self, stats, skipped=False):
+        """Commit a successful step's summary exactly once, without collectives."""
+        if not stats or skipped:
+            return
+        self.numerator += stats['balance_numerator']
+        self.denominator += stats['balance_denominator']
+        self.cp_sample_counts.update(stats['cp_sample_counts'])
+
+    def metrics(self, reset=True):
+        """Divide accumulated work/counts once, then optionally clear the window."""
+        metrics = {}
+        if self.denominator > 0:
+            metrics['dcp/estimated_attention_balance_efficiency'] = (
+                self.numerator / self.denominator
+            )
+        sample_count = sum(self.cp_sample_counts.values())
+        if sample_count > 0:
+            metrics.update(
+                {
+                    f'dcp/cp_size_{c}_sample_fraction': count / sample_count
+                    for c, count in sorted(self.cp_sample_counts.items())
+                    if count > 0
+                }
+            )
+        if reset:
+            self.reset()
+        return metrics
 
 
 def update_packed_sequence_stats(sample_lengths, loss_mask):
