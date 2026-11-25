@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
 import math
@@ -22,12 +22,7 @@ except ImportError:
 
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .param_and_grad_buffer import (
-    _ParamAndGradBucketGroup,
-    _ParamAndGradBuffer,
-    group_params_for_buffers,
-    partition_buckets,
-)
+from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
 
 logger = logging.getLogger(__name__)
 
@@ -134,8 +129,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 )
             if not ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 raise ValueError(
-                    "MoonEP with MXFP8 requires reuse_grad_buf_for_mxfp8_param_ag=True "
-                    "(--reuse-grad-buf-for-mxfp8-param-ag)."
+                    "MoonEP with MXFP8 requires reuse_grad_buf_for_mxfp8_param_ag=True, which "
+                    "the training CLI sets for --fp8-recipe mxfp8 with --fp8-param-gather."
                 )
 
     def __init__(
@@ -229,16 +224,8 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
             all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel). fp8 params key to
-        # uint8 (own buffer); partition_buckets later merges the small non-fp8 bucket groups into
-        # the fp8 group to aggregate their communication.
-        buffer_groups = group_params_for_buffers(
-            all_params,
-            self.ddp_config.grad_reduce_in_fp32,
-            merge_layerwise_fp8_grads=not getattr(
-                self.ddp_config, 'use_layer_wise_param_layout', True
-            ),
-        )
+        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
+        buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
         # This maintains backward compatibility for callers that create DDP directly
@@ -684,7 +671,13 @@ class DistributedDataParallel(_BaseDataParallel):
         of bucket groups (e.g. a chained ``LayerWiseDistributedOptimizer`` +
         ``DistributedOptimizer`` pair) can sync only their own buckets without
         losing the post-processing that follows the collective.
+
+        Bucket groups that do not dispatch parameter sync through DDP are skipped:
+        their parameters are published by the owning optimizer (the compact LayerWise layout
+        without overlap or grad-buffer reuse gathers in ``allgather_params()``).
         """
+        if not bucket_group.param_sync_via_bucket_group:
+            return
         bucket_group.start_param_sync(force_sync=force_sync)
 
         if self.ddp_config.overlap_param_gather:

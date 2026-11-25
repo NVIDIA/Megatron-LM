@@ -121,6 +121,8 @@ class ProcessGroupCollection:
             identical to expt_dp when EGTP_remat_size=1
         intra_dp_cp: Intra partial data parallel group
         intra_expt_dp: Intra partial expert data parallel group
+        intra_dp_cp_gloo: Gloo checkpoint group for dense optimizer shards
+        intra_expt_dp_gloo: Gloo checkpoint group for expert optimizer shards
         inter_dist_opt: Inter distributed optimizer instance group
 
     Example:

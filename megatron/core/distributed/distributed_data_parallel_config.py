@@ -46,21 +46,9 @@ class DistributedDataParallelConfig:
        originally allocated model parameters, otherwise issue all-reduce collectives.
     """
 
-    disable_grad_buffers_cpu_backup: bool = False
-    """If true, allocate DDP gradient buffers in a torch_memory_saver region without CPU backup."""
-
-    disable_param_buffers_cpu_backup: bool = False
-    """If true, allocate DDP parameter buffers in a torch_memory_saver region without CPU backup."""
-
     num_distributed_optimizer_instances: int = 1
     """Sets the factor by which the DP domain is sharded to have the partial DistOpt
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
-    """
-
-    use_layer_wise_param_layout: bool = False
-    """Layer-wise (Muon) optimizer only. When True, LayerWise-managed buffers use
-       the shard-aligned padded LayerWise param layout. When False (default), the compact
-       decoupled layout is selected instead.
     """
 
     check_for_nan_in_grad: bool = False
@@ -116,8 +104,9 @@ class DistributedDataParallelConfig:
        perform the param all-gather in fp4."""
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
-    """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
-       set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
+    """Stage MXFP8 parameter all-gathers in gradient storage. Enable only for the MXFP8
+    recipe with ``fp8_param_gather``. Compact LayerWise also receives into gradient storage
+    whenever ``overlap_param_gather`` is enabled, even if this field is False."""
 
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
@@ -188,6 +177,16 @@ class DistributedDataParallelConfig:
     pool so that it can be deregistered, released, recreated, and registered
     again without disturbing persistent parameter storage.
     """
+
+    disable_grad_buffers_cpu_backup: bool = False
+    """If true, allocate the gradient buffers in a torch_memory_saver region without CPU backup,
+    so that pausing that memory (e.g. between RL phases) drops their content instead of copying
+    it to host memory. Ignored, with a warning, when torch_memory_saver is not installed. Not
+    supported with ``nccl_ub``."""
+
+    disable_param_buffers_cpu_backup: bool = False
+    """Like ``disable_grad_buffers_cpu_backup``, for the parameter buffers of the distributed
+    optimizer. A buffer that MXFP8 parameters share with gradients needs both flags equal."""
 
     fsdp_double_buffer: bool = False
     """If true, enable persistent communication-buffer pools for Megatron FSDP.
@@ -344,34 +343,6 @@ class DistributedDataParallelConfig:
     DP-Outer is prefetched one additional FSDP unit beyond the DP-Inner frontier.
     Only effective with ``outer_dp_sharding_strategy='optim'``.
     """
-
-    @property
-    def param_sync_via_bucket_group(self) -> bool:
-        """Whether DP parameter synchronization is dispatched through DDP bucket groups.
-
-        ``True``:
-        ``_ParamAndGradBucketGroup.start_param_sync()`` is the collective entry point. This is
-        the standard DistributedOptimizer path. LayerWise also uses it when overlap needs
-        bucket-level prefetch, or when MXFP8 reuse needs ``bucket.grad_data`` as the gather
-        buffer. With overlap, the current bucket's forward pre-hook waits for its gather and
-        dispatches the next bucket's gather before computation starts, allowing communication
-        for the next bucket to overlap with the current computation.
-
-        ``False``:
-        DDP bucket groups do not launch parameter all-gather. Then either:
-
-        - No gather is needed because every DP rank runs the same optimizer update.
-        - Another component performs the gather. With ``LayerWiseDistributedOptimizer``, this
-          happens when ``use_layer_wise_param_layout=False``, parameter-gather overlap is disabled,
-          and MXFP8 grad-buffer reuse is disabled. Each rank updates only its assigned parameters,
-          then the optimizer calls ``allgather_params()`` synchronously after the step.
-        """
-        if self.use_distributed_optimizer:
-            return True
-
-        # When standard DistOpt is disabled, these flags select the legacy LayerWise
-        # bucket-group path: forward-scheduled overlap or synchronous grad-buffer reuse.
-        return self.overlap_param_gather or self.reuse_grad_buf_for_mxfp8_param_ag
 
     def finalize(self) -> None:
         """Resolve local defaults after recipe edits and before wrapper construction.

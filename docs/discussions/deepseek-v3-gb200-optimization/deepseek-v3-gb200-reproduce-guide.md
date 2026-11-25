@@ -274,7 +274,6 @@ This is a very important step on GB200.
 --fp8-recipe mxfp8 \
 --fp8-format e4m3 \
 --fp8-param-gather \
---reuse-grad-buf-for-mxfp8-param-ag \
 --use-precision-aware-optimizer \
 --main-grads-dtype fp32 \
 --main-params-dtype fp32 \
@@ -329,7 +328,6 @@ The following arguments indicate key optimizations.
 --fp8-recipe mxfp8 \
 --fp8-format e4m3 \
 --fp8-param-gather \
---reuse-grad-buf-for-mxfp8-param-ag \
 ```
 
 - BF16 optimizer states

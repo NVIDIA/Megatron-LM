@@ -663,7 +663,6 @@ def get_mimo_model(
             overlap_param_gather=use_layer_wise_distributed_optimizer,
             bucket_size=10000,
             use_distributed_optimizer=True,
-            use_layer_wise_param_layout=use_layer_wise_distributed_optimizer,
         )
 
     if use_layer_wise_distributed_optimizer or freeze_encoder:
@@ -680,7 +679,6 @@ def get_mimo_model(
             ),
             ddp_config,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-            use_layer_wise_param_layout=ddp_config.use_layer_wise_param_layout,
         )
     else:
         if mimo_model.language_model is not None:

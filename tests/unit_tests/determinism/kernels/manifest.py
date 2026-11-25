@@ -162,7 +162,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_dev_sync_kernels.py",),
         kind="torch-op",
         notes="The detected bincount is CPU integer shard metadata inside ntp_map; replay it "
-        "directly. This does not qualify NTP distributed resharding collectives.",
+        "with the side-gradient and bucket ranges for replicated and sharded buffers.",
     ),
     KernelEntry(
         name="fused_linear_cross_entropy",
@@ -835,7 +835,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
-        "logging) launch the same multi_tensor kernels through multi_tensor_applier.",
+        "logging) launch the same multi_tensor kernels through multi_tensor_applier. The opt-in "
+        "per-head split-QKV Muon update (batched Newton-Schulz per head width) is replayed in "
+        "test_optimizer_kernels.py.",
     ),
     KernelEntry(
         name="tensor_metric_l2",
@@ -854,13 +856,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/distributed/test_param_storage_copyback.py",
             "tests/unit_tests/distributed/test_gradient_scaling.py",
             "tests/unit_tests/rl/test_rl_utils.py",
+            "tests/unit_tests/test_layer_wise_optimizer.py",
         ),
         kind="external-lib",
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
         "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay; "
         "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration. "
         "Token scaling is compared exactly with FP32 multiplication in eager and CUDA graph "
-        "replay, including changing factors and low-precision gradient buffers.",
+        "replay, including changing factors and low-precision gradient buffers. The LayerWise "
+        "all-reduce grad collective (all-reduced LayerWise buckets next to reduce-scattered "
+        "DistOpt buckets, uneven whole-param gathers with overlap) is replayed bit-exactly over "
+        "three training steps.",
     ),
     KernelEntry(
         name="nccl_allocator",
@@ -1087,7 +1093,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="TE cast_master_weights_to_fp8 / cast_to_fp8 (covered at model level by "
         "test_fp8_determinism.py), NVFP4 quantize_master_weights (needs TE>=2.7 + Blackwell, "
         "uncovered) and the apex multi_tensor_scale used by Megatron-FSDP mixed precision "
-        "(kernel replayed in test_optimizer_kernels.py).",
+        "(kernel replayed in test_optimizer_kernels.py). The whole-param BF16 -> MXFP8 / "
+        "blockwise requantization of LayerWise gathers is replayed in test_optimizer_kernels.py "
+        "(blockwise on Hopper, MXFP8 on Blackwell).",
     ),
     KernelEntry(
         name="inference_mxfp8_quantization",
@@ -1192,6 +1200,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/optimizer/test_layer_sharded_muon.py",
             "tests/unit_tests/optimizer/test_layer_sharded_e2e_parity.py",
             "tests/unit_tests/optimizer/test_muon_grouped_projection.py",
+            K + "test_optimizer_kernels.py",
         ),
         kind="dispatch",
         notes="LayerShardedMuon._run_ns calls emerging-optimizers newton_schulz on the assembled "
@@ -1201,7 +1210,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_layer_sharded_muon.py (test_step_matches_duplicated_mode, "
         "test_batched_matches_unbatched, test_concurrent_groups_match_serial_bitwise, "
         "test_exchange_plan_cache_bitwise_and_reused) and the e2e parity module against "
-        "TensorParallelMuon duplicated mode. test_grouped_muon_replays also checks grouped "
+        "TensorParallelMuon duplicated mode. test_muon_per_head_orthogonalize_replays covers "
+        "per-head QKV and MLA splits. test_grouped_muon_replays also checks grouped "
         "weights and momentum under stream contention for both optimizer implementations. "
         "The CI container's emerging-optimizers runs the "
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",

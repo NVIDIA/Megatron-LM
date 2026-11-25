@@ -352,13 +352,36 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Return independent batch partitions, including GTP batch shards but not CP."""
         return self.get_parallel_layout(self.get_model_world_size()).batch_parallel_size
 
+    def _mxfp8_param_gather_reuses_grad_buffer(self) -> bool:
+        """Whether the MXFP8 parameter all-gather has to stage in gradient storage.
+
+        MXFP8 parameters cannot be mapped into DDP's parameter buffer, so outside FSDP their
+        all-gather always goes through the gradient buffer. This follows from the effective
+        model and wrapper configuration, whichever entry point built the container.
+        """
+        transformer = self.model.transformer
+        return (
+            transformer.fp8 is not None
+            and transformer.fp8_recipe == "mxfp8"
+            and self.ddp.fp8_param_gather
+            and not self.ddp.use_megatron_fsdp
+            and not isinstance(self.ddp, TorchFullyShardedDataParallelConfig)
+        )
+
     def _optimizer_with_model_precision(self) -> OptimizerConfig:
-        """Return an optimizer copy with authoritative model precision, without mutation."""
-        precision = {
+        """Return an optimizer copy with authoritative model precision, without mutation.
+
+        The copy also carries the derived MXFP8 grad-buffer reuse. Only ``validate_args``
+        sets that flag for CLI runs; YAML and native configs reach validation and
+        finalization through this copy.
+        """
+        effective = {
             name: getattr(self.model.transformer, name)
             for name in ("fp16", "bf16", "params_dtype", "fp8_recipe")
         }
-        return replace(self.optimizer, **precision)
+        if self._mxfp8_param_gather_reuses_grad_buffer():
+            effective["reuse_grad_buf_for_mxfp8_param_ag"] = True
+        return replace(self.optimizer, **effective)
 
     def _resolve_batch_sizes(
         self, batch_parallel_size: int | None = None
@@ -486,13 +509,26 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
         global_batch_size, _, _ = self._resolve_batch_sizes()
-        self._validate_ddp_config()
+        self._validate_ddp_config(optimizer)
         self._validate_rl_config(global_batch_size)
         optimizer.validate_run(
             ddp_config=self.ddp,
             use_torch_fsdp2=isinstance(self.ddp, TorchFullyShardedDataParallelConfig),
             ckpt_format=self.checkpoint.ckpt_format,
         )
+        # A conversion run saves its optimizer under --ckpt-convert-format, which the check above
+        # does not see. A skip_train run builds no optimizer, and --no-save-optim skips its state.
+        if (
+            self.checkpoint.ckpt_convert_format == "torch"
+            and self.checkpoint.save_optim
+            and not self.validation.skip_train
+            and optimizer.uses_layer_wise_distributed_optimizer()
+        ):
+            raise ValueError(
+                "--ckpt-convert-format torch does not save the state of the DistributedOptimizer "
+                "that the LayerWise layouts chain next to the layer-wise optimizer. Use "
+                "--ckpt-convert-format torch_dist, or --no-save-optim to convert the model only."
+            )
         optimizer.validate_model(
             moe_single_grouped_weight=transformer.moe_single_grouped_weight,
             virtual_pipeline_model_parallel_size=transformer.virtual_pipeline_model_parallel_size,
@@ -528,23 +564,35 @@ class PretrainConfigContainer(ConfigContainerBase):
         ):
             # Legacy checkpointing uses Gloo process groups to collect the full distributed
             # optimizer state in the CPU memory of DP rank 0. Emerging optimizers resolve to
-            # the layer-wise path at finalize and save their state separately on each rank.
+            # the layer-wise path at finalize, which rejects the legacy torch format itself
+            # (OptimizerConfig.validate_run).
             assert checkpoint.use_dist_ckpt, (
                 '--use-distributed-optimizer without Gloo process groups requires a distributed '
                 'checkpoint format (--ckpt-format torch_dist, torch_dcp or fsdp_dtensor): the legacy '
                 'torch format gathers the optimizer state through Gloo.'
             )
-            if checkpoint.dist_ckpt_optim_fully_reshardable:
-                assert not checkpoint.distrib_optim_fully_reshardable_mem_efficient, \
-                    '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+        if (
+            not dist.use_gloo_process_groups
+            and checkpoint.dist_ckpt_optim_fully_reshardable
+            and (
+                self.optimizer.use_distributed_optimizer
+                or self.optimizer.uses_layer_wise_distributed_optimizer()
+            )
+        ):
+            # Both LayerWise layouts have a scalar DistributedOptimizer that saves over Gloo.
+            assert not checkpoint.distrib_optim_fully_reshardable_mem_efficient, \
+                '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
         if self.optimizer.overlap_param_gather and checkpoint.save is not None:
             assert checkpoint.save_params_interval is None, \
                 '--save-params-interval is not supported with --overlap-param-gather'
 
-    def _validate_ddp_config(self) -> None:
-        """Check wrapper requirements without deriving or mutating other configs."""
+    def _validate_ddp_config(self, optimizer: OptimizerConfig) -> None:
+        """Check wrapper requirements without deriving or mutating other configs.
+
+        ``optimizer`` is the effective copy from ``_optimizer_with_model_precision``.
+        """
         # DDP's copy is derived during finalization; recipes only set optimizer policy.
-        if self.optimizer.reuse_grad_buf_for_mxfp8_param_ag and not self.ddp.use_megatron_fsdp:
+        if optimizer.reuse_grad_buf_for_mxfp8_param_ag and not self.ddp.use_megatron_fsdp:
             if self.ddp.grad_buffer_offload or self.rl.requires_grad_buffer_offload:
                 raise ValueError(
                     "Gradient-buffer offload is incompatible with "
@@ -796,7 +844,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             not isinstance(self.ddp, TorchFullyShardedDataParallelConfig)
             and not self.ddp.use_megatron_fsdp
             and self.optimizer.use_layer_wise_distributed_optimizer
-            and self.optimizer.use_layer_wise_param_layout
         )
         if transformer is not None:
             transformer.fp8_param = self.ddp.fp8_param_gather

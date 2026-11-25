@@ -159,7 +159,6 @@ ARGS:
   fp8_recipe: mxfp8
   fp8_format: e4m3
   fp8_param_gather: true
-  reuse_grad_buf_for_mxfp8_param_ag: true
   main_grads_dtype: fp32
   main_params_dtype: fp32
   moe_router_padding_for_quantization: true
@@ -201,4 +200,4 @@ ARGS:
   muon_momentum: 0.95
   muon_coefficient_type: deepseekv4
   muon_num_ns_steps: 10
-  no_use_layer_wise_param_layout: true
+  second_order_optimizer_grad_collective: all-reduce

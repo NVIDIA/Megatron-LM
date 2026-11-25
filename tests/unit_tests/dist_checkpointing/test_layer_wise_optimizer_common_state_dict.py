@@ -62,6 +62,9 @@ class TestLayerWiseOptimizerCommonStateDict:
         with TempNamedDir(tmp_path_dist_ckpt / 'test_dp_sharding', sync=True) as ckpt_dir:
             mock_args = parse_args(ignore_unknown_args=True)
             mock_args.use_distributed_optimizer = False
+            # dist_muon chains a DistributedOptimizer next to LayerWise; the checkpoint metadata
+            # must name its sharding type.
+            mock_args.use_layer_wise_distributed_optimizer = optimizer_type == 'dist_muon'
             mock_args.save_tokenizer_assets = False
             with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
                 # Initialize model and optimizer A
@@ -135,7 +138,8 @@ class TestLayerWiseOptimizerCommonStateDict:
 
     @pytest.mark.parametrize('tp', [1, 2])
     @pytest.mark.parametrize('pp', [1, 2])
-    def test_optimizer_common_state_dict_hybrid(self, tmp_path_dist_ckpt, tp, pp):
+    @pytest.mark.parametrize('grad_collective', ['reduce-scatter', 'all-reduce'])
+    def test_optimizer_common_state_dict_hybrid(self, tmp_path_dist_ckpt, tp, pp, grad_collective):
         """End-to-end ``save_checkpoint``/``load_checkpoint`` roundtrip on the
         hybrid LayerWise + DistributedOptimizer path.
 
@@ -147,7 +151,8 @@ class TestLayerWiseOptimizerCommonStateDict:
         ``use_distributed_optimizer`` off in Muon mode -- the DistOpt
         sub-optimizer then defaulted to the deprecated
         ``fully_sharded_model_space`` save path which is incompatible with
-        the post-5ab481cb45 ShardedTensor validation.
+        the post-5ab481cb45 ShardedTensor validation. Runs with the padded and the compact
+        LayerWise layout.
         """
         if tp * pp > 8:
             pytest.skip("TP*PP > 8 is larger than world size")
@@ -172,7 +177,7 @@ class TestLayerWiseOptimizerCommonStateDict:
                     initialize_fn=initialize_gpt_model,
                     dist_opt=True,
                     optimizer='dist_muon',
-                    use_param_layout=True,
+                    grad_collective=grad_collective,
                 )
 
                 init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=True)
@@ -197,7 +202,7 @@ class TestLayerWiseOptimizerCommonStateDict:
                     initialize_fn=initialize_gpt_model,
                     dist_opt=True,
                     optimizer='dist_muon',
-                    use_param_layout=True,
+                    grad_collective=grad_collective,
                 )
 
                 sync_checkpoint_config(mock_args)

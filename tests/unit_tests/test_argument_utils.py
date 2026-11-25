@@ -91,21 +91,18 @@ def test_muon_syrk_cli_flag_reaches_optimizer_config_kwargs(enabled):
 
 
 @pytest.mark.parametrize(
-    "flags, expected",
+    "flags, collective",
     [
-        ([], False),
-        (["--use-layer-wise-param-layout"], True),
-        (["--no-use-layer-wise-param-layout"], False),
-        (["--use-layer-wise-param-layout", "--no-use-layer-wise-param-layout"], False),
-        (["--no-use-layer-wise-param-layout", "--use-layer-wise-param-layout"], True),
+        ([], "reduce-scatter"),
+        (["--second-order-optimizer-grad-collective", "reduce-scatter"], "reduce-scatter"),
+        (["--second-order-optimizer-grad-collective", "all-reduce"], "all-reduce"),
     ],
 )
-def test_layer_wise_layout_cli_defaults_to_compact(flags, expected):
+def test_second_order_optimizer_grad_collective_cli_defaults_to_reduce_scatter(flags, collective):
     parser = add_megatron_arguments(ArgumentParser())
     args = parser.parse_args(flags)
-    assert args.use_layer_wise_param_layout is expected
-    kwargs = _default_config_from_args(DistributedDataParallelConfig, args, return_instance=False)
-    assert kwargs["use_layer_wise_param_layout"] is expected
+    kwargs = _default_config_from_args(OptimizerConfig, args, return_instance=False)
+    assert kwargs["second_order_optimizer_grad_collective"] == collective
 
 
 @pytest.mark.parametrize("count", [2, 3])
@@ -115,47 +112,6 @@ def test_fsdp_buffer_count_cli_reaches_ddp_config(count):
     kwargs = _default_config_from_args(DistributedDataParallelConfig, args, return_instance=False)
     assert kwargs["fsdp_buffer_count"] == count
     assert kwargs["fsdp_double_buffer"] is True
-
-
-@pytest.mark.parametrize("padded_layout", [False, True])
-def test_layerwise_fp8_validation_respects_layout_support(monkeypatch, padded_layout):
-    args = _minimal_training_args(monkeypatch)
-    args.world_size = 1
-    args.freeze_base_model_for_mtp = False
-    args.optimizer = 'muon'
-    args.use_distributed_optimizer = True
-    args.use_layer_wise_param_layout = padded_layout
-    args.bf16 = True
-    args.fp8 = 'hybrid'
-    args.fp8_recipe = 'blockwise'
-    args.fp8_param_gather = True
-    if padded_layout:
-        with pytest.raises(AssertionError, match="Padded LayerWise parameter layout"):
-            validate_args(args)
-    else:
-        validate_args(args)
-        assert args.use_layer_wise_distributed_optimizer
-
-
-@pytest.mark.parametrize("reuse_grad_buffer", [False, True])
-def test_padded_layerwise_mxfp8_requires_grad_buffer_transport(monkeypatch, reuse_grad_buffer):
-    args = _minimal_training_args(monkeypatch)
-    args.world_size = 1
-    args.freeze_base_model_for_mtp = False
-    args.optimizer = 'muon'
-    args.use_distributed_optimizer = True
-    args.use_layer_wise_param_layout = True
-    args.bf16 = True
-    args.fp8 = 'e4m3'
-    args.fp8_recipe = 'mxfp8'
-    args.fp8_param_gather = True
-    args.reuse_grad_buf_for_mxfp8_param_ag = reuse_grad_buffer
-    if reuse_grad_buffer:
-        validate_args(args)
-        assert args.use_layer_wise_distributed_optimizer
-    else:
-        with pytest.raises(AssertionError, match="reuse-grad-buf-for-mxfp8-param-ag"):
-            validate_args(args)
 
 
 def _minimal_training_args(monkeypatch):
@@ -1774,7 +1730,8 @@ def test_optimizer_model_constraints_use_the_model_owner(native_model, valid, co
     args = _make_args(moe_grouped_gemm=True, moe_use_grouped_tensor=True)
     args.micro_batch_size = 1
     args.global_batch_size = 1
-    args.ckpt_format = "torch"
+    # The step-overlap path needs the torch format; the layer-wise optimizer rejects it.
+    args.ckpt_format = "torch" if constraint == "vpp" else "torch_dist"
     args.use_distributed_optimizer = True
     args.optimizer = "adam" if constraint == "vpp" else "muon"
     args.overlap_param_gather = constraint == "vpp"
@@ -1810,18 +1767,14 @@ def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch
     args.use_distributed_optimizer = True
     args.use_gloo_process_groups = False
     args.ckpt_format = "torch"
-    args.use_layer_wise_param_layout = False
     with pytest.raises(AssertionError) if optimizer in ("adam", "sgd") else nullcontext():
         validate_args(args)
 
 
-@pytest.mark.parametrize("use_layer_wise_param_layout", [False, True])
 @pytest.mark.parametrize("optimizer", ["adam", "muon", "dist_muon"])
-def test_mem_efficient_reshardable_checkpoint_gloo_requirement(
-    monkeypatch, optimizer, use_layer_wise_param_layout
-):
+def test_mem_efficient_reshardable_checkpoint_gloo_requirement(monkeypatch, optimizer):
     """Every optimizer that builds a DistributedOptimizer needs Gloo for the mem-efficient
-    fully reshardable format, including the one the layer-wise path builds for Muon."""
+    fully reshardable format, including the one both LayerWise layouts build for Muon."""
     args = _minimal_training_args(monkeypatch)
     args.optimizer = optimizer
     args.use_distributed_optimizer = True
@@ -1829,13 +1782,7 @@ def test_mem_efficient_reshardable_checkpoint_gloo_requirement(
     args.ckpt_format = "torch_dist"
     args.dist_ckpt_optim_fully_reshardable = True
     args.distrib_optim_fully_reshardable_mem_efficient = True
-    args.use_layer_wise_param_layout = use_layer_wise_param_layout
-    builds_distributed_optimizer = optimizer == "adam" or use_layer_wise_param_layout
-    with (
-        pytest.raises(AssertionError, match="fully-reshardable-mem-efficient")
-        if builds_distributed_optimizer
-        else nullcontext()
-    ):
+    with pytest.raises(AssertionError, match="fully-reshardable-mem-efficient"):
         validate_args(args)
 
 
