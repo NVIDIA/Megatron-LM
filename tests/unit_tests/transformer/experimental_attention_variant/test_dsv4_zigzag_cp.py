@@ -1414,12 +1414,23 @@ class TestPackedDSv4ZigzagCPDistributed:
             oracle_y.append(out.detach())
             oracle_dx.append(sample.grad.detach())
             for name, parameter in model.named_parameters():
-                assert parameter.grad is not None, name
+                if (
+                    name.startswith("core_attention.compressor.")
+                    and span < model.core_attention.compress_ratio
+                ):
+                    # No full compressed KV row exists. The CP1 compressor returns before its
+                    # projections and APE, so this document contributes zero to their VJP.
+                    assert (
+                        parameter.grad is None or parameter.grad.count_nonzero().item() == 0
+                    ), name
+                    continue
+                assert parameter.grad is not None, (name, length, span)
                 if name not in oracle_grads:
                     oracle_grads[name] = parameter.grad.detach().float().clone()
                 else:
                     oracle_grads[name].add_(parameter.grad.detach().float())
             start += span
+        assert set(oracle_grads) == set(dict(modules["cp1"].named_parameters()))
         oracle_y = torch.cat(oracle_y)
         oracle_dx = torch.cat(oracle_dx)
         rows = {
