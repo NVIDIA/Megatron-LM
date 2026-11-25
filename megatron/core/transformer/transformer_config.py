@@ -4182,7 +4182,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_router_bias_bf16_counts and (
             not self.bf16 or not self.moe_router_enable_expert_bias
         ):
-            raise ValueError("moe_router_bias_bf16_counts requires BF16 and count-based expert bias.")
+            raise ValueError(
+                "moe_router_bias_bf16_counts requires BF16 and count-based expert bias."
+            )
         if self.moe_router_load_balancing_type == "quantile_balancing":
             aux_coeffs = (
                 self.moe_aux_loss_coeff

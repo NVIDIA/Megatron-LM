@@ -144,7 +144,8 @@ def test_bf16_expert_bias_counts_and_scale(monkeypatch, deterministic):
         torch.use_deterministic_algorithms(deterministic)
         for routes in [indices, valid]:
             router = SimpleNamespace(
-                enable_expert_bias=True, local_tokens_per_expert=torch.zeros(3, dtype=torch.bfloat16)
+                enable_expert_bias=True,
+                local_tokens_per_expert=torch.zeros(3, dtype=torch.bfloat16),
             )
             for _ in range(3):
                 TopKRouter._apply_expert_bias(router, routes, padding_mask=mask)
