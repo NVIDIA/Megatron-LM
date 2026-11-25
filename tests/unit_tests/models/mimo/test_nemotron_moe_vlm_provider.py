@@ -501,6 +501,8 @@ def test_language_model_spec_builds_mamba():
     from megatron.core.models.mamba.mamba_model import MambaModel
 
     args = _parse_validate(_build_argv(*_PRESET_20L))
+    # Constructor capacity is independent of this run's physical input width.
+    get_run_config().model.seq_length = 2 * args.seq_length
     args.mimo_llm_ep = 2
     args.mimo_llm_expt_tp = 2
     get_run_config().model.transformer.expert_tensor_parallel_num_weight_shards = (
@@ -512,7 +514,11 @@ def test_language_model_spec_builds_mamba():
     assert spec.params["config"].num_layers == 20
     assert spec.params["config"].expert_model_parallel_size == 2
     assert spec.params["config"].expert_tensor_parallel_size == 2
-    assert spec.params["max_sequence_length"] == args.seq_length
+    assert spec.params["max_sequence_length"] == get_run_config().model.seq_length
+    assert (
+        spec.params["max_sequence_length"]
+        != get_run_config().model.transformer.max_seq_length_per_sample
+    )
     assert spec.params["logit_dtype"] is None
     assert spec.params["mamba_stack_spec"] is mamba_stack_spec
 
