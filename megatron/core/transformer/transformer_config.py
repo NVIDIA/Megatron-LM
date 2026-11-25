@@ -1227,7 +1227,8 @@ class TransformerConfig(ModelParallelConfig):
     DeepSeek-V3 routing (sigmoid scores, 256 experts, top-8, optionally 8 groups with group
     top-4) as a single kernel in each direction and composes other router configurations from its
     separate router kernels. Used for training steps without padding mask, token dropping or
-    router replay; all other calls take the unfused path."""
+    router replay, and not with moe_router_pre_softmax (softmax scores) or a transformer_engine
+    CUDA graph of moe_router without moe_preprocess; all other calls take the unfused path."""
 
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""

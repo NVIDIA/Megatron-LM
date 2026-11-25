@@ -17,6 +17,7 @@ from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP_DENSE_ROUTING
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -1173,6 +1174,15 @@ class TopKRouter(Router):
             and config.moe_expert_capacity_factor is None
             and self.router_replay is None
             and set(routing_types) <= {"aux_loss", "seq_aux_loss", "global_aux_loss", "none"}
+            # TE's fused top-k has no pre-softmax option.
+            and not (self.score_function == "softmax" and config.moe_router_pre_softmax)
+            # A TE CUDA graph of moe_router without moe_preprocess hands its outputs to the eager
+            # preprocessing as new tensors, without the compact-layout tag.
+            and not (
+                config.cuda_graph_impl == "transformer_engine"
+                and CudaGraphModule.moe_router in config.cuda_graph_modules
+                and CudaGraphModule.moe_preprocess not in config.cuda_graph_modules
+            )
             # the fused counts are per expert, not per (sequence, expert)
             and (bsz == 1 or self.get_aux_loss_coeff("seq_aux_loss") == 0)
             and (self.expert_bias is None or self.expert_bias.dtype == torch.float32)

@@ -1850,6 +1850,59 @@ class TestFusedAuxScoresRouter:
             probs, _ = router(hidden, **kwargs)
         assert probs.shape == (256, router.config.num_moe_experts)
 
+    def test_pre_softmax_router_keeps_unfused_path(self):
+        """TE's fused top-k has no pre-softmax option, so moe_router_pre_softmax keeps the unfused
+        path. With topk=1 and no scaling the selected expert's weight is then its softmax score
+        (not 1), so the task loss gives the router a gradient."""
+        router = self._router(
+            moe_router_fused_aux_scores=True,
+            num_moe_experts=64,
+            moe_router_topk=1,
+            moe_router_score_function="softmax",
+            moe_router_pre_softmax=True,
+            moe_router_topk_scaling_factor=None,
+            moe_router_num_groups=None,
+            moe_router_group_topk=None,
+            moe_router_enable_expert_bias=False,
+            moe_router_load_balancing_type="none",
+            moe_aux_loss_coeff=0.0,
+        )
+        hidden = torch.randn(256, 1, 64, device="cuda", dtype=torch.bfloat16)
+        probs, routing_map = router(hidden)
+        assert not is_compact_route_probs(probs)
+        assert probs.shape == (256, 64)
+        route_probs = probs.gather(1, routing_map)
+        assert (route_probs < 1).all()
+        (route_probs.float() * torch.randn_like(route_probs, dtype=torch.float32)).sum().backward()
+        assert router.weight.grad.abs().sum() > 0
+
+    @pytest.mark.parametrize("with_preprocess", [False, True])
+    def test_te_cuda_graph_of_router_without_preprocess(self, with_preprocess):
+        """A transformer_engine CUDA graph of moe_router without moe_preprocess returns the router
+        outputs to the eager preprocessing as new tensors, without the compact-layout tag; the
+        router then gives full-width probs, which the dispatcher handles untagged."""
+        modules = ["moe_router", "moe_preprocess"] if with_preprocess else ["moe_router"]
+        router = self._router(
+            moe_router_fused_aux_scores=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=modules,
+        )
+        hidden = torch.randn(256, 1, 64, device="cuda", dtype=torch.bfloat16)
+        probs, routing_map = router(hidden)
+        assert is_compact_route_probs(probs) == with_preprocess
+        if with_preprocess:
+            return
+        # What graph replay hands to the eager preprocessing.
+        replayed_probs, replayed_map = probs.detach().clone(), routing_map.clone()
+        num_experts = router.config.num_moe_experts
+        dispatcher = SimpleNamespace(tp_size=1, ep_size=1, num_local_experts=num_experts)
+        init = token_dispatcher_module.MoEFlexTokenDispatcher._initialize_metadata
+        replayed_map, replayed_probs = init(dispatcher, replayed_map, replayed_probs)
+        manager = SimpleNamespace(capacity_factor=None)
+        token_dispatcher_module._NCCLEPManager.setup_metadata(manager, replayed_map, replayed_probs)
+        assert torch.equal(manager.token_indices, routing_map)
+        assert torch.equal(manager.token_probs, probs.detach().gather(1, routing_map))
+
     def test_requires_router_fusion(self):
         with pytest.raises(ValueError, match="moe_router_fused_aux_scores requires"):
             self._router(moe_router_fused_aux_scores=True, moe_router_aux_loss_fusion=False)
