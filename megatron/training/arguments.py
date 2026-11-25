@@ -2718,9 +2718,11 @@ def _add_regularization_args(parser):
                        help='Decay degree p of the angular multiplier. 0 disables the decay.')
     group.add_argument('--muown-angular-plateau-degree', type=float, default=1.0,
                        help='Plateau degree r >= 1 of the angular multiplier.')
-    group.add_argument('--muown-angular-warmup-iters', type=int, default=None,
-                       help='Iterations that keep the angular multiplier at 1. '
-                       'Defaults to the learning-rate warmup.')
+    group.add_argument('--muown-angular-warmup-iters', type=int, default=0,
+                       help='Iterations that keep the angular multiplier at 1.')
+    group.add_argument('--muown-angular-horizon-iters', type=int, default=0,
+                       help='Iterations that normalize the progress of the angular multiplier, '
+                       'usually --train-iters. 0 disables the decay.')
     group.add_argument('--muown-norm-eps', type=float, default=1e-12,
                        help='Floor for the absolute row scale and the row-normalization '
                        'denominator.')
