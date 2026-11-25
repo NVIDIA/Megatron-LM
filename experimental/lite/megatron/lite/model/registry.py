@@ -107,6 +107,13 @@ register_model(
 )
 
 register_model(
+    "minimax_m3",
+    package="megatron.lite.model.minimax_m3",
+    hf_model_types=["minimax_m3_vl"],
+    impls={"lite": "megatron.lite.model.minimax_m3.lite.protocol"},
+)
+
+register_model(
     "deepseek_v4",
     package="megatron.lite.model.deepseek_v4",
     hf_model_types=["deepseek_v4"],
