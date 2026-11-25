@@ -441,7 +441,9 @@ def _is_offline_model() -> bool:
     return transformations is not None and transformations.original_num_layers is not None
 
 
-def train_valid_test_sft_datasets_provider(train_val_test_num_samples, offline_data_dir=None):
+def train_valid_test_sft_datasets_provider(
+    train_val_test_num_samples, offline_data_dir=None, *, sequence_length
+):
     """Build the train test and validation datasets.
 
     Args:
@@ -474,7 +476,7 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples, offline_d
             "hf_dataset_split": args.finetune_data_split,
             "hf_dataset_data_files": args.finetune_data_files,
             "tokenizer": hf_tokenizer,
-            "seq_length": args.seq_length,
+            "seq_length": sequence_length,
             # Optional kwargs
             "num_shards": mpu.get_expert_data_parallel_world_size(),
             "shard_index": mpu.get_expert_data_parallel_rank(),
@@ -494,6 +496,7 @@ def get_batch(data_iterator):
 
     For OfflineDataset, the aux_hidden_states and final hidden_states from the
     base model are loaded for offline speculative model training."""
+    cfg = get_run_config()
     # TODO: this is pretty hacky, find a better way
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
         return None, None, None, None, None
@@ -526,7 +529,7 @@ def get_batch(data_iterator):
     sample_loss_mask = data_b.get("loss_mask")
     batch = build_lm_batch(
         data_b["input_ids"],
-        args.seq_length,
+        cfg.model.transformer.max_seq_length_per_sample,
         sample_loss_mask=sample_loss_mask,
         eos_token_id=get_eos_token_id(),
         reset_position_ids=args.reset_position_ids,
@@ -536,8 +539,9 @@ def get_batch(data_iterator):
     )
 
     if offline:
-        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[: args.seq_length]
-        batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[: args.seq_length]
+        sequence_length = cfg.model.transformer.max_seq_length_per_sample
+        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[:sequence_length]
+        batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[:sequence_length]
 
     return batch
 
@@ -595,12 +599,17 @@ if __name__ == "__main__":
     model_cfg = modelopt_model_config_from_args(args, vocab_size_from_tokenizer=True)
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     full_config.distillation = distillation_config_from_args(args, model_cfg)
+    if full_config.model.transformer.max_seq_length_per_sample != args.seq_length:
+        raise ValueError(
+            "ModelOpt's fixed-width dataset requires max_seq_length_per_sample == seq_length"
+        )
     set_run_config(full_config)
     pretrain(
         full_config,
         partial(
             train_valid_test_sft_datasets_provider,
             offline_data_dir=args.offline_distillation_data,
+            sequence_length=args.seq_length,
         ),
         ModelType.encoder_or_decoder,
         forward_step,

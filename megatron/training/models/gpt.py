@@ -191,9 +191,9 @@ class GPTModelConfig(ModelConfig):
 
     ### GPT Model initialization ###
     seq_length: int = 1024
-    """Position-embedding capacity, passed to GPTModel as max_sequence_length; the launcher fills
-    it from --max-position-embeddings. The training sequence length that core modules size
-    buffers from is TransformerConfig.max_seq_length_per_sample on ``transformer``.
+    """Learned position-table capacity and model/export metadata, passed to GPTModel as
+    max_sequence_length; the launcher fills it from --max-position-embeddings. It does not
+    limit RoPE inputs. Runtime buffers use ``transformer.max_seq_length_per_sample`` instead.
     """
     fp16_lm_cross_entropy: bool = False
     logit_dtype: torch.dtype | None = None
