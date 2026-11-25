@@ -347,7 +347,7 @@ class FsdpModule:
         order.advance()
 
     def _unshard_parameter_groups(self, phase: Phase | None) -> None:
-        """Ask each group to gather missing weights on the all-gather stream."""
+        """Schedule each group's DP-outer and DP-inner weight gathers."""
         if phase not in (Phase.FORWARD, Phase.BACKWARD, None):
             raise ValueError(
                 f"Unsharding requires a FORWARD, BACKWARD, or None phase, got {phase!r}."
@@ -358,13 +358,20 @@ class FsdpModule:
         if phase is Phase.BACKWARD and self._schedule_policy.unshard_all_planes_in_backward:
             phase = None
         context = self.context
-        # Groups use the DP-outer stream only for stale weights. FsdpContext.pre_forward()
-        # has already ordered it after the weight sync.
-        with torch.cuda.stream(context.allgather_stream):
+        allgather_stream = context.allgather_stream
+        outer_allgather_stream = context.outer_allgather_stream
+        with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters(
-                    phase, outer_allgather_stream=context.outer_allgather_stream
-                )
+                missing_phases = group.missing_unshard_phases(phase)
+                if not missing_phases:
+                    continue
+                if group.requires_outer_unshard:
+                    # Root pre-forward has already ordered this stream after weight sync.
+                    with torch.cuda.stream(outer_allgather_stream):
+                        group.unshard_outer()
+                    if outer_allgather_stream is not allgather_stream:
+                        allgather_stream.wait_stream(outer_allgather_stream)
+                group.unshard_inner(missing_phases)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""

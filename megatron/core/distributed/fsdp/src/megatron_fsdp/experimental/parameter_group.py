@@ -472,38 +472,29 @@ class FsdpParameterGroup:
             return False
         return buffer.is_rowwise_allocated
 
-    def unshard_parameters(
-        self, phase: Phase | None = None, *, outer_allgather_stream: torch.cuda.Stream
-    ) -> None:
-        """Prepare this group's Parameters for the requested compute phase.
-
-        On the caller-selected all-gather stream, refresh compute weights, gather
-        missing data if sharded, update FsdpParameters, switch the module's
-        Parameters to their unsharded representations, and record readiness.
-        Reuse existing events so compute never waits for a later prefetch when its
-        weights are already available.
-
-        The post-optimizer DP-outer all-gather that refreshes stale compute weights
-        runs on ``outer_allgather_stream``. It is the all-gather stream by default; a
-        separate stream lets it overlap DP-inner all-gathers of earlier groups. The
-        caller must have ordered that stream after the weight sync, which
-        ``FsdpContext.pre_forward()`` does on the root.
-        """
+    def missing_unshard_phases(self, phase: Phase | None) -> tuple[Phase, ...]:
+        """Return the requested phases that do not already have a readiness event."""
         requested_phases = (Phase.FORWARD, Phase.BACKWARD) if phase is None else (phase,)
-        missing_phases = tuple(p for p in requested_phases if p not in self._unshard_events)
-        if not missing_phases:
-            return
+        return tuple(p for p in requested_phases if p not in self._unshard_events)
 
-        if self._model_weight_is_stale:
-            allgather_stream = torch.cuda.current_stream()
-            with torch.cuda.stream(outer_allgather_stream):
-                # Writes the persistent model_weight in place; no allocation.
-                self.post_optimizer_model_weight.redistribute(
-                    self.model_weight.placements, out=self.model_weight
-                )
-            allgather_stream.wait_stream(outer_allgather_stream)
-            self._model_weight_is_stale = False
+    @property
+    def requires_outer_unshard(self) -> bool:
+        """Whether the optimizer-layout weights still need a DP-outer all-gather."""
+        return self._model_weight_is_stale
 
+    def unshard_outer(self) -> None:
+        """Refresh the persistent compute weights in place on the current stream."""
+        self.post_optimizer_model_weight.redistribute(
+            self.model_weight.placements, out=self.model_weight
+        )
+        self._model_weight_is_stale = False
+
+    def unshard_inner(self, missing_phases: tuple[Phase, ...]) -> None:
+        """Gather and bind unsharded parameters, then record readiness for the new phases.
+
+        The caller supplies the missing phases and orders the current stream after any
+        required DP-outer redistribution.
+        """
         if self._unsharded_model_weight.is_alias_of(self.model_weight):
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         elif isinstance(self._unsharded_model_weight, DBuffer):
