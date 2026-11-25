@@ -588,7 +588,9 @@ def test_overlap_cpu_optimizer_d2h_h2d_sync_correctness(
         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
 
 
-def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param(monkeypatch):
+def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Test that DistributedOptimizer works with HybridDeviceOptimizer (CPU offloading)
     when the model has mark_keep_in_fp32 parameters without raising non-leaf Tensor ValueError.
     """
@@ -629,7 +631,7 @@ def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param(monkeypatc
         initialized = []
         initialize = HybridDeviceOptimizer._init_sub_optimizers
 
-        def record_initialization(self):
+        def record_initialization(self: HybridDeviceOptimizer) -> None:
             initialize(self)
             initialized.append(
                 (weakref.ref(self), [weakref.ref(p) for p in self.gpu_params_map_cpu_copy.values()])
@@ -662,7 +664,9 @@ def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param(monkeypatc
 
 @pytest.mark.parametrize("offload_fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("overlap", [False, True])
-def test_hybrid_optimizer_releases_copies_without_gc(offload_fraction: float, overlap: bool):
+def test_hybrid_optimizer_releases_copies_without_gc(
+    offload_fraction: float, overlap: bool
+) -> None:
     """Dropping HDO releases its CPU copies and GPU masters without cyclic collection."""
     params = [nn.Parameter(torch.ones(16, device="cuda", dtype=torch.bfloat16)) for _ in range(2)]
     gc_enabled = gc.isenabled()
@@ -692,7 +696,7 @@ def test_hybrid_optimizer_releases_copies_without_gc(offload_fraction: float, ov
 
 
 @pytest.mark.parametrize("offload_fraction", [0.0, 1.0])
-def test_sub_optimizer_hook_after_owner_release(offload_fraction: float):
+def test_sub_optimizer_hook_after_owner_release(offload_fraction: float) -> None:
     """A retained child optimizer must not copy into the model after its owner is gone."""
     param = nn.Parameter(torch.ones(16, device="cuda", dtype=torch.bfloat16))
     optimizer = HybridDeviceOptimizer(
