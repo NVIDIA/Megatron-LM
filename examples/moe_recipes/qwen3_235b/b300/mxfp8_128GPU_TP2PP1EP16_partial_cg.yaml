@@ -88,6 +88,7 @@ ENV_VARS:
   NVTE_NORM_FWD_USE_CUDNN: '1'
   NVTE_NORM_BWD_USE_CUDNN: '1'
   CUDA_DEVICE_MAX_CONNECTIONS: '32'
+  NCCL_GRAPH_REGISTER: '0'
 ARGS:
   tokenizer_type: HuggingFaceTokenizer
   tokenizer_model: Qwen/Qwen3-235B-A22B

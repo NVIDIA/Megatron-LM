@@ -238,6 +238,14 @@ and the pinned recipe dependencies, before the latest dev merge. Each configurat
 ran twice on 128 GB200 GPUs across 32 nodes; each EP64 group stayed within one NVL72 domain. The index reports
 the median over both trials (160 measured iterations for 4K and 120 for 64K).
 
+The MoK `schedule_capacity_multiplier` of `0.0625` in
+`moe_megakernel_backend_config` is sized for that forced, balanced routing. With
+real data and learned routing the per-rank schedule table overflows within the
+first few steps and the run aborts with `CUDA error: unspecified launch
+failure`. Raise the multiplier before training on real data: `1.0` ran the 4K
+Flash recipe at full size on SlimPajama for 300 steps without the abort, and the
+MoK default is `0.5`. A larger table uses more memory and has not been timed.
+
 | Recipe | TFLOP/s/GPU from mean step time, trials 1 / 2 | Mean step (s), trials 1 / 2 | Peak allocated memory (GiB/GPU) |
 | --- | --- | --- | --- |
 | BSHD 4K | 721.8 / 727.2 | 8.242 / 8.181 | 146.2 |

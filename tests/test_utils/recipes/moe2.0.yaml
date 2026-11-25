@@ -102,18 +102,3 @@ products:
         environment: [dev]
         scope: [nightly-broken]
         platforms: [dgx_h100]
-  - test_case: [bert_mcore_tp1_pp2]
-    products:
-      - environment: [dev]
-        scope: [nightly-broken]
-        platforms: [dgx_h100]
-  - test_case: [bert_mcore_tp1_pp4_vp2]
-    products:
-      - environment: [dev]
-        scope: [nightly-broken]
-        platforms: [dgx_h100]
-  - test_case: [bert_mcore_tp4_pp1]
-    products:
-      - environment: [dev]
-        scope: [nightly-broken]
-        platforms: [dgx_h100]
