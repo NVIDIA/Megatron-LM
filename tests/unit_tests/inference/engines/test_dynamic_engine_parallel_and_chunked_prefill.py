@@ -665,10 +665,16 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     # attention reduction order, so the last bits legitimately differ. What must be identical
     # is WHICH positions get written, and that is exact.
     #
-    # `MTPMetadata.write_token_maps` is the single funnel for MTP write destinations: its only
-    # two callers are `_mtp_setup_decode_step` (one per draft depth) and
-    # `_mtp_setup_prefill_step` (the varlen commit pass). Recording it captures complete
-    # coverage without perturbing the numerics at all.
+    # Coverage is observed in the KV memory itself: the MTP plane's keys are poisoned with a
+    # sentinel before any request runs, and a committed position is covered iff its key is no
+    # longer the sentinel. That holds whichever code path did the write -- the eager varlen
+    # commit pass or the Triton draft-step metadata -- and covers graph replays, which no
+    # Python hook can observe.
+    #
+    # Write DESTINATIONS (needed for the shared-block and unallocated-column guards) are
+    # recorded by wrapping every MTPMetadata method that builds MTP token write maps. A
+    # destination that reached memory but was not recorded means a new write path bypasses
+    # the recorder, which would silently weaken those guards, so that is asserted too.
 
     @staticmethod
     @contextlib.contextmanager
@@ -683,64 +689,122 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             be empty. `_mtp_setup_prefill_step` redirects such writes to the dummy block via
             `write_token_maps(inherited_blocks=...)`, mirroring the main KV path's
             `overlap_start_token` span; this is the guard on that redirect.
+
+        Every MTPMetadata method that builds MTP token write maps is wrapped: the eager
+        `write_token_maps` and the Triton `write_draft_step_metadata` (each draft depth). Each fills
+        `gpu_view.token_to_block_idx` / `token_to_local_position_within_kv_block` with the
+        forward's write destinations before the (possibly graphed) forward consumes them, so
+        reading them right after the builder returns sees exactly what the forward writes.
         """
         meta = context.mtp_metadata
         alloc = context.kv_block_allocator
-        original = meta.write_token_maps
         written = set()
         shared = []
-        # `block_ref_counts` exists only under prefix caching; without it no block is ever
-        # shared, so the shared-write check is vacuous rather than skipped.
-        ref_counts = getattr(alloc, "block_ref_counts", None)
+        # Per-block ref counts live on the allocator's prefix-cache state, which exists only
+        # under prefix caching; without it no block is ever shared, so the shared-write check
+        # is vacuous rather than skipped.
+        ref_counts = alloc.pc_state.block_ref_counts if alloc.pc_state is not None else None
 
-        def recording(gpu_view, rows, positions, block_table, padded_token_count, **kwargs):
-            # Observe the OUTPUT, not the inputs: `write_token_maps` decides the final
-            # destination (including redirecting inherited and padded rows to the dummy block),
-            # so reading the map it produced keeps this in step with the implementation instead
-            # of re-deriving it here. `**kwargs` absorbs future arguments for the same reason.
-            result = original(
+        def record(gpu_view, token_count):
+            # Observe the OUTPUT, not the inputs: the builder decides the final destination
+            # (including redirecting inherited, unused and padded rows to the dummy block), so
+            # reading the map it produced keeps this in step with the implementation instead of
+            # re-deriving it here.
+            if not token_count:
+                return
+            dest = gpu_view.token_to_block_idx[:token_count].tolist()
+            slots = gpu_view.token_to_local_position_within_kv_block[:token_count].tolist()
+            # Dummy-block rows are deliberately discarded writes, not coverage.
+            pairs = [(b, sl) for b, sl in zip(dest, slots) if b != meta.dummy_block_idx]
+            written.update(pairs)
+            if ref_counts is not None and pairs:
+                refs = ref_counts[torch.tensor([b for b, _ in pairs], dtype=torch.long)]
+                shared.extend((b, sl, r) for (b, sl), r in zip(pairs, refs.tolist()) if r > 1)
+
+        # Builders a given tree does not have are skipped: the memory-based completeness check
+        # still catches any write path the recorder misses.
+        originals = {
+            name: getattr(meta, name)
+            for name in ("write_token_maps", "write_draft_step_metadata")
+            if hasattr(meta, name)
+        }
+
+        def write_token_maps(
+            gpu_view, rows, positions, block_table, padded_token_count, inherited_blocks=None
+        ):
+            result = originals["write_token_maps"](
                 gpu_view=gpu_view,
                 rows=rows,
                 positions=positions,
                 block_table=block_table,
                 padded_token_count=padded_token_count,
-                **kwargs,
+                inherited_blocks=inherited_blocks,
             )
-            total = positions.numel()
-            if total:
-                dest = gpu_view.token_to_block_idx[:total].tolist()
-                slots = gpu_view.token_to_local_position_within_kv_block[:total].tolist()
-                # Dummy-block rows are deliberately discarded writes, not coverage.
-                pairs = [(b, sl) for b, sl in zip(dest, slots) if b != meta.dummy_block_idx]
-                written.update(pairs)
-                if ref_counts is not None and pairs:
-                    refs = ref_counts[torch.tensor([b for b, _ in pairs], dtype=torch.long)]
-                    shared.extend((b, sl, r) for (b, sl), r in zip(pairs, refs.tolist()) if r > 1)
+            record(gpu_view, positions.numel())
             return result
 
-        meta.write_token_maps = recording
+        def write_draft_step_metadata(gpu_view):
+            # One token per request slot; padding rows are sent to the dummy block.
+            result = originals["write_draft_step_metadata"](gpu_view)
+            record(gpu_view, meta.padded_count)
+            return result
+
+        wrappers = {
+            "write_token_maps": write_token_maps,
+            "write_draft_step_metadata": write_draft_step_metadata,
+        }
+        wrappers = {name: wrapper for name, wrapper in wrappers.items() if name in originals}
+        for name, wrapper in wrappers.items():
+            setattr(meta, name, wrapper)
         try:
             yield written, shared
         finally:
-            meta.write_token_maps = original
+            for name in wrappers:
+                # Drop the instance attribute so the class method is visible again.
+                delattr(meta, name)
 
     @staticmethod
-    def _missing_mtp_kv_positions(context, written, row, committed_len):
-        """MTP positions in `0 .. committed_len-2` that nobody wrote.
+    def _poison_mtp_kv(context):
+        """Fill the MTP plane's keys with a sentinel; return the sentinel as a 0-d tensor.
+
+        Only keys: newly acquired value pages are zeroed on allocation
+        (`_initialize_mha_value_pages`), while key pages are left as they were, so an unwritten
+        key slot keeps the sentinel until an MTP forward writes it. A written key matching the
+        sentinel in every head and channel is not a realistic collision.
+        """
+        assert not context.cache_mla_latent, "sentinel check assumes a separate MHA key plane"
+        keys = context.memory_buffer[0, context.mtp_kv_layer_slot]
+        keys.fill_(-0.3125)  # Exactly representable in every float dtype the cache uses.
+        return keys.flatten()[0].clone()
+
+    @staticmethod
+    def _unwritten_mtp_kv_positions(context, sentinel, row, committed_len):
+        """MTP positions in `0 .. committed_len-2` whose key still holds the sentinel.
 
         Entry p pairs h_p with t_{p+1}, so it only becomes writable once position p+1 is itself
-        committed -- hence the -1. Inherited positions count as covered: the producing request's
-        writes are in the same recorded set, which is keyed by (block, slot) rather than by
-        request, so sharing a block means sharing its coverage.
+        committed -- hence the -1. Inherited positions count as covered: the producing request
+        wrote the very block this one reads. Returns `(missing, written_pairs)`, the latter the
+        (block, slot) of every covered position, for the recorder-completeness check.
+
+        A block released and reacquired keeps its previous owner's keys, so a gap there is masked;
+        within this test's two-request run that can only under-report, never false-alarm.
         """
+        n = committed_len - 1
+        if n <= 0:
+            return [], []
         bs = context.block_size_tokens
-        table = context.request_to_kv_block_ids[row].tolist()
-        missing = []
-        for p in range(max(0, committed_len - 1)):
-            block = table[p // bs]
-            if block < 0 or (block, p % bs) not in written:
-                missing.append(p)
-        return missing
+        device = context.memory_buffer.device
+        positions = torch.arange(n, device=device)
+        blocks = context.request_to_kv_block_ids[row].to(device)[positions // bs].long()
+        slots = positions % bs
+        keys = context.memory_buffer[0, context.mtp_kv_layer_slot]
+        # [n, heads, head_dim] -> [n]: still the sentinel in every element.
+        untouched = (keys[blocks.clamp(min=0), slots] == sentinel).flatten(1).all(dim=1)
+        unwritten = untouched | (blocks < 0)
+        missing = positions[unwritten].tolist()
+        covered = ~unwritten
+        written_pairs = list(zip(blocks[covered].tolist(), slots[covered].tolist()))
+        return missing, written_pairs
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -806,6 +870,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             )
 
         saw_chunking = False
+        sentinel = self._poison_mtp_kv(context)
         with self._record_mtp_kv_writes(context) as (written, shared_writes):
 
             def step_and_check():
@@ -815,12 +880,20 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
                 saw_chunking |= context.chunked_prefill_request_id != -1
                 for row in range(context.paused_request_count, context.total_request_count):
                     committed = int(context.request_kv_length_offsets[row].item())
-                    missing = self._missing_mtp_kv_positions(context, written, row, committed)
+                    missing, in_memory = self._unwritten_mtp_kv_positions(
+                        context, sentinel, row, committed
+                    )
                     assert not missing, (
                         f"MTP draft KV is unwritten at positions {missing[:8]} "
                         f"(of {committed} committed) for active row {row}; "
                         f"chunked_prefill={enable_chunked_prefill}, "
                         f"prefix_caching={enable_prefix_caching}"
+                    )
+                    unrecorded = [pair for pair in in_memory if pair not in written]
+                    assert not unrecorded, (
+                        f"MTP draft KV reached (block, slot) {unrecorded[:8]} for active row "
+                        f"{row} through a path the destination recorder does not wrap; add its "
+                        f"builder to _record_mtp_kv_writes so the shared-block guard sees it"
                     )
 
             add_request(0)
@@ -965,13 +1038,12 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
                     f"matched={len(m.matched_block_ids)} backed_off={m.backed_off_blocks} "
                     f"skip={m.prefix_skip_tokens} "
                     f"mamba={getattr(req, '_mamba_num_matched_blocks', 'n/a')} "
-                    # The hash map exists only when prefix caching is on; the oracle run has
-                    # no registry at all.
-                    f"registry={len(getattr(alloc, 'kv_hash_to_block_id', ()))}"
+                    # The registry is filled only when prefix caching is on; the oracle run
+                    # registers nothing.
+                    f"registry={len(context.prefix_cache_registry.kv_hash_to_block_id)}"
                 )
                 return m
 
-            alloc = context.kv_block_allocator
             context._compute_prefix_match = _traced_match
 
             def add(request_id, prompt):
@@ -1129,7 +1201,9 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         def step_and_sample():
             nonlocal max_ref_seen
             env.engine.step_modern()
-            max_ref_seen = max(max_ref_seen, int(context.kv_block_allocator.block_ref_counts.max()))
+            max_ref_seen = max(
+                max_ref_seen, int(context.kv_block_allocator.pc_state.block_ref_counts.max())
+            )
 
         with self._record_mtp_kv_writes(context) as (_written, shared_writes):
             add_request(0)
@@ -1393,10 +1467,9 @@ CHUNKED_CG_MAX_SEQ_LEN = 2048
 @pytest.mark.internal
 @pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="need flash attn")
 class TestChunkedPrefillCudaGraphs:
-    """Verify correctness across chunked prefill and CUDA graph combinations.
+    """Verify chunked prefill against an unchunked baseline, eagerly and under CUDA graphs.
 
-    For each model type, runs a baseline config (no chunked prefill, no CUDA graphs)
-    and compares output tokens against every other combination.
+    Each test runs an unchunked baseline engine and compares a chunked engine's output against it.
     """
 
     @classmethod
@@ -1703,25 +1776,40 @@ class TestChunkedPrefillCudaGraphs:
         [("gpt", None), ("hybrid", "mamba"), ("hybrid", "gdp")],
         ids=["gpt", "mamba", "gdp"],
     )
-    @pytest.mark.parametrize("chunked_prefill", [False, True])
-    @pytest.mark.parametrize("num_cuda_graphs", [None, 2])
+    @pytest.mark.parametrize(
+        "chunked_prefill,num_cuda_graphs",
+        [(False, None), (True, None), (True, 2)],
+        ids=["unchunked_eager", "chunked_eager", "chunked_cuda_graphs"],
+    )
     @torch.inference_mode()
     def test_chunked_prefill_cuda_graphs(
         self, model_provider, ssm_mixer, chunked_prefill, num_cuda_graphs
     ):
-        """Verify generated tokens match across chunked prefill and CUDA graph configs."""
+        """Verify generated tokens match across chunked-prefill configs, per CUDA-graph mode."""
         skip_if_mamba_sequence_packing_not_available(model_provider, ssm_mixer or "mamba")
 
         clear_nvte_env_vars()
 
-        random.seed(123)
-        torch.manual_seed(123)
-        model_parallel_cuda_manual_seed(
-            seed=123, inference_rng_tracker=True, use_cudagraphable_rng=False, force_reset_rng=True
-        )
+        # One model per engine: CUDA-graph runners live on the model's layers,
+        # and a second graphed engine on the same model would be handed the first engine's runners.
+        # Reseeding before each build gives both models identical weights.
+        def build_model():
+            random.seed(123)
+            torch.manual_seed(123)
+            model_parallel_cuda_manual_seed(
+                seed=123,
+                inference_rng_tracker=True,
+                use_cudagraphable_rng=False,
+                force_reset_rng=True,
+            )
+            return self._create_model(model_provider, num_cuda_graphs=2, ssm_mixer=ssm_mixer)
 
-        # Create model with CUDA graph support so it can be used for both CG and non-CG engines.
-        model = self._create_model(model_provider, num_cuda_graphs=2, ssm_mixer=ssm_mixer)
+        baseline_model = build_model()
+        test_model = build_model()
+        for (name, p), (_, q) in zip(
+            baseline_model.named_parameters(), test_model.named_parameters()
+        ):
+            assert torch.equal(p, q), f"reseeded rebuild differs at {name}"
 
         # 3 prompts of 512 tokens each, disjoint token ranges (no prefix sharing).
         device = torch.cuda.current_device()
@@ -1734,9 +1822,12 @@ class TestChunkedPrefillCudaGraphs:
         # (only ~1.5 of the 512-token prompts fit per step).
         context_max_tokens = 768 if chunked_prefill else None
 
-        # Baseline: no chunked prefill, no CUDA graphs.
+        # Baseline: no chunked prefill, same CG config (CG padding can flip fp32 near-tie argmax).
         baseline_engine = self._build_engine(
-            model, enable_chunked_prefill=False, num_cuda_graphs=None, context_max_tokens=None
+            baseline_model,
+            enable_chunked_prefill=False,
+            num_cuda_graphs=num_cuda_graphs,
+            context_max_tokens=None,
         )
         baseline_logits = {}
         baseline_outputs, baseline_steps = self._run_to_completion(
@@ -1745,7 +1836,7 @@ class TestChunkedPrefillCudaGraphs:
 
         # Test config.
         test_engine = self._build_engine(
-            model,
+            test_model,
             enable_chunked_prefill=chunked_prefill,
             num_cuda_graphs=num_cuda_graphs,
             context_max_tokens=context_max_tokens,

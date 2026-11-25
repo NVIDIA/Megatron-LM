@@ -16,8 +16,8 @@ import torch
 
 from megatron.core.tensor_parallel.gtp_api import (
     HAVE_GTP,
-    GTPChain,
     classify_gtp_remat_chains,
+    is_graphed_chain,
     wait_for_gtp_grad_reduction_on_current_stream,
 )
 
@@ -282,7 +282,8 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
     gtp_params = [param for param in partial_cg.parameters() if isinstance(param, GTPShardedParam)]
     assert gtp_params, "GTP not active: no GTPShardedParam found"
     params_in_scope = get_latent_params(partial_cg) if latent_projection_case else gtp_params
-    assert all(param.chain_id == GTPChain.GRAPHED.value for param in params_in_scope)
+    assert params_in_scope
+    assert all(is_graphed_chain(param.chain_id) for param in params_in_scope)
     for name, param in partial_cg.named_parameters():
         param.data.copy_(saved_local_weights[name])
     # Production captures after DDP maps every parameter into a main-grad buffer and initializes
@@ -412,8 +413,9 @@ class TestGTPPartialCGCorrectness:
     ):
         """Local-CG loss trajectory and global grad norm must match eager execution.
 
-        Flaky under a busy shared process (eager/replay drift or a rare Inf grad norm); cause
-        is unconfirmed, suspected GEMM algorithm-selection sensitivity to process-wide GPU state.
+        Flaky in the full H100 dev bucket: the attention case's first replay after capture can
+        differ from eager while later replays match. It does not reproduce alone or after the
+        preceding GTP files; cause unconfirmed.
         """
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")

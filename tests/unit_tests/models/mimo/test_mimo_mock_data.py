@@ -71,28 +71,40 @@ def _topology(*, language_rank, encoder_rank=None, cp_rank=0, cp_size=1, gtp_ran
 @pytest.fixture
 def adapter(monkeypatch, run_config):
     from examples.mimo.training import data
+    from megatron.training.models import MimoBuildConfig
 
     run_config.rng.seed = 123
+    run_config.model = MimoBuildConfig(
+        transformer=run_config.model.transformer,
+        seq_length=8,
+        img_h=4,
+        img_w=4,
+        patch_dim=2,
+        drop_vision_class_token=True,
+    )
+    run_config.tokenizer.vocab_size = 64
+    run_config.model.transformer.max_seq_length_per_sample = 8
     monkeypatch.setattr(data, "is_pp_first_stage", lambda pg: pg.rank() == 0)
     monkeypatch.setattr(data, "is_pp_last_stage", lambda pg: pg.rank() == pg.size() - 1)
     return data
 
 
-def test_dynamic_radio_loader_emits_patchified_cpu_metadata(adapter):
+def test_dynamic_radio_loader_emits_patchified_cpu_metadata(adapter, run_config):
     args = _args()
     args.micro_batch_size = 2
     args.mimo_llm_dp = 1
     args.seq_length = 24
+    run_config.model.transformer.max_seq_length_per_sample = 24
     args.image_seq_length = 12
     args.params_dtype = torch.bfloat16
     args.dynamic_resolution = True
     args.pixel_shuffle = True
-    args.patch_dim = 8
-    args.img_h = 224
-    args.img_w = 224
+    run_config.model.patch_dim = 8
+    run_config.model.img_h = 224
+    run_config.model.img_w = 224
     args.num_image_tiles = 3
     loader = adapter.build_train_valid_test_data_loaders(
-        args, _topology(encoder_rank=True, language_rank=False)
+        args, _topology(encoder_rank=True, language_rank=False), image_sequence_length=12
     )[0]
 
     inputs = next(iter(loader))["modality_inputs"][RADIO_ENCODER_MODULE_NAME][

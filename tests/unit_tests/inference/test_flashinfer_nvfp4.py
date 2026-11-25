@@ -164,6 +164,29 @@ def test_flashinfer_nvfp4_refresh_requantizes_in_place(monkeypatch):
     assert captured["fc2"] is grouped_mlp._fc2_weight
 
 
+@pytest.mark.parametrize("built", [False, True], ids=["before_first_forward", "after"])
+def test_refit_cache_refresh_requantizes_nvfp4(monkeypatch, built):
+    """Every refit path ends in refresh_module_caches; it must reach the NVFP4 stacks."""
+    from megatron.core.resharding.execution import refresh_module_caches
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    calls, syncs = [], []
+
+    def _refresh(self):
+        calls.append(self)
+        return built
+
+    monkeypatch.setattr(InferenceGroupedMLP, "refresh_flashinfer_nvfp4_weights", _refresh)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: syncs.append(True))
+    grouped_mlp = InferenceGroupedMLP.__new__(InferenceGroupedMLP)
+    torch.nn.Module.__init__(grouped_mlp)
+
+    refresh_module_caches([torch.nn.Sequential(grouped_mlp)])
+
+    assert calls == [grouped_mlp]
+    assert syncs == ([True] if built else [])
+
+
 def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
     from megatron.core.transformer.moe import experts
 
@@ -214,10 +237,11 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
 
 
 @pytest.mark.parametrize("built", [False, True], ids=["before_first_forward", "after"])
-def test_refit_rejects_built_nvfp4_expert_weights(monkeypatch, built):
-    """A refit after the NVFP4 copy is built would leave generation on the old weights.
+def test_refit_accepts_built_nvfp4_expert_weights(monkeypatch, built):
+    """Refit runs whether or not the NVFP4 copy exists yet.
 
-    Before the first forward there is no copy yet; it is built from the refit weights.
+    Before the first forward there is no copy; it is built from the refit weights.
+    After it, execute_reshard_plan's refresh_module_caches requantizes it in place.
     """
     from megatron.core.resharding import refit
 
@@ -227,18 +251,13 @@ def test_refit_rejects_built_nvfp4_expert_weights(monkeypatch, built):
     executed = []
     monkeypatch.setattr(refit, "_unwrap_model_cores", lambda src, tgt: (None, tgt, 2))
     monkeypatch.setattr(refit, "_build_or_get_plan", lambda *args, **kwargs: "plan")
-    monkeypatch.setattr(refit, "_harmonize_buffer_dtypes", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         refit, "execute_reshard_plan", lambda plan, *args, **kwargs: executed.append(plan)
     )
     service = SimpleNamespace(set_model_roles=lambda **kwargs: None)
 
-    if built:
-        with pytest.raises(NotImplementedError, match="per-token NVFP4"):
-            refit.reshard_model_weights(None, target, service)
-    else:
-        refit.reshard_model_weights(None, target, service)
-    assert executed == ["plan"], "the plan must run on every rank before raising"
+    refit.reshard_model_weights(None, target, service)
+    assert executed == ["plan"]
 
 
 def test_gated_fc1_is_padded_per_half_and_interleaved_up_gate():
@@ -816,13 +835,22 @@ class TestNVFP4MoELayer:
         self._assert_close_to_bf16(refreshed, training_output, activation)
 
     @pytest.mark.parametrize("activation", _ACTIVATIONS)
-    @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
+    @pytest.mark.parametrize(
+        "dispatcher,local_tokens",
+        [
+            pytest.param("nccl", 32, id="nccl"),
+            pytest.param("nvls", None, id="nvls"),
+            pytest.param("nvls", 64, id="nvls-64"),
+        ],
+    )
     def test_nvfp4_moe_layer_cuda_graph_replay_tracks_inputs_and_refresh(
-        self, dispatcher, activation
+        self, dispatcher, activation, local_tokens
     ):
         """A captured layer replays like eager, and an in-place refresh reaches the graph."""
         layer = self._make_layer(dispatcher, activation)
-        local_tokens = 32 if dispatcher == "nccl" else 17 + torch.distributed.get_rank()
+        # Cover both uneven EP input and the 64-token bucket where warmup stalled.
+        if local_tokens is None:
+            local_tokens = 17 + torch.distributed.get_rank()
         hidden_size = layer.config.hidden_size
         static_hidden = self._hidden_states(local_tokens, hidden_size)
 
