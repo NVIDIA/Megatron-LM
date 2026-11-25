@@ -646,7 +646,26 @@ class FsdpParameterGroup:
             partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
             fsdp_parameter.unsharded.grad = None
 
-    def accumulate_local_gradients(self) -> None:
+    def accumulate_gradients(self, partial_grad: DBuffer | None = None) -> None:
+        """Accumulate one backward's gradients and install views when missing or stale.
+
+        With partial_grad, reduce packed gradients across DP-inner before accumulating.
+        Otherwise, accumulate unsharded .grad tensors locally and retain them for caller
+        cleanup. The caller selects the stream and orders any subsequent outer reduction.
+        """
+        assert self.main_grad is not None
+        has_sharded_grads = self._has_sharded_grads()
+        needs_install = not has_sharded_grads or self._main_grad_is_stale
+
+        if partial_grad is None:
+            self._accumulate_local_gradients(has_sharded_grads)
+        else:
+            self._reduce_inner_gradients(partial_grad, has_sharded_grads)
+
+        if needs_install:
+            self._install_sharded_grads(self.main_grad)
+
+    def _accumulate_local_gradients(self, has_sharded_grads: bool) -> None:
         """Accumulate on compute, retaining source gradients for caller cleanup.
 
         The caller clears the source .grad references on the same stream after
@@ -657,7 +676,6 @@ class FsdpParameterGroup:
             if fsdp_parameter.unsharded.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
 
-        has_sharded_grads = self._has_sharded_grads()
         self._clear_stale_main_grad()
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = fsdp_parameter.unsharded.grad
@@ -670,7 +688,6 @@ class FsdpParameterGroup:
                 destination.copy_(grad)
                 if self.grad_scale != 1:
                     destination.mul_(self.grad_scale)
-        self._install_sharded_grads(self.main_grad)
 
     def _has_sharded_grads(self) -> bool:
         """Whether installed .grad views select accumulation instead of overwrite.
@@ -706,19 +723,10 @@ class FsdpParameterGroup:
         # Later microbatches must preserve the contributions already accumulated.
         self._main_grad_is_stale = False
 
-    def reduce_inner_gradients(self, partial_grad: DBuffer) -> None:
-        """Reduce a packed partial gradient across DP-inner and accumulate into main_grad.
-
-        main_grad rests at the DP-outer-Partial accumulation placement, accumulating
-        each backward through the standard zero_grad contract, and ``.grad`` binds to
-        it. The last-microbatch DP-outer reduction is applied separately by
-        ``reduce_outer_gradients``; the caller (``_reduce_gradient_groups``)
-        decides when and on which stream to run it, which is what lets the DP-outer
-        reduction overlap the next group's DP-inner reduction.
-        """
+    def _reduce_inner_gradients(self, partial_grad: DBuffer, has_sharded_grads: bool) -> None:
+        """Reduce a packed partial gradient across DP-inner and accumulate into main_grad."""
         assert self.main_grad is not None
 
-        has_sharded_grads = self._has_sharded_grads()
         self._clear_stale_main_grad()
         if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
@@ -739,15 +747,13 @@ class FsdpParameterGroup:
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
-        self._install_sharded_grads(self.main_grad)
-
     def reduce_outer_gradients(self) -> None:
         """Finalize the deferred DP-outer reduction into the optimizer-layout view.
 
         All-reduce (HSDP) or reduce-scatter (HFSDP) the accumulator across DP-outer
         into ``pre_optimizer_main_grad`` (the persistent buffer's optimizer-layout
         view), then bind each sharded ``.grad`` to it. Runs after
-        ``reduce_inner_gradients`` on the last microbatch; the caller can run it on
+        ``accumulate_gradients`` on the last microbatch; the caller can run it on
         its own stream to overlap the DP-inner reductions (see
         ``FsdpModule._reduce_gradient_groups``). main_grad and its view are
         persistent, so running on a separate stream needs no cross-stream free.
