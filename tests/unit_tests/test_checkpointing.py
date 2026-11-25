@@ -663,25 +663,44 @@ def test_checkpoint_model_checks_use_config_not_stale_args(run_config, model_cls
 
 
 @pytest.mark.parametrize("saved_config", [False, True])
-def test_checkpoint_allows_rope_to_yarn(run_config, saved_config):
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "yarn"])
+def test_checkpoint_position_capacity(run_config, saved_config, position_embedding_type):
     args = SimpleNamespace(
         num_layers=2,
         hidden_size=32,
         num_attention_heads=4,
         add_position_embedding=True,
-        vocab_file=None,
+        vocab_file="vocab",
         use_dist_ckpt=True,
         phase_transition_iterations=None,
     )
-    checkpoint_args = SimpleNamespace(**vars(args), position_embedding_type="rope")
-    run_config.model.position_embedding_type = "rope"
+    checkpoint_args = SimpleNamespace(
+        **vars(args),
+        max_position_embeddings=run_config.model.seq_length,
+        make_vocab_size_divisible_by=run_config.model.make_vocab_size_divisible_by,
+        tokenizer_type=run_config.tokenizer.tokenizer_type,
+    )
+    run_config.tokenizer.vocab_file = "vocab"
+    run_config.model.position_embedding_type = (
+        "rope" if position_embedding_type == "yarn" else position_embedding_type
+    )
     saved = run_config.to_dict() if saved_config else None
-    run_config.model.position_embedding_type = "yarn"
+    run_config.model.position_embedding_type = position_embedding_type
     with (
         mock.patch('megatron.training.checkpointing.get_args', return_value=args),
         mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
     ):
         check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        # Changing this metadata does not change RoPE/YaRN weight shapes.
+        run_config.model.seq_length *= 2
+        if position_embedding_type == "learned_absolute":
+            with pytest.raises(AssertionError, match="max_position_embeddings"):
+                check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+            check_checkpoint_args(
+                checkpoint_args, skip_args={"max_position_embeddings"}, checkpoint_config=saved
+            )
+        else:
+            check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
         checkpoint_args.add_position_embedding = False
         with pytest.raises(AssertionError, match="add_position_embedding"):
             check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
@@ -2048,6 +2067,50 @@ def _stub_loader_to_the_policy(monkeypatch, args, existing, loads):
     monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
 
 
+@pytest.mark.parametrize("non_persistent_type", ["global", "local"])
+@pytest.mark.parametrize("selection", ["inherited", "cleared", "explicit"])
+def test_per_load_selectors_reach_both_checkpoint_reads(
+    monkeypatch, run_config, non_persistent_type, selection
+):
+    """Teacher selectors override both reads without changing the student's run section."""
+    checkpoint = run_config.checkpoint
+    checkpoint.load = "/student"
+    checkpoint.ckpt_format = "torch_dist"
+    checkpoint.ckpt_step = 50
+    checkpoint.pretrained_checkpoint = "/student-fallback"
+    checkpoint.non_persistent_ckpt_type = non_persistent_type
+    original = vars(checkpoint).copy()
+    overrides = {
+        "inherited": {},
+        "cleared": dict(ckpt_step=None, pretrained_checkpoint=None, non_persistent_ckpt_type=None),
+        "explicit": dict(
+            ckpt_step=7, pretrained_checkpoint="/teacher-fallback", non_persistent_ckpt_type=None
+        ),
+    }[selection]
+    args = _loader_args()
+    reads = []
+    _stub_loader_to_the_policy(monkeypatch, args, ("/teacher",), [])
+
+    def base_load(directory, run_args, *, rank0, checkpoint, finetune, **kwargs):
+        reads.append((directory, rank0, checkpoint))
+        assert finetune is True
+        for name in ("ckpt_step", "pretrained_checkpoint", "non_persistent_ckpt_type"):
+            assert getattr(checkpoint, name) == overrides.get(name, original[name])
+        return None, "", False, None
+
+    monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
+    assert load_checkpoint(
+        [object()], None, None, load_dir="/teacher", finetune=True, **overrides
+    ) == (0, 0)
+    assert [(directory, rank0) for directory, rank0, _ in reads] == [
+        ("/teacher", True),
+        ("/teacher", False),
+    ]
+    assert reads[0][2] is reads[1][2]
+    assert vars(checkpoint) == original
+    assert vars(args) == vars(_loader_args())
+
+
 def test_only_the_primary_load_records_the_finetune_classification(
     init_model_parallel, monkeypatch, run_config
 ):
@@ -2087,7 +2150,8 @@ def test_the_frozen_layer_load_is_weights_only_at_any_data_position(
     """--freeze-all-layers loads the model weights-only and resumes the data position from the
     run's own progress tracker: the classification is recorded on the train state, the position
     stays the load's own business, and the namespace receives neither."""
-    args = _loader_args(freeze_all_layers=True)
+    args = _loader_args()
+    run_config.train.freeze_all_layers = True
     train_state = TrainState()
     monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
     run_config.checkpoint.load = "/frozen"
