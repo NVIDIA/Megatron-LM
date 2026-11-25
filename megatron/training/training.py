@@ -1730,13 +1730,15 @@ def pretrain(
             args, train_valid_test_dataset_provider
         )
 
-    # Lazy bootstrap may return a continuation; skipped setup retains the caller's groups.
+    # Retain bootstrap groups for model setup without changing the schedule's
+    # caller-provided pg_collection/p2p_communicator pair.
+    model_pg_collection = pg_collection
     if isinstance(initialized_pg_collection, ProcessGroupCollection):
-        if pg_collection is None:
-            pg_collection = initialized_pg_collection
+        if model_pg_collection is None:
+            model_pg_collection = initialized_pg_collection
         elif cfg_container.dist.create_separate_param_all_gather_groups:
-            pg_collection.dp_cp_ag = initialized_pg_collection.dp_cp_ag
-            pg_collection.expt_dp_ag = initialized_pg_collection.expt_dp_ag
+            model_pg_collection.dp_cp_ag = initialized_pg_collection.dp_cp_ag
+            model_pg_collection.expt_dp_ag = initialized_pg_collection.expt_dp_ag
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
@@ -1747,8 +1749,8 @@ def pretrain(
             checkpointing_context=checkpointing_context,
             cfg_container=cfg_container,
             pg_collection=(
-                pg_collection
-                if pg_collection is not None
+                model_pg_collection
+                if model_pg_collection is not None
                 else ProcessGroupCollection.use_mpu_process_groups()
             ),
             run_train_loop_without_updates=run_train_loop_without_updates,

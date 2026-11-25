@@ -292,6 +292,89 @@ def test_distributed_initialization_prefers_config_to_args(
     assert vars(args) == original_args
 
 
+@pytest.mark.parametrize(
+    "separate_ag,explicit_pipeline_groups",
+    [
+        pytest.param(False, False, id="default"),
+        pytest.param(True, False, id="default-ag"),
+        pytest.param(True, True, id="explicit-ag"),
+    ],
+)
+def test_pretrain_keeps_bootstrap_groups_out_of_default_pipeline_schedule(
+    monkeypatch, run_config, separate_ag, explicit_pipeline_groups
+):
+    from megatron.training import training
+
+    class TrainReached(Exception):
+        pass
+
+    # Exercise pretrain through the train/evaluation handoff without GPU work.
+    model_config = object()
+    initialized = ProcessGroupCollection()
+    initialized.dp_cp_ag = object() if separate_ag else None
+    initialized.expt_dp_ag = object() if separate_ag else None
+    supplied = ProcessGroupCollection() if explicit_pipeline_groups else None
+    communicator = SimpleNamespace(config=model_config) if supplied is not None else None
+    run_config.dist.create_separate_param_all_gather_groups = separate_ag
+    run_config.model.transformer.pipeline_model_parallel_size = 2
+    run_config.train.train_iters = 1
+    monkeypatch.setattr(run_config, "validate", Mock())
+    monkeypatch.setattr(run_config, "finalize", Mock())
+    monkeypatch.setattr(training, "_STARTUP_TIMESTAMPS", {"program_start": None})
+    monkeypatch.setattr(training, "_LEGACY_TRAIN_START_TIME", 0)
+    monkeypatch.setattr(training, "get_args", lambda: Namespace(train_full_dataset=False))
+    monkeypatch.setattr(
+        training,
+        "get_train_state",
+        lambda: SimpleNamespace(iteration=0, do_train=True, do_valid=False, do_test=False),
+    )
+    monkeypatch.setattr(training, "initialize_megatron", Mock(return_value=initialized))
+    monkeypatch.setattr(training.ft_integration, "setup", Mock())
+    monkeypatch.setattr(training, "one_logger_utils", Mock())
+    monkeypatch.setattr(training, "get_timers", Mock(return_value=Mock()))
+    monkeypatch.setattr(training, "get_one_logger", lambda: None)
+    monkeypatch.setattr(training, "get_wandb_writer", lambda: None)
+    monkeypatch.setattr(training, "_otel_telemetry_active", lambda: False)
+    monkeypatch.setattr(training, "_otel_managed_span", lambda *a, **k: nullcontext())
+    for name in (
+        "set_jit_fusion_options",
+        "warmup_training_kernels",
+        "_start_otel_job_spans",
+        "_end_otel_job_spans",
+        "_backdated_otel_span",
+        "set_startup_timestamps",
+        "print_rank_0",
+        "print_datetime",
+    ):
+        monkeypatch.setattr(training, name, Mock())
+    monkeypatch.setattr(training.mpu, "get_tensor_model_parallel_group", Mock())
+    monkeypatch.setattr(training.torch, "tensor", Mock(return_value=Mock(item=lambda: 0)))
+    monkeypatch.setattr(training.torch.distributed, "all_reduce", Mock())
+    monkeypatch.setattr(
+        training, "build_train_valid_test_data_iterators", Mock(return_value=(None, None, None))
+    )
+    setup_model = Mock(return_value=([Mock()], Mock(), Mock()))
+    monkeypatch.setattr(training, "setup_model_and_optimizer", setup_model)
+    monkeypatch.setattr(training, "get_model_config", lambda model: model_config)
+
+    def train(*args, pg_collection, p2p_communicator, run_eval, **kwargs):
+        model_groups = setup_model.call_args.kwargs["pg_collection"]
+        assert model_groups is (supplied if supplied is not None else initialized)
+        assert model_groups.dp_cp_ag is initialized.dp_cp_ag
+        assert model_groups.expt_dp_ag is initialized.expt_dp_ag
+        assert pg_collection is supplied
+        assert p2p_communicator is communicator
+        assert run_eval.keywords["pg_collection"] is supplied
+        assert run_eval.keywords["p2p_communicator"] is communicator
+        raise TrainReached
+
+    monkeypatch.setattr(training, "train", train)
+    with pytest.raises(TrainReached):
+        training.pretrain(
+            run_config, Mock(), None, Mock(), pg_collection=supplied, p2p_communicator=communicator
+        )
+
+
 @pytest.mark.parametrize("experimental", [False, True])
 def test_parse_only_prepares_args(monkeypatch, isolated_globals, experimental):
     args = Namespace(use_checkpoint_args=False, yaml_cfg=None, enable_experimental=experimental)
