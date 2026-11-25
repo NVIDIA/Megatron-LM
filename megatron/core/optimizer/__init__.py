@@ -68,7 +68,7 @@ from .emerging_optimizers import (
     _create_fsdp_emerging_optimizer,
     _get_qkv_split_shapes,
 )
-from .fully_sharded_optimizer import FullyShardedOptimizer
+from .fully_sharded_optimizer import FullyShardedChainedOptimizer, FullyShardedOptimizer
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
 from .optimizer import (
@@ -1203,7 +1203,7 @@ def _get_megatron_fsdp_emerging_optimizer(
             # ChainedOptimizer asserts that all sub-optimizers share the top-level config.
             optimizer.config = config
         optimizers.append(optimizer)
-    return ChainedOptimizer(optimizers)
+    return FullyShardedChainedOptimizer(optimizers)
 
 
 def _clear_high_precision_initializers(model_chunks: List[MegatronModule]) -> None:
@@ -1412,7 +1412,7 @@ def get_megatron_optimizer(
         if len(optimizers) == 1:
             return optimizers[0]
 
-        return ChainedOptimizer(optimizers)
+        return (FullyShardedChainedOptimizer if is_mfsdp_v2 else ChainedOptimizer)(optimizers)
 
     if dump_param_to_param_group_map is not None:
         param_to_param_group = {}

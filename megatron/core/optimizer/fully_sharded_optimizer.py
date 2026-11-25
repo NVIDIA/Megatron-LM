@@ -18,7 +18,7 @@ from ..transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 from ..transformer.module import MegatronModule
 from ..utils import is_te_min_version
 from .grad_scaler import MegatronGradScaler
-from .optimizer import MixedPrecisionOptimizer
+from .optimizer import ChainedOptimizer, MixedPrecisionOptimizer
 from .optimizer_config import OptimizerConfig
 
 
@@ -254,11 +254,12 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         :meth:`DistributedOptimizer.load_state_dict`.
         """
         param_groups = self._param_groups_from_group_meta(state_dict["param_to_group_meta"])
-        state = state_dict["state"]
-        if not is_te_min_version("2.18.0"):
-            # Empty-shard placeholders are not owned by the older TE optimizer.
-            owned_fqns = {fqn for group in param_groups for fqn in group["params"]}
-            state = {fqn: param_state for fqn, param_state in state.items() if fqn in owned_fqns}
+        # A chain shares one FQN-keyed checkpoint, so take only this optimizer's parameters.
+        state = {}
+        for group in param_groups:
+            for fqn in group["params"]:
+                if fqn in state_dict["state"]:
+                    state[fqn] = state_dict["state"][fqn]
         self.optimizer.load_state_dict({"state": state, "param_groups": param_groups})
 
     @override
@@ -438,3 +439,31 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
 
     def _copy_model_params_to_main_params(self, state_dict=None) -> None:
         """No-op: model loads already write into MFSDP v2's main weights."""
+
+
+class FullyShardedChainedOptimizer(ChainedOptimizer):
+    """Chains FullyShardedOptimizers, whose states share one FQN-keyed checkpoint.
+
+    Each member owns disjoint parameters, so their ``fsdp_dtensor`` states merge into one mapping,
+    and on load each member selects its own FQNs from it.
+    """
+
+    @override
+    def sharded_state_dict(
+        self, model_sharded_state_dict: ShardedStateDict, is_loading: bool = False, **kwargs
+    ) -> ShardedStateDict:
+        self._synchronize_steps()
+        sharded_state_dict = {"state": {}, "param_to_group_meta": {}}
+        for optimizer in self.chained_optimizers:
+            optim_state_dict = optimizer.sharded_state_dict(
+                model_sharded_state_dict, is_loading, **kwargs
+            )
+            for key, value in optim_state_dict.items():
+                sharded_state_dict[key].update(value)
+        return sharded_state_dict
+
+    @override
+    def load_state_dict(self, state_dict):
+        for optimizer in self.chained_optimizers:
+            optimizer.load_state_dict(state_dict)
+        self._synchronize_steps()
