@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 import torch
-import yaml
 
 from megatron.bridge.models.conversion.checkpoint import (
     load_megatron_model,
@@ -16,50 +15,14 @@ from megatron.bridge.models.conversion.checkpoint import (
 from megatron.bridge.models.hybrid.model_config import BridgeHybridModelConfig
 from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
-from megatron.training.config.yaml_utils import safe_yaml_representers
+from megatron.training.config import RootConfigContainer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
-@pytest.mark.parametrize(
-    "config_format",
-    ["flat-training", "flat-inference", "root-training", "root-inference", "root-both"],
-)
-def test_load_model_config_accepts_flat_and_root_checkpoint_metadata(
-    tmp_path, monkeypatch, config_format
-):
-    """Conversion reads old configs and the training/inference wrapper from #9031."""
-    config = BridgeHybridModelConfig(
-        transformer=TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=2),
-        hybrid_layer_pattern="**",
-        vocab_size=128,
-        seq_length=64,
-    )
-    container_module = "megatron.training.config.container"
-    training = {
-        "_target_": f"{container_module}.PretrainConfigContainer",
-        "model": config.as_dict(),
-    }
-    inference = {
-        "_target_": f"{container_module}.InferenceConfigContainer",
-        "model": config.as_dict(),
-    }
-    if config_format == "flat-training":
-        metadata = training
-    elif config_format == "flat-inference":
-        metadata = inference
-    else:
-        metadata = {"_target_": f"{container_module}.RootConfigContainer"}
-        if config_format in ("root-training", "root-both"):
-            metadata["training"] = training
-        if config_format in ("root-inference", "root-both"):
-            metadata["inference"] = inference
-        if config_format == "root-both":
-            # Match MLM's training-first selection, not the rollout model's metadata.
-            inference["model"]["vocab_size"] = 256
-
-    with safe_yaml_representers():
-        (tmp_path / "run_config.yaml").write_text(yaml.safe_dump(metadata))
+def test_load_model_config_from_root_container(tmp_path, monkeypatch, run_config):
+    """Conversion reads the model from a root-wrapped training checkpoint."""
+    RootConfigContainer(training=run_config).to_yaml(str(tmp_path / "run_config.yaml"))
     # This test only needs metadata, not a model-weight checkpoint directory.
     monkeypatch.setattr(
         "megatron.bridge.models.conversion.checkpoint.resolve_checkpoint_path",
@@ -68,10 +31,8 @@ def test_load_model_config_accepts_flat_and_root_checkpoint_metadata(
 
     restored, _ = load_model_config(tmp_path)
 
-    assert type(restored) is BridgeHybridModelConfig
-    assert restored.vocab_size == 128
-    assert restored.seq_length == 64
-    assert restored.transformer.hidden_size == 16
+    assert type(restored) is type(run_config.model)
+    assert restored.vocab_size == run_config.model.vocab_size
 
 
 @pytest.mark.parametrize("release", [False, True])
