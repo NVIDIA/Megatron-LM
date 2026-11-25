@@ -3,9 +3,48 @@
 """Recipe overrides edit native config leaves without replacing Python objects."""
 
 import pytest
+import torch
 
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.training.config.utils import apply_config_overrides
+
+
+@pytest.mark.parametrize("dtype", ["torch.bfloat16", "bfloat16"])
+def test_overrides_preserve_dtype_and_enum(run_config, dtype):
+    apply_config_overrides(
+        run_config,
+        [f"model.transformer.params_dtype={dtype}", "model.transformer.attention_backend=local"],
+    )
+    assert run_config.model.transformer.params_dtype is torch.bfloat16
+    assert run_config.model.transformer.attention_backend is AttnBackend.local
+    # Optional typed fields must work even when their initial value is None.
+    run_config.model.transformer.pipeline_dtype = None
+    apply_config_overrides(run_config, [f"model.transformer.pipeline_dtype={dtype}"])
+    assert run_config.model.transformer.pipeline_dtype is torch.bfloat16
+    apply_config_overrides(run_config, ["model.transformer.pipeline_dtype=null"])
+    assert run_config.model.transformer.pipeline_dtype is None
+
+
+@pytest.mark.parametrize(
+    "override",
+    ["model.transformer.params_dtype=invalid", "model.transformer.attention_backend=invalid"],
+)
+def test_invalid_typed_overrides_fail_before_assignment(run_config, override):
+    transformer = run_config.model.transformer
+    original = (transformer.params_dtype, transformer.attention_backend)
+    with pytest.raises(ValueError, match="Invalid"):
+        apply_config_overrides(run_config, [override])
+    assert (transformer.params_dtype, transformer.attention_backend) == original
+
+
+def test_llama_recipe_preserves_bridge_effective_weight_decay():
+    from megatron.bridge.recipes.llama import llama3_8b_pretrain_config
+
+    cfg = llama3_8b_pretrain_config()
+    cfg.scheduler.finalize_scheduler_config(cfg.optimizer.weight_decay)
+    assert cfg.optimizer.weight_decay == 0.033
+    assert cfg.scheduler.start_weight_decay == cfg.scheduler.end_weight_decay == 0.033
 
 
 def test_overrides_preserve_native_objects_and_leave_finalization_to_startup(run_config):

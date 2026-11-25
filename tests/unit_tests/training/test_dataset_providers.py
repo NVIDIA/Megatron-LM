@@ -677,6 +677,7 @@ def test_shared_rank_predicate_reads_the_registered_model_config(monkeypatch):
                 "sequence_packing_scheduler": "dp_balanced",
                 "pipeline_model_parallel_layout": "layout",
                 "mtp_num_layers": 2,
+                "needs_batch_on_all_pipeline_stages": False,
             },
         )
     ]

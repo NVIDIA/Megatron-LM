@@ -77,7 +77,8 @@ def llama3_8b_pretrain_config() -> PretrainConfigContainer:
             min_lr=3e-5,
             adam_beta1=0.9,
             adam_beta2=0.95,
-            weight_decay=0.1,
+            # Bridge's constant scheduler applies 0.033, overriding its optimizer default.
+            weight_decay=0.033,
             clip_grad=1.0,
             bf16=True,
             params_dtype=torch.bfloat16,

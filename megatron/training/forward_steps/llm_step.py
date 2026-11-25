@@ -29,6 +29,7 @@ from functools import partial
 
 import torch
 
+from megatron.core import tensor_parallel
 from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.pipeline_parallel.utils import (
@@ -63,6 +64,7 @@ _BATCH_KEYS = (
     "local_cp_size",
     "loss_mask",
     "max_seqlen",
+    "padding_mask",
     "position_ids",
     "tokens",
 )
@@ -99,7 +101,8 @@ def get_batch(
     is_first = is_pp_first_stage(pg_collection.pp) and is_vp_first_stage(vp_stage, vp_size)
     is_last = is_pp_last_stage(pg_collection.pp) and is_vp_last_stage(vp_stage, vp_size)
     has_cu_seqlens = cfg.data.has_cu_seqlens()
-    if not is_first and not is_last and not use_mtp and not has_cu_seqlens:
+    needs_masks = cfg.data.creates_attention_mask() or config.num_moe_experts is not None
+    if not is_first and not is_last and not use_mtp and not has_cu_seqlens and not needs_masks:
         return ContextParallelBatch.from_single_layout(
             config.linear_cp_layout, dict.fromkeys(_BATCH_KEYS), None
         )
@@ -132,6 +135,7 @@ def get_batch(
         pipeline_model_parallel_size=pg_collection.pp.size(),
         is_pipeline_first_stage=is_first,
         is_pipeline_last_stage=is_last,
+        broadcast_padding_mask=True,
     )
     batch = flatten_batch_for_packed_sequences(batch)
     # mRoPE positions are [3, batch, sequence], not [batch, sequence]. The model
@@ -205,10 +209,32 @@ def forward_step(
     with stimer(bdata=True):
         cp_batch = get_batch(data_iterator, pg_collection=pg_collection, vp_stage=vp_stage)
         batch = cp_batch.get_batch()
-        if batch.get("cu_seqlens") is not None:
+        # The scheduler already supplies global totals. Otherwise each physical rank
+        # counts a logical microbatch only once, not once per virtual model chunk.
+        if (
+            cfg.model.transformer.sequence_packing_scheduler is None
+            and vp_stage in (None, 0)
+            and batch.get("cu_seqlens") is not None
+        ):
             update_seqlen_stats_from_cu_seqlens(batch["cu_seqlens"].squeeze(0))
     timers("batch-generator").stop()
 
+    padding_mask = batch.get("padding_mask")
+    # GPT scatters alongside embeddings on its first stage only. Later stages
+    # receive SP-local activations; Hybrid handles its masks inside the model.
+    if (
+        padding_mask is not None
+        and cfg.model.transformer.sequence_parallel
+        and not isinstance(cfg.model, HybridModelConfig)
+        and not get_attr_wrapped_model(model, "pre_process")
+    ):
+        padding_mask = (
+            tensor_parallel.scatter_to_sequence_parallel_region(
+                padding_mask.transpose(0, 1).contiguous(), group=pg_collection.tp
+            )
+            .transpose(0, 1)
+            .contiguous()
+        )
     forward_args = {
         "input_ids": batch.get("tokens"),
         "position_ids": batch.get("position_ids"),
@@ -216,7 +242,7 @@ def forward_step(
         "labels": batch.get("labels"),
         "loss_mask": batch.get("loss_mask"),
         "packed_seq_params": cp_batch.get_packed_seq_params(),
-        "padding_mask": batch.get("padding_mask"),
+        "padding_mask": padding_mask,
     }
     with stimer:
         if return_schedule_plan:

@@ -6,8 +6,9 @@ import inspect
 import logging
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
+from enum import Enum
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, get_args, get_type_hints
 
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -41,6 +42,7 @@ def apply_config_overrides(config: "ConfigContainerBase", overrides: list[str]) 
     Raises:
         ValueError: An override is malformed or does not name an editable field.
     """
+    import torch
     from omegaconf import OmegaConf
 
     for override in overrides:
@@ -72,6 +74,34 @@ def apply_config_overrides(config: "ConfigContainerBase", overrides: list[str]) 
         value = OmegaConf.to_container(OmegaConf.from_dotlist([f"value={literal}"]), resolve=True)[
             "value"
         ]
+        # OmegaConf leaves dtype/enum names as strings; preserve the recipe's typed leaves.
+        annotation = get_type_hints(type(owner)).get(names[-1])
+        field_types = get_args(annotation) or (annotation,)
+        enum_type = next(
+            (t for t in field_types if isinstance(t, type) and issubclass(t, Enum)),
+            type(current) if isinstance(current, Enum) else None,
+        )
+        field = next(field for field in dataclass_fields(owner) if field.name == names[-1])
+        if value is None and (type(None) in field_types or field.default is None):
+            pass
+        elif isinstance(current, torch.dtype) or torch.dtype in field_types:
+            dtype = (
+                getattr(torch, value.removeprefix("torch."), None)
+                if isinstance(value, str)
+                else None
+            )
+            if not isinstance(dtype, torch.dtype):
+                raise ValueError(f"Invalid torch dtype for {path!r}: {value!r}")
+            value = dtype
+        elif enum_type is not None:
+            try:
+                value = (
+                    enum_type[value]
+                    if isinstance(value, str) and value in enum_type.__members__
+                    else enum_type(value)
+                )
+            except (ValueError, TypeError) as error:
+                raise ValueError(f"Invalid {enum_type.__name__} for {path!r}: {value!r}") from error
         setattr(owner, names[-1], value)
 
 

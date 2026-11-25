@@ -8,7 +8,7 @@ from functools import partial
 from megatron.core.enums import ModelType
 from megatron.training.callbacks import Callback, CallbackManager
 from megatron.training.config import PretrainConfigContainer
-from megatron.training.datasets.providers import build_gpt_datasets
+from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.global_vars import set_run_config
 from megatron.training.models.gpt import GPTModelConfig
 from megatron.training.models.hybrid import HybridModelConfig
@@ -44,7 +44,15 @@ def pretrain(
         raise ValueError("Config-only pretraining currently supports torch_dist checkpoints")
     config.validate()
     set_run_config(config)
-    provider = partial(build_gpt_datasets, data_config=config.data)
+    # Dense attention masks and MoE padding masks are needed by middle PP stages too.
+    built_on_rank = partial(
+        is_dataset_built_on_rank,
+        needs_batch_on_all_pipeline_stages=(
+            config.data.creates_attention_mask()
+            or config.model.transformer.num_moe_experts is not None
+        ),
+    )
+    provider = partial(build_gpt_datasets, data_config=config.data, built_on_rank=built_on_rank)
     provider.is_distributed = True
     pretrain_loop(
         config, provider, ModelType.encoder_or_decoder, forward_step_func, callbacks=callbacks
