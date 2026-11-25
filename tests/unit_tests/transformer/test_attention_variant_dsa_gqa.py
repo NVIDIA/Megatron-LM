@@ -59,22 +59,25 @@ from tests.unit_tests.test_utilities import Utils, make_flops_test_layer
 
 
 @pytest.mark.parametrize(
-    "backend, width, topk, warmup, training, sparse_loss, include_backward, expected",
+    "backend, width, topk, warmup, mode, sparse_loss, include_backward, expected",
     [
-        ("min-memory-torch", 2, 2, False, False, True, False, 4160),
-        ("min-memory-triton", 2, 4, False, False, True, False, 4480),
-        ("min-memory-torch", 4, 2, False, False, True, False, 4800),
-        ("min-memory-torch", 2, 2, False, True, True, True, 12048),
-        ("min-memory-torch", 2, 2, False, True, False, True, 13120),
-        ("min-memory-torch", 2, 2, True, False, False, False, 4096),
-        ("min-memory-torch", 2, 2, True, True, False, True, 14208),
-        ("reference", 2, 2, False, False, True, False, 5888),
-        ("reference", 2, 4, False, False, True, False, 5888),
-        ("reference", 2, 2, False, True, True, True, 18176),
+        ("min-memory-torch", 2, 2, False, "eval", True, False, 4160),
+        ("min-memory-triton", 2, 4, False, "eval", True, False, 4480),
+        ("min-memory-torch", 4, 2, False, "eval", True, False, 4800),
+        ("min-memory-torch", 2, 2, False, "train", True, True, 12048),
+        ("min-memory-torch", 2, 2, False, "train", False, True, 14016),
+        ("min-memory-torch", 2, 2, True, "eval", False, False, 4096),
+        ("min-memory-torch", 2, 2, True, "no_grad", False, False, 4096),
+        ("min-memory-torch", 2, 2, True, "no_grad", False, True, 15104),
+        ("min-memory-torch", 2, 2, True, "train", False, False, 5888),
+        ("min-memory-torch", 2, 2, True, "train", False, True, 15104),
+        ("reference", 2, 2, False, "eval", True, False, 5888),
+        ("reference", 2, 4, False, "eval", True, False, 5888),
+        ("reference", 2, 2, False, "train", True, True, 18176),
     ],
 )
 def test_grouped_dsa_estimates_constructed_core(
-    backend, width, topk, warmup, training, sparse_loss, include_backward, expected
+    backend, width, topk, warmup, mode, sparse_loss, include_backward, expected
 ):
     config = SimpleNamespace(
         hidden_size=8,
@@ -92,18 +95,19 @@ def test_grouped_dsa_estimates_constructed_core(
     )
     core = make_flops_test_layer(DSGQACoreAttention, config, indexer=indexer, layer_number=1)
     attention = make_flops_test_layer(DSGroupedSelfAttention, config, core_attention=core)
-    attention.train(training)
+    attention.train(mode != "eval")
 
     # QKV/output cost 3072. For L=8, top-k=2 retains ~14 causal pairs, full
-    # causal attention uses ~32, and the masked reference computes all 64.
-    assert (
-        attention.estimate_flops(
-            total_real_tokens_in_batch=8,
-            seqlen_squared_sum_in_batch=64,
-            include_backward=include_backward,
+    # causal attention uses ~32, and dense KL computes all 64 (1024 teacher FLOPs).
+    with torch.set_grad_enabled(mode == "train"):
+        assert (
+            attention.estimate_flops(
+                total_real_tokens_in_batch=8,
+                seqlen_squared_sum_in_batch=64,
+                include_backward=include_backward,
+            )
+            == expected
         )
-        == expected
-    )
 
 
 @pytest.mark.parametrize("layer_number, expected", [(1, 3520), (2, 4096)])

@@ -620,23 +620,36 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         seqlen_squared_sum_in_batch: float,
         include_backward: bool = False,
         compute_mtp_loss: bool = True,
+        has_mtp_targets: bool = True,
+        num_output_tokens: int | None = None,
     ) -> float:
-        """Estimate this chunk's work for a global batch using the same MTP flag as forward."""
+        """Estimate this chunk's work for a global batch.
+
+        Pass the same compute_mtp_loss flag as forward. Set has_mtp_targets to False
+        when neither labels nor input IDs are available for MTP. num_output_tokens
+        counts the rows sent to the main vocabulary head and defaults to all real tokens.
+        A forward-only estimate uses the caller's grad mode. Including backward models
+        a grad-enabled forward even when the estimate itself is requested under no_grad.
+        """
         batch_stats = dict(
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
         )
-        decoder_backward = include_backward and not (
-            self.training and self.config.freeze_base_model_for_mtp
-        )
-        flops = self.decoder.estimate_flops(**batch_stats, include_backward=decoder_backward)
+        grad_enabled = include_backward or torch.is_grad_enabled()
+        frozen_decoder = self.training and self.config.freeze_base_model_for_mtp
+        decoder_backward = include_backward and not frozen_decoder
+        with torch.set_grad_enabled(grad_enabled and not frozen_decoder):
+            flops = self.decoder.estimate_flops(**batch_stats, include_backward=decoder_backward)
         run_mtp = self.mtp_process and compute_mtp_loss and not InferenceMode.is_active()
+        process_mtp_targets = run_mtp and has_mtp_targets
         if run_mtp:
             # Training keeps a zero gradient connection even when both objectives are disabled.
             mtp_backward = include_backward and (
-                self.training or self.config.mtp_ce_loss_weight > 0 or not self.post_process
+                not self.post_process
+                or (has_mtp_targets and (self.training or self.config.mtp_ce_loss_weight > 0))
             )
-            flops += self.mtp.estimate_flops(**batch_stats, include_backward=mtp_backward)
+            with torch.set_grad_enabled(grad_enabled):
+                flops += self.mtp.estimate_flops(**batch_stats, include_backward=mtp_backward)
         if self.post_process:
             # Each projection has a forward matmul and up to two gradient matmuls.
             head_matmuls = 1
@@ -649,19 +662,22 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 )
                 weight_backward = weight.requires_grad
                 # process_mtp_loss attaches the MTP losses to the main hidden states.
-                head_matmuls += int(decoder_backward or run_mtp) + int(weight_backward)
-            if run_mtp:
+                head_matmuls += int(decoder_backward or process_mtp_targets) + int(weight_backward)
+            output_rows = (
+                total_real_tokens_in_batch if num_output_tokens is None else num_output_tokens
+            )
+            projected_rows = output_rows * head_matmuls
+            if process_mtp_targets:
                 teacher = self.training and self.config.mtp_kl_loss_weight > 0
                 if teacher:
-                    head_matmuls += 1  # Teacher logits are computed under no_grad.
+                    projected_rows += total_real_tokens_in_batch  # Forward-only teacher logits.
                 if teacher or self.config.mtp_ce_loss_weight > 0:
                     student_matmuls = 1 + int(include_backward)
                     student_matmuls += int(weight_backward and not self.config.mtp_detach_heads)
-                    head_matmuls += self.config.mtp_num_layers * student_matmuls
-            projection_flops = (
-                2 * total_real_tokens_in_batch * self.config.hidden_size * self.vocab_size
-            )
-            flops += projection_flops * head_matmuls
+                    projected_rows += (
+                        total_real_tokens_in_batch * self.config.mtp_num_layers * student_matmuls
+                    )
+            flops += 2 * projected_rows * self.config.hidden_size * self.vocab_size
         return flops
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:

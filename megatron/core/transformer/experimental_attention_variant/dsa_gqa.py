@@ -586,23 +586,26 @@ class DSGQACoreAttention(MegatronModule):
         head_width = config.num_attention_heads * config.kv_channels
         attention = 4 * pairs * head_width * support
         flops = (3 if include_backward else 1) * attention
-        train_indexer = self.training and (config.dsa_indexer_loss_coeff or 0) > 0
+        # A frozen MTP backbone stays in training mode but skips the indexer loss.
+        grad_enabled = include_backward or torch.is_grad_enabled()
+        train_indexer = self.training and grad_enabled and (config.dsa_indexer_loss_coeff or 0) > 0
         if warmup and not train_indexer:
             return flops
 
         width = self.indexer.index_head_dim
         projections = 4 * total_real_tokens_in_batch * config.hidden_size * width
-        scores = 2 * pairs * width
-        flops += projections + scores
+        if not warmup:
+            flops += projections + 2 * pairs * width  # Top-k routing.
         if train_indexer:
-            loss_support = support if config.dsa_indexer_use_sparse_loss else 1.0
-            # Sparse routing followed by a separate dense KL pass reprojects Q/K.
-            if not reference and not warmup and not config.dsa_indexer_use_sparse_loss:
-                flops += projections + scores
-            flops += 2 * pairs * head_width * loss_support  # Detached teacher's QK scores.
+            loss_pairs = pairs * support
+            if not reference and not config.dsa_indexer_use_sparse_loss:
+                # Dense KL projects its own indexer Q/K and scores the full square before masking.
+                loss_pairs = seqlen_squared_sum_in_batch
+                flops += projections + 2 * loss_pairs * width
+            flops += 2 * loss_pairs * head_width  # Detached teacher's QK scores.
             if include_backward:
                 # Detached indexer input needs weight gradients only; scores need dQ and dK.
-                flops += projections + 2 * scores * loss_support
+                flops += projections + 4 * loss_pairs * width
         return flops
 
     def __init__(

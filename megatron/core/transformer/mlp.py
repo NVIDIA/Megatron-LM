@@ -180,15 +180,15 @@ class MLP(MegatronModule):
         include_backward: bool = False,
     ) -> float:
         """Estimate projection FLOPs for a dense MLP."""
-        config = self.config
-        projections = 3 if config.gated_linear_unit else 2
-        forward = (
-            2
-            * projections
-            * total_real_tokens_in_batch
-            * config.hidden_size
-            * config.ffn_hidden_size
-        )
+        if hasattr(self, "_fc1_dims"):
+            fc1_in, fc1_out = self._fc1_dims
+            fc2_in, fc2_out = self._fc2_dims
+        else:
+            # Config-only callers describe a standard hidden -> FFN -> hidden MLP.
+            fc1_in = fc2_out = self.config.hidden_size
+            fc2_in = self.config.ffn_hidden_size
+            fc1_out = fc2_in * (2 if self.config.gated_linear_unit else 1)
+        forward = 2 * total_real_tokens_in_batch * (fc1_in * fc1_out + fc2_in * fc2_out)
         return (3 if include_backward else 1) * forward
 
     def __init__(
@@ -238,9 +238,13 @@ class MLP(MegatronModule):
         # shared_experts.
         use_latent_size = (self.config.moe_latent_size is not None) and is_expert
 
-        self.linear_fc1 = submodules.linear_fc1(
+        # Keep the global projection dimensions before the linear backends partition them.
+        self._fc1_dims = (
             self.input_size if not use_latent_size else not_none(self.config.moe_latent_size),
             ffn_hidden_size,
+        )
+        self.linear_fc1 = submodules.linear_fc1(
+            *self._fc1_dims,
             config=self.config,
             init_method=not_none(self.config.init_method),
             gather_output=False,
@@ -259,11 +263,14 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
-        self.linear_fc2 = submodules.linear_fc2(
+        self._fc2_dims = (
             not_none(self.config.ffn_hidden_size),
             not_none(
                 self.config.hidden_size if not use_latent_size else self.config.moe_latent_size
             ),
+        )
+        self.linear_fc2 = submodules.linear_fc2(
+            *self._fc2_dims,
             config=self.config,
             init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,

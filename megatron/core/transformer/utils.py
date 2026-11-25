@@ -5,7 +5,6 @@
 import functools
 import gc
 import logging
-import math
 import os
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Tuple, Union
@@ -598,7 +597,7 @@ def capped_causal_attention_fraction(
     if not max_keys or total_real_tokens <= 0 or seqlen_squared_sum <= 0:
         return 1.0
     mean_length = seqlen_squared_sum / total_real_tokens
-    effective_keys = min(max_keys, math.floor(mean_length))
+    effective_keys = min(max_keys, mean_length)
     attended = effective_keys * (1 - effective_keys / (2 * mean_length))
     return attended / (mean_length / 2)
 

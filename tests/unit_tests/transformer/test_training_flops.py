@@ -97,22 +97,27 @@ def test_mamba_flops_use_resolved_mixer_dimensions():
 
 
 @pytest.mark.parametrize(
-    "attention_backend,packing_scheduler,loss_coeff,expected_training",
+    "attention_backend,packing_scheduler,loss_coeff,sparse_loss,expected_training",
     [
-        ("auto", None, 0.0, 7664),
-        ("auto", None, 0.1, 7728),
-        ("unfused", None, 0.0, 7728),
-        ("unfused", "dp_balanced", 0.0, 7664),
+        ("auto", None, 0.0, True, 31472),
+        ("auto", None, 0.1, False, 32496),
+        ("auto", None, 0.1, True, 31696),
+        ("unfused", None, 0.0, False, 32496),
+        ("unfused", None, 0.1, True, 32496),
+        ("unfused", "dp_balanced", 0.0, True, 31472),
+        ("unfused", "dp_balanced", 0.1, True, 31696),
     ],
 )
 def test_csa_counts_score_backward_for_the_configured_kernel(
-    attention_backend, packing_scheduler, loss_coeff, expected_training
+    attention_backend, packing_scheduler, loss_coeff, sparse_loss, expected_training
 ):
     config = _config(loss_coeff)
     config.output_projection_lora_rank = 2
     config.output_projection_groups = 1
     config.csa_window_size = 2
     config.csa_dense_mode = False
+    config.dsa_indexer_topk = 1
+    config.dsa_indexer_use_sparse_loss = sparse_loss
     config.attention_backend = attention_backend
     config.dsa_kernel_backend = "cudnn"
     config.sequence_packing_scheduler = packing_scheduler
@@ -120,8 +125,10 @@ def test_csa_counts_score_backward_for_the_configured_kernel(
     attention = make_flops_test_layer(DSv4HybridSelfAttention, config, _dsv4_compress_ratio=4)
 
     # The resolved ratio is sufficient for legacy configs that lack compress_ratio.
-    # Sparse ratio 4 costs 2,544 projection/window/attention FLOPs and 32 indexer score FLOPs.
-    assert attention.estimate_flops(**BATCH_STATS) == 2576
+    # One 16-token sequence has 64 query/compressed-key pairs for routing. For top-k 1,
+    # the causal approximation gives 14 selected pairs for the sparse score gradients.
+    stats = dict(total_real_tokens_in_batch=16, seqlen_squared_sum_in_batch=256)
+    assert attention.estimate_flops(**stats) == 10832
     config.compress_ratio = 0
-    assert attention.estimate_flops(**BATCH_STATS, include_backward=True) == expected_training
-    assert DSv4HybridSelfAttention.estimate_flops(config, **BATCH_STATS) == 992
+    assert attention.estimate_flops(**stats, include_backward=True) == expected_training
+    assert DSv4HybridSelfAttention.estimate_flops(config, **stats) == 3968
