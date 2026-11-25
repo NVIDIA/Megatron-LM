@@ -31,18 +31,18 @@ class _ReorderedMetadataRequest(DynamicInferenceRequest):
 def _requests(context, request_type=DynamicInferenceRequest):
     policies = (
         SamplingParams(
-            num_tokens_to_generate=6,
+            num_tokens_to_generate=8,
             termination_id=-1,
             top_k=1,
             return_log_probs=True,
             skip_prompt_log_probs=False,
             top_n_logprobs=3,
-            # Both sequences end on token 13; the longest simultaneous match wins.
-            stop_words=["12 13", "11 12 13"],
+            # Both sequences end on token 16; the longest simultaneous match wins.
+            stop_words=["15 16", "14 15 16"],
             detokenize_stop_sequence=False,
         ),
         SamplingParams(
-            num_tokens_to_generate=2,
+            num_tokens_to_generate=4,
             termination_id=-1,
             stop_token_ids=[22, 55],
             top_k=1,
@@ -200,15 +200,15 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
         _assert_engine_drained(engine, futures, completed, range(3))
         finished = [completed[request_id] for request_id in range(3)]
         assert [request.generated_tokens for request in finished] == [
-            [],
+            [11, 12, 13],
             [21, 22],
             [31, 32, 33, 34],
         ]
         assert [request.finish_reason for request in finished] == ["stop", "stop", "length"]
         assert all(request.status == Status.COMPLETED for request in finished)
-        assert finished[0].sampling_params.stop_words == ["12 13", "11 12 13"]
+        assert finished[0].sampling_params.stop_words == ["15 16", "14 15 16"]
         assert finished[1].sampling_params.stop_token_ids == [22, 55]
-        assert finished[1].generated_length == finished[1].sampling_params.num_tokens_to_generate
+        assert finished[1].generated_length < finished[1].sampling_params.num_tokens_to_generate
         assert runtime["middle-finished-with-survivors"] > 0
 
         for request in finished:
@@ -262,7 +262,7 @@ class TestSamplingOutputMatrix(RequestLifecyclePairwiseBase):
             and key[2] == (0, 2)
             and len(value) == 2
         }
-        assert (1, 2) in survivor_score_support
+        assert survivor_score_support == {(1, 2)}
         survivor_metadata = [
             values
             for key, values in runtime.items()
