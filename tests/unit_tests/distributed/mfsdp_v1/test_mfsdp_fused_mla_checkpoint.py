@@ -305,7 +305,7 @@ def preprocess(sharded, state_dict):
     from megatron.training.checkpointing import preprocess_fsdp_dtensor_state_dict
 
     config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
-    return preprocess_fsdp_dtensor_state_dict(config, state_dict, sharded)
+    return preprocess_fsdp_dtensor_state_dict(config, state_dict, [sharded])
 
 
 def save_checkpoint(sharded, path):
