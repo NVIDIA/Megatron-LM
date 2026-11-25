@@ -55,10 +55,12 @@ def cutemok_available() -> bool:
         cutemok_api()
     except ImportError:
         return False
-    try:  # CuTe MoK checks its CuTe DSL only when it compiles; this check is private, best effort.
+    # CuTe MoK checks its CuTe DSL only when it compiles, so check it now with cuDNN's own gate.
+    # The gate is private: if it cannot be imported, treat CuTe MoK as unavailable.
+    try:
         from cudnn.moe_ep._cutemok.cutedsl._version_gate import require_cutedsl
     except ImportError:
-        return True
+        return False
     try:
         require_cutedsl()
     except RuntimeError:
