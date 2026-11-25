@@ -156,13 +156,12 @@ def test_muon_matches_reference(
     torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)
 
 
-def _assert_one_fsdp_group_matches_reference(
-    distributed_setup, layer_groups: list[list[int]], weight_decay_method: str, nesterov: bool
-) -> None:
-    """Shard four linear layers as one FSDP group; FsdpMuon must match unsharded Muon.
+@pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
+@pytest.mark.parametrize("nesterov", [False, True], ids=["momentum", "nesterov"])
+def test_muon_batches_each_optimizer_group(distributed_setup, weight_decay_method, nesterov):
+    """One FSDP group holds two optimizer groups of two matrices each.
 
-    layer_groups lists the layers of each optimizer group; group k uses its own learning rate
-    and weight decay, so a batch that mixed groups would change the losses.
+    Each optimizer group is updated as one batch with its own learning rate and weight decay.
     """
     mesh = init_device_mesh("cuda", (distributed_setup.world_size,))
     placements = Placements(
@@ -174,39 +173,29 @@ def _assert_one_fsdp_group_matches_reference(
     reference = copy.deepcopy(model)
     with fully_shard_context(FsdpContext(device=distributed_setup.device)):
         fully_shard(model, mesh=mesh, placements=placements)
-    kwargs = dict(momentum=0.9, nesterov=nesterov, weight_decay_method=weight_decay_method)
-    groups = [
-        {
-            "params": [model[i].weight for i in layers],
-            "lr": 0.05 / (k + 1),
-            "weight_decay": 0.1 * (k + 1),
-        }
-        for k, layers in enumerate(layer_groups)
-    ]
-    reference_groups = [
-        {**group, "params": [reference[i].weight for i in layers]}
-        for group, layers in zip(groups, layer_groups)
-    ]
-    optimizer = muon.FsdpMuon(groups, **kwargs)
+    kwargs = dict(
+        lr=0.05,
+        momentum=0.9,
+        nesterov=nesterov,
+        weight_decay=0.1,
+        weight_decay_method=weight_decay_method,
+    )
+    optimizer = muon.FsdpMuon(
+        [
+            {"params": [model[0].weight, model[2].weight]},
+            {"params": [model[1].weight, model[3].weight], "lr": 0.02, "weight_decay": 0.3},
+        ],
+        **kwargs,
+    )
     fully_shard_optimizer(optimizer, precision_aware=True)
+    reference_optimizer = Muon(
+        [
+            {"params": [reference[0].weight, reference[2].weight]},
+            {"params": [reference[1].weight, reference[3].weight], "lr": 0.02, "weight_decay": 0.3},
+        ],
+        **kwargs,
+    )
     inputs = torch.randn(5, 4, 8, device=distributed_setup.device)
-    reference_losses = _train(reference, (Muon(reference_groups, **kwargs),), inputs)
+    reference_losses = _train(reference, (reference_optimizer,), inputs)
     losses = _train(model, (optimizer,), inputs)
     torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)
-
-
-@pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
-@pytest.mark.parametrize("nesterov", [False, True], ids=["momentum", "nesterov"])
-def test_muon_batches_one_fsdp_group(distributed_setup, weight_decay_method, nesterov):
-    """Four matrices in one FSDP group and one optimizer group are updated as one batch."""
-    _assert_one_fsdp_group_matches_reference(
-        distributed_setup, [[0, 1, 2, 3]], weight_decay_method, nesterov
-    )
-
-
-@pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
-def test_muon_keeps_optimizer_groups_apart(distributed_setup, weight_decay_method):
-    """Two optimizer groups in one FSDP group keep their own learning rate and weight decay."""
-    _assert_one_fsdp_group_matches_reference(
-        distributed_setup, [[0, 2], [1, 3]], weight_decay_method, nesterov=False
-    )
