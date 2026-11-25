@@ -203,11 +203,11 @@ class LanguageModule(MegatronModule):
         # sums the dummy weight gradients returned under gradient_accumulation_fusion. ZeroTensor
         # dummies make that sum free (see LinearWithGradAccumulationAndAsyncCommunication).
         # Tied heads receive the shared embedding weight instead of output_layer.weight.
-        if getattr(self.config, 'mtp_num_layers', 0) and self.post_process:
+        if getattr(self.config, "mtp_num_layers", 0) and self.post_process:
             if self.share_embeddings_and_output_weights:
                 head_weight = self.shared_embedding_or_output_weight()
             else:
-                head_weight = getattr(getattr(self, 'output_layer', None), 'weight', None)
+                head_weight = getattr(getattr(self, "output_layer", None), "weight", None)
             if head_weight is not None:
                 head_weight.zero_tensor_dummy_wgrad = True
 
