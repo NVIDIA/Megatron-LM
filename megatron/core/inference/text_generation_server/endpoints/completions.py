@@ -26,7 +26,15 @@ _DEBUG_FILENAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 
 
 def _validate_debug_filename(value) -> str:
-    """Validate a debug artifact label before including it in a local filename."""
+    """Validate a debug artifact label before including it in a local filename.
+
+    ``debug_fname`` comes straight from the request body and ends up in the path of a file
+    written with ``torch.save`` (a pickle). Unsanitized, a value such as ``../../tmp/x``
+    would write that file anywhere on the filesystem, and loading it later could run
+    arbitrary code. Restricting it to a plain label (no path separators or ``..``) keeps
+    the file in the working directory. This is a security fix meant for main, not a
+    debugging aid.
+    """
     if not isinstance(value, str) or not _DEBUG_FILENAME_PATTERN.fullmatch(value):
         raise ValueError(
             "debug_fname must be 1-128 ASCII letters, digits, dots, underscores, or hyphens"

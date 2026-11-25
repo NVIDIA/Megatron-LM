@@ -268,19 +268,13 @@ def test_inflight_byte_budget_is_split_across_replicas(monkeypatch):
 
 
 @pytest.mark.parametrize("num_replicas", [1, 4, 16, 17, 32, 64])
-def test_default_budget_starts_for_every_replica_count(monkeypatch, num_replicas):
-    """The launcher picks max(DP size, 4) replicas, so no replica count may be refused."""
+def test_inflight_limits_are_off_by_default(monkeypatch, num_replicas):
+    """No limit is configured unless the caller sets one, for any replica count."""
     server, budgets = _patch_replica_launch(monkeypatch)
 
     _start(server, num_replicas=num_replicas)
 
-    assert len(budgets) == num_replicas
-    # Every replica can still accept a maximum-size request ...
-    assert min(budgets) >= 2**30
-    # ... and the aggregate stays bounded: 16 GiB, or one maximum-size request per replica
-    # once there are more than 16 replicas.
-    assert sum(budgets) <= max(2**34, num_replicas * 2**30)
-    assert len(set(budgets)) == 1
+    assert budgets == [None] * num_replicas
 
 
 def test_inflight_byte_budget_must_fit_a_max_size_request_per_replica(monkeypatch):
@@ -385,6 +379,56 @@ async def test_frontend_process_exposes_sampling_config_and_stops_client(monkeyp
     assert captured["hypercorn_config"].h2_max_concurrent_streams == 7
     assert captured["hypercorn_config"].bind == ["fd://23"]
     assert captured["listener_closed"] is True
+
+
+@pytest.mark.asyncio
+async def test_frontend_process_has_no_inflight_limiter_by_default(monkeypatch):
+    """The limiter is opt-in: without limits the app is served unwrapped."""
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+        text_generation_server as server,
+    )
+
+    captured = {}
+
+    class FakeInferenceClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    async def fake_serve(app, config):
+        captured["app"] = app
+        captured["hypercorn_config"] = config
+
+    class FakeListener:
+        def fileno(self):
+            return 23
+
+        def listen(self, backlog):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server, "InferenceClient", FakeInferenceClient)
+    monkeypatch.setattr(server, "serve", fake_serve)
+    monkeypatch.setattr(server.endpoints, "__all__", [])
+    monkeypatch.setattr(server, "_bind_reuseport_socket", lambda _port, _host: FakeListener())
+
+    await server._run_text_gen_server(
+        coordinator_addr="tcp://coord:5555",
+        tokenizer=object(),
+        rank=0,
+        server_port=4321,
+        hostname="127.0.0.1",
+    )
+
+    assert not isinstance(captured["app"].asgi_app, server._InflightHTTPLimit)
+    assert captured["hypercorn_config"].h2_max_concurrent_streams == 2**14
 
 
 @pytest.mark.asyncio

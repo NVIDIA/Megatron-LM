@@ -32,6 +32,10 @@ except ImportError:
     HAVE_ZMQ = False
 
 _AUTH_FRAGMENT = "#auth="
+# 32 random bytes is 256 bits of entropy: the stdlib's own default for ``secrets``
+# (``secrets.DEFAULT_ENTROPY``) and well above the 128 bits usually recommended for a
+# shared secret. The token is also the PLAIN password, so there is no benefit to making
+# it shorter.
 _AUTH_TOKEN_BYTES = 32
 _PLAIN_USERNAME = b"megatron"
 

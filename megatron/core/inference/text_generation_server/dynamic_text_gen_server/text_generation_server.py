@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import logging
+import math
 import multiprocessing as mp
 import socket
 from concurrent.futures import ThreadPoolExecutor
@@ -30,8 +31,10 @@ logger = logging.getLogger(__name__)
 
 # Per-request payload limit, enforced by Quart.
 _MAX_REQUEST_CONTENT_SIZE = 2**30
-# Default per-rank budget for in-flight request payload bytes (see start_text_gen_server).
-_DEFAULT_MAX_INFLIGHT_BYTES = 2**34
+# Hypercorn settings.
+_KEEP_ALIVE_TIMEOUT_SECONDS = 30.0  # Keep connections alive between long-running requests.
+_LISTEN_BACKLOG = 2**14  # Expect high load; ensure we do not drop connections.
+_H2_MAX_CONCURRENT_STREAMS = 2**14  # Streams one HTTP/2 connection may open.
 
 # Global reference to manage the background server processes
 _SERVER_PROCESSES: List[mp.Process] = []
@@ -57,7 +60,8 @@ def temp_log_level(level, logger=None):
 class _InflightHTTPLimit:
     """ASGI middleware that caps how much request state one server replica can hold.
 
-    It limits two totals across all of the replica's in-flight HTTP requests:
+    It limits two totals across all of the replica's in-flight HTTP requests, each
+    optional (``None`` leaves that total unlimited):
 
     - ``max_inflight_requests``: the number of requests being handled at once.
     - ``max_inflight_bytes``: the payload bytes (prompt JSON, base64 media) those
@@ -74,14 +78,16 @@ class _InflightHTTPLimit:
     def __init__(
         self,
         app,
-        max_inflight_requests: int,
-        max_inflight_bytes: int,
+        max_inflight_requests: Optional[int],
+        max_inflight_bytes: Optional[int],
         max_request_content_size: int,
     ) -> None:
         self.app = app
         self.max_request_content_size = max_request_content_size
-        self.max_inflight_requests = max_inflight_requests
-        self.max_inflight_bytes = max_inflight_bytes
+        self.max_inflight_requests = (
+            math.inf if max_inflight_requests is None else max_inflight_requests
+        )
+        self.max_inflight_bytes = math.inf if max_inflight_bytes is None else max_inflight_bytes
         self.inflight = 0
         self.inflight_bytes = 0
 
@@ -168,8 +174,8 @@ async def _run_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
-    max_inflight_requests: int = 16384,
-    max_inflight_bytes: int = _DEFAULT_MAX_INFLIGHT_BYTES,
+    max_inflight_requests: Optional[int] = None,
+    max_inflight_bytes: Optional[int] = None,
     ready_conn: Optional[mp_connection.Connection] = None,
 ):
     """
@@ -240,15 +246,19 @@ async def _run_text_gen_server(
         for endpoint in endpoints.__all__:
             app.register_blueprint(endpoint)
 
-        app.asgi_app = _InflightHTTPLimit(
-            app.asgi_app, max_inflight_requests, max_inflight_bytes, _MAX_REQUEST_CONTENT_SIZE
-        )
+        if max_inflight_requests is not None or max_inflight_bytes is not None:
+            # Opt-in: the limiter's overhead and scalability have not been benchmarked.
+            app.asgi_app = _InflightHTTPLimit(
+                app.asgi_app, max_inflight_requests, max_inflight_bytes, _MAX_REQUEST_CONTENT_SIZE
+            )
 
         config = Config()
-        config.keep_alive_timeout = 30.0  # Keep connection alive between long-running requests.
-        config.backlog = 2**14  # Expect high load; ensure we do not drop connections.
+        config.keep_alive_timeout = _KEEP_ALIVE_TIMEOUT_SECONDS
+        config.backlog = _LISTEN_BACKLOG
         # One HTTP/2 connection can open as many streams as the replica will handle.
-        config.h2_max_concurrent_streams = max_inflight_requests
+        config.h2_max_concurrent_streams = (
+            _H2_MAX_CONCURRENT_STREAMS if max_inflight_requests is None else max_inflight_requests
+        )
 
         # Held for this worker's lifetime; closing it would drop the listener.
         own_socket = _bind_reuseport_socket(server_port, bind_host)
@@ -298,8 +308,8 @@ def _server_process_worker(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
-    max_inflight_requests: int = 16384,
-    max_inflight_bytes: int = _DEFAULT_MAX_INFLIGHT_BYTES,
+    max_inflight_requests: Optional[int] = None,
+    max_inflight_bytes: Optional[int] = None,
     ready_conn: Optional[mp_connection.Connection] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
@@ -389,7 +399,7 @@ def start_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
-    max_inflight_requests: int = 16384,
+    max_inflight_requests: Optional[int] = None,
     max_inflight_bytes: Optional[int] = None,
 ) -> Optional[str]:
     """Start the text generation server and wait until every replica is listening.
@@ -415,12 +425,14 @@ def start_text_gen_server(
         chat_template: Chat template to apply, as a file path or an inline
             template string. None falls back to the tokenizer's own template.
         max_inflight_requests: Per replica, the most HTTP requests handled at
-            once. Requests beyond it get 503.
+            once. Requests beyond it get 503. None (default) leaves it unlimited.
         max_inflight_bytes: Per rank, the most request payload bytes held at once,
             split evenly across replicas. Each share must be at least 1 GiB (the
-            per-request limit), otherwise ``ValueError``. Defaults to
-            ``max(16 GiB, num_replicas * 1 GiB)``. Counts raw bytes, so actual
-            memory use is a few times higher; lower it on small hosts.
+            per-request limit), otherwise ``ValueError``. None (default) leaves it
+            unlimited. Counts raw bytes, so actual memory use is a few times higher.
+
+            The in-flight limiter is off by default because its overhead and
+            scalability have not been benchmarked. Setting either limit enables it.
 
     Returns:
         The base URL this rank serves on, or None if the server was already
@@ -436,22 +448,20 @@ def start_text_gen_server(
         logger.warning("Text gen server processes are already running.")
         return None
 
-    if max_inflight_requests < 1:
+    if max_inflight_requests is not None and max_inflight_requests < 1:
         raise ValueError(f"max_inflight_requests must be >= 1, got {max_inflight_requests}")
     if num_replicas < 1:
         raise ValueError(f"num_replicas must be >= 1, got {num_replicas}")
-    if max_inflight_bytes is None:
-        max_inflight_bytes = max(
-            _DEFAULT_MAX_INFLIGHT_BYTES, num_replicas * _MAX_REQUEST_CONTENT_SIZE
-        )
-    # The budget is per rank; each replica enforces an equal share of it.
-    replica_inflight_bytes = max_inflight_bytes // num_replicas
-    if replica_inflight_bytes < _MAX_REQUEST_CONTENT_SIZE:
-        raise ValueError(
-            f"max_inflight_bytes is split across {num_replicas} replicas and each share must be "
-            f">= {_MAX_REQUEST_CONTENT_SIZE} (the per-request limit), so it must be >= "
-            f"{num_replicas * _MAX_REQUEST_CONTENT_SIZE}; got {max_inflight_bytes}"
-        )
+    replica_inflight_bytes = None
+    if max_inflight_bytes is not None:
+        # The budget is per rank; each replica enforces an equal share of it.
+        replica_inflight_bytes = max_inflight_bytes // num_replicas
+        if replica_inflight_bytes < _MAX_REQUEST_CONTENT_SIZE:
+            raise ValueError(
+                f"max_inflight_bytes is split across {num_replicas} replicas and each share "
+                f"must be >= {_MAX_REQUEST_CONTENT_SIZE} (the per-request limit), so it must "
+                f"be >= {num_replicas * _MAX_REQUEST_CONTENT_SIZE}; got {max_inflight_bytes}"
+            )
 
     if sock is not None:
         # Take the port and release the socket: replicas each bind their own with
