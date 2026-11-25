@@ -343,6 +343,18 @@ class KimiDeltaAttention(_GDNBase):
         self.a_log_dim = self.num_k_heads_local_tp
         self.gate_params_dtype = torch.float32
         self.gated_delta_rule = chunk_kda
+        if self.config.kda_kernel_backend == "cudnn":
+            if self.config.deterministic_mode:
+                raise ValueError("deterministic_mode=True requires kda_kernel_backend='fla'.")
+            if self.config.kda_lower_bound is None:
+                raise ValueError(
+                    "kda_kernel_backend='cudnn' requires kda_lower_bound: cuDNN's KDA kernels "
+                    "support only the bounded gate."
+                )
+            # cudnn-frontend is needed only when this backend is selected.
+            from megatron.core.ssm.gated_delta_net.cudnn_kda import chunk_kda_cudnn
+
+            self.gated_delta_rule = chunk_kda_cudnn
 
     def _get_in_proj_qkv_layout(self) -> QKVLayout:
         """Describe KDA's rank-major packed input projection for Muon splitting."""
