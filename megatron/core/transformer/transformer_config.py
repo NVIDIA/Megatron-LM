@@ -1366,6 +1366,17 @@ class TransformerConfig(ModelParallelConfig):
     minimum of 2 per-graph warmup steps regardless of this value, because the first warmup builds
     the weight-prefetch chain and the second exercises the prefetch path before capture."""
 
+    cuda_graph_batched_input_staging: bool = False
+    """For cuda_graph_impl "full_iteration" only.
+
+    When True, the inputs of each step are copied into the static input buffers of the
+    full-iteration CUDA graph with batched copies: each microbatch is copied once per step instead
+    of once per virtual pipeline chunk, all copies share one stream synchronization, top-level
+    tensor inputs with the same shape, dtype and device in all microbatches are copied with one
+    copy per key into a contiguous buffer, and the copies of host inputs wait only for the last
+    graph replay. The static buffers hold the same bytes and the data iterators are advanced the
+    same number of times as with the default per-microbatch copies."""
+
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.
     When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""

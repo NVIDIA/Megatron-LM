@@ -2694,6 +2694,7 @@ def prepare_data_for_update(
                     forward_backward_func,
                     cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
                     use_single_mempool=args.cuda_graph_use_single_mempool,
+                    batched_input_staging=args.cuda_graph_batched_input_staging,
                 )
 
             if is_batch_invariant_mode_enabled():

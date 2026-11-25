@@ -4739,6 +4739,7 @@ def train(
             forward_backward_func,
             cuda_graph_warmup_steps=cfg.model.transformer.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
+            batched_input_staging=cfg.model.transformer.cuda_graph_batched_input_staging,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if cfg.model.transformer.moe_expert_rank_capacity_factor is not None:
@@ -5505,6 +5506,7 @@ def evaluate(
             forward_backward_func,
             cuda_graph_warmup_steps=cfg.model.transformer.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
+            batched_input_staging=cfg.model.transformer.cuda_graph_batched_input_staging,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if cfg.model.transformer.moe_expert_rank_capacity_factor is not None:

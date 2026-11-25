@@ -213,6 +213,12 @@ graphs to be used on MoE models as well:
   capture. Setting it to 0 is not recommended: some operations rely on the first few iterations
   for lazy initialization or autotuning, and capturing too early may produce incorrect or
   suboptimal graphs.
+- `--cuda-graph-batched-input-staging` (default: off) reduces the host time spent copying the
+  inputs of each step into the static buffers of a `full_iteration` graph. Each microbatch is
+  copied once per step instead of once per virtual pipeline chunk, tensors with the same shape
+  in all microbatches are copied with one copy per key, and the copies of host inputs overlap
+  the work queued after the previous graph replay. The graph inputs are bit-identical to the
+  default path.
 - Inference CUDA graphs (serving or RL rollout) currently require
   `--cuda-graph-impl local`. Use `--inference-cuda-graph-scope layer|block` with
   `local`; all other implementations must set `--inference-cuda-graph-scope none`,
