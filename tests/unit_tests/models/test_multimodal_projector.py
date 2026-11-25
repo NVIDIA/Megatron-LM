@@ -49,6 +49,13 @@ class TestMultimodalProjector:
 
         num_weights = sum([p.numel() for p in self.mlp.parameters()])
         assert num_weights == 280896
+        # The encoder projects 1024 -> 256 -> 64.
+        assert (
+            self.mlp.encoder.estimate_flops(
+                total_real_tokens_in_batch=1, seqlen_squared_sum_in_batch=1
+            )
+            == 557_056
+        )
 
         num_weights = sum([p.numel() for p in self.affine.parameters()])
         assert num_weights == 65600

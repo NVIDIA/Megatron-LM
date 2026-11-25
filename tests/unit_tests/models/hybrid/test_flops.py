@@ -118,18 +118,63 @@ def test_mtp_counts_active_objectives(
         )
 
 
-@pytest.mark.parametrize("compute_mtp_loss", [False, True])
-def test_frozen_backbone_counts_only_mtp_gradients(compute_mtp_loss):
-    config = _config(ffn_hidden_size=32, mtp_num_layers=1, freeze_base_model_for_mtp=True)
+@pytest.mark.parametrize(
+    "compute_mtp_loss,has_mtp_targets,mtp_flops,head_matmuls",
+    [(False, True, 0, 1), (True, True, 3 * 14_336, 5), (True, False, 14_336, 1)],
+)
+def test_frozen_backbone_counts_only_mtp_gradients(
+    compute_mtp_loss, has_mtp_targets, mtp_flops, head_matmuls
+):
+    config = _config(
+        ffn_hidden_size=32, mtp_num_layers=1, freeze_base_model_for_mtp=True, mtp_kl_loss_weight=1
+    )
     model = _model(config, [_bare(MLP, config)], mtp=_stack(config, [_bare(MLP, config)]))
     model.output_layer.requires_grad_(False)
-    # Frozen decoder is forward-only. With MTP, both heads propagate activation gradients.
-    expected = 14_336 + (3 * 14_336 + 4 * 7168 if compute_mtp_loss else 7168)
+    # With targets, main and student heads propagate gradients and the KL teacher runs once.
+    # Without targets, the MTP block runs forward and its output is discarded.
+    expected = 14_336 + mtp_flops + head_matmuls * 7168
     assert (
         model.estimate_flops(
-            **BATCH_STATS, include_backward=True, compute_mtp_loss=compute_mtp_loss
+            **BATCH_STATS,
+            include_backward=True,
+            compute_mtp_loss=compute_mtp_loss,
+            has_mtp_targets=has_mtp_targets,
         )
         == expected
+    )
+
+
+@pytest.mark.parametrize("grad_enabled,backward", [(True, False), (False, False), (False, True)])
+def test_frozen_decoder_scopes_forward_grad_mode(monkeypatch, grad_enabled, backward):
+    config = _config(mtp_num_layers=1, freeze_base_model_for_mtp=True)
+    model = _model(config, [], mtp=_stack(config, []))
+    modes = []
+
+    def record_mode(**stats):
+        modes.append((torch.is_grad_enabled(), stats["include_backward"]))
+        return 0
+
+    monkeypatch.setattr(model.decoder, "estimate_flops", record_mode)
+    monkeypatch.setattr(model.mtp, "estimate_flops", record_mode)
+    with torch.set_grad_enabled(grad_enabled):
+        model.estimate_flops(**BATCH_STATS, include_backward=backward)
+        assert torch.is_grad_enabled() == grad_enabled
+    assert modes == [(False, False), (grad_enabled or backward, backward)]
+
+
+def test_last_token_projection_preserves_decoder_flops():
+    config = _config(ffn_hidden_size=32)
+    model = _model(config, [_bare(MLP, config)]).eval()
+    # The FFN processes all 2,048 prompt tokens; a single last row reaches the main head.
+    decoder = 4 * 2048 * 16 * 32
+    head = 2 * 1 * 16 * 32
+    assert (
+        model.estimate_flops(
+            total_real_tokens_in_batch=2048,
+            seqlen_squared_sum_in_batch=2048**2,
+            num_output_tokens=1,
+        )
+        == decoder + head
     )
 
 

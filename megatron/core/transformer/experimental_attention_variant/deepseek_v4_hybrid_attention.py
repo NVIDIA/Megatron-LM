@@ -741,18 +741,23 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     + q_rank * indexer_heads * indexer_dim
                     + hidden * indexer_heads
                 )
-                score_flops = 2 * indexer_heads * indexer_dim * seqlen_squared_sum_in_batch / 4
-                # Native SBHD computes score gradients even with a zero loss coefficient.
-                # The fused SBHD and packed kernels skip those matmuls.
-                if include_backward and (
-                    (config.dsa_indexer_loss_coeff or 0.0) > 0
-                    or (
+                pair_flops = 2 * indexer_heads * indexer_dim
+                dense_pairs = seqlen_squared_sum_in_batch / ratio
+                score_flops = pair_flops * dense_pairs
+                if include_backward:
+                    native_sbhd = (
                         config.sequence_packing_scheduler is None
                         and config.context_parallel_size == 1
                         and not use_fused_dsa_kernels(config)
                     )
-                ):
-                    score_flops *= 3
+                    # Native SBHD uses dense gradient matmuls even for a masked or zero loss.
+                    if native_sbhd or (config.dsa_indexer_loss_coeff or 0.0) > 0:
+                        backward_pairs = (
+                            total_real_tokens_in_batch * average_compressed_keys
+                            if not native_sbhd and config.dsa_indexer_use_sparse_loss
+                            else dense_pairs
+                        )
+                        score_flops += 2 * pair_flops * backward_pairs
         forward = 2 * (
             token_term * total_real_tokens_in_batch + core_term * seqlen_squared_sum_in_batch
         )
