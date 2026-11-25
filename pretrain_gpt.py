@@ -197,7 +197,7 @@ def get_batch(
         cp_group=get_context_parallel_group(),
         additional_layouts={
             cfg.model.transformer.attention_cp_layout,
-            cfg.model.transformer.linear_cp_layout,
+            cfg.model.transformer.linear_attention_cp_layout,
         }
         - {boundary},
         use_per_sequence_balancing=cfg.data.use_per_sequence_balancing(),
@@ -215,7 +215,13 @@ def get_batch(
 
 @lru_cache(maxsize=1)
 def _build_cached_logits_loss_func(
-    logprobs_dir, decode_threads, msc_prefetch_depth, kd_loss_alpha, ignore_errors, ignore_hash
+    logprobs_dir,
+    decode_threads,
+    msc_prefetch_depth,
+    kd_loss_alpha,
+    ignore_errors,
+    ignore_hash,
+    cp_layout="zigzag",
 ):
     """Build (once) the offline knowledge-distillation loss callable for cached logits.
 
@@ -231,6 +237,7 @@ def _build_cached_logits_loss_func(
         kd_loss_alpha=kd_loss_alpha,
         ignore_errors=ignore_errors,
         ignore_hash=ignore_hash,
+        cp_layout=cp_layout,
     )
 
 
@@ -261,6 +268,7 @@ def loss_func(
             kd_loss_alpha=args.logits_load_kd_loss_alpha,
             ignore_errors=args.logits_load_ignore_errors,
             ignore_hash=args.logits_load_ignore_hash,
+            cp_layout=cfg.model.transformer.global_cp_layout,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and is_distillation_model(model):  # [ModelOpt]
@@ -343,7 +351,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             if packed_seq_params is not None:
                 cu_seqlens = values["cu_seqlens"].squeeze(0)
                 cu_seqlens_padded = packed_seq_params.cu_seqlens_q_padded
-                update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+                if cfg.model.transformer.sequence_packing_scheduler is None:
+                    update_seqlen_stats_from_cu_seqlens(cu_seqlens)
         elif len(batch) == 7:
             (
                 tokens,

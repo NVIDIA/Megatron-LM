@@ -113,6 +113,43 @@ def _layer():
     return layer
 
 
+def test_mixed_gpt_uses_each_attention_consumers_layout():
+    layer = _layer()
+    layer.config.experimental_attention_variant = "gated_delta_net"
+    layer.config.linear_attention_cp_layout = "contiguous"
+    assert cp_module.attention_cp_layout(layer) == "zigzag"
+    layer.self_attention.cp_input_layout = "contiguous"
+    assert cp_module.attention_cp_layout(layer) == "contiguous"
+
+
+@pytest.mark.parametrize("wide", [False, True])
+def test_mamba_split_projection_restores_before_residual_write(wide):
+    from megatron.core.ssm.mamba_layer import MambaLayer
+    from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
+
+    cls = WideResidualMambaLayer if wide else MambaLayer
+    layer = cls.__new__(cls)
+    torch.nn.Module.__init__(layer)
+    projection = torch.nn.Linear(2, 2, bias=False)
+    with torch.no_grad():
+        projection.weight.copy_(torch.eye(2) * 3)
+    bias = torch.tensor([1.0, 2.0])
+    layer.mixer = SimpleNamespace(forward_post_core_attn=lambda x: (projection(x), bias))
+    layer._apply_mixer_update = lambda out, state, **kwargs: out[0] + out[1] + state
+    converter = SimpleNamespace(restore_output=lambda out: (out[0].flip(0), out[1]))
+    x = torch.arange(8.0).reshape(4, 1, 2).requires_grad_()
+    intermediate = cp_module.CPLayoutIntermediate(x.flip(0), converter)
+    residual = torch.ones_like(x)
+    output = (
+        layer.forward_post_core_attn(intermediate, residual, residual)
+        if wide
+        else layer.forward_post_core_attn(intermediate, residual)
+    )
+    torch.testing.assert_close(output, x * 3 + residual + bias)
+    output.sum().backward()
+    torch.testing.assert_close(x.grad, torch.full_like(x, 3))
+
+
 @pytest.mark.parametrize("split", [False, True])
 def test_real_layer_restores_before_bda_and_interleaved_calls(monkeypatch, split):
     calls = []

@@ -211,7 +211,9 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         data_iterator, num_real_tokens = create_sft_data_iterator(seq_length)
 
     cp_batch = get_batch(data_iterator)
-    assert set(cp_batch.batches_by_layout) == {args.linear_cp_layout}
+    assert set(cp_batch.batches_by_layout) == {
+        pretrain_hybrid.get_run_config().model.transformer.global_cp_layout
+    }
     batch = cp_batch.get_batch()
     (
         attention_mask,
@@ -992,6 +994,8 @@ def test_get_batch_builds_required_cp_layouts():
     )
     cfg = pretrain_hybrid.get_run_config()
     cfg.model.transformer.linear_cp_layout = "contiguous"
+    cfg.model.transformer.linear_attention_cp_layout = "contiguous"
+    cfg.model.transformer.global_cp_layout = "contiguous"
     cfg.model.transformer.attention_cp_layout = "zigzag"
 
     tokens = torch.arange(seq_length, dtype=torch.int64).view(1, -1)
@@ -1109,6 +1113,8 @@ def test_intermediate_pipeline_batch_uses_config_layout(monkeypatch):
         dataloader_inter_document_masking=False,
         create_attention_mask_in_dataloader=False,
         linear_cp_layout="zigzag",
+        global_cp_layout="zigzag",
+        linear_attention_cp_layout="zigzag",
     )
     config = SimpleNamespace(
         sequence_packing_scheduler=None,
@@ -1117,6 +1123,8 @@ def test_intermediate_pipeline_batch_uses_config_layout(monkeypatch):
         mtp_num_layers=None,
         dynamic_context_parallel=False,
         linear_cp_layout="contiguous",
+        global_cp_layout="contiguous",
+        linear_attention_cp_layout="contiguous",
     )
     monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
     # The batch flags come from the data section (a loader-only one here: plain GPT flags).
@@ -1166,6 +1174,8 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
         linear_cp_layout="zigzag",
+        global_cp_layout="zigzag",
+        linear_attention_cp_layout="zigzag",
     )
     run_config = SimpleNamespace(
         model=SimpleNamespace(transformer=config),
@@ -1262,6 +1272,8 @@ def test_unpacked_get_batch_places_mtp_by_the_callers_pipeline_group(
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
         linear_cp_layout="zigzag",
+        global_cp_layout="zigzag",
+        linear_attention_cp_layout="zigzag",
     )
     global_pp_group = object()
     global_grid = SimpleNamespace(

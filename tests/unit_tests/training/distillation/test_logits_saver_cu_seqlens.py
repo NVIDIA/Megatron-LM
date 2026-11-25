@@ -46,6 +46,7 @@ def _bare_saver(cp_size=1, tp_rank=0, tp_size=1, dp_rank=0, dp_size=1):
     saver.tp_size = tp_size
     saver.cp_rank = 0
     saver.cp_size = cp_size
+    saver.cp_layout = "zigzag"
     saver.dp_rank = dp_rank
     saver.dp_size = dp_size
     saver._save_dtype = torch.float16

@@ -69,6 +69,7 @@ def _make_gdn_variant_stub(backend: str, *, deterministic_mode: bool = False) ->
             deterministic_mode=deterministic_mode,
             gdn_kernel_backend=backend,
             gdn_pre_gated_delta_rule_fusion=False,
+            linear_cp_mode="headwise",
         ),
         num_value_heads=2,
         qk_dim_local_tp=64,

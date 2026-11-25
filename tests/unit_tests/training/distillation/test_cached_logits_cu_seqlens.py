@@ -122,7 +122,8 @@ def _load_args(monkeypatch, *, sft: bool, num_samples: int):
 # ---------------------------------------------------------------------------
 
 
-def test_teacher_tar_dataset_document_aware_cp_reslicing(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cp_layout", ["zigzag", "contiguous"])
+def test_teacher_tar_dataset_document_aware_cp_reslicing(tmp_path, monkeypatch, cp_layout):
     seq_len = 16
     cp_size = 2
     cu_seqlens_padded = torch.tensor([[0, seq_len]])  # one sample, single document
@@ -132,14 +133,22 @@ def test_teacher_tar_dataset_document_aware_cp_reslicing(tmp_path, monkeypatch):
     full = torch.arange(seq_len).float().view(seq_len, 1, 1)
     for cp_rank in range(cp_size):
         dataset = make_teacher_tar_dataset(
-            str(tmp_path), cp_rank=cp_rank, cp_size=cp_size, dp_rank=0, dp_size=1, ignore_hash=True
+            str(tmp_path),
+            cp_rank=cp_rank,
+            cp_size=cp_size,
+            dp_rank=0,
+            dp_size=1,
+            ignore_hash=True,
+            cp_layout=cp_layout,
         )
         loaded = list(dataset)
         assert len(loaded) == 1
         _, values_list, _ = loaded[0]
         assert len(values_list) == 1
 
-        expected = slice_tensor_for_cp_rank(full, cp_rank, cp_size, cu_seqlens=cu_seqlens_padded[0])
+        expected = slice_tensor_for_cp_rank(
+            full, cp_rank, cp_size, cu_seqlens=cu_seqlens_padded[0], cp_layout=cp_layout
+        )
         assert torch.equal(values_list[0], expected)
 
 

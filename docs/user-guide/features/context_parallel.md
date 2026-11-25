@@ -154,6 +154,12 @@ layer-run orchestration is replaced by `prepare_module_cp_input` and its
 call-local reverse converter. Two-stage execution carries that converter with
 its intermediate result, so interleaved calls do not overwrite shared state.
 
+External custom layers retain their supplied config objects. Their shared invocation
+adapter aligns activations, token IDs and padding masks with the declared input layout,
+then restores the stack boundary on return, including under recomputation and mHC.
+The adapter reuses the same conversion backend; it does not convert persistent residual history.
+After cloning a config, update the canonical layout fields rather than their input aliases.
+
 A module whose input and compute layouts already match performs no layout
 conversion. Runtime CP1 likewise requires no communication or route. A kernel
 supporting an alternate native layout can declare and validate that support,
@@ -169,6 +175,12 @@ batch views once. `ContextParallelBatch.prepare_module_layouts()` attaches
 acyclic `CPLayoutViews`: leaves have no back reference, tensors and the canonical
 plan are reused, and module calls neither copy metadata nor build routes.
 RoPE preparation covers the largest physical sequence length among the views.
+
+MIMO and LLaVA inputs use the global boundary policy; packed LLaVA metadata uses
+the shared producer and conversion plan. Offline teacher-logit
+cache readers and writers use the same policy to preserve token order. Fixed-length
+inter-document batches keep whole-sample zigzag partitioning when no alternate
+layout is requested; per-document padding must not enlarge their pipeline tensors.
 
 Metadata-only callers can use `finalize_packed_seq_params` at batch preparation
 and must use its return value. Existing stack callers supplying both the

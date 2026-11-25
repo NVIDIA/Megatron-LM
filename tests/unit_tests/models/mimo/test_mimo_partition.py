@@ -203,7 +203,7 @@ class TestPartitionAdapter:
                 "labels": labels[:, :4],
                 "loss_mask": loss_mask[:, :4],
             },
-            MagicMock(spec=PackedSeqParams),
+            MagicMock(spec=PackedSeqParams, cp_partition_mode="zigzag"),
         )
         with (
             patch('megatron.core.models.mimo.partition.utils.get_pg_size', return_value=2),
@@ -262,6 +262,7 @@ class TestPartitionAdapterContextParallelBatch:
             seq_parallel=True,
             tp_comm_overlap=False,
             max_seq_len=8,
+            global_cp_layout="contiguous",
             linear_cp_layout="contiguous",
             attention_cp_layout="zigzag",
             cp_group=cp_group,
@@ -292,13 +293,13 @@ class TestPartitionAdapterContextParallelBatch:
             "mtp_input_mask": mtp_input_mask[:, 4:],
             "decoder_input": embeddings.transpose(0, 1)[:, 4:],
         }
-        local_packed = MagicMock(spec=PackedSeqParams)
+        local_packed = MagicMock(spec=PackedSeqParams, cp_partition_mode="contiguous")
         cp_batch = ContextParallelBatch(
             boundary_layout="contiguous",
             batches_by_layout={"contiguous": boundary_batch, "zigzag": zigzag_batch},
             packed_seq_params_by_layout={
                 "contiguous": local_packed,
-                "zigzag": MagicMock(spec=PackedSeqParams),
+                "zigzag": MagicMock(spec=PackedSeqParams, cp_partition_mode="zigzag"),
             },
             thd_plan=MagicMock(),
         )

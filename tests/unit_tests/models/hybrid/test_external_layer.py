@@ -275,7 +275,7 @@ def test_external_layer_cp_token_ids_match_unsharded_reference(
         )
         configs = [TokenGainConfig.from_config(root) for _ in layouts]
         for config, layout in zip(configs, layouts, strict=True):
-            config.linear_cp_layout = layout
+            config.linear_attention_cp_layout = layout
         return HybridStack(
             config=root,
             submodules=HybridStackSubmodules(),

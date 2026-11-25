@@ -72,7 +72,7 @@ def test_packed_batch_uses_supplied_groups_and_mtp_pipeline_stage(
     assert kwargs["dynamic_cp"] is True
     assert "dynamic_cp_group_func" not in kwargs
     assert "dynamic_tp_cp_group_func" not in kwargs
-    assert kwargs.get("return_context_parallel_batch", False) is (module is pretrain_hybrid)
+    assert kwargs["return_context_parallel_batch"] is True
     bootstrap.assert_not_called()
 
 
@@ -99,7 +99,17 @@ def test_direct_packed_entrypoint_bootstraps_collection(packed_entrypoint, monke
 def test_forward_step_passes_groups_from_wrapped_model(packed_entrypoint, monkeypatch):
     module, pgs, _ = packed_entrypoint
     output, iterator = object(), object()
-    model = _Wrapper(_Wrapper(Mock(spec=[], pg_collection=pgs, vp_stage=2, return_value=output)))
+    model = _Wrapper(
+        _Wrapper(
+            Mock(
+                spec=[],
+                pg_collection=pgs,
+                vp_stage=2,
+                cp_required_layouts={"zigzag"},
+                return_value=output,
+            )
+        )
+    )
     if module is pretrain_gpt:
         batch = (None,) * 7
     else:

@@ -64,6 +64,105 @@ def test_gdn_chunkwise_cp_requires_supported_backend(backend):
         GatedDeltaNet._setup_variant_attrs(module)
 
 
+@pytest.fixture
+def chunkwise_gdn_pair():
+    """The real CP2 FLA dispatch and a CP1 reference with identical weights."""
+    pytest.importorskip("fla.ops.cp")
+    if Utils.world_size < 2 or Utils.world_size % 2:
+        pytest.skip("Requires an even GPU world size for CP2")
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        get_gated_delta_net_module_spec,
+    )
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.ssm.gated_delta_net.gdn import GatedDeltaNet
+    from megatron.core.transformer import TransformerConfig
+
+    Utils.initialize_model_parallel(context_parallel_size=2)
+    try:
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        seeded()
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+            linear_conv_kernel_dim=2,
+            context_parallel_size=2,
+            linear_cp_mode="chunkwise",
+            gdn_kernel_backend="fla",
+            activation_func=torch.nn.functional.silu,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+        )
+        spec = get_gated_delta_net_module_spec(config)
+
+        def build(pg):
+            return (
+                GatedDeltaNet(config, spec.submodules, layer_number=1, pg_collection=pg)
+                .cuda()
+                .bfloat16()
+            )
+
+        local = build(groups)
+        reference = build(ProcessGroupCollection(tp=groups.tp, cp=groups.tp, tp_cp=groups.tp))
+        reference.load_state_dict(local.state_dict())
+        cu = torch.tensor([0, 37, 128], device="cuda", dtype=torch.int32)
+        params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            max_seqlen_q=91,
+            max_seqlen_kv=91,
+            cp_partition_mode="contiguous",
+        )
+        full = torch.sin(torch.arange(128 * 128, device="cuda").float() / 31)
+        full = full.reshape(128, 1, 128).bfloat16().requires_grad_()
+        shard = full.detach().chunk(2)[groups.cp.rank()].clone().requires_grad_()
+        yield local, reference, shard, full, params, groups
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_fla_chunkwise_cp_unaligned_documents(chunkwise_gdn_pair):
+    """Documents may cross contiguous rank boundaries; outputs and gradients match CP1."""
+    local, reference, shard, full, params, groups = chunkwise_gdn_pair
+    actual, _ = local(shard, attention_mask=None, packed_seq_params=params)
+    expected, _ = reference(full, attention_mask=None, packed_seq_params=params)
+    (actual.float().square().sum() / expected.numel()).backward()
+    expected.float().square().mean().backward()
+    for parameter in local.parameters():
+        if parameter.grad is not None:
+            torch.distributed.all_reduce(parameter.grad, group=groups.cp)
+    rank = groups.cp.rank()
+    torch.testing.assert_close(actual, expected.chunk(2)[rank], atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(shard.grad, full.grad.chunk(2)[rank], atol=5e-3, rtol=5e-3)
+    for name, parameter in local.named_parameters():
+        torch.testing.assert_close(
+            parameter.grad,
+            reference.get_parameter(name).grad,
+            atol=5e-3,
+            rtol=5e-3,
+            msg=lambda msg: f"{name}: {msg}",
+        )
+
+
+def test_fla_chunkwise_cp_replays_fwd_bwd(chunkwise_gdn_pair):
+    """Replay the distributed convolution and recurrence, including all parameter grads."""
+    local, _, shard, _, params, _ = chunkwise_gdn_pair
+    assert_module_replays_bit_exact(
+        local,
+        dict(hidden_states=shard, attention_mask=None, packed_seq_params=params),
+        replays=3,
+        what="FLA chunkwise CP2 convolution and recurrence",
+    )
+
+
 @pytest.fixture(autouse=True)
 def ssm_deterministic(monkeypatch):
     """Pin the SSM autotuner / workspace path like ``--deterministic-mode`` does."""

@@ -409,7 +409,11 @@ def pad_and_stack_cu_seqlens(cu_seqlens_list: List[torch.Tensor]) -> torch.Tenso
 
 
 def slice_tensor_for_cp_rank(
-    tensor: torch.Tensor, cp_rank: int, cp_size: int, cu_seqlens: Optional[torch.Tensor] = None
+    tensor: torch.Tensor,
+    cp_rank: int,
+    cp_size: int,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    cp_layout: str = "zigzag",
 ) -> torch.Tensor:
     """Return this CP rank's zigzag sequence slice from a full sequence tensor.
 
@@ -425,8 +429,15 @@ def slice_tensor_for_cp_rank(
     document layout -- required whenever different samples in the same
     saved iteration were packed differently.
     """
+    if cp_layout not in ("zigzag", "contiguous"):
+        raise ValueError(f"Unsupported CP layout: {cp_layout}")
     if cp_size <= 1:
         return tensor
+
+    if cp_layout == "contiguous":
+        if tensor.size(0) % cp_size:
+            raise ValueError("Sequence length must be divisible by CP size")
+        return tensor.chunk(cp_size, dim=0)[cp_rank].contiguous()
 
     if cu_seqlens is None:
         num_cp_chunks = 2 * cp_size
@@ -461,7 +472,9 @@ def slice_tensor_for_cp_rank(
 
 
 def reassemble_cp_sequence(
-    local_tensors: List[torch.Tensor], cu_seqlens: Optional[torch.Tensor] = None
+    local_tensors: List[torch.Tensor],
+    cu_seqlens: Optional[torch.Tensor] = None,
+    cp_layout: str = "zigzag",
 ) -> torch.Tensor:
     """Reassemble CP-rank zigzag sequence shards into full sequence order.
 
@@ -469,6 +482,8 @@ def reassemble_cp_sequence(
     zigzag. With *cu_seqlens* given (see :func:`slice_tensor_for_cp_rank`
     for its shape conventions), inverts the per-document zigzag instead.
     """
+    if cp_layout not in ("zigzag", "contiguous"):
+        raise ValueError(f"Unsupported CP layout: {cp_layout}")
     cp_size = len(local_tensors)
     if cp_size == 1:
         return local_tensors[0]
@@ -480,6 +495,9 @@ def reassemble_cp_sequence(
                 f"All CP shards must have matching shapes; got {tensor.shape} "
                 f"for rank {cp_rank}, expected {first.shape}."
             )
+
+    if cp_layout == "contiguous":
+        return torch.cat(local_tensors, dim=0).contiguous()
 
     if cu_seqlens is None:
         if first.size(0) % 2 != 0:

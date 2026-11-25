@@ -319,7 +319,7 @@ class KimiDeltaAttention(_GDNBase):
             assert not self.config.sequence_parallel
             raise NotImplementedError("KimiDeltaAttention does not support inference for now.")
 
-        if cp_size_headwise > 1 and self.config.linear_cp_layout != "zigzag":
+        if cp_size_headwise > 1 and self.config.linear_attention_cp_layout != "zigzag":
             raise ValueError(
                 "KimiDeltaAttention with headwise CP requires zigzag layout. CP partition "
                 "conversion must be handled before calling KimiDeltaAttention."

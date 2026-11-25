@@ -44,17 +44,8 @@ from megatron.core.utils import (
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
 
-    try:
-        import transformer_engine_torch as tex
-
-        HAVE_TEX = True
-    except ImportError:
-        tex = None
-        HAVE_TEX = False
 else:
     TEDotProductAttention = None
-    tex = None
-    HAVE_TEX = False
 
 
 IGNORE_INDEX = -100  # ID for labels that should be ignored.
@@ -1148,21 +1139,46 @@ class LLaVAModel(MegatronModule):
                 from megatron.core.utils import get_batch_on_this_cp_rank
 
                 batch = get_batch_on_this_cp_rank(
-                    batch, dynamic_cp=False, cp_group=self.pg_collection.cp
+                    batch,
+                    dynamic_cp=False,
+                    cp_group=self.pg_collection.cp,
+                    cp_partition_mode=self.config.global_cp_layout,
                 )
             else:
-                assert HAVE_TEX and is_te_min_version(
+                assert HAVE_TE and is_te_min_version(
                     "1.10.0"
                 ), "Please update Transformer Engine to >= 1.10 to use \
                     Context Parallel with THD format data"
-                index = tex.thd_get_partitioned_indices(
-                    packed_seq_params.cu_seqlens_q_padded,
-                    batch[next(iter(batch))].size(1),
-                    self.cp_group.size(),
-                    self.cp_group.rank(),
+                from megatron.core.context_parallel import get_batches_on_this_cp_rank
+
+                cu = packed_seq_params.cu_seqlens_q
+                cp_batch = get_batches_on_this_cp_rank(
+                    dict(
+                        decoder_input=batch.get("combined_embeddings"),
+                        labels=batch.get("expanded_labels"),
+                        loss_mask=batch.get("expanded_loss_mask"),
+                        cu_seqlens=cu,
+                        cu_seqlens_padded=packed_seq_params.cu_seqlens_q_padded,
+                        max_seqlen=torch.tensor(packed_seq_params.max_seqlen_q, device=cu.device),
+                    ),
+                    boundary_layout=self.config.global_cp_layout,
+                    additional_layouts={
+                        self.config.linear_attention_cp_layout,
+                        self.config.attention_cp_layout,
+                    },
+                    dynamic_cp=False,
+                    cp_group=self.pg_collection.cp,
+                    tp_group=self.pg_collection.tp,
+                    tp_cp_group=self.pg_collection.tp_cp,
+                    sequence_parallel=self.sequence_parallel_lm,
+                ).prepare_module_layouts()
+                view = cp_batch.get_batch()
+                batch = dict(
+                    combined_embeddings=view.get("decoder_input"),
+                    expanded_labels=view.get("labels"),
+                    expanded_loss_mask=view.get("loss_mask"),
                 )
-                for key, data in batch.items():
-                    batch[key] = data.index_select(1, index)
+                packed_seq_params = cp_batch.get_packed_seq_params()
 
             if self.pre_process:
                 combined_embeddings = batch["combined_embeddings"]  # [B, S/CP, H]

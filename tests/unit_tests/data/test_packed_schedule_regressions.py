@@ -132,6 +132,8 @@ def test_static_packing_returns_hybrid_layouts(
         config=SimpleNamespace(
             sequence_parallel=sequence_parallel,
             linear_cp_layout=linear_cp_layout,
+            global_cp_layout=linear_cp_layout,
+            linear_attention_cp_layout=linear_cp_layout,
             attention_cp_layout="zigzag",
         ),
         return_context_parallel_batch=True,
@@ -313,6 +315,8 @@ def test_dynamic_layouts_use_injected_runtime_groups(
         config=SimpleNamespace(
             sequence_parallel=sequence_parallel,
             linear_cp_layout="contiguous",
+            global_cp_layout="contiguous",
+            linear_attention_cp_layout="contiguous",
             attention_cp_layout="zigzag",
         ),
         return_context_parallel_batch=True,
@@ -360,7 +364,11 @@ def test_dynamic_group_callbacks_override_collection_maps(cpu_batch_communicatio
         dynamic_cp_group_func=runtime_cp,
         dynamic_tp_cp_group_func=runtime_tp_cp,
         config=SimpleNamespace(
-            sequence_parallel=True, linear_cp_layout="contiguous", attention_cp_layout="zigzag"
+            sequence_parallel=True,
+            linear_cp_layout="contiguous",
+            global_cp_layout="contiguous",
+            linear_attention_cp_layout="contiguous",
+            attention_cp_layout="zigzag",
         ),
         return_context_parallel_batch=True,
     )
@@ -413,7 +421,11 @@ def test_sequence_parallel_rejects_missing_tp_cp_group(cpu_batch_communication, 
             dynamic_cp=dynamic_cp,
             pg_collection=pg,
             config=SimpleNamespace(
-                sequence_parallel=True, linear_cp_layout="contiguous", attention_cp_layout="zigzag"
+                sequence_parallel=True,
+                linear_cp_layout="contiguous",
+                global_cp_layout="contiguous",
+                linear_attention_cp_layout="contiguous",
+                attention_cp_layout="zigzag",
             ),
             return_context_parallel_batch=True,
         )

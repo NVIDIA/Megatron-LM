@@ -282,7 +282,7 @@ def test_config_includes_mtp_ratio_and_derives_dimensions():
 def test_config_requires_contiguous_context_parallelism():
     """Static packed CP uses the main-owned contiguous layout contract."""
     with pytest.raises(ValueError, match="attention_cp_layout='contiguous'"):
-        _make_config(context_parallel_size=2)
+        _make_config(context_parallel_size=2, attention_cp_layout="zigzag")
     config = _make_config(context_parallel_size=2, attention_cp_layout="contiguous")
     assert config.context_parallel_size == 2
 

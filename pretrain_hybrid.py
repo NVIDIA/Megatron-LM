@@ -208,7 +208,7 @@ def get_batch(
         additional_layouts.update(required_cp_layouts)
     elif cp_size > 1:
         additional_layouts.update(
-            (cfg.model.transformer.linear_cp_layout, cfg.model.transformer.attention_cp_layout)
+            (cfg.model.transformer.linear_attention_cp_layout, cfg.model.transformer.attention_cp_layout)
         )
     additional_layouts.discard(boundary_layout)
     cp_batch = get_batches_on_this_cp_rank(

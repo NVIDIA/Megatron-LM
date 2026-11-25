@@ -660,7 +660,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             R + 'test_ssm_replay.py',
         ),
         kind="torch.compile",
-        notes="deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
+        notes="test_fla_chunkwise_cp_replays_fwd_bwd covers FLA CP2 convolution and recurrence. "
+        "deterministic_mode selects torch_chunk_gated_delta_rule over FLA (recorded non-deterministic). "
         "Dynamic-inference decode runs the Megatron forks causal_conv1d_update and "
         "fused_recurrent_gated_delta_rule_update (in-kernel gate), both replayed in "
         "test_ssm_kernels.py. Dynamic-inference prefill runs the GDP chunk scan with a single "

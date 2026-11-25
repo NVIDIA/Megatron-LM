@@ -74,6 +74,8 @@ def test_packed_schedule_pipeline_cp_and_hybrid_sp(dynamic_cp, cp_size, hybrid):
             mtp_num_layers=None,
             sequence_parallel=True,
             linear_cp_layout='contiguous',
+            global_cp_layout='contiguous',
+            linear_attention_cp_layout='contiguous',
             attention_cp_layout='zigzag',
         )
         iterator = None
@@ -182,6 +184,8 @@ def test_static_packing_default_zigzag_matches_tuple_path():
             mtp_num_layers=None,
             sequence_parallel=False,
             linear_cp_layout='zigzag',
+            global_cp_layout='zigzag',
+            linear_attention_cp_layout='zigzag',
             attention_cp_layout='zigzag',
         )
 

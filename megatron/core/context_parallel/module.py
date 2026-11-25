@@ -123,7 +123,7 @@ def prepare_module_cp_input(
         return hidden_states, packed_seq_params, None
     source = getattr(packed_seq_params, "cp_partition_mode", None)
     if source is None:
-        source = get_cp_boundary_layout(config)
+        source = getattr(module, "cp_boundary_layout", None) or get_cp_boundary_layout(config)
     if source == target_layout:
         return hidden_states, packed_seq_params, None
     groups = module.pg_collection
@@ -193,14 +193,7 @@ def attention_cp_layout(module):
     consumer_layout = getattr(getattr(module, "self_attention", None), "cp_input_layout", None)
     if consumer_layout is not None:
         return consumer_layout
-    config = module.config
-    if getattr(config, "experimental_attention_variant", None) in (
-        "gdn",
-        "gdn2",
-        "gated_delta_net",
-    ):
-        return config.linear_attention_cp_layout
-    return getattr(config, "attention_cp_layout", "zigzag")
+    return module.config.attention_cp_layout
 
 
 def finalize_packed_seq_params(

@@ -21,6 +21,115 @@ from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.fixture(autouse=True)
+def fused_attention_backend(monkeypatch):
+    """CP model parity requires the fused TE backend under the repository fixtures too."""
+    monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
+    monkeypatch.setenv("NVTE_FLASH_ATTN", "0")
+
+
+@pytest.mark.parametrize("boundary", ["contiguous", "zigzag"])
+def test_mimo_global_boundary_to_attention_roundtrip(boundary):
+    from types import SimpleNamespace
+
+    from megatron.core.context_parallel.module import prepare_module_cp_input
+    from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
+
+    if Utils.world_size < 2:
+        pytest.skip("Requires CP2")
+    Utils.initialize_model_parallel(context_parallel_size=2)
+    try:
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            context_parallel_size=2,
+            global_cp_layout=boundary,
+        )
+        adapter = PartitionAdapter(
+            PartitionConfig.from_mp_config(
+                config,
+                max_seq_len=8,
+                cp_group=groups.cp,
+                tp_group=groups.tp,
+                tp_cp_group=groups.tp_cp,
+            )
+        )
+        tokens = torch.arange(8, device="cuda").reshape(1, 8)
+        embeddings = tokens.T.float().reshape(8, 1, 1).requires_grad_()
+        batch = adapter.partition(
+            embeddings, tokens, tokens, tokens + 1, torch.ones_like(tokens), None
+        )
+        values = batch.get_batch()
+        module = SimpleNamespace(config=config, pg_collection=groups)
+        activation, _, reverse = prepare_module_cp_input(
+            module, values["decoder_input"], batch.get_packed_seq_params(), target_layout="zigzag"
+        )
+        rank = groups.cp.rank()
+        chunks = tokens.flatten().chunk(4)
+        expected = torch.cat((chunks[rank], chunks[3 - rank]))
+        torch.testing.assert_close(activation.flatten(), expected.float())
+        restored = reverse.convert(activation) if reverse else activation
+        torch.testing.assert_close(restored.flatten(), values["tokens"].flatten().float())
+        torch.testing.assert_close(values["labels"], values["tokens"] + 1)
+        restored.sum().backward()
+        assert embeddings.grad is not None
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_llava_shards_embeddings_and_labels_in_global_layout(packed):
+    from types import SimpleNamespace
+
+    from megatron.core.models.multimodal.llava_model import LLaVAModel
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    if Utils.world_size < 2:
+        pytest.skip("Requires CP2")
+    Utils.initialize_model_parallel(context_parallel_size=2)
+    try:
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            context_parallel_size=2,
+            global_cp_layout="contiguous",
+        )
+        model = SimpleNamespace(
+            config=config,
+            pre_process=True,
+            post_process=True,
+            context_parallel_lm=2,
+            sequence_parallel_lm=False,
+            tp_comm_overlap_lm=False,
+            pg_collection=groups,
+        )
+        tokens = torch.arange(8, device="cuda").reshape(1, 8)
+        cu = torch.tensor([0, 3, 8], device="cuda", dtype=torch.int32)
+        params = (
+            PackedSeqParams(
+                qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=5, max_seqlen_kv=5
+            )
+            if packed
+            else None
+        )
+        hidden, labels, mask, local_params = LLaVAModel._process_embedding_token_parallel(
+            model, tokens.unsqueeze(-1).float(), tokens + 1, torch.ones_like(tokens), params
+        )
+        expected = tokens.chunk(2, dim=1)[groups.cp.rank()]
+        torch.testing.assert_close(hidden.flatten(), expected.flatten().float())
+        torch.testing.assert_close(labels, expected + 1)
+        assert mask.sum() == 4
+        if packed:
+            assert local_params.cp_partition_mode == "contiguous"
+            assert local_params.cp_layout_views is not None
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def _capture_projection(module, values):
     def forward_hook(_module, inputs, output):
         values["x"] = inputs[0].detach().clone()
@@ -209,7 +318,7 @@ def test_model_residual_layout_forward_backward(tp, cp, packed, pattern):
                 mode, views.batches_by_layout, views.packed_seq_params_by_layout, views.thd_plan
             )
             kwargs = (
-                {}
+                dict(cp_batch=model_views)
                 if pattern == "gpt"
                 else dict(cp_batch=model_views, output_processor=lambda **kw: kw["hidden_states"])
             )

@@ -7,7 +7,6 @@
 
 import warnings
 from contextlib import nullcontext
-from copy import copy
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
 
@@ -211,11 +210,6 @@ class HybridStack(MegatronModule):
             and layer_config.linear_cp_mode == "chunkwise"
             for layer_config in self.layer_config_list
         )
-        # The root residual layout is already resolved; pipeline stages do not infer it.
-        self.layer_config_list = [copy(layer_config) for layer_config in self.layer_config_list]
-        for layer_config in self.layer_config_list:
-            layer_config.global_cp_layout = self.boundary_layout
-            layer_config.cp_partition_mode = self.boundary_layout
         required_cp_layouts = {self.boundary_layout}
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
@@ -390,7 +384,11 @@ class HybridStack(MegatronModule):
                     "wide-residual layer classes; "
                     f"layer {layer_number} constructed {type(layer).__name__}."
                 )
+            # Keep caller-owned configs intact, including custom constructor side effects.
+            layer.cp_boundary_layout = self.boundary_layout
             compute_layout = getattr(layer, "cp_input_layout", None)
+            if compute_layout is None and layer_utils.get_custom_layer_type(layer_config):
+                compute_layout = layer_config.linear_attention_cp_layout
             if compute_layout is not None:
                 required_cp_layouts.add(compute_layout)
             if self.config.enable_mhc_connections:

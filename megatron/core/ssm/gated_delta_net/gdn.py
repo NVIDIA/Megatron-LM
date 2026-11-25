@@ -264,20 +264,22 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 not self.config.deterministic_mode
             ), "Packed sequence does not support deterministic mode."
 
+            # Chunkwise shards may cut through a document; headwise all-to-all may not.
+            headwise_cp_size = cp_size if self.config.linear_cp_mode == "headwise" else 1
             # Resolve cu_seqlens with alignment padding handling.
             cu_seqlens_q = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_q_padded,
                 packed_seq_params.cu_seqlens_q,
                 seq_len,
                 "cu_seqlens_q",
-                cp_size=cp_size,
+                cp_size=headwise_cp_size,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
                 seq_len,
                 "cu_seqlens_kv",
-                cp_size=cp_size,
+                cp_size=headwise_cp_size,
             )
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "

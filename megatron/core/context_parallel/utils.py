@@ -289,7 +289,7 @@ def get_batches_on_this_cp_rank(
         cp_size > 1
         and batch.get('cu_seqlens') is not None
         and "zigzag" in requested_layouts
-        and (dynamic_cp or use_per_sequence_balancing or "contiguous" in requested_layouts)
+        and (dynamic_cp or "contiguous" in requested_layouts)
     )
     build_thd_plan = build_packed_zigzag_view and "contiguous" in requested_layouts
 

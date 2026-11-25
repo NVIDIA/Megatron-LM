@@ -126,6 +126,8 @@ class TestDSAIndexShareHelpers:
         )
         config = SimpleNamespace(
             dsa_indexer_topk=8,
+            dynamic_context_parallel=False,
+            attention_cp_layout="zigzag",
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
             kv_channels=16,
@@ -138,7 +140,7 @@ class TestDSAIndexShareHelpers:
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
             softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
+            pg_collection=SimpleNamespace(cp=None),
         )
 
         assert attention.skip_topk
@@ -148,6 +150,8 @@ class TestDSAIndexShareHelpers:
     def test_index_share_holder_uses_attention_mask_without_packed_seq_params(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
+            dynamic_context_parallel=False,
+            attention_cp_layout="zigzag",
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
             kv_channels=16,
@@ -159,7 +163,7 @@ class TestDSAIndexShareHelpers:
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
             softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
+            pg_collection=SimpleNamespace(cp=None),
         )
         attention_mask = torch.empty(1)
 
@@ -174,6 +178,8 @@ class TestDSAIndexShareHelpers:
     def test_index_share_holder_uses_packed_seq_params_when_available(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
+            dynamic_context_parallel=False,
+            attention_cp_layout="zigzag",
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
             kv_channels=16,
@@ -185,7 +191,7 @@ class TestDSAIndexShareHelpers:
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
             softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
+            pg_collection=SimpleNamespace(cp=None),
         )
         packed_seq_params = PackedSeqParams(qkv_format="thd")
         attention_mask = torch.empty(1)
@@ -206,6 +212,8 @@ class TestDSAIndexShareHelpers:
     ):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
+            dynamic_context_parallel=False,
+            attention_cp_layout="zigzag",
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
             kv_channels=16,
@@ -217,7 +225,7 @@ class TestDSAIndexShareHelpers:
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
             softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
+            pg_collection=SimpleNamespace(cp=None),
         )
         recomputed_supports = []
 

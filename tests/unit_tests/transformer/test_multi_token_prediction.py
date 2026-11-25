@@ -4683,6 +4683,7 @@ class TestMultiTokenPredictionHybrid:
         model = types.SimpleNamespace(
             config=types.SimpleNamespace(
                 fine_grained_activation_offloading=False,
+                global_cp_layout="contiguous",
                 freeze_base_model_for_mtp=False,
                 moe_paged_stash=False,
                 moe_num_hash_layers=0,
@@ -4886,6 +4887,10 @@ class TestMultiTokenPredictionHybrid:
             packed_seq_params_by_layout=expected_packed_seq_params_by_layout,
             thd_plan=cp_layout_plan,
         )
+        cp_batch.prepare_module_layouts()
+        expected_packed_seq_params_by_layout = cp_batch.packed_seq_params_by_layout
+        contiguous_packed_seq_params = cp_batch.get_packed_seq_params("contiguous")
+        zigzag_packed_seq_params = cp_batch.get_packed_seq_params("zigzag")
 
         def process_mtp_loss_spy(**kwargs):
             call_counts["mtp_loss"] += 1

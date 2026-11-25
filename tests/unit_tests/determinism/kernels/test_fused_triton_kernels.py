@@ -192,7 +192,12 @@ def test_dsa_index_share_support_replays_across_forward_scopes(with_attention_ma
 
     seeded()
     config = SimpleNamespace(
-        dsa_indexer_topk=8, dsa_indexer_topk_freq=4, dsa_indexer_skip_topk_offset=1, kv_channels=16
+        dsa_indexer_topk=8,
+        dynamic_context_parallel=False,
+        attention_cp_layout="zigzag",
+        dsa_indexer_topk_freq=4,
+        dsa_indexer_skip_topk_offset=1,
+        kv_channels=16,
     )
     attention = dsa.DSAttention(
         config=config,
@@ -201,7 +206,7 @@ def test_dsa_index_share_support_replays_across_forward_scopes(with_attention_ma
         attn_mask_type=AttnMaskType.causal,
         attention_type="self",
         softmax_scale=1.0,
-        pg_collection=SimpleNamespace(),
+        pg_collection=SimpleNamespace(cp=None),
     )
     attention_mask = torch.empty(1, device="cuda") if with_attention_mask else None
     # Distinct candidate sets and lengths make cross-forward contamination visible.

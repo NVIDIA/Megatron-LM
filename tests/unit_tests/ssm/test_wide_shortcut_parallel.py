@@ -71,6 +71,7 @@ def _build_stack(
     cp_size,
     gtp_size,
     wide_input=False,
+    boundary_layout="zigzag",
 ):
     config = TransformerConfig(
         hidden_size=_HIDDEN,
@@ -81,6 +82,7 @@ def _build_stack(
         fp32_residual_connection=fp32_residual,
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
+        global_cp_layout=boundary_layout,
         sequence_parallel=tp_size > 1,
         expert_model_parallel_size=2,
         expert_tensor_parallel_size=1,
@@ -309,7 +311,7 @@ def _assert_parity(actual, expected, *, gtp=False):
     ("tp_size", "cp_size"), [(1, 1), (2, 1), (1, 2)], ids=["ep2", "tp2-ep2", "cp2-ep2"]
 )
 def test_wide_shortcut_forward_backward_matches_eager_serial(
-    compute_symbol, fp32_residual, tp_size, cp_size
+    compute_symbol, fp32_residual, tp_size, cp_size, boundary_layout="zigzag"
 ):
     if _WORLD_SIZE < 2 * tp_size * cp_size or _WORLD_SIZE % (2 * tp_size * cp_size):
         pytest.skip("Requires WORLD_SIZE divisible by 2 * TP * CP")
@@ -335,6 +337,7 @@ def test_wide_shortcut_forward_backward_matches_eager_serial(
                 tp_size=tp_size,
                 cp_size=cp_size,
                 gtp_size=1,
+                boundary_layout=boundary_layout,
             )
             if saved is None:
                 _synchronize_weights(module, pg_collection)
@@ -349,6 +352,13 @@ def test_wide_shortcut_forward_backward_matches_eager_serial(
     finally:
         torch.cuda.synchronize()
         Utils.destroy_model_parallel()
+
+
+def test_wide_mamba_shortcut_restores_contiguous_residual():
+    """CP2 mixer conversion restores the wide residual in serial, overlap and replay."""
+    test_wide_shortcut_forward_backward_matches_eager_serial(
+        Symbols.MAMBA, False, 1, 2, boundary_layout="contiguous"
+    )
 
 
 def _run_wide_shortcut_gtp_parity(compute_symbol):

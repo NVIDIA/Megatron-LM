@@ -281,6 +281,10 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
         """Apply Mamba's output projection and the layer's residual-update hook."""
 
         del inference_context, padding_mask
+        return self._apply_mixer_update(self._project_mixer_output(ssm_output), residual)
+
+    def _project_mixer_output(self, ssm_output):
+        """Project a split-call result and restore its residual boundary layout."""
         cp_reverse = None
         if isinstance(ssm_output, CPLayoutIntermediate):
             cp_reverse = ssm_output.converter
@@ -288,7 +292,7 @@ class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAt
         mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
         if cp_reverse is not None:
             mixer_out_with_bias = cp_reverse.restore_output(mixer_out_with_bias)
-        return self._apply_mixer_update(mixer_out_with_bias, residual)
+        return mixer_out_with_bias
 
     def _get_residual_connection(self):
         """Return an optional architecture-owned connection around the Mamba mixer."""

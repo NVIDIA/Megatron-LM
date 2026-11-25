@@ -54,6 +54,8 @@ def _layer(wide, fp32, dropout=0.0):
     nn.Module.__init__(layer)
     layer.config = SimpleNamespace(
         hidden_size=8,
+        global_cp_layout="zigzag",
+        linear_attention_cp_layout="zigzag",
         params_dtype=torch.bfloat16,
         fp32_residual_connection=fp32,
         bias_dropout_fusion=False,
