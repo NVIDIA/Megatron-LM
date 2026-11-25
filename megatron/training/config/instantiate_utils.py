@@ -84,39 +84,6 @@ _TORCH_CONFIG_TARGETS = frozenset(
         "torch.Size",
         "torch.dtype",
         *{
-            f"torch.{name}"
-            for name in (
-                "bool",
-                "uint8",
-                "int8",
-                "int16",
-                "short",
-                "int32",
-                "int",
-                "int64",
-                "long",
-                "float16",
-                "half",
-                "bfloat16",
-                "float32",
-                "float",
-                "float64",
-                "double",
-                "complex32",
-                "chalf",
-                "complex64",
-                "cfloat",
-                "complex128",
-                "cdouble",
-                "float8_e4m3fn",
-                "float8_e4m3fnuz",
-                "float8_e5m2",
-                "float8_e5m2fnuz",
-                "float8_e8m0fnu",
-                "float4_e2m1fn_x2",
-            )
-        },
-        *{
             f"torch.nn.functional.{name}"
             for name in (
                 "gelu",
@@ -168,6 +135,15 @@ _ALLOWED_PRIVATE_TARGETS = frozenset(
         "megatron.bridge.diffusion.models.llada15.llada15_provider._llada15_layer_spec",
     }
 )
+
+
+def _is_torch_dtype_name(target: str) -> bool:
+    """Recognize dtype exports from the installed PyTorch version without importing a target."""
+    if not target.startswith("torch.") or target.count(".") != 1:
+        return False
+    import torch
+
+    return isinstance(vars(torch).get(target.split(".")[1]), torch.dtype)
 
 
 def _is_torch_module_constructor_name(target: str) -> bool:
@@ -622,11 +598,21 @@ def validate_target_arguments(
     if target is _Partial and args:
         validate_target_arguments(args[0], args[1:], kwargs, full_key=full_key)
     if isinstance(target, type) and issubclass(target, ModuleSpec):
+        if "module" not in kwargs and not args:
+            return  # A partial may receive its module later from trusted application code.
         module = kwargs.get("module", args[0] if args else None)
         if isinstance(module, (tuple, list)):
             if len(module) != 2 or not all(isinstance(part, str) for part in module):
                 raise InstantiationException(f"Invalid ModuleSpec.module at {full_key}.module")
-            _resolve_target(".".join(module), full_key=f"{full_key}.module")
+            module = _resolve_target(".".join(module), full_key=f"{full_key}.module")
+        elif not callable(module):
+            raise InstantiationException(f"Invalid ModuleSpec.module at {full_key}.module")
+        # A spec can itself construct another spec or partial. Its params are
+        # deferred constructor arguments and must follow the same validation.
+        params = kwargs.get("params", args[1] if len(args) > 1 else {})
+        if not isinstance(params, dict):
+            raise InstantiationException(f"Invalid ModuleSpec.params at {full_key}.params")
+        validate_target_arguments(module, (), params, full_key=f"{full_key}.params")
 
 
 def _convert_target_to_string(t: Any) -> Any:
@@ -828,6 +814,7 @@ def _validate_target_name(*, target: str, full_key: str | int) -> None:
         and target not in _TORCH_CONFIG_TARGETS
         and target not in target_allowlist.allowed_exact
         and not _is_torch_module_constructor_name(target)
+        and not _is_torch_dtype_name(target)
     ):
         raise InstantiationException(
             f"Target '{target}' is not a supported torch configuration target. "
