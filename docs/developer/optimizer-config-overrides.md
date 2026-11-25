@@ -13,6 +13,10 @@ cfg.optimizer_config_overrides = {
 }
 ```
 
+For type annotations, import `OptimizerConfigOverrides` and
+`OptimizerConfigOverrideHook` from `megatron.training.config.optimizer_config`.
+This is the shared public import path for MLM and Bridge recipes.
+
 `optimizer_config_overrides_mode="extend"` is the default: the contribution is combined
 with standard weight-decay and decoupled-LR rules. An empty contribution preserves
 those rules. Set `"replace"` explicitly to supply their replacement, including an
