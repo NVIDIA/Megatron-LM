@@ -134,6 +134,12 @@ def _num_microbatches_from_config(config, ps: ParallelState) -> int:
     return ensure_divisible(config.gbs, config.mbs * ps.dp_size)
 
 
+def _loss_divisor(config, num_microbatches: int) -> int:
+    """Per-microbatch loss divisor: ``num_microbatches``, or 1 in per-token-loss mode, where the
+    model returns a token sum and ``finalize_grads(num_tokens=...)`` divides by the global count."""
+    return 1 if getattr(config, "per_token_loss", False) else num_microbatches
+
+
 def _set_aux_loss_scale(pre_forward_hook, num_microbatches: int) -> None:
     if pre_forward_hook is not None:
         scale = torch.tensor(1.0 / num_microbatches, device="cuda")
@@ -170,6 +176,8 @@ def _compact_pipeline_output(out: dict | None) -> dict:
     if "loss" in out and out["loss"] is not None:
         loss = out["loss"]
         compact["loss"] = loss.detach().item() if isinstance(loss, torch.Tensor) else float(loss)
+    if out.get("num_tokens") is not None:
+        compact["num_tokens"] = torch.as_tensor(out["num_tokens"]).detach()
     if "_loss_fn_metrics" in out:
         compact["metrics"] = out["_loss_fn_metrics"]
     elif "metrics" in out:
@@ -194,14 +202,14 @@ def _no_pipeline(
         if grad_sync_fn and i == num_microbatches - 1:
             grad_sync_fn()
         batch = next(data_iter)
-        _set_aux_loss_scale(pre_forward_hook, num_microbatches)
+        _set_aux_loss_scale(pre_forward_hook, _loss_divisor(config, num_microbatches))
         output = forward_step_fn(model, batch)
         if loss_fn is not None:
             loss, _metrics = _apply_external_loss(output, batch, loss_fn)
             assert loss is not None
         else:
             loss = output["loss"]
-        loss = loss / num_microbatches
+        loss = loss / _loss_divisor(config, num_microbatches)
         loss.backward()
         outputs.append(_compact_pipeline_output(output))
     return outputs
@@ -251,6 +259,7 @@ def _1f1b_schedule(
     receiver sizes its recv buffer from that. No local shape derivation, no fixed
     ``tensor_shape`` fallback — a desync fails loud instead of silently truncating.
     """
+    divisor = _loss_divisor(config, num_microbatches)
     num_warmup = min(ps.pp_size - ps.pp_rank - 1, num_microbatches)
     num_steady = num_microbatches - num_warmup
 
@@ -265,7 +274,7 @@ def _1f1b_schedule(
     outputs: list[dict] = []
 
     def _run_forward(input_tensor, batch, loss_context=None):
-        _set_aux_loss_scale(pre_forward_hook, num_microbatches)
+        _set_aux_loss_scale(pre_forward_hook, divisor)
         if not ps.pp_is_first:
             # `model` is the dist_opt DDP-wrapped chunk; set_input_tensor lives on the base lite model.
             from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
@@ -310,7 +319,7 @@ def _1f1b_schedule(
         current_input = fwd_input
         out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
-        loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
+        loss_s = out["loss"] / divisor if "loss" in out and ps.pp_is_last else None
 
         # Recv the next forward input for every remaining warmup mb AND — on the
         # last warmup step — for the first STEADY mb (num_steady > 0). Middle
@@ -341,7 +350,7 @@ def _1f1b_schedule(
         mb_idx += 1
         out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
-        loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
+        loss_s = out["loss"] / divisor if "loss" in out and ps.pp_is_last else None
 
         input_tensors.append(fwd_input if not ps.pp_is_first else None)
         output_hiddens.append(hidden)
@@ -778,6 +787,7 @@ def _interleaved_1f1b_schedule(
     order, which is slower but deterministic and easy to validate against
     Megatron.
     """
+    divisor = _loss_divisor(config, num_microbatches)
     num_chunks = len(model_chunks)
     total_stages = ps.pp_size * num_chunks
     rank = dist.get_rank()
@@ -793,7 +803,7 @@ def _interleaved_1f1b_schedule(
 
     for mb_id in range(num_microbatches):
         batch = next(data_iter)
-        _set_aux_loss_scale(pre_forward_hook, num_microbatches)
+        _set_aux_loss_scale(pre_forward_hook, divisor)
         saved: dict[
             int, tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, dict]
         ] = {}
@@ -840,7 +850,7 @@ def _interleaved_1f1b_schedule(
                         f"chunk={chunk_id} hidden_shape={hidden_shape}",
                         flush=True,
                     )
-                loss = out["loss"] / num_microbatches if is_last_stage and "loss" in out else None
+                loss = out["loss"] / divisor if is_last_stage and "loss" in out else None
                 saved[stage_id] = (activation, hidden, loss, out)
 
                 if is_last_stage:

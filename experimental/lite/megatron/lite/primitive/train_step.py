@@ -22,6 +22,7 @@ def run_microbatch_loop(
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
     forward_only: bool = False,
+    per_token_loss: bool = False,
 ):
     """Run forward-backward over microbatches with loss accumulation.
 
@@ -41,6 +42,9 @@ def run_microbatch_loop(
             ``loss_fn(model_output: dict, batch) -> (loss: Tensor, metrics: dict)``.
             When provided, ``forward_fn`` output is passed to ``loss_fn`` instead of
             reading ``out["loss"]`` directly. This enables RLHF policy/value losses.
+        per_token_loss: The loss is a token sum: no 1/num_microbatches scaling (of the
+            loss or of auxiliary losses); the summed ``num_tokens`` of the microbatches is
+            returned as ``"_num_tokens"`` for ``finalize_grads(num_tokens=...)``.
         forward_only: When True, run forward without backward (e.g. validation /
             ``infer_batch``). The caller (verl) runs the forward under ``no_grad`` so the
             loss has no ``grad_fn``; calling ``.backward()`` then raises. Mirrors the
@@ -48,10 +52,12 @@ def run_microbatch_loop(
     """
     last_out = None
     all_metrics: list[dict] = []
+    divisor = 1 if per_token_loss else num_microbatches
+    num_tokens = None
     for mb in range(num_microbatches):
         batch, loss_context = split_loss_context(next(data_iter))
         if pre_forward_hook is not None:
-            scale = torch.tensor(1.0 / num_microbatches, device="cuda")
+            scale = torch.tensor(1.0 / divisor, device="cuda")
             pre_forward_hook(scale)
         with use_loss_context(loss_context):
             out = forward_fn(model, batch)
@@ -63,14 +69,21 @@ def run_microbatch_loop(
             else:
                 loss, metrics = loss_fn(out, batch, loss_context)
             if not forward_only:
-                (loss / num_microbatches).backward()
+                (loss / divisor).backward()
             out["loss"] = loss.detach()
             all_metrics.append(metrics)
         elif not forward_only:
-            (out["loss"] / num_microbatches).backward()
+            (out["loss"] / divisor).backward()
+        if per_token_loss and out.get("num_tokens") is not None:
+            mb_tokens = torch.as_tensor(out["num_tokens"]).detach().float()
+            # A fresh tensor: finalize_grads all-reduces the total in place, which must not
+            # rewrite the microbatch's own count (``.float()`` of a float tensor is no copy).
+            num_tokens = mb_tokens.clone() if num_tokens is None else num_tokens + mb_tokens
         last_out = out
     if last_out is not None and all_metrics:
         last_out["_loss_fn_metrics"] = all_metrics
+    if last_out is not None and num_tokens is not None:
+        last_out["_num_tokens"] = num_tokens
     return last_out
 
 
