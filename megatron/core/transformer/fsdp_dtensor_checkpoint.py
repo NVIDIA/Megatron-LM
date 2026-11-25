@@ -377,7 +377,9 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                     continue
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
                 new_opt_state_dict[f"{key}_v"] = opt_state_dict[key].copy()
-                for subkey in ["exp_avg", "exp_avg_sq"]:
+                for subkey in ["exp_avg", "exp_avg_sq", "master_param"]:
+                    if subkey not in opt_state_dict[key]:
+                        continue
                     dist_param = model.get_parameter(
                         expert_param_local_key(key[len("module.") :], num_experts)
                     )
@@ -545,7 +547,9 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 sizes, names, dim = match
                 for sub_name in names:
                     new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
-                for subkey in ["exp_avg", "exp_avg_sq"]:
+                for subkey in ["exp_avg", "exp_avg_sq", "master_param"]:
+                    if subkey not in opt_state[key]:
+                        continue
                     dist_param = model.get_parameter(key[len("module.") :])
                     sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
                     for sub_name, tensor in zip(names, sub_tensors):
@@ -768,7 +772,9 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
             for new_key in new_keys:
                 new_optimizer_state[new_key] = optimizer_state[key].copy()
             dist_param = model.get_parameter(key[len("module.") :])
-            for subkey in ["exp_avg", "exp_avg_sq"]:
+            for subkey in ["exp_avg", "exp_avg_sq", "master_param"]:
+                if subkey not in optimizer_state[key]:
+                    continue
                 sections = split_fused_fsdp_param(
                     optimizer_state[key][subkey], dist_param, split_sizes
                 )

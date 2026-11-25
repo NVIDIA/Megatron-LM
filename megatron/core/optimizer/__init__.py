@@ -1282,12 +1282,10 @@ def get_megatron_optimizer(
                 and not is_mfsdp_v2
                 and getattr(optimizer_part.optimizer, "master_weights", None) is not None
             ):
-                # NOTE(@cspades): FusedAdam is provided Megatron-FSDP's main weights as
-                # non-quantized DTensor(s). Megatron-FSDP should NEVER use FusedAdam's
-                # main weights, complete waste of memory as the optimizer step is still
-                # applied to the Megatron-FSDP main weight and extended to FusedAdam
-                # main weights. Override this here.
-                setattr(optimizer_part.optimizer, "master_weights", False)
+                if ddp_config.megatron_fsdp_main_params_dtype is not None:
+                    # Avoid duplicate master weights when Megatron-FSDP owns a main buffer.
+                    # Otherwise, preserve the optimizer's master weight configuration.
+                    setattr(optimizer_part.optimizer, "master_weights", False)
                 # Megatron-FSDP always uses a decoupled gradient when using FusedAdam.
                 setattr(optimizer_part.optimizer, "use_decoupled_grad", True)
 
