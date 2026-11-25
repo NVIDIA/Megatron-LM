@@ -29,11 +29,74 @@ Implemented in [`megatron/training/distillation/`](https://github.com/NVIDIA/Meg
 - `utils.py` — shared tar/storage format, index bit-packing, and the DP/MBS/GBS
   resharding plan.
 
+## Run Configuration
+
+Offline KD is configured on `PretrainConfigContainer.offline_distillation`, independently
+of the online ModelOpt `distillation` section. Omit it (or set it to `null`) to disable
+offline KD. When present, **exactly one** of `teacher_save` or `student_load` must be set;
+an empty section or a run that both saves and loads logits is rejected before runtime
+initialization. `student_load` also cannot be combined with online `distillation`.
+
+The following are sections of a teacher run config:
+
+```yaml
+train:
+  _target_: megatron.training.config.training_config.TrainingConfig
+  # Other training settings omitted.
+  freeze_all_layers: true
+checkpoint:
+  _target_: megatron.training.config.training_config.CheckpointConfig
+  # The checkpoint output directory and save interval also determine when logits flush.
+  save: /teacher-dump-progress
+  save_interval: 100
+  async_save: true
+  use_persistent_ckpt_worker: true
+offline_distillation:
+  _target_: megatron.training.config.offline_distillation_config.OfflineDistillationConfig
+  teacher_save:
+    _target_: megatron.training.config.offline_distillation_config.LogitsSaveConfig
+    directory: /teacher-cache
+    top_k: 128
+    top_p: null
+    min_k: 1
+    dtype: fp16
+```
+
+A student run instead uses:
+
+```yaml
+offline_distillation:
+  _target_: megatron.training.config.offline_distillation_config.OfflineDistillationConfig
+  student_load:
+    _target_: megatron.training.config.offline_distillation_config.LogitsLoadConfig
+    directory: /teacher-cache
+    loss_alpha: 1.0
+    decode_threads: 4
+    msc_prefetch_depth: 2
+    ignore_errors: false
+    ignore_hash: false
+```
+
+Batch sizes stay in `train`, dataset and packing settings in `data`, and progress in
+`TrainState`; these are not duplicated in the offline KD config. Both phases require a
+fixed global batch size (no ramp-up or step batch-size schedule) and a configured
+`data.dataset`. Freezing is an independent training setting: `teacher_save` can also
+capture logits during active training when `train.freeze_all_layers` is false.
+Frozen runs disable distributed-optimizer and parameter-gather overlap flags before
+checking their prerequisites, so a teacher dump can reuse those settings from a
+training recipe. Validation checks a temporary copy; finalization updates the run
+config and warns about settings it disables.
+
+The existing `--logits-save-*`, `--logits-load-*`, and `--freeze-all-layers` CLI flags
+remain supported. They populate these config sections once; the saver, reader, and loss
+then use the active run config rather than the CLI namespace. Dataset hashes and the
+on-disk cache format are unchanged, so existing v1 and v2 teacher caches remain readable.
+
 ## How It Works
 
 **Saving (teacher run):** pass `--logits-save-dir`. `LogitsSaverHooks` attaches a
 forward hook to the model's output layer on the last pipeline stage
-(`megatron/training/training.py`, gated on `args.logits_save_dir is not None`). Each
+(`megatron/training/training.py`, gated on `offline_distillation.teacher_save`). Each
 microbatch's logits are converted to top-K log-probs (TP-aware: local top-K is computed
 per rank first, then gathered to TP rank 0 for the global top-K, avoiding a
 full-vocab-sized tensor), optionally narrowed further with top-P nucleus masking, and
@@ -57,7 +120,7 @@ and computes the sparse forward KL divergence `KL(teacher ‖ student)` between 
 teacher's top-K positions and the student's log-probs at those same vocab indices. The
 total loss is `alpha * kd_loss + (1 - alpha) * lm_loss`.
 
-Both hooks are attached automatically based on the CLI flags below — no application
+Both hooks are attached automatically based on the config sections or CLI flags below — no application
 code changes are needed beyond invoking `pretrain_gpt.py` / `pretrain_hybrid.py` with
 the relevant `--logits-save-*` or `--logits-load-*` flags.
 

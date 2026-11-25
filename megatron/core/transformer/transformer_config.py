@@ -5008,14 +5008,13 @@ class TransformerConfig(ModelParallelConfig):
                     "'tilelang' and 'cudnn' select fused kernels and are MLA-only."
                 )
                 # DSA over MLA supports CP/SP (upstream gates CP on cp_comm_type=allgather
-                # below). The GQA path does not: its min-memory kernels have no
-                # sequence-parallel gather and no CP support yet.
+                # below). The GQA path has no CP support yet. Sequence parallelism is supported
+                # by dynamic-batching inference only: its indexer gathers the sequence shards.
+                # Training and static inference (DSGQACoreAttention.forward) reject it at run
+                # time, since the min-memory kernels have no sequence-parallel gather.
                 assert (
                     self.context_parallel_size == 1
                 ), "Context parallelism is not supported by DSA over GQA."
-                assert (
-                    not self.sequence_parallel
-                ), "Sequence parallelism is not supported by DSA over GQA."
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if min_memory_dsa_backend:
                 if dense_dsa_warmup:

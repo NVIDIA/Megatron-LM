@@ -1115,14 +1115,13 @@ def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point)
         lambda batch, **kw: tp_calls.append(kw) or dict.fromkeys(script.BATCH_KEYS),
     )
     monkeypatch.setattr(script, "flatten_batch_for_packed_sequences", lambda batch: batch)
-    if entry_point == "hybrid":
-        monkeypatch.setattr(
-            script, "get_batches_on_this_cp_rank", lambda batch, **kw: cp_calls.append(kw) or batch
-        )
-    else:
-        monkeypatch.setattr(
-            script, "get_batch_on_this_cp_rank", lambda batch, **kw: cp_calls.append(kw) or batch
-        )
+    from megatron.core.context_parallel import ContextParallelBatch
+
+    def prepare_batch(batch, **kwargs):
+        cp_calls.append(kwargs)
+        return ContextParallelBatch.from_single_layout(kwargs["boundary_layout"], batch, None)
+
+    monkeypatch.setattr(script, "get_batches_on_this_cp_rank", prepare_batch)
     script.get_batch(None)
     tp = tp_calls.pop()
     assert tp["has_cu_seqlens"] is True  # inter-document masking from the section, not args.sft

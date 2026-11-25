@@ -22,6 +22,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -47,9 +48,12 @@ except ImportError:
 
 from megatron.core import parallel_state as mpu
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
-from megatron.training import get_args, get_train_state
+from megatron.training import get_train_state
 from megatron.training.global_vars import get_run_config
-from megatron.training.utils import get_blend_and_blend_per_split
+
+if TYPE_CHECKING:
+    from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+    from megatron.training.config import DataConfig, PretrainConfigContainer
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +233,7 @@ def get_current_iteration() -> int:
     return get_train_state().iteration
 
 
-def is_packed_sequence_run() -> bool:
+def is_packed_sequence_run(data: "DataConfig | None" = None) -> bool:
     """Return whether the current run packs multiple documents per sequence.
 
     ``get_batch``'s ``has_cu_seqlens``, read from the same source: the data section of the
@@ -239,24 +243,25 @@ def is_packed_sequence_run() -> bool:
     ``CachedLogitsKDLoss``'s sequence-length-trim safety check) so the two can't drift out of
     sync with the batch path.
     """
-    return bool(get_run_config().data.has_cu_seqlens())
+    data = get_run_config().data if data is None else data
+    return bool(data.has_cu_seqlens())
 
 
 def get_consumed_train_samples() -> int:
     """Return the cumulative global sample count consumed so far.
 
-    ``training.py`` only updates ``args.consumed_train_samples`` **after**
+    ``training.py`` only updates ``TrainState.consumed_train_samples`` **after**
     ``train_step()`` returns, so at forward-hook time (inside
     ``train_step``) this value is exactly the global sample count *before*
     the in-flight iteration's batch -- i.e. the v2 tar naming scheme's
     ``start_sample``, for free.
     """
-    return get_args().consumed_train_samples
+    return get_train_state().consumed_train_samples
 
 
-def _blend_identifiers(args: Any) -> Dict[str, Any]:
+def _blend_identifiers(dataset: "GPTDatasetConfig") -> Dict[str, Any]:
     """Build a path-agnostic representation of the training data blend."""
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
+    blend, blend_per_split = dataset.blend, dataset.blend_per_split
 
     def _normalise(blend_tuple) -> Optional[List[List[Any]]]:
         if blend_tuple is None:
@@ -277,15 +282,16 @@ def _blend_identifiers(args: Any) -> Dict[str, Any]:
     return {"kind": "mock", "mock": True}
 
 
-def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
+def compute_dataset_hash(
+    cfg: "PretrainConfigContainer | None" = None,
+) -> Tuple[str, Dict[str, Any]]:
     """Compute the dataset-identity hash for the current training run.
 
     The fields included are exactly those that determine the global sample
     stream itself: ``seed``, ``train_samples`` (with a fall-back to
     ``train_iters * global_batch_size``), and the data ``blend``.
     """
-    cfg = get_run_config()
-    args = get_args()
+    cfg = get_run_config() if cfg is None else cfg
     train_samples = cfg.train.train_samples
     if train_samples is None:
         train_iters = cfg.train.train_iters
@@ -296,7 +302,7 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
     identifiers = OrderedDict()
     identifiers["seed"] = cfg.rng.seed
     identifiers["train_samples"] = train_samples
-    identifiers["blend"] = _blend_identifiers(args)
+    identifiers["blend"] = _blend_identifiers(cfg.data.dataset)
 
     description = json.dumps(identifiers, sort_keys=False, separators=(',', ':'))
     md5_hex = hashlib.md5(description.encode("utf-8"), usedforsecurity=False).hexdigest()

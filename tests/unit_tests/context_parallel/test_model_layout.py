@@ -80,7 +80,8 @@ def test_mimo_global_boundary_to_attention_roundtrip(boundary):
 
 
 @pytest.mark.parametrize("packed", [False, True])
-def test_llava_shards_embeddings_and_labels_in_global_layout(packed):
+@pytest.mark.parametrize("boundary", ["contiguous", "zigzag"])
+def test_llava_shards_embeddings_and_labels_in_global_layout(packed, boundary):
     from types import SimpleNamespace
 
     from megatron.core.models.multimodal.llava_model import LLaVAModel
@@ -96,7 +97,7 @@ def test_llava_shards_embeddings_and_labels_in_global_layout(packed):
             hidden_size=8,
             num_attention_heads=2,
             context_parallel_size=2,
-            global_cp_layout="contiguous",
+            global_cp_layout=boundary,
         )
         model = SimpleNamespace(
             config=config,
@@ -108,10 +109,18 @@ def test_llava_shards_embeddings_and_labels_in_global_layout(packed):
             pg_collection=groups,
         )
         tokens = torch.arange(8, device="cuda").reshape(1, 8)
-        cu = torch.tensor([0, 3, 8], device="cuda", dtype=torch.int32)
+        cu = torch.tensor(
+            [0, 3 if boundary == "contiguous" else 4, 8], device="cuda", dtype=torch.int32
+        )
         params = (
             PackedSeqParams(
-                qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=5, max_seqlen_kv=5
+                qkv_format="thd",
+                cu_seqlens_q=cu,
+                cu_seqlens_kv=cu,
+                max_seqlen_q=5,
+                max_seqlen_kv=5,
+                cu_seqlens_q_padded=cu if boundary == "zigzag" else None,
+                cu_seqlens_kv_padded=cu if boundary == "zigzag" else None,
             )
             if packed
             else None
@@ -119,13 +128,22 @@ def test_llava_shards_embeddings_and_labels_in_global_layout(packed):
         hidden, labels, mask, local_params = LLaVAModel._process_embedding_token_parallel(
             model, tokens.unsqueeze(-1).float(), tokens + 1, torch.ones_like(tokens), params
         )
-        expected = tokens.chunk(2, dim=1)[groups.cp.rank()]
+        rank = groups.cp.rank()
+        if boundary == "contiguous":
+            expected = tokens.chunk(2, dim=1)[rank]
+        elif packed:
+            expected = tokens[:, [[0, 3, 4, 7], [1, 2, 5, 6]][rank]]
+        else:
+            expected = torch.cat(
+                (tokens.chunk(4, dim=1)[rank], tokens.chunk(4, dim=1)[3 - rank]), dim=1
+            )
         torch.testing.assert_close(hidden.flatten(), expected.flatten().float())
         torch.testing.assert_close(labels, expected + 1)
         assert mask.sum() == 4
         if packed:
-            assert local_params.cp_partition_mode == "contiguous"
-            assert local_params.cp_layout_views is not None
+            assert local_params.cp_partition_mode == boundary
+            if boundary == "contiguous":
+                assert local_params.cp_layout_views is not None
     finally:
         Utils.destroy_model_parallel()
 
