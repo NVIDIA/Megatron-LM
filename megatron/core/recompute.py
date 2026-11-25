@@ -35,6 +35,7 @@ def checkpointed_forward(
     input_ids_by_layout: Optional[dict[str, Tensor]] = None,
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
+    strict_runtime_validation_frequency: Optional[str] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -49,6 +50,12 @@ def checkpointed_forward(
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
         input_ids (Tensor, optional): Boundary-layout token IDs for hash-routed MoE
             and custom layers.
+        strict_runtime_validation_frequency (str, optional):
+            ``config.strict_runtime_validation_frequency`` of the calling stack. When given,
+            per-layer ``strict_runtime_validation`` flags are derived once per checkpointed
+            forward for layers that support validation, keyed on their config type, so a
+            recompute does not re-validate layers that the first forward already validated.
+            Other layers keep their original interface and need no validation config.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -57,6 +64,7 @@ def checkpointed_forward(
     if extract_layer_indices is None:
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
+    strictly_validated_layer_types: Set[type] = set()
 
     dsa_index_share_carrier = None
     dsa_index_share_carrier_scope = None
@@ -112,6 +120,22 @@ def checkpointed_forward(
                         index, padding_mask, padding_mask_by_layout
                     )
 
+                strict_runtime_validation = None
+                if strict_runtime_validation_frequency is not None and (
+                    isinstance(layer, TransformerLayer)
+                    or getattr(layer, "supports_hybrid_recompute_kwargs", False)
+                    or getattr(layer, "supports_strict_runtime_validation", False)
+                ):
+                    # Key on the per-layer config type (HybridStack builds every layer and mHC
+                    # wrapper with ``config=layer_config``); ``layer_type_list`` is a derived
+                    # property that is recomputed on every access.
+                    layer_type = type(layer.config)
+                    strict_runtime_validation = strict_runtime_validation_frequency == "always" or (
+                        strict_runtime_validation_frequency == "once_per_microbatch"
+                        and layer_type not in strictly_validated_layer_types
+                    )
+                    strictly_validated_layer_types.add(layer_type)
+
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
                     if self.config.fp8:
@@ -158,6 +182,8 @@ def checkpointed_forward(
                     is_custom_layer or getattr(router, "is_hash_layer", False)
                 ):
                     layer_kwargs["input_ids"] = layer_input_ids
+                if strict_runtime_validation is not None:
+                    layer_kwargs["strict_runtime_validation"] = strict_runtime_validation
                 with inner_quantization_context:
                     if is_custom_layer and not getattr(
                         layer, "supports_hybrid_recompute_kwargs", False
