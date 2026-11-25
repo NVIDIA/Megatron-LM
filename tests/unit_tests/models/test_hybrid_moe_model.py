@@ -205,6 +205,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "gdn_gated_output_norm_fusion": False,
     "gdn_conv_pad_alignment": None,
     "linear_value_head_dim": 128,
+    "lm_head_loss_num_chunks": 1,
     "log_max_attention_logit": False,
     "mamba_head_dim": 64,
     "mamba_num_groups": 8,
