@@ -1497,6 +1497,14 @@ version = "1.0.0+9edee0c"
 source = { git = "https://github.com/deepseek-ai/FlashMLA?rev=nv_dev#b7643bd54521f563b839b98289b5cd048c062ba2" }
 
 [[package]]
+name = "flashinfer-cubin"
+version = "0.7.2.post1"
+source = { registry = "https://flashinfer.ai/whl" }
+wheels = [
+    { url = "https://github.com/flashinfer-ai/flashinfer/releases/download/v0.7.2.post1/flashinfer_cubin-0.7.2.post1-py3-none-any.whl", hash = "sha256:1998c7006bcc06ee5dd3208a682af247382c6710d6b370a961381262c04c11f0" },
+]
+
+[[package]]
 name = "flashinfer-jit-cache"
 version = "0.7.2.post1+cu130"
 source = { registry = "https://flashinfer.ai/whl/cu130" }
@@ -2692,6 +2700,7 @@ dev = [
     { name = "zstandard" },
 ]
 inference = [
+    { name = "flashinfer-cubin", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-jit-cache", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-jit-cache-sm100a", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-jit-cache-sm103a", marker = "sys_platform == 'linux'" },
@@ -2805,6 +2814,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "flash-attn-4", extras = ["cu13"], marker = "extra == 'dev'", specifier = "==4.0.0b27" },
     { name = "flash-linear-attention", marker = "extra == 'ssm'", specifier = "==0.5.1" },
+    { name = "flashinfer-cubin", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl" },
     { name = "flashinfer-jit-cache", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm100a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
     { name = "flashinfer-jit-cache-sm103a", marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==0.7.2.post1", index = "https://flashinfer.ai/whl/cu130" },
