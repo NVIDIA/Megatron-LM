@@ -1153,8 +1153,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             # over FP8 bytes). Dequantize to real BF16 so the checkpoint stores portable
             # high-precision values, not raw FP8 bytes mislabeled as BF16. Offsets above were
             # already read from the FP8 param's GTP attrs; shape is preserved by dequantize.
-            # (dequantize_gtp_native_fp8 restores the base FP8 class for the dequantize call —
-            # TE's tex.dequantize does not recognize the dynamic GTP_<Fp8Tensor> subclass.)
+            # dequantize_gtp_native_fp8 also handles older TE releases that reject subclasses.
             if is_float8tensor(tensor):
                 fp8_param = tensor
                 tensor = dequantize_gtp_native_fp8(tensor)
