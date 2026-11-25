@@ -26,7 +26,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from .dbuffer import DBuffer
-from .muon import FsdpMuon
+from .muon import FsdpMuon, _FsdpGroupAssignment
 from .parameter_group import FsdpParameterGroup
 
 __all__ = ["FsdpAngularMuOwn"]
@@ -238,15 +238,17 @@ class FsdpAngularMuOwn(FsdpMuon):
 
     def _apply_local_updates(
         self,
-        fsdp_group: FsdpParameterGroup,
-        tensor_to_optimizer_group_index: dict[int, int],
+        assignment: _FsdpGroupAssignment,
         full_updates: dict[int, torch.Tensor],
         local_updates: DBuffer,
     ) -> None:
         """Rotate and retract local rows, update their scales, and rewrite the weights."""
+        fsdp_group = assignment.fsdp_group
         buffer: DBuffer = fsdp_group.main_weight
         beta1, beta2 = self.row_scale_betas
-        for i, group_index in tensor_to_optimizer_group_index.items():
+        for i, group_index in assignment.tensor_to_optimizer_group_index.items():
+            if fsdp_group.fsdp_parameters[i].sharded.grad is None:
+                continue
             group: dict[str, Any] = self.param_groups[group_index]
             lr: float = group["lr"]
             step: int = group["muown_step"] + 1
