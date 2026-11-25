@@ -98,6 +98,7 @@ try:
         handle_fp8_extra_state_case,
         handle_mla_down_proj_in_state_dict,
         handle_mtp_in_state_dict,
+        handle_pipeline_layers_in_state_dict,
         handle_swiglu_in_state_dict,
         print_diff_in_state_dicts,
         validate_fsdp_dtensor_model_load,
@@ -2049,6 +2050,7 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
     # above resolve keys against live module paths, which still use the new name.
     apply(handle_mtp_in_state_dict)
+    state_dict['model'] = handle_pipeline_layers_in_state_dict(model, state_dict['model'])
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict

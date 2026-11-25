@@ -45,6 +45,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     handle_experts_in_state_dict,
+    handle_pipeline_layers_in_state_dict,
     handle_swiglu_in_state_dict,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -675,6 +676,7 @@ def test_ep_fsdp_checkpoint_roundtrip(
             state["model"] = handle_experts_in_state_dict(
                 state["model"], model.config.num_moe_experts
             )
+            state["model"] = handle_pipeline_layers_in_state_dict(model.module, state["model"])
             preprocess_state_dict_for_uneven_dtensor(state)
             return state
 
