@@ -963,6 +963,50 @@ def _expand_query_bounds_for_batch(bounds: torch.Tensor, batch: int, seqlen: int
     )
 
 
+def _kpool_explicit_mask_pool_phase(mask: torch.Tensor, pool_size: int) -> torch.Tensor:
+    """Return the pool-grid phase of each sample's first valid key in an explicit mask.
+
+    A key that no query row can see is padding, so the first valid key is the first key
+    visible to any row: one value for a shared [sq, sk] mask, or [batch] for a
+    [batch, sq, sk] mask. The Hugging Face reference KPool indexer starts pools at that
+    key; earlier pools are invalid, so only its offset modulo pool_size matters. Samples
+    without a visible key get phase 0. Computed on device without a host sync.
+    """
+    sk = mask.size(-1)
+    key_visible = torch.isfinite(mask).any(dim=-2)
+    positions = torch.arange(sk, device=mask.device, dtype=torch.int64).expand_as(key_visible)
+    first_key = positions.masked_fill(~key_visible, sk).amin(dim=-1)
+    return first_key.masked_fill(first_key == sk, 0).remainder(pool_size)
+
+
+def _shift_kpool_explicit_mask_inputs(
+    k: torch.Tensor, gate_score: Optional[torch.Tensor], mask: torch.Tensor, phase: torch.Tensor
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Shift each sample's key axis left by its pool phase: x'[t] = x[t + phase].
+
+    Keys and gates are [keys, batch, dim]; the mask is [sq, sk] or [batch, sq, sk] and
+    phase matches its leading shape. Positions past the last key get zero keys and
+    gates and are masked, so they only belong to invalid pools. A zero phase is an
+    exact identity.
+    """
+    sk, batch = k.shape[:2]
+    positions = torch.arange(sk, device=k.device, dtype=torch.int64)
+    source = positions + phase.unsqueeze(-1)
+    in_range = source < sk
+    source = source.clamp_max(sk - 1)
+    shifted_mask = torch.gather(mask, -1, source.unsqueeze(-2).expand_as(mask))
+    shifted_mask = shifted_mask.masked_fill(~in_range.unsqueeze(-2), float("-inf"))
+
+    key_source = source.reshape(-1, sk).t().expand(sk, batch).unsqueeze(-1)
+    key_in_range = in_range.reshape(-1, sk).t().expand(sk, batch).unsqueeze(-1)
+
+    def shift(x: torch.Tensor) -> torch.Tensor:
+        shifted = torch.gather(x, 0, key_source.expand(-1, -1, x.size(-1)))
+        return shifted.masked_fill(~key_in_range, 0)
+
+    return shift(k), shift(gate_score) if gate_score is not None else None, shifted_mask
+
+
 _KPOOL_SCORE_CHUNK_BYTES = 2 * 1024 * 1024 * 1024
 
 
@@ -1068,11 +1112,46 @@ def fused_qk_topk_kpool(
     coordinates. Output indices are [batch, queries, index_topk + pool_size - 1]
     when always_select_tail is enabled, with -1 for unused slots.
     Set return_index_scores=False to select in query chunks without retaining scores.
+
+    Without packing, an explicit mask starts the pool grid at each sample's first
+    valid key, as the Hugging Face reference KPool indexer (transformers v5.16.1,
+    Glm5NextTextIndexer) does. That key is the first one visible to any query
+    row of the sample's [batch, sq, sk] mask, or of a shared [sq, sk] mask; earlier
+    keys are padding. Index scores use the same grid: pool c covers keys from
+    phase + c * pool_size, where phase is the first valid key modulo pool_size.
+    Explicit-mask support:
+
+    - Contiguous left and/or right padding with causal rows: HF parity. Padded query
+      rows must be fully masked. A mask that lets padded rows see every key hides
+      the padding, so pools keep the global grid.
+    - Masks with gaps, sliding windows or row-dependent starts: tokens stay inside
+      the mask, but leading partial pools only use unused slots and there is no HF
+      parity claim.
+    - Packed THD (cu_seqlens_kv) restarts pools per document; no mask and varlen
+      bounds use the global grid. Neither is shifted.
+
+    Model-level left padding is unsupported: causal DSA layers ignore the attention
+    mask and treat padded tokens as real keys.
     """
     sk = k.size(0)
+    if q.size(0) == 0:
+        # Empty packed-CP ranks still need a fixed-width index tensor; reshape
+        # with an inferred dimension is ambiguous when there are no query rows.
+        width = index_topk + (pool_size - 1 if always_select_tail else 0)
+        scores = q.new_empty((q.size(1), 0, sk // pool_size), dtype=torch.float32)
+        indices = torch.empty((q.size(1), 0, width), dtype=torch.int32, device=q.device)
+        return scores if return_index_scores else None, indices
 
     # Packed pools restart at each document boundary.
     use_per_seg = cu_seqlens_kv is not None and cu_seqlens_kv.numel() >= 2
+    # Explicit masks pool from each sample's first valid key. Select on a key axis
+    # shifted by its pool phase, then map tokens back and mask with the caller's mask.
+    token_mask = mask
+    pool_phase = None
+    explicit_mask = mask is not None and mask.ndim in (2, 3) and mask.size(-1) == sk
+    if explicit_mask and not use_per_seg and sk > 0:
+        pool_phase = _kpool_explicit_mask_pool_phase(mask, pool_size)
+        k, gate_score, mask = _shift_kpool_explicit_mask_inputs(k, gate_score, mask, pool_phase)
     if use_per_seg:
         k_pooled, pool_token_base = _kpool_compress_keys_per_seg(
             k, gate_score, ape, pool_size, cu_seqlens_kv
@@ -1191,8 +1270,9 @@ def fused_qk_topk_kpool(
             starts = torch.zeros_like(ends)
         lengths = ends - starts
         if mask is not None and v_starts is None:
-            # Explicit masks use globally aligned pools. Fill a leading partial pool into
-            # unused expanded-pool slots, then append only the trailing global-grid tail.
+            # Pools are aligned to the shifted key axis. Fill a leading partial pool, which
+            # only a row starting off the grid has, into unused expanded-pool slots, then
+            # append the trailing tail on the same grid.
             starts = _expand_query_bounds_for_batch(starts, batch, sq).to(
                 device=token_topk.device, dtype=torch.int64
             )
@@ -1219,8 +1299,11 @@ def fused_qk_topk_kpool(
             tail_count_override=tail_counts.reshape(-1) if tail_counts is not None else None,
         ).reshape(batch, sq, -1)
 
-    if mask is not None:
-        token_topk = _mask_topk_tokens_with_token_mask(token_topk, mask)
+    if pool_phase is not None:
+        phase = pool_phase.view(-1, 1, 1).to(token_topk.dtype)
+        token_topk = torch.where(token_topk >= 0, token_topk + phase, token_topk)
+    if token_mask is not None:
+        token_topk = _mask_topk_tokens_with_token_mask(token_topk, token_mask)
 
     return index_scores, token_topk
 
@@ -3684,8 +3767,11 @@ class DSAttention(MegatronModule):
         # ===================================
         # Run sparse attention kernel
         # ===================================
+        # KPool selection without its tail leaves the rows before a query's first complete
+        # pool without a key, which the layout checks cannot see, so it certifies nothing.
+        kpool_may_leave_rows_empty = _is_kpool and not self.indexer.index_kpool_always_select_tail
         all_topk_rows_nonempty = dsa_masking.can_prove_all_topk_rows_nonempty(
-            computes_topk=computes_topk,
+            computes_topk=computes_topk and not kpool_may_leave_rows_empty,
             indexer_topk=self.index_topk,
             kv_sequence_length=skv,
             attention_mask=float_mask,

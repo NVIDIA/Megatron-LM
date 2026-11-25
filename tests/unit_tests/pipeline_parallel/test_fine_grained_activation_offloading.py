@@ -959,6 +959,91 @@ def test_duplicate_storage_accounting_is_scoped_to_one_group():
         assert group.duplicate_storage_bytes == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+@pytest.mark.skipif(
+    not (hasattr(torch.cuda, "_sleep") and hasattr(torch.cuda, "use_mem_pool")),
+    reason="requires torch.cuda._sleep and torch.cuda.use_mem_pool",
+)
+def test_bulk_offload_group_keeps_untracked_sources_until_copied():
+    """A pending D2H copy must not read memory the producer's stream has already reused.
+
+    record_stream does not protect storage the caching allocator does not own, such as the
+    from_blob views Transformer Engine's bulk_allocate carves out of one buffer for grouped GEMM
+    split offsets. A DLPack alias has the same kind of storage: dropping it frees the buffer.
+    """
+    expected = torch.arange(1 << 14, dtype=torch.int64, device="cuda")
+    group = OffloadTensorGroup("fused_group_mlp")
+    chunk = _make_warmup_chunk([group])
+    # Warm the pinned host cache and the fill kernel: a first cudaHostAlloc for the CPU backup or
+    # a first kernel load would synchronize the device and let the delayed copy finish early.
+    pinned = torch.empty(expected.shape, dtype=expected.dtype, pin_memory=True)
+    del pinned
+    torch.full_like(expected, -1)
+    torch.cuda.synchronize()
+
+    # A private pool whose only block is the source buffer, so a freed buffer is reused at once.
+    # Stay inside it until the check: leaving the pool context synchronizes the device.
+    pool = torch.cuda.MemPool()
+    with torch.cuda.use_mem_pool(pool):
+        source = torch.from_dlpack(expected.clone())
+        assert not source.untyped_storage().resizable()
+        group.push_tensor((1, 0), source)
+        # Delay the D2H stream so the copy starts only after the compute stream moved on.
+        with torch.cuda.stream(chunk.d2h_stream):
+            torch.cuda._sleep(200_000_000)
+        chunk.bulk_offload_group(group)
+        del source
+        # Without the held reference the buffer is free again, and this same-size allocation on
+        # the compute stream takes it and overwrites it before the delayed copy reads it.
+        overwrite = torch.full_like(expected, -1)
+        assert not chunk.d2h_stream.query(), "the delayed D2H copy must still be pending"
+    torch.cuda.synchronize()
+    assert len(group._unrecorded_sources) == 1
+
+    state = group._tensors[(1, 0)]
+    assert isinstance(state, tuple)
+    assert torch.equal(chunk.reload(state).cpu(), expected.cpu())
+    assert overwrite.eq(-1).all()
+
+    # Once the copy has finished, the next commit drops the held source.
+    chunk._release_copied_offload_sources()
+    assert group._unrecorded_sources == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_held_offload_sources_are_released_from_any_chunk():
+    """A chunk's last held source is freed by the next offload hook of any chunk.
+
+    Its own chunk may commit no further group before backward reloads it, so polling only the
+    chunk's own groups would keep the source on the GPU through the whole forward-backward gap.
+    """
+    source = torch.from_dlpack(torch.arange(1 << 14, device="cuda").clone())
+    held = OffloadTensorGroup("fused_group_mlp")
+    held.push_tensor((1, 0), source)
+    chunk_a = _make_warmup_chunk([held])
+    chunk_b = _make_warmup_chunk([OffloadTensorGroup("fused_group_mlp")])
+
+    chunk_a.bulk_offload_group(held)
+    torch.cuda.synchronize()
+    assert len(held._unrecorded_sources) == 1
+    chunk_b._release_copied_offload_sources()
+    assert held._unrecorded_sources == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_bulk_offload_group_relies_on_record_stream_for_allocator_storage():
+    """Allocator-owned sources stay protected by record_stream and are not held."""
+    source = torch.arange(1 << 14, dtype=torch.int64, device="cuda")
+    group = OffloadTensorGroup("fused_group_mlp")
+    group.push_tensor((1, 0), source)
+    chunk = _make_warmup_chunk([group])
+
+    chunk.bulk_offload_group(group)
+    torch.cuda.synchronize()
+    assert group._unrecorded_sources == []
+    assert torch.equal(chunk.reload(group._tensors[(1, 0)]), source)
+
+
 def _build_gpt_model(
     *,
     seed: int,

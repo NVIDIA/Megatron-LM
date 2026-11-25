@@ -238,6 +238,19 @@ def test_dsa_kpool_requires_topk():
         _make_dsa_kpool_config(dsa_indexer_kpool=4)
 
 
+@pytest.mark.parametrize("loss", [dict(), dict(dsa_indexer_loss_coeff=0.01)])
+def test_dsa_kpool_rejects_simplified_indexer(loss):
+    """The simplified indexer has no pools; KPool was silently ignored before this rule."""
+    with pytest.raises(ValueError, match="dsa_indexer_mode='simplified' does not support KPool"):
+        _make_dsa_kpool_config(
+            dsa_indexer_kpool=4,
+            dsa_indexer_topk=8,
+            dsa_indexer_mode="simplified",
+            num_query_groups=1,
+            **loss,
+        )
+
+
 def test_dsa_kpool_cudnn_accepts_unquantized_fp32_weights_projection():
     config = _make_dsa_kpool_config(
         dsa_indexer_kpool=4,
