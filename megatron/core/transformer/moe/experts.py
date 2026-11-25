@@ -869,15 +869,13 @@ class TEGroupedMLP(MegatronModule):
 
     @staticmethod
     def _ensure_main_grad(linear_module: torch.nn.Module) -> None:
-        """Expose FSDP main_grad buffers required by TE fused wgrad accumulation."""
+        """Expose FSDP main_grad buffers without changing the owner's accumulation policy."""
         if not getattr(linear_module, "fuse_wgrad_accumulation", False):
             return
         for param in linear_module.parameters(recurse=False):
             get_main_grad = getattr(param, "get_main_grad", None)
             if get_main_grad is not None and getattr(param, "main_grad", None) is None:
                 param.main_grad = get_main_grad()
-            if hasattr(param, "overwrite_main_grad"):
-                param.overwrite_main_grad = True
 
     def _ensure_main_grad_for_fused_impl(self) -> None:
         """Expose wrapper parameter main_grad buffers before TE fused ops run."""

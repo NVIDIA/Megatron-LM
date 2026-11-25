@@ -160,7 +160,7 @@ def _assert_relative_error(actual, expected, tolerance, name):
 def test_te_mega_op_matches_native_moe(
     precision, static_capacity, accumulate_main_grad, monkeypatch
 ):
-    """Compare two in-flight microbatches and all gradients against native all-to-all."""
+    """Compare two in-flight microbatches against separately computed native gradients."""
     from tests.unit_tests.test_utilities import Utils
 
     if not torch.cuda.is_available() or Utils.world_size < 2 or Utils.world_size % 2:
@@ -201,6 +201,7 @@ def test_te_mega_op_matches_native_moe(
         moe_dispatch_fwd_dtype="bf16",
         moe_combine_bwd_dtype="bf16",
         moe_token_dispatcher_type="alltoall",
+        gradient_accumulation_fusion=False,
     )
     Utils.initialize_model_parallel(expert_model_parallel_size=2)
     try:
@@ -221,14 +222,13 @@ def test_te_mega_op_matches_native_moe(
         assert not list(candidate.megakernel_experts.parameters())
         assert candidate.megakernel_experts.sharded_state_dict() == {}
         if accumulate_main_grad:
-            for model in (candidate, reference):
-                for parameter in model.experts.parameters():
-                    parameter.main_grad = torch.zeros(
-                        parameter.shape, device=parameter.device, dtype=torch.float32
-                    )
-                    parameter.overwrite_main_grad = False
-                    parameter.zero_out_wgrad = False
-                    parameter.grad_added_to_main_grad = False
+            for parameter in candidate.experts.parameters():
+                parameter.main_grad = torch.zeros(
+                    parameter.shape, device=parameter.device, dtype=torch.float32
+                )
+                parameter.overwrite_main_grad = False
+                parameter.zero_out_wgrad = False
+                parameter.grad_added_to_main_grad = False
         torch.manual_seed(177 + Utils.rank)
         records = []
         buffers = []
@@ -274,6 +274,7 @@ def test_te_mega_op_matches_native_moe(
                 )
             )
         assert buffers[0] is not buffers[1]
+        reference_grad_sums = {}
         for (
             candidate_out,
             reference_out,
@@ -283,26 +284,26 @@ def test_te_mega_op_matches_native_moe(
             reference_probs,
         ) in reversed(records):
             upstream = torch.randn_like(reference_out)
+            reference.zero_grad(set_to_none=True)
             reference_out.backward(upstream)
+            for name, parameter in reference.named_parameters():
+                if parameter.grad is not None:
+                    gradient = parameter.grad.detach().float()
+                    if name not in reference_grad_sums:
+                        reference_grad_sums[name] = torch.zeros_like(gradient)
+                    reference_grad_sums[name].add_(gradient)
             candidate_out.backward(upstream)
             _assert_relative_error(
                 candidate_hidden.grad, reference_hidden.grad, tolerance, "dinput"
             )
             _assert_relative_error(candidate_probs.grad, reference_probs.grad, tolerance, "dprobs")
-        for (name, parameter), (ref_name, reference_parameter) in zip(
-            candidate.named_parameters(), reference.named_parameters()
-        ):
-            assert name == ref_name
+        for name, parameter in candidate.named_parameters():
             actual_grad = (
                 parameter.main_grad
                 if accumulate_main_grad and name.startswith("experts.")
                 else parameter.grad
             )
-            expected_grad = (
-                reference_parameter.main_grad
-                if accumulate_main_grad and name.startswith("experts.")
-                else reference_parameter.grad
-            )
+            expected_grad = reference_grad_sums.get(name)
             if expected_grad is None:
                 assert parameter.grad is None
                 continue
