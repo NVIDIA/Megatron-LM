@@ -12,8 +12,8 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu, bias_gelu_back, bias_gelu_impl
+from megatron.core.fusions.fused_bias_grad import bias_with_main_grad
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
-from megatron.core.ops.linear.bias_grad import bias_with_main_grad
 from megatron.core.transformer import TransformerConfig
 
 

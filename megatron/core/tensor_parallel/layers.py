@@ -14,9 +14,9 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core.fusions.fused_bias_grad import try_accumulate_bias_grad
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.ops.linear.bias_grad import try_accumulate_bias_grad
 from megatron.core.parallel_state import (
     get_expert_gtp_weight_remat_rank,
     get_global_memory_buffer,
@@ -987,7 +987,9 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 # contributes only an autograd edge for the wrapper hooks.
                 grad_bias = torch.zeros_like(bias)
             else:
-                grad_bias = grad_output.sum(dim=tuple(range(grad_output.dim() - 1)))
+                # Keep the legacy reduction order when deferred wgrad leaves a 3-D tensor.
+                # Autograd reduces the remaining batch dimension to the bias shape.
+                grad_bias = grad_output.sum(dim=0)
 
         # GTP: reduce-scatter wgrad
         if ctx.gtp_remat_size > 1 and grad_weight is not None:

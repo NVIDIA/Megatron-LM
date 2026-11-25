@@ -302,7 +302,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="fused_bias_fp32_accumulation",
         sources=(
-            "megatron/core/ops/linear/bias_grad.py",
+            "megatron/core/fusions/fused_bias_grad.py",
             "megatron/core/fusions/fused_bias_dropout.py",
             "megatron/core/fusions/fused_bias_gelu.py",
             "megatron/core/fusions/fused_bias_geglu.py",
@@ -468,7 +468,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="tensor_parallel_layers",
         sources=(
             "megatron/core/tensor_parallel/layers.py",
-            "megatron/core/ops/linear/bias_grad.py",
+            "megatron/core/fusions/fused_bias_grad.py",
         ),
         tests=(
             K + "test_tensor_parallel_kernels.py",

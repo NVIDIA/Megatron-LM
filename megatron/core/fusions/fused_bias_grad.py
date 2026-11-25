@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""FP32 bias-gradient reduction and accumulation."""
+"""Shared FP32 bias-gradient reduction and accumulation for fused operators."""
 
 from typing import Any
 
@@ -20,8 +20,12 @@ def accumulate_bias_grad(grad_output: Tensor, main_grad: Tensor, overwrite: bool
     Sharded FSDP requests overwrite for its temporary full-gradient buffer;
     FSDP itself accumulates the reduced shards across microbatches.
     """
-    reduce_dims = tuple(range(grad_output.dim() - 1))
-    reduced = grad_output.sum(dim=reduce_dims, dtype=torch.float32)
+    if grad_output.dim() == 1:
+        # Each element is already the gradient of one bias channel.
+        reduced = grad_output
+    else:
+        reduce_dims = tuple(range(grad_output.dim() - 1))
+        reduced = grad_output.sum(dim=reduce_dims, dtype=torch.float32)
     if overwrite:
         main_grad.copy_(reduced)
     else:

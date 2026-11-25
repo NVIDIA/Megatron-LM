@@ -9,7 +9,7 @@ import torch.distributed as dist
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.ops.linear.bias_grad import accumulate_bias_grad
+from megatron.core.fusions.fused_bias_grad import accumulate_bias_grad
 from megatron.core.tensor_parallel.layers import LinearWithGradAccumulationAndAsyncCommunication
 from megatron.core.transformer import TransformerConfig
 
@@ -24,7 +24,7 @@ def _inputs():
     return x, dy, weight, bias
 
 
-@pytest.mark.parametrize("layout", ["dense", "strided", "empty"])
+@pytest.mark.parametrize("layout", ["dense", "strided", "empty", "vector"])
 @pytest.mark.parametrize("overwrite", [False, True])
 def test_fused_bias_reduction_layouts(layout, overwrite):
     dy = torch.ones(4, 33, 8, device="cuda", dtype=torch.bfloat16)
@@ -33,10 +33,12 @@ def test_fused_bias_reduction_layouts(layout, overwrite):
         dy = dy.transpose(0, 1)[::2, :, ::2]
     elif layout == "empty":
         dy = dy[:0]
+    elif layout == "vector":
+        dy = torch.arange(1, 9, device="cuda", dtype=torch.bfloat16)
     main_grad = torch.full((dy.shape[-1],), 0.25, device="cuda", dtype=torch.float32)
     for _ in range(2):
         accumulate_bias_grad(dy, main_grad, overwrite)
-    expected = dy.double().sum((0, 1))
+    expected = dy.double() if layout == "vector" else dy.double().sum((0, 1))
     if not overwrite:
         expected = 0.25 + 2 * expected
     torch.testing.assert_close(main_grad.double(), expected, rtol=0, atol=0)
@@ -96,6 +98,11 @@ def test_fp32_bias_accumulation(split):
 @pytest.mark.parametrize("reason", ["no_buffer", "no_protocol", "bf16_buffer", "fusion_off"])
 def test_bias_ordinary_autograd_fallback(reason):
     x, dy, weight, bias = _inputs()
+    # The two BF16 reductions round differently from a single reduction.
+    dy.zero_()
+    dy[:, 0] = 2
+    dy[0, 0] += 1 / 32
+    dy[0, 1] = 1 / 32
     if reason != "no_buffer":
         bias.main_grad = torch.zeros_like(
             bias, dtype=torch.bfloat16 if reason == "bf16_buffer" else torch.float32
@@ -104,7 +111,12 @@ def test_bias_ordinary_autograd_fallback(reason):
         bias.grad_added_to_main_grad = False
     fusion = reason != "fusion_off"
     _linear(x, weight, bias, fusion=fusion, deferred=[] if fusion else None).backward(dy)
-    torch.testing.assert_close(bias.grad, dy.sum((0, 1)), rtol=0, atol=0)
+    expected = dy.sum((0, 1))
+    if fusion:
+        legacy = dy.sum(dim=0).sum(dim=0)
+        assert not torch.equal(legacy, expected)
+        expected = legacy
+    torch.testing.assert_close(bias.grad, expected, rtol=0, atol=0)
     if hasattr(bias, "main_grad"):
         assert torch.count_nonzero(bias.main_grad) == 0
 
@@ -118,6 +130,15 @@ def test_bias_accumulation_with_deferred_weight_gradient():
     assert len(deferred) == 1
     assert torch.count_nonzero(weight.main_grad) == 0
     torch.testing.assert_close(bias.main_grad.double(), dy.double().sum((0, 1)), rtol=0, atol=0)
+
+
+def test_bias_accumulation_with_rank_one_gradient():
+    x, _, weight, bias = _inputs()
+    bias.main_grad = torch.zeros_like(bias, dtype=torch.float32)
+    bias.grad_added_to_main_grad = False
+    dy = torch.arange(1, 9, device=x.device, dtype=x.dtype)
+    _linear(x[0, 0], weight, bias, deferred=[]).backward(dy)
+    torch.testing.assert_close(bias.main_grad, dy.float(), rtol=0, atol=0)
 
 
 def test_native_linear_higher_order_bias_grad():
@@ -161,11 +182,13 @@ def test_frozen_bias_does_not_acquire_fsdp_gradient_buffer():
 def test_fsdp_bias_buffer_is_acquired_in_backward_and_reacquired():
     x, dy, weight, bias = _inputs()
     bias.__fsdp_param__ = True
+    bias.overwrite_main_grad = True
     bias.grad_added_to_main_grad = False
     buffers = []
 
     def get_main_grad():
-        buffer = torch.zeros_like(bias, dtype=torch.float32)
+        # Model a reused temporary bucket whose contents are not initialized.
+        buffer = torch.full_like(bias, 31337, dtype=torch.float32)
         buffers.append(buffer)
         return buffer
 

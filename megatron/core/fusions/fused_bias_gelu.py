@@ -2,8 +2,8 @@
 
 import torch
 
+from megatron.core.fusions.fused_bias_grad import bias_with_main_grad
 from megatron.core.jit import jit_fuser
-from megatron.core.ops.linear.bias_grad import bias_with_main_grad
 
 # BIAS GELU FUSION/ NO AUTOGRAD ################
 # 1/sqrt(2*pi)-> 0.3989423

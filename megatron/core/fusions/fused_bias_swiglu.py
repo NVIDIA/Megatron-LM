@@ -10,8 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch._subclasses.fake_tensor import unset_fake_temporarily
 
+from megatron.core.fusions.fused_bias_grad import bias_with_main_grad
 from megatron.core.jit import jit_fuser
-from megatron.core.ops.linear.bias_grad import bias_with_main_grad
 from megatron.core.utils import nvtx_decorator
 
 

@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 import torch
 from torch import Tensor
 
+from megatron.core.fusions.fused_bias_grad import bias_with_main_grad
 from megatron.core.jit import jit_fuser
-from megatron.core.ops.linear.bias_grad import bias_with_main_grad
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
