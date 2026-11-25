@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -247,6 +245,18 @@ def test_embedding_scatter_is_row_selective() -> None:
 S, B, N, C = 3, 2, 4, 16
 
 
+@pytest.mark.gpus(1)
+def test_split_sinkhorn_adds_epsilon_only_to_pre() -> None:
+    """Zero logits give pre=0.5+eps and post=1; amplify eps to catch omissions."""
+    mixes = torch.zeros(1, 1, (2 + N) * N, device="cuda")
+    scale = torch.ones(3, device="cuda")
+    base = torch.zeros((2 + N) * N, device="cuda")
+    eps = 1e-2
+    pre, post, _ = split_sinkhorn(mixes, scale, base, N, 3, eps)
+    torch.testing.assert_close(pre, torch.full_like(pre, 0.5 + eps), rtol=0, atol=1e-7)
+    torch.testing.assert_close(post, torch.ones_like(post), rtol=0, atol=0)
+
+
 def _make_inputs(dtype: torch.dtype, device: str):
     """Build (x, residual, post, comb) with a real Sinkhorn-normalised ``comb``."""
     mixes = torch.randn(S, B, (2 + N) * N).to(device=device, dtype=dtype)
@@ -259,30 +269,30 @@ def _make_inputs(dtype: torch.dtype, device: str):
 
 
 def _reference_post(x, residual, post, comb):
-    """The pre-fusion expression, kept verbatim as the numerical contract."""
+    """DeepSeek stores comb[source, destination], so residual mixing uses comb.T."""
     dtype = x.dtype
     placed = post.to(dtype).unsqueeze(-1) * x.unsqueeze(-2)
-    mixed = torch.matmul(comb.to(dtype), residual.to(dtype))
+    mixed = torch.matmul(comb.to(dtype).transpose(-1, -2), residual.to(dtype))
     return placed + mixed
 
 
 @pytest.mark.gpus(1)
 def test_orientation_is_not_symmetric() -> None:
-    """Guard the guard: passing ``comb`` un-transposed must disagree."""
+    """Guard the fixture: comb @ residual must differ from comb.T @ residual."""
     _, residual, _, comb = _make_inputs(torch.float32, "cuda")
     assert not torch.allclose(comb, comb.transpose(-1, -2), rtol=1e-3, atol=1e-3)
-    correct = torch.matmul(comb, residual)
-    swapped = torch.matmul(comb.transpose(-1, -2), residual)
+    correct = torch.matmul(comb.transpose(-1, -2), residual)
+    swapped = torch.matmul(comb, residual)
     assert not torch.allclose(correct, swapped, rtol=1e-3, atol=1e-3)
 
 
 def _reference_forward(module: HyperConnection, x: torch.Tensor) -> torch.Tensor:
-    """The pre-fusion aggregation, kept verbatim as the numerical contract."""
+    """Eager aggregation with epsilon inside the RMS square root."""
     if x.dim() == 3:
         x = x.unsqueeze(2).expand(*x.shape[:2], module.hc_mult, x.size(-1))
     shape, dtype = x.shape, x.dtype
     xf = x.flatten(2)
-    rms_inv = 1.0 / (xf.norm(dim=-1, keepdim=True) / math.sqrt(xf.shape[-1]) + module.eps)
+    rms_inv = torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + module.eps)
     mixes = F.linear(xf, module.fn.to(device=x.device, dtype=dtype)) * rms_inv
     pre, _, _ = split_sinkhorn(
         mixes, module.scale, module.base, module.hc_mult, module.sinkhorn_iters, module.eps
@@ -301,13 +311,17 @@ def test_post_matches_pre_fusion_reference_bf16_gpu() -> None:
 
 
 @pytest.mark.gpus(1)
-def test_forward_aggregation_matches_pre_fusion_reference_gpu() -> None:
-    """Same, for the aggregation half: this is the only cover for the fused kernel."""
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("input_scale", [1.0, 1e-4])
+def test_forward_aggregation_matches_pre_fusion_reference_gpu(dtype, input_scale) -> None:
+    """Small activations expose epsilon placement; BF16 also covers FP32 parameters."""
     module = HyperConnection(hidden_size=C, hc_mult=N, sinkhorn_iters=3, eps=1e-6).cuda()
-    x = torch.randn(S, B, N, C, device="cuda")
+    x = torch.randn(S, B, N, C, device="cuda", dtype=dtype) * input_scale
     expected = _reference_forward(module, x)
     actual, _, _ = module(x)
-    torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-4)
+    assert actual.dtype == dtype
+    tol = 2e-2 if dtype == torch.bfloat16 else 1e-4
+    torch.testing.assert_close(actual, expected, rtol=tol, atol=tol * input_scale)
 
 
 _ROPE_KW = dict(config=None, use_yarn=False, device=torch.device("cpu"), dtype=torch.float32)
