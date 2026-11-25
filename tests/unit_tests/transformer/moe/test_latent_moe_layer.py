@@ -47,6 +47,22 @@ class _DummyDispatcher(torch.nn.Module):
         super().__init__()
 
 
+class _ProjectionDispatcher(_DummyDispatcher):
+    def dispatch_preprocess(self, hidden_states, routing_map, probs):
+        return hidden_states, probs
+
+    def combine_postprocess(self, output):
+        return output
+
+
+class _CPUProjection(torch.nn.Linear):
+    def __init__(self, input_size: int, output_size: int, **kwargs) -> None:
+        super().__init__(input_size, output_size, bias=kwargs["bias"])
+
+    def forward(self, hidden_states):
+        return super().forward(hidden_states), None
+
+
 class _FakeProcessGroup:
     def rank(self):
         return 0
@@ -62,6 +78,128 @@ def _build_dummy_module(*args, **kwargs):
 def _record_checkpoint_call(checkpoint_calls, state_dict, prefix, *args, **kwargs):
     checkpoint_calls[prefix] = (state_dict, kwargs)
     return {}
+
+
+def _build_projection_test_layer(
+    monkeypatch, latent_size, scaling, up_scaling, with_norm, with_bias
+):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_moe_experts=1,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_token_dispatcher_type="allgather",
+        moe_ffn_hidden_size=16,
+        moe_latent_size=latent_size,
+        moe_latent_projection_scaling=scaling,
+        moe_latent_up_projection_scaling=up_scaling,
+        moe_use_norm_before_up_proj=with_norm,
+        use_cpu_initialization=True,
+        add_bias_linear=with_bias,
+    )
+    monkeypatch.setattr(moe_layer_module, "HAVE_TE", True)
+    monkeypatch.setattr(moe_layer_module, "TELinear", _CPUProjection)
+    monkeypatch.setattr(moe_layer_module, "MoEAllGatherTokenDispatcher", _ProjectionDispatcher)
+    monkeypatch.setattr(
+        moe_layer_module,
+        "TENorm",
+        lambda config, hidden_size, eps: torch.nn.RMSNorm(hidden_size, eps=eps),
+    )
+    return MoELayer(
+        config,
+        MoESubmodules(experts=_build_dummy_module, router=_build_dummy_module),
+        pg_collection=ProcessGroupCollection(tp=_FakeProcessGroup(), ep=_FakeProcessGroup()),
+    )
+
+
+@pytest.mark.parametrize("latent_size", [2, 4, 8, 16])
+@pytest.mark.parametrize("scaling", [False, True])
+@pytest.mark.parametrize("up_scaling", [False, True])
+@pytest.mark.parametrize("with_norm", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_latent_projection_scaling_forward_backward(
+    monkeypatch, latent_size, scaling, up_scaling, with_norm, with_bias
+):
+    """Control projection gains independently and leave the shared branch unscaled."""
+    torch.manual_seed(123)
+    layer = _build_projection_test_layer(
+        monkeypatch, latent_size, scaling, up_scaling, with_norm, with_bias
+    )
+    hidden_states = torch.randn(3, 2, 8, requires_grad=True)
+    shared_output = torch.randn_like(hidden_states, requires_grad=True)
+    probs = torch.rand(6, 1)
+    routing_map = torch.ones(6, 1, dtype=torch.bool)
+    scale = (8 / latent_size) ** 0.5 if scaling else 1.0
+    up_scale = (8 / latent_size) ** 0.5 if up_scaling else 1.0
+    assert layer.latent_down_projection_scale == scale
+    assert layer.latent_up_projection_scale == up_scale
+
+    latent_input, dispatched_probs = layer.preprocess(hidden_states, probs, routing_map)
+    reference_latent = (
+        torch.nn.functional.linear(
+            hidden_states, layer.fc1_latent_proj.weight, layer.fc1_latent_proj.bias
+        )
+        * scale
+    )
+    torch.testing.assert_close(latent_input, reference_latent)
+    assert dispatched_probs is probs
+
+    # An identity routed expert isolates the projection gains from the expert activation.
+    output = layer.postprocess(latent_input, shared_output)
+    if with_norm:
+        reference_latent = torch.nn.functional.rms_norm(
+            reference_latent, (latent_size,), layer.fc2_norm.weight, layer.config.layernorm_epsilon
+        )
+    reference = (
+        torch.nn.functional.linear(
+            reference_latent, layer.fc2_latent_proj.weight, layer.fc2_latent_proj.bias
+        )
+        * up_scale
+        + shared_output
+    )
+    torch.testing.assert_close(output, reference)
+
+    inputs = (hidden_states, shared_output, *layer.parameters())
+    grad_output = torch.randn_like(output)
+    grads = torch.autograd.grad(output, inputs, grad_output, retain_graph=True)
+    reference_grads = torch.autograd.grad(reference, inputs, grad_output)
+    for actual, expected in zip(grads, reference_grads):
+        torch.testing.assert_close(actual, expected)
+    # The shared expert output is added after the gain and receives an unscaled gradient.
+    torch.testing.assert_close(grads[1], grad_output)
+
+
+@pytest.mark.parametrize("latent_size", [None, 0, -4])
+@pytest.mark.parametrize(
+    "scaling_option", ["moe_latent_projection_scaling", "moe_latent_up_projection_scaling"]
+)
+def test_projection_scaling_requires_positive_latent_size(latent_size, scaling_option):
+    with pytest.raises(ValueError, match="requires a positive moe_latent_size"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            num_moe_experts=1,
+            moe_router_topk=1,
+            moe_latent_size=latent_size,
+            **{scaling_option: True},
+        )
+
+
+@pytest.mark.parametrize(
+    "scaling_option", ["moe_latent_projection_scaling", "moe_latent_up_projection_scaling"]
+)
+def test_projection_scaling_requires_moe_experts(scaling_option):
+    with pytest.raises(ValueError, match="requires num_moe_experts"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            moe_latent_size=4,
+            **{scaling_option: True},
+        )
 
 
 def test_latent_projections_use_owning_tp_group_for_checkpoint_only(monkeypatch):

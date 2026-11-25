@@ -329,6 +329,16 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
 
         # Initialize latent projections.
         if self.config.moe_latent_size:
+            self.latent_down_projection_scale = (
+                (self.config.hidden_size / self.config.moe_latent_size) ** 0.5
+                if self.config.moe_latent_projection_scaling
+                else 1.0
+            )
+            self.latent_up_projection_scale = (
+                (self.config.hidden_size / self.config.moe_latent_size) ** 0.5
+                if self.config.moe_latent_up_projection_scaling
+                else 1.0
+            )
             assert HAVE_TE, "TransformerEngine is required for MoE latent projections."
             if self.config.transformer_impl == "inference_optimized":
                 from megatron.core.tensor_parallel.inference_layers import InferenceLinear
@@ -646,6 +656,8 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
         # Project the hidden_states from hidden dimension down to latent dimension.
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
+            if self.latent_down_projection_scale != 1.0:
+                hidden_states = hidden_states * self.latent_down_projection_scale
         if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
             # Only the flex dispatcher takes the mask (dropless HybridEP and NCCL EP exclude
             # padded rows) and the packed-sequence metadata.
@@ -752,6 +764,8 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
             if self.config.moe_use_norm_before_up_proj:
                 output = apply_module(self.fc2_norm)(output)
             output, _ = self.fc2_latent_proj(output)
+            if self.latent_up_projection_scale != 1.0:
+                output = output * self.latent_up_projection_scale
 
         if shared_expert_output is not None:
             output = output + shared_expert_output
