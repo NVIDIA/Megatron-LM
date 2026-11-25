@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import common, gdn, gdn2
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.transformer import TransformerConfig
