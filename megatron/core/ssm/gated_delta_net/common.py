@@ -31,6 +31,7 @@ from megatron.core.ssm.mamba_context_parallel import (
 )
 from megatron.core.ssm.utils import _split_tensor_factory, _validate_dynamic_cp_head_geometry
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
@@ -40,7 +41,12 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import get_pg_size, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
+
+if HAVE_GTP:
+    from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+else:
+    is_gtp_param = None
 
 try:
     from fla.modules.convolution import causal_conv1d
@@ -724,18 +730,37 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
-        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
-            in_proj_dim_local_tp,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
+        in_proj_weight = self.in_proj.weight
+        if (
+            HAVE_GTP
+            and getattr(in_proj_weight, "gtp_remat_size", 1) > 1
+            and is_gtp_param(in_proj_weight)
+        ):
+            # A GTP shard holds a contiguous slice of the TP-local rows, which does not line up
+            # with the sections: each rank saves the parts of the sections its own rows cover,
+            # as the gated delta product mixer does.
+            from megatron.core.ssm.gated_delta_product import _gtp_split_tensor_factory
 
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-            list(self.in_proj_split_sections),
-            self.in_proj_split_names,
-            0,
-        )
+            sharded_state_dict[f"{prefix}in_proj.weight"] = _gtp_split_tensor_factory(
+                sharded_state_dict[f"{prefix}in_proj.weight"],
+                list(self.in_proj_split_sections),
+                self.in_proj_split_names,
+                gtp_remat_rank=torch.distributed.get_rank(in_proj_weight.group),
+                tp_rank=get_pg_rank(tp_group),
+                tp_size=get_pg_size(tp_group),
+            )
+        else:
+            in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
+            assert (
+                sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp
+            ), (in_proj_dim_local_tp, sharded_state_dict[f"{prefix}in_proj.weight"])
+
+            sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
+                sharded_state_dict[f"{prefix}in_proj.weight"],
+                list(self.in_proj_split_sections),
+                self.in_proj_split_names,
+                0,
+            )
 
         conv_layer_name_list = ["conv1d.weight"]
         assert (
