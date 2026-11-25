@@ -1231,6 +1231,12 @@ class TransformerConfig(ModelParallelConfig):
     The routing decision is based on the sum of the routing scores and the expert bias.
     See https://arxiv.org/abs/2408.15664 for details."""
 
+    moe_router_bias_bf16_counts: bool = False
+    """Use BF16 token-count accumulation, global reduction and update-scale arithmetic for
+    compatibility with checkpoints trained using BF16 expert-bias counters. This can change
+    ties near the average expert load and makes the update sensitive to token and rank layout.
+    The default uses exact integer counts. Applies only to the count-based expert bias."""
+
     moe_router_bias_update_rate: float = 1e-3
     """The expert bias is updated based on the number of assigned tokens to each expert
     in a global batch, where the bias is increased for the experts with less assigned tokens
@@ -4173,6 +4179,10 @@ class TransformerConfig(ModelParallelConfig):
             and "quantile_balancing" in self.moe_router_load_balancing_type
         ):
             raise ValueError("quantile_balancing must be the sole moe_router_load_balancing_type.")
+        if self.moe_router_bias_bf16_counts and (
+            not self.bf16 or not self.moe_router_enable_expert_bias
+        ):
+            raise ValueError("moe_router_bias_bf16_counts requires BF16 and count-based expert bias.")
         if self.moe_router_load_balancing_type == "quantile_balancing":
             aux_coeffs = (
                 self.moe_aux_loss_coeff

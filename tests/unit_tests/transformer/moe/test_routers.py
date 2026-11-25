@@ -129,6 +129,45 @@ def test_fused_router_only_forwards_supported_topk_indices(monkeypatch, supports
     assert "topk_indices" not in received_kwargs
 
 
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_bf16_expert_bias_counts_and_scale(monkeypatch, deterministic):
+    """Compatibility rounds once per microbatch and multiplies the sign in BF16."""
+    indices = torch.tensor([[0, 1]] * 513 + [[0, -1]] * 2)
+    mask = torch.zeros(len(indices), dtype=torch.bool)
+    mask[-1] = True
+    valid = torch.zeros(len(indices), 3, dtype=torch.bool)
+    valid[:, 0] = True
+    valid[:513, 1] = True
+    counts = []
+    original_mode = torch.are_deterministic_algorithms_enabled()
+    try:
+        torch.use_deterministic_algorithms(deterministic)
+        for routes in [indices, valid]:
+            router = SimpleNamespace(
+                enable_expert_bias=True, local_tokens_per_expert=torch.zeros(3, dtype=torch.bfloat16)
+            )
+            for _ in range(3):
+                TopKRouter._apply_expert_bias(router, routes, padding_mask=mask)
+            counts.append(router.local_tokens_per_expert)
+    finally:
+        torch.use_deterministic_algorithms(original_mode)
+    expected_count = torch.zeros(3, dtype=torch.bfloat16)
+    for _ in range(3):
+        expected_count += torch.tensor([514, 513, 0])
+    assert all(torch.equal(x, expected_count) for x in counts)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    bias = torch.tensor([17.0, 10.0, -11.0])
+    rate = 1e-4
+    # Both 1024 and 1023 round to the BF16 mean. Equal expert loads keep their bias.
+    tied = torch.tensor([1024, 1023, 1027], dtype=torch.bfloat16)
+    update = get_updated_expert_bias(tied, bias, rate, tp_dp_cp_group=object())
+    assert torch.equal(update, bias)
+    update = get_updated_expert_bias(counts[0], bias, rate, tp_dp_cp_group=object())
+    step = torch.tensor(rate, dtype=torch.bfloat16).float()
+    assert torch.equal(update, bias + torch.tensor([-1.0, -1.0, 1.0]) * step)
+    assert torch.isfinite(update).all()
+
+
 @pytest.mark.parametrize("padding", ["none", "mixed", "all"])
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_expert_bias_dense_counts_match_bool_path(padding, deterministic):

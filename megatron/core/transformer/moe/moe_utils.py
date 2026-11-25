@@ -1591,6 +1591,10 @@ def get_updated_expert_bias(
         torch.distributed.all_reduce(tokens_per_expert, group=tp_dp_cp_group)
         num_experts = tokens_per_expert.shape[-1]
         total_tokens = tokens_per_expert.sum(dim=-1, keepdim=True)
+        if tokens_per_expert.dtype == torch.bfloat16:
+            # Preserve the former BF16 count, mean and update scale including its tie behavior.
+            offset = total_tokens / num_experts - tokens_per_expert
+            return expert_bias + offset.sign() * expert_bias_update_rate
         # Compare each tokens_per_expert value with the row average without converting the integer
         # counts to floating point: tokens_per_expert < total / num_experts iff
         # tokens_per_expert * num_experts < total.
