@@ -35,7 +35,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--recipe", required=True, help="Config factory as module:function")
     parser.add_argument(
-        "--forward-step", help="MLM forward step as module:function; defaults to llm_step"
+        "--forward-step", help="MLM forward step as module:function; defaults based on model config"
     )
     parser.add_argument(
         "--dry-run", action="store_true", help="Validate and display config without runtime setup"
@@ -51,8 +51,6 @@ def main(argv: list[str] | None = None) -> None:
 
     import torch
 
-    from megatron.bridge.models.nemotron_3.super_vl_config import Nemotron35SuperVLModelConfig
-    from megatron.bridge.models.qwen_vl.qwen35_vl_config import Qwen35VLModelConfig
     from megatron.core._rank_utils import safe_get_rank
     from megatron.training.api import pretrain
     from megatron.training.config import PretrainConfigContainer
@@ -64,15 +62,15 @@ def main(argv: list[str] | None = None) -> None:
     if not isinstance(config, PretrainConfigContainer):
         raise TypeError("Recipe must return an MLM PretrainConfigContainer")
     apply_config_overrides(config, options.overrides)
-    is_vlm = isinstance(config.model, (Nemotron35SuperVLModelConfig, Qwen35VLModelConfig))
-    if is_vlm and options.forward_step is None:
-        raise ValueError("VLM recipes require an explicit --forward-step")
     step = options.forward_step
     if step is None:
-        if isinstance(config.model, (GPTModelConfig, HybridModelConfig)):
+        # Temporary default: exact GPT/Hybrid configs use the text step; all others
+        # use the VLM step. VLM configs inherit from HybridModelConfig, so isinstance
+        # would select the wrong step. Expand this logic as recipes and steps are added.
+        if type(config.model) in (GPTModelConfig, HybridModelConfig):
             step = "megatron.training.forward_steps.llm_step:forward_step"
         else:
-            raise TypeError("Default forward steps require a GPTModelConfig or HybridModelConfig")
+            step = "megatron.training.forward_steps.vlm_step:forward_step"
     forward_step = _load_callable(step)
     if options.dry_run:
         config.validate()

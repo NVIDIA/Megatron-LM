@@ -26,12 +26,14 @@ sections, dataset classes, and Python callables in the recipe itself.
 Both `--recipe` and `--forward-step` import and execute Python code. Only use
 trusted modules; this runner is not a sandbox for untrusted recipe names or YAML.
 
-The runner uses `megatron.training.forward_steps.llm_step.forward_step` for GPT/Hybrid models.
+The runner uses `megatron.training.forward_steps.llm_step.forward_step` for exact
+`GPTModelConfig` and `HybridModelConfig` types; all other types default to `vlm_step`.
+This temporary selection rule must expand as more recipes and step functions are added.
 This adapts Bridge's text step to MLM runtime services and its TP-rank-zero data
 loaders, without a repository-root script dependency, ModelOpt step, or `GlobalState`.
 Use `--forward-step module:function` for an explicit MLM-compatible step.
-VLM recipes require an explicit `--forward-step` and a dataset in `cfg.data`;
-the runner does not supply synthetic image inputs or a default VLM step.
+VLM recipes still require a compatible dataset in `cfg.data`; selecting a step
+does not supply synthetic image inputs or a VLM data pipeline.
 `--dry-run` validates and displays the unfinalized config without setting global
 config, initializing distributed services, building datasets, or training.
 It is not a substitute for runtime validation against the actual GPU topology.
