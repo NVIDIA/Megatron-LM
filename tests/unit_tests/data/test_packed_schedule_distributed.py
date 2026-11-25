@@ -137,6 +137,7 @@ def test_packed_schedule_pipeline_cp_and_hybrid_sp(dynamic_cp, cp_size, hybrid):
                 sequence_parallel=True,
                 tensor_model_parallel_size=2,
                 context_parallel_size=cp_size,
+                global_cp_layout=config.global_cp_layout,
                 use_cpu_initialization=True,
             )
             decoder = _RouterDecoder(result, pg, router_config)

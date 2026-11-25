@@ -599,14 +599,10 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
     is_first = mpu.is_pipeline_first_stage()
     is_last = mpu.is_pipeline_last_stage()
 
-    # Per-sequence zigzag balancing may pad each sequence to 2 * CP alignment, so the physical
-    # shard length comes from the padded metadata rather than the original sample length.
-    if cp_size > 1:
-        assert cu_seqlens_padded is not None
-        partitioned_seq_length = cu_seqlens_padded[0, -1].item() // cp_size
-    else:
-        assert cu_seqlens_padded is None
-        partitioned_seq_length = seq_length
+    # Inter-document masking keeps the fixed row width used by pipeline receives.
+    # Deriving the expected width from new padding would hide a producer/P2P mismatch.
+    assert cu_seqlens_padded is None
+    partitioned_seq_length = seq_length // cp_size
 
     if pp_size == 1:
         assert tokens is not None
@@ -795,16 +791,18 @@ def test_get_batch_on_this_cp_rank_contiguous_keeps_attention_mask_zigzag(cp_siz
 
 
 @pytest.mark.parametrize(
-    ("cp_rank", "expected_indices"),
+    ("cp_rank", "expected_indices", "fixed_indices"),
     [
-        (0, [0, -1, 4, 5, 6, -1, -1, -1]),
-        (1, [1, -1, 7, 8, 9, -1, -1, -1]),
-        (2, [2, -1, 10, 11, 12, -1, -1, -1]),
-        (3, [3, -1, 13, 14, 15, -1, -1, -1]),
+        (0, [0, -1, 4, 5, 6, -1, -1, -1], [0, 1, 14, 15]),
+        (1, [1, -1, 7, 8, 9, -1, -1, -1], [2, 3, 12, 13]),
+        (2, [2, -1, 10, 11, 12, -1, -1, -1], [4, 5, 10, 11]),
+        (3, [3, -1, 13, 14, 15, -1, -1, -1], [6, 7, 8, 9]),
     ],
 )
 @pytest.mark.parametrize("with_contiguous_layout", [False, True])
-def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with_contiguous_layout):
+def test_get_batch_on_this_cp_rank_zigzag_packed(
+    cp_rank, expected_indices, fixed_indices, with_contiguous_layout
+):
     tokens = torch.arange(1, 17).view(1, 16)
     loss_mask = torch.tensor([[1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]])
     decoder_input = torch.stack((tokens, tokens + 20), dim=-1)
@@ -860,10 +858,13 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
         )
         result = cp_batch.get_batch("zigzag")
 
-    indices = torch.tensor(expected_indices)
+    # The converted compute view pads documents for TE. A same-layout fixed-row
+    # producer preserves the original positions (including already masked padding).
+    indices = torch.tensor(expected_indices if with_contiguous_layout else fixed_indices)
     padding = indices < 0
     gathered_indices = indices.clamp_min(0)
-    padding = padding | (gathered_indices == 3) | (gathered_indices >= 14)
+    if with_contiguous_layout:
+        padding = padding | (gathered_indices == 3) | (gathered_indices >= 14)
     expected_tokens = tokens.index_select(1, gathered_indices).masked_fill(padding.view(1, -1), 0)
     expected_loss_mask = loss_mask.index_select(1, gathered_indices).masked_fill(
         padding.view(1, -1), 0
@@ -882,10 +883,14 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
     torch.testing.assert_close(result["decoder_input"], expected_decoder_input)
     torch.testing.assert_close(result["mtp_input_mask"], expected_mtp_input_mask)
     torch.testing.assert_close(result["padding_mask"], expected_padding_mask)
-    torch.testing.assert_close(
-        result["cu_seqlens_padded"], torch.tensor([[0, 8, 32]], dtype=torch.int32)
+    expected_cu = (
+        torch.tensor([[0, 8, 32]], dtype=torch.int32)
+        if with_contiguous_layout
+        else cu_seqlens_padded
     )
-    assert result["max_seqlen"].item() == 24
+    expected_max = 24 if with_contiguous_layout else 12
+    torch.testing.assert_close(result["cu_seqlens_padded"], expected_cu)
+    assert result["max_seqlen"].item() == expected_max
     assert (cp_batch.thd_plan is not None) == with_contiguous_layout
     assert set(cp_batch.batches_by_layout) == (
         {"contiguous", "zigzag"} if with_contiguous_layout else {"zigzag"}
@@ -895,12 +900,16 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
     torch.testing.assert_close(
         zigzag_packed_seq_params.cu_seqlens_q_padded, result["cu_seqlens_padded"].squeeze(0)
     )
-    torch.testing.assert_close(zigzag_packed_seq_params.cu_seqlens_q, cu_seqlens.squeeze(0))
-    assert zigzag_packed_seq_params.max_seqlen_q == 24
-    assert zigzag_packed_seq_params.pad_between_seqs
-    assert zigzag_packed_seq_params.total_tokens == 32
+    expected_logical = cu_seqlens if with_contiguous_layout else cu_seqlens_padded
+    torch.testing.assert_close(zigzag_packed_seq_params.cu_seqlens_q, expected_logical.squeeze(0))
+    assert zigzag_packed_seq_params.max_seqlen_q == expected_max
+    assert zigzag_packed_seq_params.pad_between_seqs is (True if with_contiguous_layout else None)
+    assert zigzag_packed_seq_params.total_tokens == (32 if with_contiguous_layout else 16)
     torch.testing.assert_close(
-        zigzag_packed_seq_params.seq_idx, torch.tensor([[0] * 8 + [1] * 24], dtype=torch.int32)
+        zigzag_packed_seq_params.seq_idx,
+        torch.tensor(
+            [[0] * (8 if with_contiguous_layout else 4) + [1] * expected_max], dtype=torch.int32
+        ),
     )
 
 
@@ -1152,7 +1161,7 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     loss_mask = torch.ones(1, 2)
     position_ids = torch.tensor([[0, 1]])
     padding_mask = torch.zeros(1, 2, dtype=torch.bool)
-    packed_seq_params = PackedSeqParams(qkv_format="thd")
+    packed_seq_params = PackedSeqParams(qkv_format="thd", cp_partition_mode="zigzag")
     scheduler_batch = ContextParallelBatch(
         boundary_layout="zigzag",
         batches_by_layout={
