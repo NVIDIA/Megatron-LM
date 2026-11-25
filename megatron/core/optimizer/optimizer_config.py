@@ -366,13 +366,12 @@ class OptimizerConfig:
     """Plateau degree r >= 1 of kappa_t. r > 1 flattens the start of the decay.
     Defaults to 1.0."""
 
-    muown_angular_warmup_iters: Optional[int] = None
-    """Iterations that keep kappa_t = 1. None reuses the learning-rate warmup.
-    Defaults to None."""
+    muown_angular_warmup_iters: int = 0
+    """Iterations that keep kappa_t = 1. Defaults to 0."""
 
-    muown_angular_horizon_iters: Optional[int] = None
-    """Iterations T that normalize the progress of kappa_t. None uses the number of training
-    iterations. Defaults to None."""
+    muown_angular_horizon_iters: int = 0
+    """Iterations T that normalize the progress of kappa_t, usually the number of training
+    iterations. Zero disables the decay. Defaults to 0."""
 
     muown_norm_eps: float = 1e-12
     """Floor for the absolute row scale and for the row-normalization denominator.
