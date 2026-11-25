@@ -658,17 +658,17 @@ def update_gtp_config(**kwargs):
         setattr(GTP_CONFIG, key, value)
 
 
-def _current_stream_collectives_in_capture() -> bool:
-    """Dispatch directly on GTP streams while capturing a full iteration."""
+def should_dispatch_on_gtp_stream() -> bool:
+    """Return whether full-iteration capture requires direct dispatch on GTP streams."""
     global _CAPTURE_STREAM_DISPATCH_LOGGED
-    enabled = _FULL_ITERATION and torch.cuda.is_current_stream_capturing()
-    if enabled and not _CAPTURE_STREAM_DISPATCH_LOGGED:
+    dispatch_on_gtp_stream = _FULL_ITERATION and torch.cuda.is_current_stream_capturing()
+    if dispatch_on_gtp_stream and not _CAPTURE_STREAM_DISPATCH_LOGGED:
         logger.info(
             "GTP full-iteration CUDA graph capture detected: enabling direct collective "
             "dispatch on GTP communication streams."
         )
         _CAPTURE_STREAM_DISPATCH_LOGGED = True
-    return enabled
+    return dispatch_on_gtp_stream
 
 
 def tag_gtp_params_with_names(model):
@@ -1818,13 +1818,12 @@ class GTPShardedParam(torch.nn.Parameter):
         with ag_ctx:
             # Keep prefetch scheduling, buffer ownership and stream placement asynchronous.
             # On qualified backends, the sync collective API enqueues on this GTP stream.
-            collective_async_op = async_op and not _current_stream_collectives_in_capture()
             if len(gather_weights) > 1:
                 nvtx_range_push(f"{nvtx_label}.batched_gtp_ag")
                 results, handle = grouped_gather_along_first_dim(
                     gather_weights,
                     gtp_remat_group,
-                    async_op=collective_async_op,
+                    async_op=async_op and not should_dispatch_on_gtp_stream(),
                     quantizers=quantizers,
                     output_tensors=out_buffers,
                 )
@@ -1835,7 +1834,7 @@ class GTPShardedParam(torch.nn.Parameter):
                     gather_weights[0],
                     gtp_remat_group,
                     quantizer=quantizers[0],
-                    async_op=collective_async_op,
+                    async_op=async_op and not should_dispatch_on_gtp_stream(),
                     output_tensor=out_buffers[0] if out_buffers is not None else None,
                 )
                 nvtx_range_pop(f"{nvtx_label}.gtp_ag")
@@ -2525,9 +2524,15 @@ class GTPShardedParam(torch.nn.Parameter):
         with rs_ctx:
             # Deferred FP32 sums still need their asynchronous Work lifecycle. Ordinary RS
             # can dispatch directly while preserving the existing asynchronous finalization.
-            collective_async_op = async_op and (
-                fp32_accumulation or not _current_stream_collectives_in_capture()
+            dispatch_on_gtp_stream = (
+                async_op and not fp32_accumulation and should_dispatch_on_gtp_stream()
             )
+            if dispatch_on_gtp_stream:
+                # Padding may create temporary input tensors. Without a Work handle to
+                # keep them alive, record their RS-stream use so the allocator cannot
+                # reuse their memory before reduce-scatter finishes.
+                for tensor in wgrads:
+                    tensor.record_stream(rs_stream)
             if fp32_accumulation:
                 nvtx_range_push(f"{nvtx_label}.gtp_rs_fp32accum")
                 outputs, sum_handles = [], []
@@ -2566,7 +2571,10 @@ class GTPShardedParam(torch.nn.Parameter):
             if len(wgrads) == 1:
                 nvtx_range_push(f"{nvtx_label}.gtp_rs")
                 out, handle = reduce_scatter_along_first_dim(
-                    wgrads[0], self.group, async_op=collective_async_op, output=out_buffers[0]
+                    wgrads[0],
+                    self.group,
+                    async_op=async_op and not dispatch_on_gtp_stream,
+                    output=out_buffers[0],
                 )
                 nvtx_range_pop(f"{nvtx_label}.gtp_rs")
                 return [out], handle, release_bufs
@@ -2577,7 +2585,7 @@ class GTPShardedParam(torch.nn.Parameter):
             # can replace its Work handle with an outer Work, retaining input tensors
             # after the returned handle is waited on.
             with torch.distributed._coalescing_manager(
-                group=self.group, async_ops=collective_async_op
+                group=self.group, async_ops=async_op and not dispatch_on_gtp_stream
             ) as cm:
                 for out_buffer, tensor in zip(out_buffers, wgrads):
                     out, _ = reduce_scatter_along_first_dim(tensor, self.group, output=out_buffer)
