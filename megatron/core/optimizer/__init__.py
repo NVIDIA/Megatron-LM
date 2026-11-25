@@ -1286,6 +1286,17 @@ def get_megatron_optimizer(
                     # Avoid duplicate master weights when Megatron-FSDP owns a main buffer.
                     # Otherwise, preserve the optimizer's master weight configuration.
                     setattr(optimizer_part.optimizer, "master_weights", False)
+                elif config.main_params_dtype == torch.float16:
+                    # TODO: Enable scaled FP16 masters once TE handles empty local
+                    # master shards during initialization and checkpoint loading.
+                    warnings.warn(
+                        'Megatron-FSDP v1 disables TE master weights with '
+                        '--megatron-fsdp-main-params-dtype auto and --main-params-dtype fp16. '
+                        'Model weights are updated directly without extra master precision; '
+                        '--main-params-dtype fp16 is not used.',
+                        stacklevel=2,
+                    )
+                    setattr(optimizer_part.optimizer, "master_weights", False)
                 # Megatron-FSDP always uses a decoupled gradient when using FusedAdam.
                 setattr(optimizer_part.optimizer, "use_decoupled_grad", True)
 

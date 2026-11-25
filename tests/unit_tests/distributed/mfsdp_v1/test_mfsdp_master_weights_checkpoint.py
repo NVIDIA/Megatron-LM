@@ -45,7 +45,7 @@ class TestMasterWeightsCheckpoint:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _build_model_and_optimizer(zero_init=False):
+    def _build_model_and_optimizer(zero_init=False, main_params_dtype=torch.float32):
         config = TransformerConfig(
             num_layers=1,
             hidden_size=16,
@@ -77,6 +77,7 @@ class TestMasterWeightsCheckpoint:
                 bf16=True,
                 use_distributed_optimizer=True,
                 use_precision_aware_optimizer=True,
+                main_params_dtype=main_params_dtype,
             ),
             [model],
             use_gloo_process_groups=False,
@@ -87,6 +88,16 @@ class TestMasterWeightsCheckpoint:
         model.finish_grad_sync()
         optimizer.step()
         return model, optimizer
+
+    def test_scaled_fp16_masters_fall_back_to_model_weights(self):
+        with pytest.warns(UserWarning, match="disables TE master weights"):
+            model, optimizer = self._build_model_and_optimizer(main_params_dtype=torch.float16)
+        try:
+            assert not optimizer.optimizer.master_weights
+            assert optimizer.state
+            assert all("master_param" not in state for state in optimizer.state.values())
+        finally:
+            model.stop_communication()
 
     def test_save_load(self, tmp_path_dist_ckpt):
         torch.manual_seed(1234)
