@@ -920,10 +920,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """Return the LayerWise layout (``"padded"`` or ``"compact"``) of the wrapped model
         chunks.
 
-        It follows ``config.layer_wise_param_layout``, which must match the layouts
-        DDP was built with: LayerWise buffers with optimizer shards are padded, those without
-        are compact. Without DDP-wrapped model chunks (direct construction), whole params are
-        owned and gathered as in the compact layout.
+        The configured layout must match DDP's buffers. Padded LayerWise buckets have
+        equal-size DDP shards. In the compact layout, LayerWise assigns whole parameters
+        to owners separately. Direct construction without DDP uses the compact layout.
         """
         if ddp_config is None:
             return 'compact'
@@ -935,18 +934,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             )
         declared = config.layer_wise_param_layout
         validate_layer_wise_param_layout(declared)
-        sharded = {
-            layout.use_distributed_optimizer
+        built_layouts = {
+            'padded' if layout.num_optimizer_shards is not None else 'compact'
             for full_layout in full_param_layouts or []
             for buffer_key, layout in full_layout.layouts.items()
             if buffer_key.is_managed_by_layer_wise_optimizer
         }
-        if len(sharded) > 1:
-            raise ValueError(
-                "LayerWise buffers mix padded (sharded) and compact (unsharded) layouts."
-            )
+        if len(built_layouts) > 1:
+            raise ValueError("LayerWise buffers mix padded and compact layouts.")
         # Without LayerWise-managed parameters there is nothing to gather either way.
-        built = ('padded' if sharded.pop() else 'compact') if sharded else declared
+        built = next(iter(built_layouts), declared)
         if built != declared:
             raise ValueError(
                 f"layer_wise_param_layout={declared!r} does not match the {built} "

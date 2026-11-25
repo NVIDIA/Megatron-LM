@@ -1082,6 +1082,12 @@ def validate_args(args, defaults={}):
         and args.fp8_param_gather
         and not (args.use_megatron_fsdp or args.use_torch_fsdp2)
     )
+    if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather_with_optimizer_step:
+        raise ValueError(
+            "--overlap-param-gather-with-optimizer-step is incompatible with "
+            "--fp8-recipe mxfp8 and --fp8-param-gather because the MXFP8 parameter "
+            "all-gather reuses the gradient buffer."
+        )
 
     # Parameters dtype.
     args.params_dtype = torch.float

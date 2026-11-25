@@ -689,8 +689,8 @@ class OptimizerConfig:
                 or self.uses_layer_wise_distributed_optimizer()
                 or ddp_config.use_megatron_fsdp
             ), (
-                '--overlap-param-gather only supported with distributed optimizer, '
-                'megatron fsdp, or dist_muon'
+                '--overlap-param-gather requires the distributed optimizer, Megatron FSDP, '
+                'or the layer-wise distributed optimizer'
             )
             assert (
                 ddp_config.overlap_grad_reduce

@@ -1559,6 +1559,30 @@ def test_layer_wise_param_layout_cli(monkeypatch, layout):
     assert config.layer_wise_param_layout == (layout or "padded")
 
 
+@pytest.mark.parametrize("param_gather,step_overlap", [(True, True), (True, False), (False, True)])
+def test_mxfp8_param_gather_optimizer_step_overlap(monkeypatch, param_gather, step_overlap):
+    args = _minimal_training_args(monkeypatch)
+    args.optimizer = "adam"
+    args.use_distributed_optimizer = True
+    args.bf16 = True
+    args.fp8 = "e4m3"
+    args.fp8_recipe = "mxfp8"
+    args.fp8_param_gather = param_gather
+    args.overlap_grad_reduce = True
+    args.overlap_param_gather = True
+    args.overlap_param_gather_with_optimizer_step = step_overlap
+
+    if param_gather and step_overlap:
+        message = (
+            r"--overlap-param-gather-with-optimizer-step.*--fp8-recipe mxfp8.*--fp8-param-gather"
+        )
+        with pytest.raises(ValueError, match=message):
+            validate_args(args)
+    else:
+        validate_args(args)
+        assert args.reuse_grad_buf_for_mxfp8_param_ag is param_gather
+
+
 @pytest.mark.parametrize("optimizer", ["adam", "sgd", "muon", "dist_muon"])
 def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch, optimizer):
     args = _minimal_training_args(monkeypatch)

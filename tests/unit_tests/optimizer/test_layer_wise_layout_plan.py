@@ -23,6 +23,7 @@ from megatron.core.optimizer.optimizer_config import (
     OptimizerConfig,
     resolve_layer_wise_distributed_optimizer,
 )
+from megatron.core.optimizer.param_layout import BufferKey, FullParamLayout, PerBufferParamLayout
 
 
 def _param(shape, **attrs):
@@ -128,10 +129,15 @@ def test_configure_ddp_for_layer_wise_optimizer(requested, expected):
         )
 
 
-def _full_layout(sharded):
-    """A full layout whose only LayerWise buffer is sharded (padded) or not (compact)."""
-    key = type("BufferKey", (), {"is_managed_by_layer_wise_optimizer": True})()
-    return SimpleNamespace(layouts={key: SimpleNamespace(use_distributed_optimizer=sharded)})
+def _full_layout(num_optimizer_shards):
+    key = BufferKey(
+        param_dtype=torch.bfloat16,
+        grad_dtype=torch.float32,
+        is_expert_parallel=False,
+        is_managed_by_layer_wise_optimizer=True,
+    )
+    layout = PerBufferParamLayout(num_optimizer_shards=num_optimizer_shards)
+    return FullParamLayout(layouts={key: layout})
 
 
 def test_resolve_param_layout_matches_ddp_buffers():
@@ -139,11 +145,13 @@ def test_resolve_param_layout_matches_ddp_buffers():
     ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
     padded = SimpleNamespace(layer_wise_param_layout="padded")
     compact = SimpleNamespace(layer_wise_param_layout="compact")
-    assert resolve(padded, ddp_config, [_full_layout(True)]) == "padded"
-    assert resolve(compact, ddp_config, [_full_layout(False)]) == "compact"
+    assert resolve(padded, ddp_config, [_full_layout(1), _full_layout(2)]) == "padded"
+    assert resolve(compact, ddp_config, [_full_layout(None)]) == "compact"
     # The requested layout must agree with the layout of the DDP buffers.
     with pytest.raises(ValueError, match="does not match"):
-        resolve(compact, ddp_config, [_full_layout(True)])
+        resolve(compact, ddp_config, [_full_layout(2)])
+    with pytest.raises(ValueError, match="mix padded and compact"):
+        resolve(padded, ddp_config, [_full_layout(2), _full_layout(None)])
     # Chunks not wrapped for the layer-wise optimizer (e.g. the removed legacy layout).
     with pytest.raises(ValueError, match="wrapped for it"):
         resolve(padded, DistributedDataParallelConfig(use_distributed_optimizer=False), None)
