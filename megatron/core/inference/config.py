@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Sequence, Tuple, Unio
 
 import torch
 
+from megatron.core.enums import Fp8Recipe
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
@@ -932,8 +934,22 @@ class InferenceConfig:
             )
         if model_config.params_dtype != torch.bfloat16:
             raise ValueError("inference_shortcut_moe_overlap requires BF16 model parameters")
-        if model_config.fp8 or model_config.fp4:
-            raise ValueError("Shortcut MoE overlap with FP8 or FP4 requires further testing")
+        if model_config.fp4:
+            raise ValueError("Shortcut MoE overlap with FP4 requires further testing")
+        if model_config.fp8 and (
+            model_config.fp8_recipe != Fp8Recipe.mxfp8
+            or model_config.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
+        ):
+            raise ValueError(
+                "Shortcut MoE overlap with FP8 requires fp8_recipe='mxfp8' and "
+                "inference_grouped_gemm_backend='flashinfer'. Other backends are intended for "
+                "testing, not performance. Other FP8 recipes require further testing."
+            )
+        if model_config.fp8 and model_config.activation_func_tanh_clamp_scale is None:
+            raise ValueError(
+                "MXFP8 shortcut overlap requires activation_func_tanh_clamp_scale "
+                "for FlashInfer CUTLASS; the routed path is not yet validated."
+            )
         if model_config.context_parallel_size != 1:
             raise ValueError("inference_shortcut_moe_overlap requires CP=1")
         # TP > 1 is safe because every TP-group collective stays on the main stream: see

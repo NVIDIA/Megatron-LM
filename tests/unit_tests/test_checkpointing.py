@@ -663,25 +663,44 @@ def test_checkpoint_model_checks_use_config_not_stale_args(run_config, model_cls
 
 
 @pytest.mark.parametrize("saved_config", [False, True])
-def test_checkpoint_allows_rope_to_yarn(run_config, saved_config):
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "yarn"])
+def test_checkpoint_position_capacity(run_config, saved_config, position_embedding_type):
     args = SimpleNamespace(
         num_layers=2,
         hidden_size=32,
         num_attention_heads=4,
         add_position_embedding=True,
-        vocab_file=None,
+        vocab_file="vocab",
         use_dist_ckpt=True,
         phase_transition_iterations=None,
     )
-    checkpoint_args = SimpleNamespace(**vars(args), position_embedding_type="rope")
-    run_config.model.position_embedding_type = "rope"
+    checkpoint_args = SimpleNamespace(
+        **vars(args),
+        max_position_embeddings=run_config.model.seq_length,
+        make_vocab_size_divisible_by=run_config.model.make_vocab_size_divisible_by,
+        tokenizer_type=run_config.tokenizer.tokenizer_type,
+    )
+    run_config.tokenizer.vocab_file = "vocab"
+    run_config.model.position_embedding_type = (
+        "rope" if position_embedding_type == "yarn" else position_embedding_type
+    )
     saved = run_config.to_dict() if saved_config else None
-    run_config.model.position_embedding_type = "yarn"
+    run_config.model.position_embedding_type = position_embedding_type
     with (
         mock.patch('megatron.training.checkpointing.get_args', return_value=args),
         mock.patch('megatron.training.checkpointing.get_checkpoint_version', return_value=3.0),
     ):
         check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+        # Changing this metadata does not change RoPE/YaRN weight shapes.
+        run_config.model.seq_length *= 2
+        if position_embedding_type == "learned_absolute":
+            with pytest.raises(AssertionError, match="max_position_embeddings"):
+                check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
+            check_checkpoint_args(
+                checkpoint_args, skip_args={"max_position_embeddings"}, checkpoint_config=saved
+            )
+        else:
+            check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
         checkpoint_args.add_position_embedding = False
         with pytest.raises(AssertionError, match="add_position_embedding"):
             check_checkpoint_args(checkpoint_args, checkpoint_config=saved)
@@ -1198,6 +1217,66 @@ def test_load_checkpoint(
         else:
             assert new_optimizer.state_dict() == {"optimizer": "dummy1"}
             assert new_opt_param_scheduler.state_dict() == {"opt_param_scheduler": "dummy2"}
+
+
+def test_adapter_only_save_and_resume(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, run_config
+):
+    """With an adapter filter, a save keeps only the adapter weights and a resume restores only
+    those, leaving the rest of the model untouched."""
+    args = create_ckpt_load_args
+    args.padded_vocab_size = None
+    run_config.tokenizer.padded_vocab_size = 128
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = True
+    args.use_dist_ckpt = False
+    args.fp16 = False
+    args.bf16 = False
+
+    def is_adapter(key):
+        return key == "l.bias"
+
+    with TempNamedDir(
+        tmp_path_dist_ckpt / "test_adapter_only_save_and_resume", sync=True
+    ) as ckpt_dir:
+        args.load = str(ckpt_dir)
+        args.save = str(ckpt_dir)
+        args.save_tokenizer_assets = False
+        set_args(args)
+
+        config = TransformerConfig(num_layers=1, kv_channels=1)
+        model = MockModel(config)  # weight = ones, bias = zeros
+        with torch.no_grad():
+            model.l.bias.fill_(5)
+        optimizer = MockState({"optimizer": "optimizer_state"})
+        opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+
+        sync_checkpoint_config(args)
+        save_checkpoint(
+            123, [model], optimizer, opt_param_scheduler, 456, adapter_key_filter=is_adapter
+        )
+
+        sync_checkpoint_config(args)
+        saved, _, _, _ = _load_base_checkpoint(args.save, args, rank0=True)
+        assert set(saved["model"]) == {"l.bias"}
+
+        # Resume into a model whose adapter and base weights both differ from the saved ones.
+        new_model = MockModel(config)
+        with torch.no_grad():
+            new_model.l.weight.zero_()
+            new_model.l.bias.zero_()
+        sync_checkpoint_config(args)
+        loaded_iter, loaded_flops = load_checkpoint(
+            [new_model],
+            MockState({"optimizer": "dummy1"}),
+            MockState({"opt_param_scheduler": "dummy2"}),
+            strict=True,
+            adapter_key_filter=is_adapter,
+        )
+
+        assert (loaded_iter, loaded_flops) == (123, 456)
+        assert torch.equal(new_model.l.bias, model.l.bias)  # the adapter weight is restored
+        assert torch.equal(new_model.l.weight, torch.zeros_like(new_model.l.weight))  # base is not
 
 
 @pytest.mark.parametrize("strict", [False, True])
@@ -2131,7 +2210,8 @@ def test_the_frozen_layer_load_is_weights_only_at_any_data_position(
     """--freeze-all-layers loads the model weights-only and resumes the data position from the
     run's own progress tracker: the classification is recorded on the train state, the position
     stays the load's own business, and the namespace receives neither."""
-    args = _loader_args(freeze_all_layers=True)
+    args = _loader_args()
+    run_config.train.freeze_all_layers = True
     train_state = TrainState()
     monkeypatch.setattr(checkpointing, "get_train_state", lambda: train_state)
     run_config.checkpoint.load = "/frozen"

@@ -653,14 +653,25 @@ def test_shortcut_overlap_model_validation():
                 fp8="hybrid" if mxfp8 else None,
                 fp8_recipe="mxfp8" if mxfp8 else "delayed",
                 fp8_param=mxfp8,
+                activation_func_tanh_clamp_scale=16.0,
             )
-            if mxfp8:
-                with pytest.raises(ValueError, match="requires further testing"):
+            if mxfp8 and backend != InferenceGroupedGemmBackend.FLASHINFER:
+                with pytest.raises(ValueError, match="fp8_recipe='mxfp8' and"):
                     config.validate_shortcut_moe_model(candidate)
             else:
                 config.validate_shortcut_moe_model(candidate)
-    model_config.fp8 = "e4m3"
-    with pytest.raises(ValueError, match="requires further testing"):
+                if mxfp8:
+                    candidate.activation_func_tanh_clamp_scale = None
+                    with pytest.raises(ValueError, match="routed path is not yet validated"):
+                        config.validate_shortcut_moe_model(candidate)
+    # Non-MXFP8 FP8 recipes stay rejected, even with FlashInfer experts.
+    for backend in ("vllm", "flashinfer"):
+        candidate = dataclasses.replace(model_config, inference_grouped_gemm_backend=backend)
+        candidate.fp8 = "e4m3"
+        with pytest.raises(ValueError, match="fp8_recipe='mxfp8' and"):
+            config.validate_shortcut_moe_model(candidate)
+    model_config.fp4 = "nvfp4"
+    with pytest.raises(ValueError, match="FP4 requires further testing"):
         config.validate_shortcut_moe_model(model_config)
 
 

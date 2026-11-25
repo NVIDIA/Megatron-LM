@@ -45,6 +45,7 @@ LATE_PROMPT = 1100
 GENERATE = 6
 
 pytestmark = [
+    pytest.mark.launch_on_gb200,
     pytest.mark.skipif(
         not torch.cuda.is_available()
         or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),

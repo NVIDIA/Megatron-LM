@@ -1024,9 +1024,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             ), "Router recording/replay requested but no MoE experts specified!"
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
+        # MoE layers cannot be built without num_moe_experts, so a model without it is dense
+        # and must not set up dispatcher state: the NVLS buffers need a symmetric-memory
+        # rendezvous over the tp_ep group, which equals the TP group for a dense model.
+        has_moe_layers = model_config.num_moe_experts is not None
+
         # are we using the inference_optimized nccl ep dispatcher for MoEs?
         self._nccl_ep_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
+            has_moe_layers
+            and get_pg_size(self.expert_model_parallel_group) > 1
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
@@ -1034,7 +1040,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # The NVLS dispatcher gathers over the tp_ep group, so it is also active
         # for EP == 1 with expert tensor parallelism (ETP > 1).
         self._nvls_dispatcher = (
-            get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
+            has_moe_layers
+            and get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
             and model_config.inference_moe_token_dispatcher_type == 'nvls'
         )
 
