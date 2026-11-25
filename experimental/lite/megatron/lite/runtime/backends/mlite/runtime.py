@@ -14,6 +14,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
+
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
@@ -27,11 +28,18 @@ from megatron.lite.runtime.contracts.loss import (
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     """Construct typed impl config, backfilling hf_path + optimizer_config."""
+    validator = getattr(proto, "validate_impl_cfg_keys", None)
+    if validator is not None:
+        validator(rt_cfg.impl_cfg)
     init_fields = {f.name for f in dc_fields(proto.ImplConfig) if f.init}
     # Only forward impl_cfg keys this model's ImplConfig declares: the connector
     # may pass knobs (e.g. cross_entropy_fusion) that some models don't model.
     impl_cfg_kwargs = {key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields}
     impl_cfg_kwargs["parallel"] = rt_cfg.parallel
+    if "initialize_weights" in init_fields:
+        impl_cfg_kwargs.setdefault(
+            "initialize_weights", not (rt_cfg.load_hf_weights and rt_cfg.hf_path)
+        )
     if (
         "attention_backend_override" in init_fields
         and impl_cfg_kwargs.get("attention_backend_override") is None
@@ -81,10 +89,7 @@ def _reset_parameters(module: torch.nn.Module) -> None:
                 )
             if original_local.data_ptr() != replacement_local.data_ptr():
                 original_local.copy_(
-                    replacement_local.to(
-                        device=original_local.device,
-                        dtype=original_local.dtype,
-                    )
+                    replacement_local.to(device=original_local.device, dtype=original_local.dtype)
                 )
             module._parameters[name] = original
 
@@ -201,6 +206,11 @@ def _pipeline_callbacks(forward_step: Callable, loss_fn: Callable | None):
         return loss_fn(output, batch, loss_context)
 
     return wrapped_forward_step, wrapped_loss_fn
+
+
+def _has_chunked_state_offload(optimizer):
+    owners = getattr(optimizer, "chained_optimizers", None) or [optimizer]
+    return any(getattr(owner, "_optimizer_state_offloader", None) is not None for owner in owners)
 
 
 class MegatronLiteRuntime(RuntimeBase):
@@ -415,6 +425,13 @@ class MegatronLiteRuntime(RuntimeBase):
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
 
+        # Complete overlapped DistOpt gathers before publishing updated weights.
+        wrapped = handle._model if isinstance(handle._model, (list, tuple)) else [handle._model]
+        for chunk in {id(c): c for c in [*model_chunks, *wrapped]}.values():
+            sync = getattr(chunk, "start_param_sync", None)
+            if callable(sync):
+                sync(force_sync=True)
+
         if proto and hasattr(proto, "export_hf_weights"):
             yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
         else:
@@ -446,20 +463,29 @@ class MegatronLiteRuntime(RuntimeBase):
             load_optimizer,
             offload_model_to_cpu,
             offload_optimizer,
+            release_grad_buffers,
+            restore_grad_buffers,
         )
 
-        # A model+gradient transfer is the training context boundary.  On its
+        # A gradient transfer (with or without the model) is the training context boundary.  On its
         # CPU side the colocated rollout is about to map its sleeping weights;
         # on its CUDA side training is taking the device back.  Keep the whole
         # release/restore contract here rather than teaching VERL about backend
         # scratch buffers or optimizer residency.
-        training_transfer = model and grad
+        training_transfer = grad
+        chunked = _has_chunked_state_offload(handle._optimizer)
         if device == "cpu":
             if model:
                 offload_model_to_cpu(model_chunks)
+            elif grad:
+                release_grad_buffers(model_chunks)
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
-                if callable(offload_state):
+                if chunked:
+                    # The step left masters and moments on GPU; park them in their pinned
+                    # host copies. The next prepare_grads prefetches them back.
+                    handle._optimizer.offload_optimizer_state_for_forward(offload_master=True)
+                elif callable(offload_state):
                     offload_state()
                 else:
                     offload_optimizer(handle._optimizer)
@@ -477,7 +503,9 @@ class MegatronLiteRuntime(RuntimeBase):
         elif device == "cuda":
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
-            if (optimizer or training_transfer) and handle._optimizer is not None:
+            elif grad:
+                restore_grad_buffers(model_chunks)
+            if (optimizer or training_transfer) and handle._optimizer is not None and not chunked:
                 load_state = getattr(handle._optimizer, "load_state_to_device", None)
                 if callable(load_state):
                     load_state()
@@ -584,6 +612,7 @@ class MegatronLiteRuntime(RuntimeBase):
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),
                     loss_fn=loss_fn,
                     forward_only=forward_only,
+                    post_backward_hook=handle._extras.get("post_backward_hook"),
                 )
             finally:
                 if replay_driver is not None:

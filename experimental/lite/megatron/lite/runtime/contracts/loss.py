@@ -19,6 +19,7 @@ class LossContext:
     return_log_probs: bool = True
     loss_scale: float = 1.0
     source_batch: Any | None = None
+    normalization_denominator: float | None = None
 
 
 _CURRENT_LOSS_CONTEXT: ContextVar[LossContext | None] = ContextVar(
