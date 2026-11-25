@@ -139,19 +139,22 @@ def validate_layer_offloading(
     config: TransformerConfig, layers: str | Sequence[TransformerConfig]
 ) -> None:
     """Check activation-offload scopes against the full hybrid architecture."""
-    if (
-        not config.fine_grained_activation_offloading
-        or "gdn_core_attn" not in config.offload_modules
-    ):
-        return
+    model_offloads_gdn = (
+        config.fine_grained_activation_offloading and "gdn_core_attn" in config.offload_modules
+    )
     if isinstance(layers, str):
-        has_gdn = Symbols.GDN in layers
+        layer_offloads_gdn = model_offloads_gdn and Symbols.GDN in layers
     else:
-        has_gdn = any(type(layer) is GDNLayerConfig for layer in layers)
-    if not has_gdn:
-        raise ValueError(
-            "gdn_core_attn offloading requires a GDN layer in the hybrid architecture."
+        layer_offloads_gdn = any(
+            type(layer) is GDNLayerConfig
+            and layer.fine_grained_activation_offloading
+            and "gdn_core_attn" in layer.offload_modules
+            for layer in layers
         )
+    if model_offloads_gdn and not layer_offloads_gdn:
+        raise ValueError("gdn_core_attn offloading requires a GDN layer with the scope enabled.")
+    if layer_offloads_gdn and not model_offloads_gdn:
+        raise ValueError("gdn_core_attn offloading requires the scope on the HybridModel config.")
 
 
 def invoke_custom_layer(

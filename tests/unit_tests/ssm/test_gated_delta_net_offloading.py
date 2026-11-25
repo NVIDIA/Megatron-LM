@@ -32,6 +32,14 @@ def _config(**overrides):
     [
         ({"experimental_attention_variant": None}, "only supports GDN"),
         (
+            {
+                "experimental_attention_variant": "gdn2",
+                "is_hybrid_model": True,
+                "linear_attention_freq": None,
+            },
+            "only supports GDN",
+        ),
+        (
             {"recompute_granularity": "selective", "recompute_modules": ["gdn"]},
             "whole-GDN recomputation",
         ),
@@ -60,16 +68,31 @@ def gdn_groups():
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize("use_config_list", [False, True], ids=["pattern", "config-list"])
-def test_hybrid_offload_requires_gdn(gdn_groups, use_config_list):
-    config = _training_config(1, False, 1, 1, None, 1.0, False, native_hybrid=True)
-    if use_config_list:
-        architecture = {"hybrid_layer_config_list": [create_layer_config(config, "*")] * 8}
-    else:
-        architecture = {"hybrid_layer_pattern": "********"}
-    with pytest.raises(ValueError, match="requires a GDN layer"):
+@pytest.mark.parametrize(
+    "symbol,model_enabled,layer_enabled",
+    [
+        pytest.param(None, True, True, id="pattern"),
+        pytest.param("*", True, True, id="config-list"),
+        pytest.param("G", True, False, id="layer-off"),
+        pytest.param("G", False, True, id="model-off"),
+    ],
+)
+def test_hybrid_offload_requires_gdn(gdn_groups, symbol, model_enabled, layer_enabled):
+    enabled = _training_config(1, False, 1, 1, None, 1.0, False, native_hybrid=True)
+    disabled = replace(enabled, fine_grained_activation_offloading=False, offload_modules=[])
+    architecture = (
+        {"hybrid_layer_pattern": "*" * enabled.num_layers}
+        if symbol is None
+        else {
+            "hybrid_layer_config_list": [
+                create_layer_config(enabled if layer_enabled else disabled, symbol)
+            ]
+            * enabled.num_layers
+        }
+    )
+    with pytest.raises(ValueError, match="gdn_core_attn offloading requires"):
         HybridModel(
-            config=config,
+            config=enabled if model_enabled else disabled,
             vocab_size=512,
             max_sequence_length=128,
             pg_collection=gdn_groups,

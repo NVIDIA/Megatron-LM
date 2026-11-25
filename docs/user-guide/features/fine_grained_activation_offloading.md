@@ -58,6 +58,7 @@ are not force-released; evaluation and no-grad execution bypass the scope.
 
 Enable this scope with `--fine-grained-activation-offloading --offload-modules gdn_core_attn`.
 For HybridModel, select GDN with `G` in `--hybrid-layer-pattern`.
+With an explicit layer-config list, enable the scope on the model config and at least one GDN layer.
 Selective `gdn_norm_out` recomputation and native pre-GDR fusion are supported.
 Whole-GDN selective recomputation (`--recompute-modules gdn`), full recomputation,
 GDN2, FP8/NVFP4, other recurrence backends, and CUDA graphs are rejected.

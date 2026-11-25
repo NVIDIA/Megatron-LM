@@ -3497,7 +3497,8 @@ class TransformerConfig(ModelParallelConfig):
                 f'Allowed modules are: {allowed_modules}'
             )
             if "gdn_core_attn" in self.offload_modules:
-                if not self.is_hybrid_model and self.experimental_attention_variant != "gdn":
+                variant = self.experimental_attention_variant
+                if variant != "gdn" and (not self.is_hybrid_model or variant == "gdn2"):
                     raise ValueError("gdn_core_attn offloading only supports GDN (gdn).")
                 if not self.bf16 or self.fp8 or self.fp4:
                     raise ValueError("gdn_core_attn offloading requires BF16 without FP8 or FP4.")
