@@ -129,8 +129,9 @@ class TestCreateCheckpointManager:
     def test_unsafe_target_is_rejected_before_import(self):
         from megatron.training.config.instantiate_utils import target_allowlist
 
-        with patch.object(target_allowlist, "is_allowed", return_value=True), patch(
-            "importlib.import_module"
+        with (
+            patch.object(target_allowlist, "is_allowed", return_value=True),
+            patch("importlib.import_module") as import_module,
         ) as import_module:
             with pytest.raises(ValueError, match="not allowed"):
                 cm.create_checkpoint_manager(_config("torch.hub.load"))
@@ -255,7 +256,11 @@ class TestDefaultCheckpointManager:
             config=config,
         )
         load_ctx = cm.CheckpointLoadContext(
-            model=[], optimizer=None, opt_param_scheduler=None, train_state=train_state, config=config
+            model=[],
+            optimizer=None,
+            opt_param_scheduler=None,
+            train_state=train_state,
+            config=config,
         )
         for ctx in (save_ctx, load_ctx):
             assert ctx.train_state is train_state
@@ -263,11 +268,7 @@ class TestDefaultCheckpointManager:
 
     @pytest.mark.parametrize(
         "ckpt_format, fsdp2_ddp, expected",
-        [
-            ("torch_dist", True, True),
-            ("torch_dist", False, False),
-            ("torch", True, False),
-        ],
+        [("torch_dist", True, True), ("torch_dist", False, False), ("torch", True, False)],
     )
     def test_load_skips_load_state_dict_only_for_fsdp2_torch_dist(
         self, ckpt_format, fsdp2_ddp, expected
