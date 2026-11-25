@@ -1,0 +1,38 @@
+# Keep the observer independent of images and artifacts built by this pipeline.
+include:
+  - project: dl/nemo/cerno
+    ref: &cerno_health_commit f397f4ddd2095c8a375bceca17c883e856727591
+    file: /.gitlab/templates/pipeline-health.yml
+
+health:non_test_failures:
+  extends: .cerno_pipeline_health
+  tags:
+    - arch/amd64
+    - env/prod
+    - origin/jet-fleet
+    - owner/jet-core
+    - purpose/utility
+    - team/megatron
+  timeout: 15m
+  variables:
+    CERNO_COMMIT: *cerno_health_commit
+    CERNO_CONFIG: .gitlab/cerno-health.yml
+    RO_API_TOKEN: ${PROJECT_ACCESS_TOKEN_MCORE}
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: always
+    - when: never
+  script:
+    - |
+      set +x
+      : "${PAT:?PAT is required to install Cerno}"
+      GIT_CONFIG_COUNT=1 \
+        GIT_CONFIG_KEY_0="http.${CI_SERVER_URL}/.extraHeader" \
+        GIT_CONFIG_VALUE_0="Authorization: Basic $(printf 'oauth2:%s' "$PAT" | base64 | tr -d '\n')" \
+        python -m pip install --disable-pip-version-check --no-cache-dir \
+          "cerno @ git+${CI_SERVER_URL}/dl/nemo/cerno.git@${CERNO_COMMIT}"
+    - >-
+      python tests/test_utils/python_scripts/notify_ci_failures.py
+      --pipeline-id "${CI_PIPELINE_ID}"
+      --config "${CERNO_CONFIG}"
+      --output pipeline_health.json
