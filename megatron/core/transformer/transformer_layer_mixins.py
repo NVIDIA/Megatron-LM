@@ -748,6 +748,20 @@ class TECudaGraphHyperConnectionTransformerLayerMixin(TECudaGraphTransformerLaye
     self-attention, and the mHC read, write and MLP run eagerly around it.
     """
 
+    def register_te_cuda_graph(self):
+        """Validate the mHC layer's TE capture scopes after the base layer is built."""
+        if self.is_moe_layer and CudaGraphModule.moe in self.config.cuda_graph_modules:
+            raise NotImplementedError(
+                "mHC TE graphs support MoE router capture with optional preprocessing only."
+            )
+        if _uses_mhc_attention_cuda_graph_split(self.config) and not isinstance(
+            self.cross_attention, IdentityOp
+        ):
+            raise NotImplementedError(
+                "mhc_recompute_attn_cuda_graph_split does not support cross-attention."
+            )
+        return super().register_te_cuda_graph()
+
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Override to produce n-stream hidden_states of shape [s, b, n*C].
 
