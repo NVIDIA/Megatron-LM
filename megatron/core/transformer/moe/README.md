@@ -548,6 +548,10 @@ EP All-to-All can consume 30-40% of training time without optimization. These fe
 
 > **Full activation recompute with EP A2A Overlap**: `--recompute-granularity full` is supported and is applied per layer segment, so `--recompute-method` and `--recompute-num-layers` carry exactly the same meaning as without `--overlap-moe-expert-parallel-comm`. Both flags are required. This overlap recompute path requires `--cuda-graph-impl none`; CUDA Graph execution, including `full_iteration`, is not supported.
 
+##### Waiting for the Backward PP Receive on the Communication Stream
+
+With PP/VPP and `--overlap-moe-expert-parallel-comm`, the backward pipeline receive is waited for on the EP communication stream instead of the computation stream, so the paired forward layer's pre-dispatch computation does not wait for a late gradient. Results are bitwise identical to waiting on the computation stream. See [Combined 1F1B: Expert-Parallel All-to-All Overlap](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/moe_a2a_overlap.md#backward-pipeline-receive-wait) for the behavior, a diagram, limitations and profiling.
+
 ### Compute Optimization
 
 Fine-grained MoE produces many small operations that can underutilize GPU resources. These optimizations reduce kernel launch overhead and improve GPU utilization.
