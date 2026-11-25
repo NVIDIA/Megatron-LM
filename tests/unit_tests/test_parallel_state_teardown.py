@@ -256,18 +256,13 @@ def test_destroy_releases_captured_collective(distributed_without_model_parallel
         torch.distributed.all_reduce(value, group=group)
     stream.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with capture_constants(graph), torch.cuda.graph(graph, stream=stream):
-        register_capture_constant(value)
-        torch.distributed.all_reduce(value, group=group)
-    graph.replay()
-    torch.cuda.synchronize()
-
     if owner == "runner":
         runner = _CudaGraphRunner(
             MegatronModule(config=None), None, [], {}, func=None, need_backward=False
         )
-        # Simulate a capture that never reached the record/flag updates.
+        # create_fwd_graph registers the runner before capturing the collective.
         runner.fwd_graph = graph
+        _CudagraphGlobalRecord.captured_runners.add(runner)
     elif owner == "full_iteration":
         grad_copy = FullIterationGradCopy()
         grad_copy.forward_backward_graph = graph
@@ -276,6 +271,11 @@ def test_destroy_releases_captured_collective(distributed_without_model_parallel
     else:
         OptimizerCudaGraphWrapper.cuda_graph = graph
         OptimizerCudaGraphWrapper.curr_iteration = 3
+    with capture_constants(graph), torch.cuda.graph(graph, stream=stream):
+        register_capture_constant(value)
+        torch.distributed.all_reduce(value, group=group)
+    graph.replay()
+    torch.cuda.synchronize()
     del graph
 
     # A live captured communicator prevents graceful NCCL finalization from completing.

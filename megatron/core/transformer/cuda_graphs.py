@@ -7,7 +7,6 @@ import logging
 import math
 import os
 import time
-import weakref
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
@@ -598,11 +597,6 @@ class _CudagraphGlobalRecord:
     _saved_tensors_observer = None
     _te_capture_started = False
 
-    # Every live runner, including runners that are neither recorded nor in
-    # 'captured_runners', so that 'release_all_cuda_graphs' can reset them all. Weak
-    # references, so the set does not extend runner lifetimes.
-    all_runners: "weakref.WeakSet" = weakref.WeakSet()
-
     # Owners are local/full-iteration graphs or TE graph callables.
     # Weak keys avoid extending their lifetimes merely to retain their constants.
     capture_constants: WeakKeyDictionary[torch.cuda.CUDAGraph, dict[int, torch.Tensor]] = (
@@ -873,41 +867,37 @@ def release_capture_constants(owner_graph: torch.cuda.CUDAGraph) -> None:
     _CudagraphGlobalRecord.capture_constants.pop(owner_graph, None)
 
 
-def _reset_cuda_graph_runner(runner):
-    """Drop a runner's graphs and capture state so that it records and captures again."""
-    # Some callers (e.g., test_cuda_graphs.py) delete graph attributes
-    # before the global teardown runs.
-    for graph in (getattr(runner, "fwd_graph", None), getattr(runner, "bwd_graph", None)):
-        if graph is not None:
-            graph.reset()
-            release_capture_constants(graph)
-    runner.cudagraph_created = False
-    runner.fwd_graph_recorded = False
-    runner.bwd_graph_recorded = False
-    runner.fwd_graph = None
-    runner.bwd_graph = None
-    runner.mempool = None
-    runner._gtp_fwd_params_to_ensure_ready = ()
-
-
-def _delete_cuda_graphs(*, include_all_runners: bool) -> None:
-    runners = set(_CudagraphGlobalRecord.captured_runners)
-    for record in chain(
-        _CudagraphGlobalRecord.cudagraph_record, _CudagraphGlobalRecord.cudagraph_inference_record
-    ):
-        runners.add(record[0])
-    if include_all_runners:
-        runners.update(_CudagraphGlobalRecord.all_runners)
-        if not runners and CudaGraphManager.global_mempool is None:
-            return
+def delete_cuda_graphs():
+    """Delete all CUDA graphs."""
 
     _CudagraphGlobalRecord._disable_saved_tensors_observer()
+
+    # Reset runners.
+    runners = set(_CudagraphGlobalRecord.captured_runners)
+    for record in [
+        *_CudagraphGlobalRecord.cudagraph_record,
+        *_CudagraphGlobalRecord.cudagraph_inference_record,
+    ]:
+        runners.add(record[0])
     if runners:
         # Replay can still be using external constants when graph destruction is requested.
         torch.cuda.synchronize()
     for runner in runners:
         assert isinstance(runner, _CudaGraphRunner)
-        _reset_cuda_graph_runner(runner)
+
+        # Some callers (e.g., test_cuda_graphs.py) delete graph attributes
+        # before the global teardown runs.
+        for graph in (getattr(runner, "fwd_graph", None), getattr(runner, "bwd_graph", None)):
+            if graph is not None:
+                graph.reset()
+                release_capture_constants(graph)
+        runner.cudagraph_created = False
+        runner.fwd_graph_recorded = False
+        runner.bwd_graph_recorded = False
+        runner.fwd_graph = None
+        runner.bwd_graph = None
+        runner.mempool = None
+        runner._gtp_fwd_params_to_ensure_ready = ()
 
     # Reset global tracking state
     _CudagraphGlobalRecord.cudagraph_created = False
@@ -923,26 +913,19 @@ def _delete_cuda_graphs(*, include_all_runners: bool) -> None:
     CudaGraphManager.global_mempool = None
 
 
-def delete_cuda_graphs():
-    """Delete the graphs of recorded and captured runners and reset the global capture state.
+def release_all_cuda_graphs() -> None:
+    """Release local CUDA graphs before destroying their communicators.
 
-    This includes every runner that started a capture since the last call, so the
-    training graphs that 'create_cudagraphs' created are deleted too; for example, an
-    inference engine's suspend releases them.
+    Forward capture registers its runner before recording any CUDA work, so
+    ``captured_runners`` also covers interrupted captures.
     """
-    _delete_cuda_graphs(include_all_runners=False)
-
-
-def release_all_cuda_graphs():
-    """Release the graphs of every live runner and reset the global capture state.
-
-    Unlike 'delete_cuda_graphs', this also resets live runners that are neither
-    recorded nor in 'captured_runners'. A captured graph keeps the communicators of its
-    collectives alive, and destroying such a communicator waits for the graph, so
-    model-parallel teardown must release every graph first. Does nothing if no runner
-    is alive and no graph memory pool exists.
-    """
-    _delete_cuda_graphs(include_all_runners=True)
+    if (
+        _CudagraphGlobalRecord.captured_runners
+        or _CudagraphGlobalRecord.cudagraph_record
+        or _CudagraphGlobalRecord.cudagraph_inference_record
+        or CudaGraphManager.global_mempool is not None
+    ):
+        delete_cuda_graphs()
 
 
 register_model_parallel_teardown(TeardownStage.RELEASE_CUDA_GRAPHS, release_all_cuda_graphs)
@@ -1145,7 +1128,6 @@ class _CudaGraphRunner(torch.nn.Module):
         self.fwd_graph = None
         self.bwd_graph = None
         self.bwd_graph_replay_complete_event = torch.cuda.Event()
-        _CudagraphGlobalRecord.all_runners.add(self)
 
         self.fwd_graph_recorded = False
         self.bwd_graph_recorded = False
