@@ -1157,8 +1157,12 @@ class LLaVAModel(MegatronModule):
                         decoder_input=batch.get("decoder_input"),
                         labels=batch.get("labels"),
                         loss_mask=batch.get("loss_mask"),
-                        cu_seqlens=cu,
-                        cu_seqlens_padded=packed_seq_params.cu_seqlens_q_padded,
+                        cu_seqlens=cu.unsqueeze(0),
+                        cu_seqlens_padded=(
+                            packed_seq_params.cu_seqlens_q_padded.unsqueeze(0)
+                            if packed_seq_params.cu_seqlens_q_padded is not None
+                            else None
+                        ),
                         max_seqlen=torch.tensor(packed_seq_params.max_seqlen_q, device=cu.device),
                     ),
                     boundary_layout=self.config.global_cp_layout,
