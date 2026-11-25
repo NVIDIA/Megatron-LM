@@ -39,7 +39,6 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import (
     TECudaGraphHelper,
-    _get_mtp_te_layers,
     _te_cuda_graph_layer_is_graphable,
     convert_te_cuda_graph_schedule_table_to_order,
 )
@@ -314,7 +313,14 @@ class TestMHCTEGraphs:
         ],
     )
     def test_capture_replay_all_gradients(self, kind, scopes, fused, monkeypatch):
-        self._run(kind, scopes, fused, monkeypatch)
+        # A request to pair layers must still replay each mHC wrapper once, including in MTP.
+        self._run(
+            kind,
+            scopes,
+            fused,
+            monkeypatch,
+            cuda_graph_pair_hybrid_layers=(kind == "hybrid_moe_mtp"),
+        )
 
     def test_combined_hybrid_attention_moe_graph_is_rejected(self):
         Utils.initialize_model_parallel(1, 1)
@@ -366,7 +372,7 @@ class TestMHCTEGraphs:
         model = _model(kind, config, ProcessGroupCollection.use_mpu_process_groups())
         layers = list(model.decoder.layers)
         for mtp in getattr(getattr(model, "mtp", None), "layers", []):
-            layers.extend(_get_mtp_te_layers(mtp.mtp_model_layer))
+            layers.extend(getattr(mtp.mtp_model_layer, "layers", (mtp.mtp_model_layer,)))
         graphable = [layer for layer in layers if _te_cuda_graph_layer_is_graphable(layer, config)]
         assert graphable
         for layer in layers:
@@ -513,7 +519,7 @@ class TestMHCTEGraphs:
         self.helper = TECudaGraphHelper([graphed], config, 32, 2, pg_collection=pg)
         expected = list(graphed.decoder.layers)
         for mtp in getattr(getattr(graphed, "mtp", None), "layers", []):
-            expected.extend(_get_mtp_te_layers(mtp.mtp_model_layer))
+            expected.extend(getattr(mtp.mtp_model_layer, "layers", (mtp.mtp_model_layer,)))
         expected = [layer for layer in expected if _te_cuda_graph_layer_is_graphable(layer, config)]
         assert self.helper.flattened_callables == expected and expected
         if "mtp" in kind:

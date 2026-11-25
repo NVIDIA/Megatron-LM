@@ -84,6 +84,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "csa_dense_mode": False,
     "csa_window_size": 128,
     "cuda_graph_impl": "none",
+    "cuda_graph_pair_hybrid_layers": False,
     "cuda_graph_retain_backward_graph": False,
     "cuda_graph_modules": [],
     "cuda_graph_use_single_mempool": True,

@@ -38,7 +38,6 @@ from megatron.core.tensor_parallel import random as tensor_parallel_random
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import (
     TECudaGraphHelper,
-    _get_mtp_te_layers,
     _te_cuda_graph_layer_is_graphable,
 )
 from megatron.core.transformer.enums import CudaGraphModule
@@ -108,7 +107,7 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph, recompute_rebu
             for depth in getattr(getattr(module, "mtp", None), "layers", []):
                 nested_layers = [
                     layer
-                    for layer in _get_mtp_te_layers(depth.mtp_model_layer)
+                    for layer in getattr(depth.mtp_model_layer, "layers", (depth.mtp_model_layer,))
                     if _te_cuda_graph_layer_is_graphable(layer, config)
                 ]
                 expected_layers.extend(nested_layers)

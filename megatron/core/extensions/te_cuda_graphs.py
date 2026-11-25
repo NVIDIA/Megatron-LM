@@ -466,18 +466,19 @@ def set_te_cuda_graph_current_microbatch(model, microbatch_id):
         for layer in model_with_decoder.decoder.layers:
             if layer.config.cuda_graph_impl == "transformer_engine":
                 layer.te_cuda_graph_current_microbatch = microbatch_id
-        if hasattr(model_with_decoder, 'mtp'):
-            # import here to avoid a circular import
-            from megatron.core.transformer.cuda_graphs import _get_mtp_te_layers
-
-            for layer in model_with_decoder.mtp.layers:
+        model_with_mtp = model_with_decoder
+        if not hasattr(model_with_mtp, 'mtp'):
+            # A VLM keeps the MTP block in its language model, where TECudaGraphHelper finds it.
+            model_with_mtp = getattr(model_with_mtp, 'language_model', None)
+        if hasattr(model_with_mtp, 'mtp'):
+            for layer in model_with_mtp.mtp.layers:
                 assert hasattr(
                     layer, 'mtp_model_layer'
                 ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
                 if layer.mtp_model_layer.config.cuda_graph_impl == "transformer_engine":
                     layer.mtp_model_layer.te_cuda_graph_current_microbatch = microbatch_id
-                # Hybrid MTP stacks graph each of their layers separately.
-                for inner_layer in _get_mtp_te_layers(layer.mtp_model_layer):
+                # TE graphs capture the layers of a Hybrid MTP block one by one.
+                for inner_layer in getattr(layer.mtp_model_layer, 'layers', ()):
                     if inner_layer.config.cuda_graph_impl == "transformer_engine":
                         inner_layer.te_cuda_graph_current_microbatch = microbatch_id
 
