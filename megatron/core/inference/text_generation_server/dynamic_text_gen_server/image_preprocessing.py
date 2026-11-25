@@ -207,6 +207,46 @@ def dynamic_res_preprocess(
     return resized_img
 
 
+def longest_edge_target_hw(height: int, width: int, config: ImageProcessingConfig):
+    """Return the Pixtral-style ``(height, width)`` for ``dynamic_resolution_longest_edge``."""
+    longest_edge = config.dynamic_resolution_longest_edge
+    unit = config.patch_dim * max(2 if config.pixel_shuffle else 1, config.spatial_merge_size)
+    ratio = max(height / longest_edge, width / longest_edge, 1.0)
+    height, width = round(height / ratio), round(width / ratio)
+    return (math.ceil(height / unit) * unit, math.ceil(width / unit) * unit)
+
+
+def _rgb_on_white(image):
+    """Convert to RGB, compositing any transparency onto white like HF ``convert_to_rgb``."""
+    from PIL import Image
+
+    if image.mode == "RGB":
+        return image
+    rgba = image.convert("RGBA")
+    background = Image.new("RGBA", rgba.size, (255, 255, 255))
+    background.paste(rgba, (0, 0), rgba)
+    return background.convert("RGB")
+
+
+def _cv2_area_tensor(image, target_hw, pixel_mean, pixel_std):
+    """Resize a PIL RGB image with float32 ``cv2.INTER_AREA`` and normalize to CHW."""
+    try:
+        import cv2
+    except ImportError as exc:
+        raise ImportError(
+            "dynamic_resolution_resize_mode='cv2_area' requires OpenCV "
+            "(pip install opencv-python-headless)."
+        ) from exc
+
+    target_h, target_w = target_hw
+    hwc = np.asarray(image, dtype=np.uint8).astype(np.float32) / np.float32(255.0)
+    resized = cv2.resize(hwc, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    img_tensor = torch.from_numpy(np.ascontiguousarray(resized)).permute(2, 0, 1)
+    mean = torch.tensor(pixel_mean, dtype=torch.float32).view(-1, 1, 1)
+    std = torch.tensor(pixel_std, dtype=torch.float32).view(-1, 1, 1)
+    return (img_tensor - mean) / std
+
+
 def preprocess_image(
     image, config: ImageProcessingConfig, target_hw=None, device: Optional[torch.device] = None
 ) -> tuple:
@@ -220,14 +260,19 @@ def preprocess_image(
             "PyTorch container that ships one."
         ) from exc
 
-    img = image.convert("RGB")
+    resize_mode = config.dynamic_resolution_resize_mode
+    img = _rgb_on_white(image) if resize_mode == "cv2_area" else image.convert("RGB")
     source_img = img
 
     patch_dim = config.patch_dim
 
+    if target_hw is None and config.dynamic_resolution_longest_edge is not None:
+        target_hw = longest_edge_target_hw(img.height, img.width, config)
+
     if target_hw is not None:
-        target_h, target_w = target_hw
-        img = img.resize((target_w, target_h))
+        if resize_mode != "cv2_area":
+            target_h, target_w = target_hw
+            img = img.resize((target_w, target_h))
     else:
         img = dynamic_res_preprocess(
             img,
@@ -245,10 +290,14 @@ def preprocess_image(
     if pixel_mean is None or pixel_std is None:
         pixel_mean, pixel_std = _resolve_pixel_stats(vision_type)
 
-    if config.dynamic_resolution_resize_mode == "pil":
+    if resize_mode == "pil":
         transform = T.Compose([T.ToTensor(), T.Normalize(mean=pixel_mean, std=pixel_std)])
         img_tensor = transform(img)  # [C, H, W]
-    elif config.dynamic_resolution_resize_mode == "torch_bicubic_antialias":
+    elif resize_mode == "cv2_area":
+        if target_hw is None:
+            target_hw = (img.height, img.width)
+        img_tensor = _cv2_area_tensor(source_img, target_hw, pixel_mean, pixel_std)
+    elif resize_mode == "torch_bicubic_antialias":
         import torch.nn.functional as F
 
         target_hw = (img.height, img.width)
@@ -265,8 +314,8 @@ def preprocess_image(
         img_tensor = ((img_tensor / 255.0 - mean) / std).squeeze(0)
     else:
         raise ValueError(
-            "dynamic_resolution_resize_mode must be 'pil' or "
-            f"'torch_bicubic_antialias', got {config.dynamic_resolution_resize_mode!r}."
+            "dynamic_resolution_resize_mode must be 'pil', 'torch_bicubic_antialias', "
+            f"or 'cv2_area', got {resize_mode!r}."
         )
     C, H, W = img_tensor.shape
 
@@ -505,16 +554,21 @@ def preprocess_video_bytes_list(
 
         frame_tensors = []
         frame_sizes = []
-        reference_image = dynamic_res_preprocess(
-            sampled_frames[0],
-            min_patches=config.image_config.dynamic_resolution_min_patches,
-            max_patches=config.image_config.dynamic_resolution_max_patches,
-            res_step=config.image_config.patch_dim,
-            pixel_shuffle=config.image_config.pixel_shuffle,
-            spatial_merge_size=config.image_config.spatial_merge_size,
-            video_maintain_aspect_ratio=config.video_maintain_aspect_ratio,
-        )
-        reference_hw = (reference_image.height, reference_image.width)
+        if config.image_config.dynamic_resolution_longest_edge is not None:
+            reference_hw = longest_edge_target_hw(
+                sampled_frames[0].height, sampled_frames[0].width, config.image_config
+            )
+        else:
+            reference_image = dynamic_res_preprocess(
+                sampled_frames[0],
+                min_patches=config.image_config.dynamic_resolution_min_patches,
+                max_patches=config.image_config.dynamic_resolution_max_patches,
+                res_step=config.image_config.patch_dim,
+                pixel_shuffle=config.image_config.pixel_shuffle,
+                spatial_merge_size=config.image_config.spatial_merge_size,
+                video_maintain_aspect_ratio=config.video_maintain_aspect_ratio,
+            )
+            reference_hw = (reference_image.height, reference_image.width)
         for frame in sampled_frames:
             imgs, imgs_sizes = preprocess_image(
                 frame, config.image_config, target_hw=reference_hw, device=device

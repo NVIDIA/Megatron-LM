@@ -387,12 +387,15 @@ def test_expanded_prefix_stitching_metadata_marks_expanded_prefix():
             id="several-eos",
         ),
         pytest.param(
+            2, [1, 10, 42], [1, 10, 42, 2, 12], [2, 12], None, id="exact-prefix-without-eos"
+        ),
+        pytest.param(
             2,
             [1, 10, 42],
-            [1, 10, 42, 2, 12],
+            [1, 10, 99, 2, 12],
             None,
-            "Could not locate an EOS-delimited",
-            id="no-eos-in-prefix",
+            "rendered prefix does not exactly match",
+            id="changed-prefix-without-eos",
         ),
         pytest.param(
             2, [1, 2, 10, 2], [1, 2, 10, 12], None, "Expected 2 EOS token", id="fewer-eos-in-turn"
@@ -487,6 +490,24 @@ def _legacy_replace_prefix_tokens(
             [100, 101, 200, 11, 30],
             False,
             id="exact-trailing-eos-among-several",
+        ),
+        pytest.param(
+            2,
+            [100, 101, 200, 201],
+            [1, 10, 42],
+            [1, 10, 42, 30, 31],
+            [100, 101, 200, 201, 30, 31],
+            False,
+            id="exact-text-delimited-prefix",
+        ),
+        pytest.param(
+            2,
+            [100, 101, 200, 2],
+            [1, 10, 42],
+            [1, 10, 42, 30, 31],
+            [100, 101, 200, 2, 30, 31],
+            False,
+            id="text-delimited-prefix-preserves-generated-eos",
         ),
     ],
 )
@@ -1181,6 +1202,16 @@ class _MultiEosPrefixStitchingTokenizer(_PrefixStitchingTokenizer):
     generation_config = {"eos_token_id": [2, 11]}
 
 
+class _TextDelimitedPrefixStitchingTokenizer(_PrefixStitchingTokenizer):
+    def apply_chat_template(
+        self, messages, *, tokenize=True, add_generation_prompt=True, **_kwargs
+    ):
+        assert tokenize is True
+        if len(messages) == 2 and not add_generation_prompt:
+            return [10, 20, 42]
+        return [10, 20, 42, 30, 31]
+
+
 class _BosPrefixStitchingTokenizer(_PrefixStitchingTokenizer):
     bos = 1
 
@@ -1311,6 +1342,14 @@ def _fake_tokenize(history, suffix):
             [200, 201, 11],
             [100, 101, 200, 201, 11, 30, 31],
             id="every-model-eos",
+        ),
+        pytest.param(
+            True,
+            False,
+            _TextDelimitedPrefixStitchingTokenizer,
+            [200, 201],
+            [100, 101, 200, 201, 30, 31],
+            id="text-delimited-assistant-turn",
         ),
     ],
 )

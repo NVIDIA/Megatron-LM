@@ -397,7 +397,12 @@ def _execute_batch(
 
         dst_param = dst_params.get(op.param_name)
         if dst_param is None:
-            continue
+            # The sender still sends this slice. Skipping the matching receive
+            # would leave the transfer unmatched and hang until the NCCL timeout.
+            raise RuntimeError(
+                f"Reshard plan receives {op.param_name!r} from rank {op.peer_rank}, "
+                "but the destination module has no such parameter or buffer."
+            )
 
         dst_requires_staging = _requires_bf16_staging(dst_param)
         if dst_requires_staging:

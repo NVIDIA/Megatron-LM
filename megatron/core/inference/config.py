@@ -344,9 +344,17 @@ class ImageProcessingConfig:
     """How pixel sides round to patch counts before scaling. For a 48-px side and 16-px
     patches, ``ceil`` gives 3 and ``round_plus_half`` (HF's ``round(x + 0.5)``) gives 4."""
 
-    dynamic_resolution_resize_mode: Literal["pil", "torch_bicubic_antialias"] = "pil"
+    dynamic_resolution_resize_mode: Literal["pil", "torch_bicubic_antialias", "cv2_area"] = "pil"
     """Resize backend: ``pil`` uses ``PIL.Image.resize``; ``torch_bicubic_antialias`` uses
-    ``F.interpolate(mode="bicubic", antialias=True)`` to match torch-based HF processors."""
+    ``F.interpolate(mode="bicubic", antialias=True)`` to match torch-based HF processors;
+    ``cv2_area`` composites transparency onto white, rescales to float32 ``[0, 1]``, then
+    uses ``cv2.resize(INTER_AREA)``, matching HF image processors that resize with OpenCV."""
+
+    dynamic_resolution_longest_edge: Optional[int] = None
+    """Pixtral-style sizing that replaces the min/max patch budget for images and video
+    frames: shrink (never enlarge) so the longest side is at most this many pixels, round
+    each side, then round it up to a multiple of ``patch_dim`` times the merge factor. With
+    1036 and a 28-px merged unit, 2000x500 becomes 1036x280."""
 
     def __post_init__(self):
         if self.dynamic_resolution_rounding_mode not in ("ceil", "round_plus_half"):
@@ -354,10 +362,21 @@ class ImageProcessingConfig:
                 "ImageProcessingConfig.dynamic_resolution_rounding_mode must be "
                 "'ceil' or 'round_plus_half'."
             )
-        if self.dynamic_resolution_resize_mode not in ("pil", "torch_bicubic_antialias"):
+        if self.dynamic_resolution_resize_mode not in (
+            "pil",
+            "torch_bicubic_antialias",
+            "cv2_area",
+        ):
             raise ValueError(
                 "ImageProcessingConfig.dynamic_resolution_resize_mode must be "
-                "'pil' or 'torch_bicubic_antialias'."
+                "'pil', 'torch_bicubic_antialias', or 'cv2_area'."
+            )
+        if (
+            self.dynamic_resolution_longest_edge is not None
+            and self.dynamic_resolution_longest_edge <= 0
+        ):
+            raise ValueError(
+                "ImageProcessingConfig.dynamic_resolution_longest_edge must be positive."
             )
         if (
             self.dynamic_resolution_model_length is not None
@@ -392,7 +411,8 @@ class VideoProcessingConfig:
 
     video_maintain_aspect_ratio: bool = True
     """Fit each frame's grid to ``dynamic_resolution_max_patches``. With 256 patches, True maps
-    16:9 to 12x21 and False to a 16x16 square."""
+    16:9 to 12x21 and False to a 16x16 square. Ignored when
+    ``image_config.dynamic_resolution_longest_edge`` is set."""
 
 
 @dataclass(frozen=True)

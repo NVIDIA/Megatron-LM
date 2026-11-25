@@ -14,6 +14,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.imag
     _load_frame_sequence_manifest,
     _video_sample_indices,
     dynamic_res_preprocess,
+    longest_edge_target_hw,
     preprocess_image,
     preprocess_image_bytes_list,
     preprocess_video_bytes_list,
@@ -228,6 +229,58 @@ def test_torch_bicubic_antialias_resize_mode_uses_tensor_resize(monkeypatch):
     assert imgs_sizes.tolist() == [[4, 4]]
 
 
+@pytest.mark.parametrize(
+    "height,width,expected",
+    [
+        (500, 2000, (280, 1036)),  # shrink, then round each side up to 28
+        (1036, 1036, (1036, 1036)),
+        (100, 50, (112, 56)),  # never enlarged beyond the 28-px rounding
+        (3000, 40, (1036, 28)),
+    ],
+)
+def test_longest_edge_target_hw_matches_pixtral_rule(height, width, expected):
+    config = ImageProcessingConfig(
+        patch_dim=14,
+        dynamic_resolution=True,
+        spatial_merge_size=2,
+        dynamic_resolution_longest_edge=1036,
+    )
+
+    assert longest_edge_target_hw(height, width, config) == expected
+
+
+def test_cv2_area_resize_mode_composites_and_resizes_float_image():
+    image_module = pytest.importorskip("PIL.Image")
+    cv2 = pytest.importorskip("cv2")
+    pytest.importorskip("torchvision")
+    import numpy as np
+
+    rgba = np.zeros((60, 90, 4), dtype=np.uint8)
+    rgba[..., 0] = np.arange(90, dtype=np.uint8)[None, :] * 2
+    rgba[..., 3] = 255
+    rgba[:10, :, 3] = 0  # transparent band composites onto white
+    image = image_module.fromarray(rgba, mode="RGBA")
+    config = ImageProcessingConfig(
+        patch_dim=14,
+        dynamic_resolution=True,
+        spatial_merge_size=2,
+        dynamic_resolution_longest_edge=56,
+        dynamic_resolution_resize_mode="cv2_area",
+        pixel_mean=[0.5, 0.5, 0.5],
+        pixel_std=[0.25, 0.25, 0.25],
+    )
+
+    images, imgs_sizes = preprocess_image(image, config)
+
+    rgb = rgba[..., :3].copy()
+    rgb[:10] = 255
+    expected = cv2.resize(rgb.astype(np.float32) / 255.0, (56, 56), interpolation=cv2.INTER_AREA)
+    expected = (torch.from_numpy(expected).permute(2, 0, 1) - 0.5) / 0.25
+    expected = expected.reshape(3, 4, 14, 4, 14).permute(1, 3, 0, 2, 4).reshape(16, 3 * 14 * 14)
+    assert imgs_sizes.tolist() == [[56, 56]]
+    torch.testing.assert_close(images[0], expected, rtol=0, atol=0)
+
+
 def test_image_list_applies_model_length_budget_per_request(monkeypatch, caplog):
     observed_budgets = []
 
@@ -304,6 +357,44 @@ def test_video_manifest_packs_frames_with_one_shared_resolution(monkeypatch):
     assert result["num_frames"].tolist() == [2]
     assert result["video_frame_indices"] == [[0, 1]]
     assert result["video_fps"] == [1.0]
+
+
+def test_video_longest_edge_sizes_frames_without_patch_budget(monkeypatch):
+    image_module = pytest.importorskip("PIL.Image")
+    frames = [image_module.new("RGB", (2000, 500)), image_module.new("RGB", (2000, 500))]
+    target_shapes = []
+
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+        image_preprocessing,
+    )
+
+    monkeypatch.setattr(
+        image_preprocessing,
+        "_load_frame_sequence_manifest",
+        lambda _payload, _magic: (frames, [0, 1], 1.0),
+    )
+
+    def fake_preprocess_image(_frame, _config, target_hw=None, device=None):
+        target_shapes.append(target_hw)
+        return torch.ones(1, 1, 2), torch.tensor([target_hw], dtype=torch.int32)
+
+    monkeypatch.setattr(image_preprocessing, "preprocess_image", fake_preprocess_image)
+    config = VideoProcessingConfig(
+        image_config=ImageProcessingConfig(
+            patch_dim=14,
+            dynamic_resolution=True,
+            spatial_merge_size=2,
+            dynamic_resolution_max_patches=1024,
+            dynamic_resolution_longest_edge=1036,
+        ),
+        num_frames=2,
+        frame_manifest_magic=b"frames:",
+        video_maintain_aspect_ratio=False,
+    )
+
+    preprocess_video_bytes_list([b"frames:{}"], config)
+
+    assert target_shapes == [(280, 1036), (280, 1036)]
 
 
 def test_video_manifest_rejects_wrong_frame_count(monkeypatch):

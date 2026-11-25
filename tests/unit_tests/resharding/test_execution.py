@@ -167,6 +167,20 @@ class TestExecuteReshard:
             dict(src_module.named_parameters())["weight"].data,
         )
 
+    def test_receive_for_missing_destination_param_raises(self):
+        """A planned receive with no destination tensor fails fast instead of hanging."""
+        src_module = _make_module_with_params({"weight": torch.randn(4, 8, device="cuda")})
+        dst_module = _make_module_with_params({"other": torch.zeros(4, 8, device="cuda")})
+
+        s = _full_slice(2)
+        plan = ReshardPlan(
+            send_ops=[_make_transfer_op("weight", 1, True, s, s, task_id=0)],
+            recv_ops=[_make_transfer_op("weight", 0, False, s, s, task_id=0)],
+        )
+
+        with pytest.raises(RuntimeError, match="no such parameter or buffer"):
+            _run(plan, src_module, dst_module, MockCopyService())
+
     def test_slice_copy(self):
         """Copy a row-slice of a parameter."""
         src_data = torch.randn(8, 4, device="cuda")

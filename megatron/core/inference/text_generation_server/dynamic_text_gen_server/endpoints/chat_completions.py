@@ -592,7 +592,10 @@ def _replace_prefix_tokens(
     current_turn_additional_token_ids = _suffix_tokens_after_prefix(
         eos_token_ids, retokenized_previous_turn_token_ids, current_turn_token_ids
     )
-    if previous_turn_token_ids[-1] in eos_token_ids:
+    template_prefix_has_eos = any(
+        token_id in eos_token_ids for token_id in retokenized_previous_turn_token_ids
+    )
+    if previous_turn_token_ids[-1] in eos_token_ids and template_prefix_has_eos:
         # Preserve the exact EOS emitted previously. The rendered suffix begins
         # with its own boundary EOS, which may be a different accepted EOS ID.
         current_turn_additional_token_ids = current_turn_additional_token_ids[1:]
@@ -662,14 +665,26 @@ def _serialize_eos_token_ids(eos_token_ids):
 
 
 def _suffix_tokens_after_prefix(eos_token_ids, template_prefix_token_ids, current_tokens):
-    """Return the current-turn suffix, beginning at the prefix's final EOS."""
+    """Return tokens added after the rendered previous turn.
+
+    EOS-delimited templates retain the boundary EOS for the caller to reconcile
+    with the exact generation. Text-delimited templates return only new tokens.
+    """
     # Count the number of EOS tokens in the retokenized prefix.
     eos_token_ids = _normalize_eos_token_ids(eos_token_ids)
     eos_count = sum(token_id in eos_token_ids for token_id in template_prefix_token_ids)
     if eos_count <= 0:
+        # Some agent templates delimit assistant tool turns with plain text
+        # (for example, two newlines) rather than a model EOS. In that case an
+        # exact rendered prefix still gives an unambiguous boundary. Require the
+        # complete prefix to match so altered history cannot be stitched.
+        prefix_length = len(template_prefix_token_ids)
+        if prefix_length > 0 and current_tokens[:prefix_length] == template_prefix_token_ids:
+            return current_tokens[prefix_length:]
         raise ValueError(
-            "Could not locate an EOS-delimited previous turn: the chat template's turn "
-            f"terminator is not among the model EOS token IDs {sorted(eos_token_ids)}."
+            "Could not locate the previous-turn boundary: the chat template has "
+            f"no model EOS token from {sorted(eos_token_ids)}, and its rendered "
+            "prefix does not exactly match the current prompt."
         )
 
     # Scan current_tokens from beginning to end. Return the suffix after eos_count
