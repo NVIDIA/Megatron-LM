@@ -32,12 +32,6 @@ if not HAVE_TRITON:
 
 
 @triton.jit
-def _signed_floor(g, norm_eps):
-    """copysign(max(|g|, norm_eps), g), with g = -0 taken as +0."""
-    return tl.where(g < 0, -1.0, 1.0) * tl.maximum(tl.abs(g), norm_eps)
-
-
-@triton.jit
 def _momentum_inputs_kernel(
     weight_ptr,
     grad_ptr,
@@ -57,7 +51,8 @@ def _momentum_inputs_kernel(
     row = tl.program_id(0).to(tl.int64)
     base = row * n_cols
     g = tl.load(row_scale_ptr + row)
-    scale = _signed_floor(g, norm_eps)
+    # copysign(max(|g|, norm_eps), g), with g = -0 taken as +0.
+    scale = tl.where(g < 0, -1.0, 1.0) * tl.maximum(tl.abs(g), norm_eps)
 
     # U = W / g.  d = <G, U>: the radial gradient, which is dL/dg.
     acc = tl.zeros([BLOCK], dtype=tl.float32)
@@ -115,7 +110,8 @@ def _apply_update_kernel(
     row = tl.program_id(0).to(tl.int64)
     base = row * n_cols
     g = tl.load(row_scale_ptr + row)
-    scale = _signed_floor(g, norm_eps)
+    # copysign(max(|g|, norm_eps), g), with g = -0 taken as +0.
+    scale = tl.where(g < 0, -1.0, 1.0) * tl.maximum(tl.abs(g), norm_eps)
 
     # U+ = W / g - lr * kappa_t * O;  rho = ||U+||,  rho_den = max(rho, norm_eps).
     acc = tl.zeros([BLOCK], dtype=tl.float32)
@@ -151,19 +147,6 @@ def _apply_update_kernel(
     tl.store(row_scale_ptr + row, new_g * (row_norm / denominator))
 
 
-def _launch_config(n_cols: int) -> tuple[int, int]:
-    """Column block and warps for one program per row."""
-    block = min(triton.next_power_of_2(n_cols), 4096)
-    return block, 8 if block >= 2048 else 4
-
-
-def _check(rows: torch.Tensor, *row_states: torch.Tensor) -> None:
-    assert rows.dim() == 2 and rows.is_contiguous(), "rows must be contiguous (rows, cols)"
-    for state in row_states:
-        assert state.dtype == torch.float32 and state.is_contiguous()
-        assert state.numel() == rows.shape[0], "row states must be (rows, 1)"
-
-
 def fused_angular_muown_momentum_inputs(
     weight: torch.Tensor,
     grad: torch.Tensor,
@@ -183,13 +166,8 @@ def fused_angular_muown_momentum_inputs(
     Updates ``momentum``, ``row_scale_exp_avg``, ``row_scale_exp_avg_sq``, and ``ns_input`` in
     place; ``weight``, ``grad``, and ``row_scale`` are read only.
     """
-    _check(weight, row_scale, row_scale_exp_avg, row_scale_exp_avg_sq)
-    for rows in (grad, momentum, ns_input):
-        assert rows.shape == weight.shape and rows.is_contiguous()
     n_rows, n_cols = weight.shape
-    if n_rows == 0:
-        return
-    block, num_warps = _launch_config(n_cols)
+    block = min(triton.next_power_of_2(n_cols), 4096)
     _momentum_inputs_kernel[(n_rows,)](
         weight,
         grad,
@@ -205,7 +183,7 @@ def fused_angular_muown_momentum_inputs(
         norm_eps,
         NESTEROV=nesterov,
         BLOCK=block,
-        num_warps=num_warps,
+        num_warps=8 if block >= 2048 else 4,
     )
 
 
@@ -228,12 +206,8 @@ def fused_angular_muown_apply_update(
     ``direction_lr`` is ``lr * kappa_t`` and ``decay`` is ``1 - lr * lambda'``. Updates
     ``weight`` and ``row_scale`` in place.
     """
-    _check(weight, row_scale, row_scale_exp_avg, row_scale_exp_avg_sq)
-    assert update.shape == weight.shape and update.is_contiguous()
     n_rows, n_cols = weight.shape
-    if n_rows == 0:
-        return
-    block, num_warps = _launch_config(n_cols)
+    block = min(triton.next_power_of_2(n_cols), 4096)
     _apply_update_kernel[(n_rows,)](
         weight,
         update,
@@ -249,5 +223,5 @@ def fused_angular_muown_apply_update(
         adam_eps,
         norm_eps,
         BLOCK=block,
-        num_warps=num_warps,
+        num_warps=8 if block >= 2048 else 4,
     )
