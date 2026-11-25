@@ -134,14 +134,16 @@ def _apply_update_kernel(
         tl.sqrt(exp_avg_sq / bias_correction2) + adam_eps
     )
 
-    # W = g * U+ / rho_den, with the U+ that the old g recovers.
+    # W = g * U+ / rho_den, with the U+ that the old g recovers and |g| floored as above, so a row
+    # whose g lands on zero keeps its direction.
+    new_scale = tl.where(new_g < 0, -1.0, 1.0) * tl.maximum(tl.abs(new_g), norm_eps)
     for start in range(0, n_cols, BLOCK):
         cols = start + tl.arange(0, BLOCK)
         mask = cols < n_cols
         w = tl.load(weight_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
         update = tl.load(update_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
         direction = w / scale - direction_lr * update
-        w = direction * (new_g / denominator)
+        w = direction * (new_scale / denominator)
         tl.store(weight_ptr + base + cols, w.to(weight_ptr.dtype.element_ty), mask=mask)
     # g <- g * rho / rho_den: a no-op unless the clamp fired, where it keeps |g| = ||W||.
     tl.store(row_scale_ptr + row, new_g * (row_norm / denominator))
