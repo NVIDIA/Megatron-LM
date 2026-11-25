@@ -200,3 +200,17 @@ load-side microbatch, which saved DP-rank shard(s) and row ranges to read.
 - PP > 1 support relies on a per-pipeline-stage collective for remote shard discovery
   (all last-PP-stage ranks participate) rather than a world-group broadcast, to avoid
   deadlocking with the loader's restriction to the last pipeline stage.
+
+## Training loss callbacks
+
+GPT and Hybrid explicitly build a callback using
+`megatron.training.losses.build_loss_func(full_config)` and pass it to `forward_step`.
+Ordinary pretraining and teacher-logits saving use the shared masked LM loss. Student-logits
+loading selects `LossFuncCallable`; an explicit online distillation config selects ModelOpt's
+post-training loss. Without either setting, the factory uses basic LM loss, regardless of model
+wrappers. All configured callbacks share the run's NaN, Inf and spike checks.
+
+`forward_step` also accepts a caller-provided `loss_func`, defaulting to basic LM loss.
+The caller owns the callback and its offline reader across microbatches and evaluation.
+No callbacks or restart bookkeeping are stored on the model or config. The pipeline scheduler's
+loss sums, token counts and reporting interface are unchanged.

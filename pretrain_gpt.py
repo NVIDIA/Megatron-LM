@@ -15,10 +15,8 @@ from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 # cannot reach them.
 suppress_duplicate_logs_off_rank0()
 
-from functools import lru_cache, partial
+from functools import partial
 from typing import List, Optional
-
-import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
@@ -29,7 +27,6 @@ from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
@@ -60,17 +57,17 @@ from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.datasets.utils import get_dataset_input_length
 from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.losses import build_loss_func, language_model_loss
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
-    from megatron.post_training.loss_func import loss_func as loss_func_modelopt
     from megatron.post_training.model_config import (
         apply_modelopt_model_config,
         distillation_config_from_args,
     )
-    from megatron.post_training.utils import is_distillation_model, should_use_modelopt_config
+    from megatron.post_training.utils import should_use_modelopt_config
 
     has_nvidia_modelopt = True
 except ImportError:
@@ -218,108 +215,9 @@ def get_batch(
     return [batch[key] for key in BATCH_KEYS]
 
 
-@lru_cache(maxsize=1)
-def _build_cached_logits_loss_func(
-    logprobs_dir,
-    decode_threads,
-    msc_prefetch_depth,
-    kd_loss_alpha,
-    ignore_errors,
-    ignore_hash,
+def forward_step(
+    data_iterator, model: GPTModel, return_schedule_plan: bool = False, *, loss_func=language_model_loss
 ):
-    """Build (once) the offline knowledge-distillation loss callable for cached logits.
-
-    Memoized so the teacher log-probability reader is constructed a single time per
-    process, replacing the previous module-level mutable global.
-    """
-    from megatron.training.distillation import LossFuncCallable
-
-    return LossFuncCallable(
-        logprobs_dir=logprobs_dir,
-        decode_threads=decode_threads,
-        msc_prefetch_depth=msc_prefetch_depth,
-        kd_loss_alpha=kd_loss_alpha,
-        ignore_errors=ignore_errors,
-        ignore_hash=ignore_hash,
-    )
-
-
-def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
-):
-    """Loss function.
-
-    Args:
-        loss_mask (torch.Tensor): Used to mask out some portions of the loss
-        output_tensor (torch.Tensor): The tensor with the losses
-        model (GPTModel, optional): The model (can be wrapped)
-
-    Returns:
-        the loss scalar for this micro-batch
-        the number of non-padded tokens in this microbatch
-        a dict containing reporting metrics on the loss and number of tokens across
-            the data parallel ranks
-    """
-    cfg = get_run_config()
-
-    offline_kd_cfg = cfg.offline_distillation
-    if offline_kd_cfg is not None and offline_kd_cfg.student_load is not None:
-        student_load_cfg = offline_kd_cfg.student_load
-        # Offline knowledge distillation loss using cached teacher log-probabilities.
-        loss_func_cached_logits = _build_cached_logits_loss_func(
-            logprobs_dir=student_load_cfg.directory,
-            decode_threads=student_load_cfg.decode_threads,
-            msc_prefetch_depth=student_load_cfg.msc_prefetch_depth,
-            kd_loss_alpha=student_load_cfg.loss_alpha,
-            ignore_errors=student_load_cfg.ignore_errors,
-            ignore_hash=student_load_cfg.ignore_hash,
-        )
-        loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
-    elif has_nvidia_modelopt and is_distillation_model(model):  # [ModelOpt]
-        loss, num_tokens, report = loss_func_modelopt(loss_mask, output_tensor, model=model)
-    else:
-        losses = output_tensor.view(-1).float()
-        loss_mask = loss_mask.view(-1).float()
-        loss = torch.sum(losses * loss_mask)
-
-        num_tokens = loss_mask.sum().clone().detach().to(torch.int)
-        report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
-
-    # Check individual rank losses are not NaN prior to DP all-reduce.
-    rerun_state_machine = get_rerun_state_machine()
-    if cfg.rerun_state_machine.check_for_nan_in_loss:
-        rerun_state_machine.validate_result(
-            result=loss,
-            rejection_func=torch.isnan,
-            message="found NaN in local forward loss calculation",
-            tolerance=0.0,  # forward pass calculations are deterministic
-            fatal=True,
-        )
-        rerun_state_machine.validate_result(
-            result=loss,
-            rejection_func=torch.isinf,
-            message="found Inf in local forward loss calculation",
-            tolerance=0.0,  # forward pass calculations are deterministic
-            fatal=True,
-        )
-    # Check for spiky loss
-    if cfg.rerun_state_machine.check_for_spiky_loss:
-        rerun_state_machine.validate_result(
-            result=loss,
-            rejection_func=partial(
-                rerun_state_machine.is_unexpectedly_large,
-                threshold=cfg.rerun_state_machine.spiky_loss_factor,
-                context="loss",
-            ),
-            message="Spiky loss",
-            tolerance=0.0,  # forward pass calculations are deterministic
-            fatal=False,
-        )
-
-    return loss, num_tokens, report
-
-
-def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
     """Forward training step.
 
     Args:
@@ -437,7 +335,6 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 padding_mask=padding_mask,
             )
 
-    # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
@@ -500,7 +397,7 @@ if __name__ == "__main__":
         full_config,
         train_valid_test_datasets_provider,
         ModelType.encoder_or_decoder,
-        forward_step,
+        partial(forward_step, loss_func=build_loss_func(full_config)),
         store=store,
         get_embedding_ranks=get_embedding_ranks,
     )
