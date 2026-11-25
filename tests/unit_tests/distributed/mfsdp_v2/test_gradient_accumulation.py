@@ -417,8 +417,8 @@ def _full_tensor(tensor: DTensor) -> torch.Tensor:
     return torch.cat(shards, dim=0)
 
 
-def test_split_backward_gradients_and_updates_match_baseline(distributed_setup):
-    """Losses, public gradients, and updated weights match dense training."""
+def test_multiple_backward_calls_match_baseline(distributed_setup):
+    """Match dense losses, gradients, and updates with multiple backward calls per microbatch."""
     setup = distributed_setup
     torch.manual_seed(0)
     baseline = nn.Sequential(nn.Linear(16, 16, bias=False), nn.Linear(16, 16, bias=False)).to(
