@@ -217,6 +217,52 @@ def test_tp_user_buffers_use_config_and_explicit_batch_shape(
     initialize_ub.assert_called_once_with(**expected)
 
 
+@pytest.mark.parametrize("bf16_layers,bf16_mtp", [(1, False), (0, True)])
+def test_bf16_tp_user_buffers_drop_atomic_gemm(monkeypatch, bf16_layers, bf16_mtp):
+    """Atomic GEMM is FP8 only: the BF16 buffers of an FP8 model register first, without it."""
+    from transformer_engine.pytorch import module as te_module
+
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=128,
+        num_attention_heads=8,
+        tensor_model_parallel_size=2,
+        fp8="hybrid",
+        fp8_recipe="tensorwise",
+        first_last_layers_bf16=bool(bf16_layers),
+        num_layers_at_start_in_bf16=bf16_layers,
+        mtp_num_layers=1 if bf16_mtp else None,
+        keep_mtp_in_bf16=bf16_mtp,
+    )
+    overrides = {
+        "qkv_fprop": {"method": "ring_exchange", "atomic_gemm": 1},
+        "proj_fprop": {"method": "ring_exchange", "atomic_gemm": 1},
+        "fc1_fprop": {"method": "ring_exchange", "aggregate": 0},
+    }
+    initialize_ub = Mock()
+    modes = SimpleNamespace(NONE="none", FP8="fp8")
+    monkeypatch.setattr(te_module.base, "initialize_ub", initialize_ub)
+    monkeypatch.setattr(te_module.base, "UserBufferQuantizationMode", modes, raising=False)
+    monkeypatch.setattr(initialize, "is_te_min_version", lambda minimum: True)
+
+    initialize._initialize_tp_communicators(
+        config, sequence_length=96, micro_batch_size=3, tp_comm_overlap_cfg=overrides
+    )
+
+    bf16_overrides = {
+        "qkv_fprop": {"method": "ring_exchange"},
+        "proj_fprop": {"method": "ring_exchange"},
+        "fc1_fprop": {"method": "ring_exchange", "aggregate": 0},
+    }
+    initialize_ub.assert_called_once_with(
+        shape=[288, 128],
+        tp_size=2,
+        quantization_modes=[modes.NONE, modes.FP8],
+        ub_cfgs=[bf16_overrides, overrides],
+        bootstrap_backend=config.tp_comm_bootstrap_backend,
+    )
+
+
 @pytest.mark.parametrize("external_mapping", [None, False, True])
 def test_distributed_initialization_prefers_config_to_args(
     monkeypatch, run_config, external_mapping

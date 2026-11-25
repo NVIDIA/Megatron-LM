@@ -564,15 +564,42 @@ def _get_extra_te_kwargs(config: TransformerConfig):
     return extra_transformer_engine_kwargs
 
 
-def _use_tp_comm_overlap(config: TransformerConfig, tp_comm_buffer_name: Optional[str]) -> bool:
+def has_bf16_tp_comm_layers(config: TransformerConfig) -> bool:
+    """Return whether an FP8 model has BF16 layers that need BF16 TP communication user buffers."""
+    bf16_first_last_layers = config.first_last_layers_bf16 and (
+        config.num_layers_at_start_in_bf16 > 0 or config.num_layers_at_end_in_bf16 > 0
+    )
+    bf16_mtp = config.keep_mtp_in_bf16 and bool(config.mtp_num_layers)
+    return config.fp8 is not None and (bf16_first_last_layers or bf16_mtp)
+
+
+def _use_tp_comm_overlap(
+    config: TransformerConfig,
+    tp_comm_buffer_name: Optional[str],
+    quant_config: Optional[QuantizationConfig] = None,
+) -> bool:
     """Return whether a TE linear layer overlaps its TP communication with its GEMM.
 
     Transformer Engine registers user buffers for a fixed set of names only, and they do not
     support FP4 or blockwise FP8. A layer with another name or one of these precisions runs
-    without overlap. All layers share ``config``, so it is not modified.
+    without overlap. So does a layer that ``quant_config`` keeps in BF16 when the FP8 model
+    registers no BF16 buffers. All layers share ``config``, so it is not modified.
     """
     if not config.tp_comm_overlap:
         return False
+    if quant_config is not None and config.fp8 is not None:
+        recipe = TEQuantizationParams.parse_from_config(
+            quant_config, model_config=config
+        ).training_recipe
+        bf16_layer = (
+            recipe.fp8_quantization_recipe is None and recipe.fp4_quantization_recipe is None
+        )
+        if bf16_layer and not (is_te_min_version("2.7.0") and has_bf16_tp_comm_layers(config)):
+            warnings.warn(
+                "The FP8 model registers no BF16 user buffers for a layer its quantization recipe "
+                "keeps in BF16. Disabling TP communication overlap for this layer."
+            )
+            return False
     if config.fp4 is not None or (
         config.fp8 is not None and config.fp8_recipe == Fp8Recipe.blockwise
     ):
@@ -1394,7 +1421,8 @@ class TELinear(te.pytorch.Linear):
             else:
                 raise RuntimeError("Only TE with version >=2.3.0 supports delay_wgrad_compute now.")
 
-        tp_comm_overlap = _use_tp_comm_overlap(self.config, tp_comm_buffer_name)
+        quant_config = get_quant_config_or_none(name, config.quant_recipe)
+        tp_comm_overlap = _use_tp_comm_overlap(self.config, tp_comm_buffer_name, quant_config)
 
         if is_te_min_version("0.8.0"):
             if tp_comm_overlap and parallel_mode != "duplicated":
@@ -1481,7 +1509,6 @@ class TELinear(te.pytorch.Linear):
                 tp_group_for_te = None
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
-        quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
             self.te_quant_params, torch.is_grad_enabled()
@@ -1664,9 +1691,16 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 f"Transformer Engine v{te_version} does not support {self.config.normalization}."
             )
 
+        quant_config = get_quant_config_or_none(name, config.quant_recipe)
         if is_te_min_version("0.8.0"):
-            if _use_tp_comm_overlap(self.config, tp_comm_buffer_name):
+            if _use_tp_comm_overlap(self.config, tp_comm_buffer_name, quant_config):
                 extra_kwargs["ub_bulk_wgrad"] = self.config.tp_comm_bulk_wgrad
+                if self.config.delay_wgrad_compute and self.config.tp_comm_bulk_wgrad:
+                    warnings.warn(
+                        "Transformer Engine does not support bulk wgrad overlap with "
+                        "delay_wgrad_compute. Disabling tp_comm_bulk_wgrad for this layer."
+                    )
+                    extra_kwargs["ub_bulk_wgrad"] = False
                 extra_kwargs["ub_bulk_dgrad"] = self.config.tp_comm_bulk_dgrad
                 if is_te_min_version("1.5.0", check_equality=False):
                     # Use old overlap flags if they were supplied instead
@@ -1708,7 +1742,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
-        quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
             self.te_quant_params, torch.is_grad_enabled()

@@ -296,6 +296,8 @@ def _initialize_tp_communicators(
         import yaml
         from transformer_engine.pytorch import module as te_module
 
+        from megatron.core.extensions.transformer_engine import has_bf16_tp_comm_layers
+
     except ImportError:
         raise RuntimeError(
             "Tensor Parallel Communication/GEMM Overlap optimization needs 'yaml' and "
@@ -320,12 +322,17 @@ def _initialize_tp_communicators(
         quantization_modes = [
             UserBufferQuantizationMode.FP8 if config.fp8 else UserBufferQuantizationMode.NONE
         ]
-        bf16_first_last_layers = config.first_last_layers_bf16 and (
-            config.num_layers_at_start_in_bf16 > 0 or config.num_layers_at_end_in_bf16 > 0
-        )
-        bf16_mtp = config.keep_mtp_in_bf16 and bool(config.mtp_num_layers)
-        if config.fp8 is not None and (bf16_first_last_layers or bf16_mtp):
+        if has_bf16_tp_comm_layers(config):
             quantization_modes.append(UserBufferQuantizationMode.NONE)
+            if any(ub_cfg.get("atomic_gemm") for ub_cfg in ub_cfgs.values()):
+                # Atomic GEMM is FP8 only. Transformer Engine checks an atomic ring-exchange pair
+                # against the buffers it registered earlier, so the BF16 buffers go first.
+                quantization_modes.reverse()
+                bf16_ub_cfgs = {
+                    name: {key: value for key, value in ub_cfg.items() if key != "atomic_gemm"}
+                    for name, ub_cfg in ub_cfgs.items()
+                }
+                ub_cfgs = [bf16_ub_cfgs, ub_cfgs]
         # The process group with the target bootstrap backend is created in Transformer Engine.
         te_module.base.initialize_ub(
             shape=input_shape,
