@@ -175,6 +175,7 @@ from megatron.training.logging.packed_sequence_stats import (
     update_packed_sequence_stats,
 )
 from megatron.training.models import ModelConfig, T5ModelConfig
+from megatron.training.peft.checkpointing import checkpoint_kwargs as peft_checkpoint_kwargs
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -2511,6 +2512,8 @@ def setup_model_and_optimizer(
     use_model_builder = (
         model_provider_func is None and cfg_container is not None and isinstance(cfg.model, ModelConfig)
     )
+    if cfg.peft is not None and not use_model_builder:
+        raise ValueError("Native PEFT requires the config-driven model builder")
 
     def _build_model_wrapper(wrap_with_ddp: bool, transformer_config=None):
         if use_model_builder:
@@ -2549,6 +2552,17 @@ def setup_model_and_optimizer(
                     ],
                 )
 
+            if cfg.peft is not None:
+                from megatron.training.peft.setup import prepare_lora_model
+
+                # Build-time hooks are not recipe fields and must not accumulate on cfg.model.
+                model_config = dataclasses.replace(
+                    model_config,
+                    pre_wrap_hooks=[
+                        *model_config.pre_wrap_hooks,
+                        functools.partial(prepare_lora_model, config=cfg),
+                    ],
+                )
             builder = builder_cls(model_config)
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
@@ -2745,7 +2759,9 @@ def setup_model_and_optimizer(
 
     if (
         cfg.checkpoint.load is not None or cfg.checkpoint.pretrained_checkpoint is not None
-    ) and not args.moe_use_upcycling:
+    ) and not args.moe_use_upcycling and (
+        cfg.peft is None or checkpoint_exists(cfg.checkpoint.load)
+    ):
         one_logger and one_logger.log_metrics(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
@@ -2771,6 +2787,7 @@ def setup_model_and_optimizer(
                 dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
                 expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
+                **peft_checkpoint_kwargs(model, cfg),
             )
             train_state.resume_iteration = train_state.iteration
             train_state.resume_num_floating_point_operations = (
@@ -2796,6 +2813,8 @@ def setup_model_and_optimizer(
         train_state.resume_iteration = 0
         train_state.num_floating_point_operations_so_far = 0
         train_state.resume_num_floating_point_operations = 0.0
+        if cfg.peft is not None:
+            train_state.effective_finetune = True
     # Paired with the report after the model/optimizer build: the delta is what loading the
     # checkpoint cost. On the from-scratch path, iteration is 0 and this is the baseline.
     report_memory(
@@ -2865,6 +2884,7 @@ def setup_model_and_optimizer(
             save=os.path.join(cfg.checkpoint.ckpt_convert_save, converted_format),
             ckpt_format=converted_format,
             verify_integrity=cfg.checkpoint.verify_integrity and converted_format == "torch_dist",
+            **peft_checkpoint_kwargs(model, cfg),
         )
 
         print_rank_0(
@@ -4195,6 +4215,7 @@ def save_checkpoint_and_time(
                 rng_state_key_prefix=rng_state_key_prefix,
                 cp_group=cp_group,
                 on_saved=on_saved,
+                **peft_checkpoint_kwargs(model, cfg),
             )
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.

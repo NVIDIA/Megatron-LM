@@ -65,6 +65,7 @@ from megatron.training.models import (
 )
 from megatron.training.models.base import ModelConfig
 from megatron.training.models.distillation import DistillationConfig, validate_distillation_student
+from megatron.training.peft import LoRA
 
 T = TypeVar("T", bound="ConfigContainerBase")
 logger = logging.getLogger(__name__)
@@ -309,6 +310,9 @@ class PretrainConfigContainer(ConfigContainerBase):
     distillation: DistillationConfig | None = None
     """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
 
+    peft: "LoRA | None" = None
+    """Native low-rank adapters; None preserves full-parameter training."""
+
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""
         launch_world_size = safe_get_world_size()
@@ -470,6 +474,41 @@ class PretrainConfigContainer(ConfigContainerBase):
         # Config-only topology checks also run when validating a recipe off-cluster.
         # Launch world-size checks remain in the runtime parallel-size helpers.
         transformer = self.model.transformer
+        if self.peft is not None:
+            if not isinstance(self.model, ModelConfig):
+                raise ValueError("Native PEFT requires a builder-backed model config")
+            if self.checkpoint.pretrained_checkpoint is None:
+                raise ValueError("PEFT requires checkpoint.pretrained_checkpoint for the frozen base")
+            if self.checkpoint.ckpt_format != "torch_dist":
+                raise ValueError("Native PEFT currently supports torch_dist checkpoints")
+            if self.checkpoint.finetune:
+                raise ValueError(
+                    "PEFT loads the base with weights-only semantics; "
+                    "leave checkpoint.finetune=False for adapter resume"
+                )
+            if self.distillation is not None or getattr(self.model, "transformations", None):
+                raise ValueError(
+                    "Combining native PEFT with ModelOpt transformations is not supported yet"
+                )
+            if (
+                isinstance(self.ddp, TorchFullyShardedDataParallelConfig)
+                or self.ddp.use_megatron_fsdp
+            ):
+                raise ValueError("Native PEFT FSDP support is not enabled in this draft")
+            if transformer.fp8 or transformer.fp4 or transformer.gtp_weight_remat_size > 1:
+                raise ValueError(
+                    "Native PEFT currently requires unquantized parameters "
+                    "without GTP weight rematerialization"
+                )
+            if transformer.init_model_with_meta_device:
+                raise ValueError("Native PEFT requires materialized base parameters before loading")
+            model_dtype = (
+                torch.float16 if transformer.fp16
+                else torch.bfloat16 if transformer.bf16
+                else transformer.params_dtype
+            )
+            if self.peft.lora_dtype not in (None, torch.float32, model_dtype):
+                raise ValueError("LoRA dtype must match model precision or be float32")
         if (
             transformer.max_seq_length_per_sample is not None
             and transformer.max_seq_length_per_sample <= 0
