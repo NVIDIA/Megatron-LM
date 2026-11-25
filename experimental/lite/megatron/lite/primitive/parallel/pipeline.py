@@ -254,11 +254,6 @@ def _1f1b_schedule(
     num_warmup = min(ps.pp_size - ps.pp_rank - 1, num_microbatches)
     num_steady = num_microbatches - num_warmup
 
-    # Split each microbatch into (PackedBatch, LossContext) like run_microbatch_loop; the connector
-    # yields (batch, loss_context) tuples, so forward_step must receive the unwrapped batch.
-    batches = [split_loss_context(next(data_iter)) for _ in range(num_microbatches)]
-    mb_idx = 0
-
     input_tensors: list[torch.Tensor | None] = []
     output_hiddens: list[torch.Tensor | None] = []
     losses: list[torch.Tensor | None] = []
@@ -305,8 +300,7 @@ def _1f1b_schedule(
         if not ps.pp_is_first and k == 0:
             fwd_input, _ = _p2p(recv_fwd=True)
 
-        batch, loss_ctx = batches[mb_idx]
-        mb_idx += 1
+        batch, loss_ctx = split_loss_context(next(data_iter))
         current_input = fwd_input
         out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
@@ -337,8 +331,7 @@ def _1f1b_schedule(
         if not ps.pp_is_first and k == 0 and num_warmup == 0:
             fwd_input, _ = _p2p(recv_fwd=True)
 
-        batch, loss_ctx = batches[mb_idx]
-        mb_idx += 1
+        batch, loss_ctx = split_loss_context(next(data_iter))
         out = _run_forward(fwd_input, batch, loss_ctx)
         hidden = out.get("hidden_states")
         loss_s = out["loss"] / num_microbatches if "loss" in out and ps.pp_is_last else None
