@@ -1,12 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 import random
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core import dist_checkpointing
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
@@ -25,6 +28,7 @@ from megatron.core.models.hybrid.recurrence import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import is_te_min_version
 from megatron.training.state import TrainState
 from tests.unit_tests.test_utilities import Utils
 
@@ -342,6 +346,7 @@ def model_factory():
         dtype=torch.float32,
         grad_fusion=False,
         config_overrides=None,
+        use_cpu_initialization=True,
         **kwargs,
     ):
         config = TransformerConfig(
@@ -350,7 +355,7 @@ def model_factory():
             num_attention_heads=4,
             params_dtype=dtype,
             bf16=dtype == torch.bfloat16,
-            use_cpu_initialization=True,
+            use_cpu_initialization=use_cpu_initialization,
             hidden_dropout=0,
             attention_dropout=0,
             gradient_accumulation_fusion=grad_fusion,
@@ -676,6 +681,121 @@ def test_ddp_accumulates_shared_weight_gradients(model_factory, grad_fusion, pat
             torch.distributed.all_reduce(expected.grad, group=group)
             torch.testing.assert_close(parameter.main_grad, expected.grad / group.size())
         assert any(p.main_grad.abs().sum() > 0 for p in model.decoder.layers[1].parameters())
+
+
+@pytest.mark.parametrize("single_grouped_weight", [False, True], ids=["per-expert", "packed"])
+def test_recurrent_moe_te_grouped_linear_accumulates_wgrad(
+    model_factory, monkeypatch, single_grouped_weight
+):
+    """Compare shared fused wgrad buffers against untied experts with ordinary autograd."""
+    ops = pytest.importorskip("transformer_engine.pytorch.ops")
+    if not is_te_min_version("2.14.0") or not all(
+        hasattr(ops, name) for name in ("GroupedLinear", "ScaledSwiGLU")
+    ):
+        pytest.skip("Transformer Engine GroupedLinear op-fuser API is unavailable")
+    if "single_grouped_weight" not in inspect.signature(ops.GroupedLinear).parameters:
+        pytest.skip("Transformer Engine GroupedLinear lacks the required weight layout API")
+
+    if single_grouped_weight:
+        supports_grouped_tensor = getattr(
+            inspect.getmodule(ops.GroupedLinear), "is_op_fuser_grouped_tensor_path_supported", None
+        )
+        if supports_grouped_tensor is None or not supports_grouped_tensor(None, torch.bfloat16):
+            pytest.skip("Packed weights require native BF16 grouped GEMM support")
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1" if single_grouped_weight else "0")
+    # Route every token to both experts so every FC1 and FC2 receives real gradients
+    # on every visit, including the first visit (the last one to run in backward).
+    config = dict(
+        num_moe_experts=2,
+        moe_router_topk=2,
+        moe_router_load_balancing_type="none",
+        moe_grouped_gemm=True,
+        moe_single_grouped_weight=single_grouped_weight,
+        use_transformer_engine_op_fuser=True,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        add_bias_linear=False,
+    )
+    model = model_factory(
+        pattern=":E:",
+        dtype=torch.bfloat16,
+        grad_fusion=True,
+        config_overrides=config,
+        use_cpu_initialization=False,
+    )
+    ddp = DistributedDataParallel(
+        config=model.config,
+        ddp_config=DistributedDataParallelConfig(
+            overlap_grad_reduce=True, grad_reduce_in_fp32=True
+        ),
+        module=model,
+        pg_collection=model.pg_collection,
+    )
+    ddp.broadcast_params()
+    group = model.pg_collection.dp_cp
+    layer = model.decoder.layers[0]
+    experts = layer.mlp.experts
+    assert experts.linear_fc1.single_grouped_weight == single_grouped_weight
+    assert experts.linear_fc2.single_grouped_weight == single_grouped_weight
+    weights = dict(experts.named_parameters())
+    assert weights
+    tokens, positions = _inputs()
+
+    for count in (2, 3):
+        # Different modules own the weights at each reference visit. No shared
+        # main_grad buffer or fused wgrad accumulation is used by the reference.
+        reference = model_factory(
+            pattern="E" * count,
+            distribution=None,
+            dtype=torch.bfloat16,
+            config_overrides=config,
+            use_cpu_initialization=False,
+        )
+        reference.embedding.load_state_dict(model.embedding.state_dict())
+        reference.decoder.final_norm.load_state_dict(model.decoder.final_norm.state_dict())
+        reference.output_layer.load_state_dict(model.output_layer.state_dict())
+        for replica in reference.decoder.layers:
+            replica.load_state_dict(layer.state_dict())
+        reference_weights = [
+            dict(replica.mlp.experts.named_parameters()) for replica in reference.decoder.layers
+        ]
+        ddp.zero_grad_buffer()
+        expected = {name: torch.zeros_like(weight.main_grad) for name, weight in weights.items()}
+        for microbatch in (0, 1):
+            inputs = (tokens + group.rank() + 7 * microbatch) % 32
+            with ddp.no_sync() if microbatch == 0 else nullcontext():
+                actual = ddp(inputs, positions, None, n_loops=count)
+                actual.float().square().sum().backward()
+
+            reference.zero_grad(set_to_none=True)
+            output = reference(inputs, positions, None)
+            torch.testing.assert_close(actual, output)
+            output.float().square().sum().backward()
+            for name in weights:
+                for visit in reversed(reference_weights):
+                    gradient = visit[name].grad
+                    assert gradient is not None and gradient.count_nonzero(), name
+                    expected[name].add_(gradient)
+
+        ddp.finish_grad_sync()
+        for name, weight in weights.items():
+            torch.distributed.all_reduce(expected[name], group=group)
+            expected[name].div_(group.size())
+            # Reference wgrads are rounded to BF16 before their FP32 sum;
+            # fused accumulation writes straight into FP32 main_grad.
+            torch.testing.assert_close(
+                weight.main_grad,
+                expected[name],
+                rtol=0.02,
+                atol=0.002 * expected[name].abs().max().item(),
+                msg=f"{count=} {name}",
+            )
+
+    # Do not pass by accidentally falling back to the module-based MoE path.
+    (fused_ops,) = experts._fused_ops
+    for op in (fused_ops[0], fused_ops[-1]):
+        assert isinstance(op, ops.GroupedLinear)
+        assert op._accumulate_into_main_grad
 
 
 @pytest.mark.parametrize(
