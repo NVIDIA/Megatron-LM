@@ -98,7 +98,7 @@ try:
         handle_fp8_extra_state_case,
         handle_mla_down_proj_in_state_dict,
         handle_mtp_in_state_dict,
-        handle_pipeline_chunks_in_state_dict,
+        handle_pipeline_layers_in_state_dict,
         handle_swiglu_in_state_dict,
         print_diff_in_state_dicts,
         validate_fsdp_dtensor_model_load,
@@ -2025,36 +2025,41 @@ def _localize_redundant_extra_states(state_dict):
 def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     """Map ``raw_state_dict`` of the model chunks ``model`` to the fsdp_dtensor format on disk.
 
-    Pipeline stages' layers take their global names, so with virtual pipeline stages the chunks'
-    sections ``model0``, ``model1``, ... merge into one ``model`` section.
+    Each chunk's section (``model``, or ``model0``, ``model1``, ... with virtual pipeline stages)
+    is handled with that chunk. Pipeline layers take their global names, as in torch_dist.
     """
     state_dict = raw_state_dict.copy()
     sections = ['model'] if len(model) == 1 else [f'model{i}' for i in range(len(model))]
-    model_state_dicts = [state_dict.pop(section, {}) for section in sections]
-    for model_state_dict in model_state_dicts:
-        handle_fp8_extra_state_case(model_state_dict)
+    for section, chunk in zip(sections, model):
+        if section not in state_dict:
+            continue
+        handle_fp8_extra_state_case(state_dict[section])
+        state_dict[section] = handle_pipeline_layers_in_state_dict(chunk, state_dict[section])
 
-    handlers = []
-    if (
-        config.gated_linear_unit
-        and config.activation_func is torch.nn.functional.silu
-    ):
-        handlers.append(handle_swiglu_in_state_dict)
-    # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
-    # layout used on disk. No-op for unfused models.
-    handlers.append(handle_mla_down_proj_in_state_dict)
-    # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
-    # above resolve keys against live module paths, which still use the new name.
-    handlers.append(handle_mtp_in_state_dict)
-    state_dict['model'], optimizer_state_dict = handle_pipeline_chunks_in_state_dict(
-        model, model_state_dicts, state_dict.get('optimizer'), handlers
-    )
-    if 'optimizer' in state_dict:
-        state_dict['optimizer'] = optimizer_state_dict
-    if config.num_moe_experts:
-        state_dict['model'] = handle_experts_in_state_dict(
-            state_dict['model'], config.num_moe_experts
-        )
+        def apply(handler):
+            """Run a state dict handler over the section and, when present, the optimizer state."""
+            model_state_dict, optimizer_state_dict = handler(
+                chunk, state_dict[section], state_dict.get('optimizer')
+            )
+            state_dict[section] = model_state_dict
+            if 'optimizer' in state_dict:
+                state_dict['optimizer'] = optimizer_state_dict
+
+        if (
+            config.gated_linear_unit
+            and config.activation_func is torch.nn.functional.silu
+        ):
+            apply(handle_swiglu_in_state_dict)
+        # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
+        # layout used on disk. No-op for unfused models.
+        apply(handle_mla_down_proj_in_state_dict)
+        if config.num_moe_experts:
+            state_dict[section] = handle_experts_in_state_dict(
+                state_dict[section], config.num_moe_experts
+            )
+        # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
+        # above resolve keys against live module paths, which still use the new name.
+        apply(handle_mtp_in_state_dict)
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
@@ -2566,8 +2571,7 @@ def _load_base_checkpoint(
         if raw_optimizer_state_dict is not None:
             state_dict['optimizer'] = raw_optimizer_state_dict
 
-        # Hand back each chunk's own section; with virtual pipeline stages these are not 'model'.
-        state_dict.pop('model', None)
+        # Hand back each chunk's section under the names the chunk loads.
         state_dict.update(raw_model_state_dicts)
     else:
         raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')
