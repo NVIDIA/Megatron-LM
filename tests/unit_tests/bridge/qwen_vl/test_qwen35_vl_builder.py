@@ -140,7 +140,10 @@ class TestQwen35VLModelConfig:
     def test_finalize_computes_per_token_loss_for_context_parallelism(
         self, context_parallel_size, per_token_loss
     ):
-        config = _model_config(context_parallel_size=context_parallel_size)
+        # GDN's FLA kernels are rejected by the default deterministic_mode.
+        config = _model_config(
+            context_parallel_size=context_parallel_size, deterministic_mode=False
+        )
 
         config.finalize()
 

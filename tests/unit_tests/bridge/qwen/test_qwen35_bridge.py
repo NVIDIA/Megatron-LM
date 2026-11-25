@@ -1046,6 +1046,8 @@ class TestQwen35BuilderConfig:
     def test_hybrid_export_preserves_hf_layer_schedule(self, bridge_class, make_config):
         hf_config = make_config()
         model_config = bridge_class().hf_config_to_model_config(hf_config)
+        # GDN's FLA kernels are rejected by the default deterministic_mode.
+        model_config.deterministic_mode = False
         model_config.finalize()
         exported = bridge_class.megatron_to_hf_config(model_config)
         assert exported["num_hidden_layers"] == hf_config.num_hidden_layers
@@ -1124,6 +1126,8 @@ class TestQwen35BuilderConfig:
         config.virtual_pipeline_model_parallel_size = 2
         config.pipeline_dtype = torch.bfloat16
         config.mtp_num_layers = 1
+        # GDN's FLA kernels are rejected by the default deterministic_mode.
+        config.deterministic_mode = False
         if explicit_pattern:
             pattern = config.hybrid_layer_pattern
             config.hybrid_layer_pattern = "|".join(
