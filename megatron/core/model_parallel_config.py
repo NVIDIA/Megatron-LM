@@ -463,6 +463,12 @@ class ModelParallelConfig:
         should only be set if the sequence length varies by microbatch within a global batch.
     """
 
+    pipeline_p2p_fixed_shape: bool = False
+    """Skip shape exchange for packed THD inputs padded to a fixed CP-local capacity.
+
+    Requires static CP and maximum-size padding; standalone MTP keeps dynamic shape exchange.
+    """
+
     overlap_p2p_comm: bool = False
     """When True some of the peer to peer communication for pipeline parallelism will overlap with
        computation. Must be False if batch_p2p_comm is true.
@@ -633,6 +639,35 @@ class ModelParallelConfig:
             # Integer alignment is combined with TP/CP/MXFP8 requirements by
             # get_packed_sequence_alignment, so the requested multiple need not
             # itself be divisible by TP.
+
+        if self.pipeline_p2p_fixed_shape:
+            if self.sequence_packing_scheduler is None:
+                raise ValueError("pipeline_p2p_fixed_shape requires a sequence_packing_scheduler")
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape does not support dynamic_context_parallel"
+                )
+            capacity = self.max_seqlen_per_dp_cp_rank
+            if not isinstance(capacity, int) or isinstance(capacity, bool) or capacity <= 0:
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape requires a positive integer max_seqlen_per_dp_cp_rank"
+                )
+            if self.pad_packed_seq_alignment not in ("max", capacity):
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape requires pad_packed_seq_alignment='max' "
+                    "or max_seqlen_per_dp_cp_rank"
+                )
+            if (
+                self.sequence_parallel
+                and self.max_seqlen_per_dp_cp_rank % self.tensor_model_parallel_size != 0
+            ):
+                raise ValueError("Fixed packed P2P capacity must be divisible by TP for SP")
+            if self.mtp_standalone:
+                warnings.warn(
+                    "pipeline_p2p_fixed_shape has no effect when mtp_standalone=True; "
+                    "dynamic shape exchange remains enabled",
+                    stacklevel=2,
+                )
 
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:

@@ -173,6 +173,80 @@ def test_full_cuda_graph_warmup_with_retained_none_grad_leaf(mocker):
         Utils.destroy_model_parallel()
 
 
+def test_full_cuda_graph_replays_prepared_inputs_per_virtual_chunk(mocker):
+    """Replay refreshes each VPP chunk's packed inputs from its own static slots."""
+    mocker.patch("megatron.core.full_cuda_graph.get_all_rng_states", return_value={})
+    mocker.patch(
+        "megatron.core.full_cuda_graph.get_rerun_state_machine",
+        return_value=RerunStateMachine(mode=RerunMode.DISABLED),
+    )
+    mocker.patch("torch.autograd.graph.set_override_stale_capture_stream", create=True)
+
+    chunks = [torch.nn.Identity() for _ in range(2)]
+    for chunk in chunks:
+        chunk.config = Mock(sequence_packing_scheduler="dp_balanced")
+    prepared_chunks = []
+    capture_states = []
+    capacity = 4
+
+    def prepare_batch(batch, chunk):
+        assert not torch.cuda.is_current_stream_capturing()
+        prepared_chunks.append(chunk)
+        valid_tokens = batch["cu_seqlens"][-1].item()
+        padding_mask = torch.arange(capacity, device="cuda") >= valid_tokens
+        return {**batch, "padding_mask": padding_mask}
+
+    def forward_step(data_iterator, _chunk):
+        batch = next(data_iterator)
+        return batch["tokens"].masked_fill(batch["padding_mask"], 0).sum()
+
+    forward_step.prepare_batch_for_cuda_graph = prepare_batch
+
+    def forward_backward(forward_step_func, data_iterator, model, num_microbatches, **_):
+        capture_states.append(torch.cuda.is_current_stream_capturing())
+        return torch.stack(
+            [
+                forward_step_func(iterator, chunk)
+                for chunk, iterator in zip(model, data_iterator)
+                for _ in range(num_microbatches)
+            ]
+        )
+
+    wrapper = FullCudaGraphWrapper(forward_backward, cuda_graph_warmup_steps=1)
+    try:
+        for step in range(3):
+            iterators = []
+            expected = []
+            for vp_stage in range(2):
+                batches = []
+                for microbatch in range(2):
+                    value = 4 * step + 2 * vp_stage + microbatch + 1
+                    valid_tokens = 3 + (step + vp_stage + microbatch) % 2
+                    batches.append(
+                        {
+                            "tokens": torch.full((capacity,), value, device="cuda"),
+                            "cu_seqlens": torch.tensor([0, 1, valid_tokens], device="cuda"),
+                        }
+                    )
+                    expected.append(value * valid_tokens)
+                iterators.append(iter(batches))
+
+            output = wrapper(
+                forward_step_func=forward_step,
+                data_iterator=iterators,
+                model=chunks,
+                num_microbatches=2,
+                seq_length=capacity,
+                forward_only=False,
+            )
+            torch.testing.assert_close(output, torch.tensor(expected, device="cuda"))
+
+        assert all(prepared_chunks.count(chunk) == 6 for chunk in chunks)
+        assert capture_states == [False, True]
+    finally:
+        wrapper.reset_cuda_graph()
+
+
 @pytest.mark.skipif(
     not is_torch_min_version("2.14.0a0"),
     reason="Generator capture state is created lazily only on PyTorch >= 2.14",

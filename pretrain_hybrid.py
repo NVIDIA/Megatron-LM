@@ -27,6 +27,7 @@ from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequ
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.package_info import __version__ as mcore_version
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
@@ -90,6 +91,65 @@ BATCH_KEYS = [
     "position_ids",
     "tokens",
 ]
+
+
+def prepare_batch_for_cuda_graph(batch, model):
+    """Run the ordinary packed batch preparation outside the full-iteration graph."""
+    config = get_run_config().model.transformer
+    groups = get_attr_wrapped_model(model, "pg_collection")
+    if (
+        config.sequence_packing_scheduler != "dp_balanced"
+        or config.dynamic_context_parallel
+        or groups.tp.size() != 1
+        or groups.cp.size() != 1
+        or config.linear_cp_layout != config.attention_cp_layout
+        or config.pad_packed_seq_alignment != "max"
+        or config.cuda_graph_thd_max_packed_sequences is None
+        or config.mtp_standalone
+    ):
+        raise ValueError("Full-iteration THD HybridModel requires fixed DP packing and TP1/CP1")
+    if groups.pp.size() > 1:
+        if not config.pipeline_p2p_fixed_shape:
+            raise ValueError("Full-iteration THD requires fixed-shape pipeline P2P")
+        if config.batch_p2p_comm and config.batch_p2p_sync:
+            raise ValueError(
+                "Full-iteration THD requires pipeline P2P without host synchronization"
+            )
+
+    vp_stage = get_attr_wrapped_model(model, "vp_stage")
+    cp_batch = get_batch(iter((dict(batch),)), vp_stage, pg_collection=groups)
+    params = cp_batch.get_packed_seq_params()
+    values = cp_batch.get_batch()
+    capacity = config.max_seqlen_per_dp_cp_rank
+    if (
+        values['padding_mask'].shape != (1, capacity)
+        or params.total_tokens != capacity
+        or params.max_seqlen_q != capacity
+    ):
+        raise ValueError("Packed HybridModel batch does not match its fixed token capacity")
+    return {
+        **{key: values.get(key) for key in BATCH_KEYS},
+        'padding_mask': values['padding_mask'],
+        'seq_idx': params.seq_idx,
+    }
+
+
+def _get_prepared_cuda_graph_batch(data_iterator, config):
+    batch = dict(next(data_iterator))
+    capacity = config.max_seqlen_per_dp_cp_rank
+    # The eager preparation already built seq_idx. Attach the fixed offset tensors after
+    # construction so PackedSeqParams does not launch a new repeat_interleave during capture.
+    params = PackedSeqParams(
+        qkv_format="thd",
+        max_seqlen_q=capacity,
+        max_seqlen_kv=capacity,
+        total_tokens=capacity,
+        pad_between_seqs=True,
+        seq_idx=batch.pop('seq_idx'),
+    )
+    params.cu_seqlens_q = params.cu_seqlens_kv = batch['cu_seqlens'].squeeze(0)
+    params.cu_seqlens_q_padded = params.cu_seqlens_kv_padded = batch['cu_seqlens_padded'].squeeze(0)
+    return ContextParallelBatch.from_single_layout(config.linear_cp_layout, batch, params)
 
 
 def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroupCollection] = None):
@@ -334,10 +394,19 @@ def forward_step(data_iterator, model: HybridModel):
     timers('batch-generator', log_level=2).start()
 
     with stimer(bdata=True):
-        vp_stage = get_attr_wrapped_model(model, "vp_stage")
-        cp_batch = get_batch(
-            data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
+        config = get_run_config().model.transformer
+        prepared_thd = (
+            config.cuda_graph_impl == "full_iteration" and config.sequence_packing_scheduler
         )
+        if prepared_thd:
+            cp_batch = _get_prepared_cuda_graph_batch(data_iterator, config)
+        else:
+            vp_stage = get_attr_wrapped_model(model, "vp_stage")
+            cp_batch = get_batch(
+                data_iterator,
+                vp_stage,
+                pg_collection=get_attr_wrapped_model(model, "pg_collection"),
+            )
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
         cu_seqlens = batch.get("cu_seqlens")
@@ -347,7 +416,7 @@ def forward_step(data_iterator, model: HybridModel):
         tokens = batch.get("tokens")
         packed_seq_params = cp_batch.get_packed_seq_params()
         padding_mask = batch.get("padding_mask")
-        if cu_seqlens is not None:
+        if cu_seqlens is not None and not prepared_thd:
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)
@@ -381,6 +450,9 @@ def forward_step(data_iterator, model: HybridModel):
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
+
+
+forward_step.prepare_batch_for_cuda_graph = prepare_batch_for_cuda_graph
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
