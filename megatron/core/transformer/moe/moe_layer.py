@@ -953,6 +953,12 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
                 )
 
             def megakernel_forward(hidden_states, padding_mask):
+                # NOTE(nightly-sync 24_11_2026): dev #8497 runs MoK with TP/SP, and main #8654
+                # gives the backend a padding mask. Localize the batch-first mask once so the
+                # router and the backend both see the SP-local tokens of ``hidden_states``.
+                padding_mask = self._align_batch_first_to_sequence_parallel(
+                    padding_mask, hidden_states
+                )
                 shared_output = None
                 if not self.megakernel_fuses_shared_expert:
                     shared_output = self.shared_experts_compute(hidden_states)

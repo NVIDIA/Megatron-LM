@@ -425,7 +425,9 @@ class MockSFTDataset(SFTDataset):
             tokens_list = tokens_list[:pack_length] + [eod]
         valid_len = len(tokens_list) - 1
 
-        if self.dataset.format == "sbhd":
+        # Any indexable low-level dataset is accepted; only MockSFTLowLevelDataset carries a
+        # layout, so a dataset without one uses the default THD packing.
+        if getattr(self.dataset, "format", "thd") == "sbhd":
             # SBHD format: single padded sequence without cu_seqlens.
             # Pad to pack_length + 1 (offset by 1 for input/label split).
             pad_len = pack_length + 1 - len(tokens_list)

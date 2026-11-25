@@ -676,7 +676,8 @@ def roll_tensor(
 
     Tensor callers retain the main API, including None and optional reductions.
     Grouped callers retain shared metadata, per-field fills and prefetched halos.
-    Packed first-axis tensors are moved into the grouped dispatcher's sequence frame.
+    Packed tensors whose sequence axis is not last are moved into the grouped dispatcher's
+    sequence frame and moved back after the roll.
 
     Packed rolls respect document boundaries. With zigzag CP > 1, each physical document
     length must be divisible by twice the CP size so every rank receives two equal chunks.
@@ -738,8 +739,7 @@ def roll_tensor(
     sequence_dim = dims if dims >= 0 else fields[0].dim() + dims
     moved = packed_seq_params is not None and sequence_dim != fields[0].dim() - 1
     if moved:
-        assert sequence_dim == 0, "Packed sequence roll supports the first or last dimension."
-        fields = [field.movedim(dims, -1) for field in fields]
+        fields = [field.movedim(sequence_dim, -1) for field in fields]
     rolled = _roll_tensor_fields(
         fields,
         shifts=shifts,
@@ -752,7 +752,7 @@ def roll_tensor(
         roll_depth=roll_depth,
     )
     if moved:
-        rolled = [field.movedim(-1, dims) for field in rolled]
+        rolled = [field.movedim(-1, sequence_dim) for field in rolled]
     if single:
         return rolled[0], rolled[0].sum() if return_sum else None
     return rolled

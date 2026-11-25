@@ -17,10 +17,19 @@ def _continuation_mask(tensor, packed_seq_params, cp_group, dims, sp_group=None)
     rows = torch.arange(rank * length, (rank + 1) * length, device=tensor.device)
     if real.numel() == 1:
         return torch.ones_like(rows, dtype=torch.bool)
+    lengths = real[1:] - real[:-1]
+    # NOTE(nightly-sync 24_11_2026): as in dev's packed roll, static THD metadata can append
+    # empty/dummy physical sequences without adding logical documents. Their valid lengths are
+    # zero, so none of their rows continue.
+    extra_sequences = physical.numel() - real.numel()
+    if extra_sequences < 0:
+        raise ValueError("Packed physical boundaries must cover every logical sequence.")
+    if extra_sequences:
+        lengths = torch.nn.functional.pad(lengths, (0, extra_sequences))
     seq = torch.bucketize(rows, physical[1:], right=True)
     in_pack = seq < physical.numel() - 1
     seq = seq.clamp_max(physical.numel() - 2)
-    ends = physical[seq] + (real[1:] - real[:-1])[seq]
+    ends = physical[seq] + lengths[seq]
     valid = ~in_pack | ((rows >= physical[seq]) & (rows + 1 < ends))
     return valid
 

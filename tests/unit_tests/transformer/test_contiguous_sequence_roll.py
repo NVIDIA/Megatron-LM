@@ -131,3 +131,52 @@ def test_dense_fields_do_not_build_a_boundary_mask():
     torch.testing.assert_close(actual, torch.tensor([[2, 3, 4, 5, 6, 7, 8, 0]]))
     torch.testing.assert_close(actual_padding, torch.tensor([[False] * 7 + [True]]))
     arange.assert_not_called()
+
+
+@pytest.mark.parametrize("dims", [0, -1])
+def test_cp1_roll_zeroes_dummy_physical_sequences(dims):
+    """Trailing physical sequences without logical documents never continue.
+
+    NOTE(nightly-sync 24_11_2026): dev's packed roll accepts static THD metadata that appends
+    empty/dummy physical sequences; main #7834's CP1 fast path must keep that behavior.
+    """
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=torch.tensor([0, 3, 6], dtype=torch.int32),
+        cu_seqlens_q_padded=torch.tensor([0, 4, 8, 12], dtype=torch.int32),
+    )
+    values = torch.arange(1, 13, dtype=torch.float32)
+    tensor = (values.view(-1, 1) if dims == 0 else values.view(1, -1)).requires_grad_()
+    rolled = roll_contiguous(tensor, dims, None, params)
+    expected = torch.tensor([2, 3, 0, 0, 6, 7, 0, 0, 0, 0, 0, 0], dtype=torch.float32)
+    assert torch.equal(rolled.detach().reshape(-1), expected)
+    rolled.sum().backward()
+    expected_grad = torch.tensor([0, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0], dtype=torch.float32)
+    assert torch.equal(tensor.grad.reshape(-1), expected_grad)
+
+    mask = torch.ones(1, 12, dtype=torch.bool)
+    (rolled_mask,) = roll_contiguous_fields((mask,), None, params)
+    assert torch.equal(rolled_mask.reshape(-1), expected.bool())
+
+
+def test_cp1_roll_with_equal_boundary_counts():
+    """Equal physical and logical boundary counts keep the per-sequence padding rows."""
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=torch.tensor([0, 3, 6], dtype=torch.int32),
+        cu_seqlens_q_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+    tensor = torch.arange(1, 9, dtype=torch.float32).view(1, -1)
+    rolled = roll_contiguous(tensor, -1, None, params)
+    assert torch.equal(rolled.reshape(-1), torch.tensor([2, 3, 0, 0, 6, 7, 0, 0.0]))
+
+
+def test_cp1_roll_rejects_physical_metadata_shorter_than_logical():
+    """Physical boundaries must cover every logical sequence."""
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=torch.tensor([0, 3, 6], dtype=torch.int32),
+        cu_seqlens_q_padded=torch.tensor([0, 8], dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="must cover every logical sequence"):
+        roll_contiguous(torch.zeros(1, 8), -1, None, params)

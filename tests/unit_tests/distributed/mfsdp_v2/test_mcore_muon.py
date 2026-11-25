@@ -44,6 +44,29 @@ class TinyModel(MegatronModule):
         return self.output(self.fc2(hidden_states).relu())
 
 
+class GroupedProjection(nn.Module):
+    """A Muon matrix stored as ``[groups, out, in]``, like DSv4's TE BatchedLinear weight."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(2, 4, 8))
+        self.weight.muon_matrix_shape = (8, 8)
+
+
+class GroupedProjectionModel(MegatronModule):
+    """A 2D Muon matrix next to a grouped projection that FsdpMuon cannot update."""
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__(config)
+        self.fc1 = nn.Linear(8, 8)
+        self.grouped = GroupedProjection()
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply the dense and grouped projections."""
+        hidden_states = self.fc1(hidden_states).view(*hidden_states.shape[:-1], 2, 4)
+        return torch.einsum("...gi,goi->...go", hidden_states, self.grouped.weight)
+
+
 def _train(
     model: MegatronModule, optimizer: MegatronOptimizer, inputs: torch.Tensor
 ) -> torch.Tensor:
@@ -57,9 +80,10 @@ def _train(
         )
         success, norm, _ = optimizer.step()
         assert success
-        values.append(
-            torch.stack((losses[0], torch.as_tensor(norm, device=tokens.device).squeeze()))
-        )
+        # Dev's ChainedOptimizer returns a float64 device norm when its optimizers keep separate
+        # grad stats (#8103); main returns a Python float. Compare both in the losses' dtype.
+        norm = torch.as_tensor(norm, device=tokens.device).to(losses[0].dtype)
+        values.append(torch.stack((losses[0], norm.squeeze())))
     return torch.stack(values)
 
 
@@ -140,3 +164,29 @@ def test_mcore_muon_adam_losses(distributed_setup, pg_collection, dtype: torch.d
     expected = _train(reference_model, reference_optimizer, inputs)
     actual = _train(model, optimizer, inputs)
     torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-6)
+
+
+def test_mcore_muon_rejects_grouped_matrix_parameters(distributed_setup, pg_collection) -> None:
+    """MFSDP v2 wrapping keeps muon_matrix_shape, and the factory refuses to drop it to Adam."""
+    config = TransformerConfig(
+        num_layers=1, hidden_size=8, num_attention_heads=2, gradient_accumulation_fusion=False
+    )
+    module = GroupedProjectionModel(config).to(device=distributed_setup.device)
+    model = FullyShardedDataParallel(
+        config,
+        DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            data_parallel_sharding_strategy="optim_grads_params",
+        ),
+        module,
+        pg_collection=pg_collection,
+    )
+    assert model.module.grouped.weight.muon_matrix_shape == (8, 8)
+    with pytest.raises(NotImplementedError, match="muon_matrix_shape"):
+        get_megatron_optimizer(
+            OptimizerConfig(optimizer="muon", lr=0.01, muon_split_qkv=False),
+            [model],
+            use_gloo_process_groups=False,
+            pg_collection=pg_collection,
+        )

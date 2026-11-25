@@ -1207,6 +1207,21 @@ def _get_megatron_fsdp_emerging_optimizer(
         raise NotImplementedError("MFSDP v2 Muon requires muon_split_qkv=False.")
     if config.muon_scalar_optimizer != 'adam':
         raise NotImplementedError("MFSDP v2 Muon supports only Adam for non-matrix parameters.")
+    # FsdpMuon updates only 2D shards. A Muon matrix stored as a higher-rank tensor (marked with
+    # ``muon_matrix_shape``, e.g. DSv4's TE BatchedLinear output projection) would be skipped by
+    # FsdpMuon or routed to Adam, silently changing its optimizer.
+    grouped_matrix_names = [
+        name
+        for model_chunk in model_chunks
+        for name, param in model_chunk.named_parameters()
+        if getattr(param, 'muon_matrix_shape', None) is not None
+        and getattr(param, 'use_muon', True)
+    ]
+    if grouped_matrix_names:
+        raise NotImplementedError(
+            "MFSDP v2 Muon does not support parameters with muon_matrix_shape "
+            f"({len(grouped_matrix_names)} found, e.g. {grouped_matrix_names[0]})."
+        )
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
             "emerging-optimizers package is required for optimizer='muon'. "

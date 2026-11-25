@@ -1870,7 +1870,7 @@ def validate_args(args, defaults={}):
             ) // total_cp_ranks
         assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= max_padded_length, (
             f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
-            f'must be >= padded physical sample length ({max_padded_length})'
+            f'must be >= padded single sequence max length ({max_padded_length})'
         )
 
     if (

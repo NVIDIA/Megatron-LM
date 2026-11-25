@@ -510,6 +510,11 @@ def test_te_cuda_graph_replay_refreshes_after_manual_hooks_and_before_the_graph(
         _get_te_cuda_graph_replay_args=lambda *args, **kwargs: (args, kwargs),
         _before_te_cuda_graph_replay=lambda: calls.append(("refresh",)),
     )
+    # Dev selects the replay slot through _te_cuda_graph_replay_microbatch (route replay
+    # state for checkpointed packed invocations); bind the real selector to the stub.
+    module._te_cuda_graph_replay_microbatch = lambda: (
+        TECudaGraphMixin._te_cuda_graph_replay_microbatch(module)
+    )
 
     assert TECudaGraphMixin._te_cuda_graph_replay_graph(module, hidden) is graph_output
     assert calls == [("hook", 7), ("refresh",), ("replay", (hidden,), {})]
@@ -528,7 +533,12 @@ def _graph_layer(is_moe_layer, megakernel, cuda_graph_modules, **attributes):
         config=SimpleNamespace(cuda_graph_modules=cuda_graph_modules),
         **attributes,
     )
-    for name in ("_cuda_graph_megakernel", "_after_te_cuda_graphs_deleted"):
+    # Dev's TECudaGraphHelper.delete_cuda_graphs also clears each layer's static hidden inputs.
+    for name in (
+        "_cuda_graph_megakernel",
+        "_after_te_cuda_graphs_deleted",
+        "clear_te_cuda_graph_static_hidden_inputs",
+    ):
         setattr(layer, name, MethodType(getattr(TransformerLayer, name), layer))
     return layer
 
@@ -903,6 +913,8 @@ def _split_module_with_main_grads(monkeypatch):
         return object()
 
     fake_mok = types.ModuleType("mok")
+    # mok_modules() imports the package's functional and ops modules together.
+    fake_mok.functional = types.ModuleType("mok.functional")
     fake_mok.ops = SimpleNamespace(
         make_routed_d_weight_storage_table=make_routed_d_weight_storage_table
     )
@@ -1022,6 +1034,7 @@ def test_mok_autograd_saves_only_backward_inputs_and_grads_every_routed_paramete
     module.ep_group = None
     module.num_local_experts = 2
     module.swiglu_limit = None
+    module.situ_beta = None
     monkeypatch.setattr(mok_backend, "_native_split_weight_view", lambda *a, **k: object())
 
     def forward(config, workspace, schedule, x, router_weights, *weights, swiglu_limit):
@@ -1217,6 +1230,9 @@ def test_deleting_te_cuda_graphs_releases_the_captured_mok_weight_views(
     )
     helper = cuda_graphs.TECudaGraphHelper.__new__(cuda_graphs.TECudaGraphHelper)
     helper.callables_per_chunk = [[layer]]
+    # NOTE(nightly-sync 2026-11-24): dev's delete_cuda_graphs also drops block-owned route
+    # arenas for every chunk with a decoder; this stand-in chunk has none.
+    helper.chunks_with_decoder = [None]
     helper.tp_group = helper.dp_cp_group = None
     helper._graphs_created = True
     # Only the deletion log needs a process group.

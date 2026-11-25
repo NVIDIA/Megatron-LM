@@ -121,6 +121,7 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype, backend, monkeypatch):
     )
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.moe.megakernel.mok import runtime
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.spec_utils import get_submodules
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -263,9 +264,9 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype, backend, monkeypatch):
             # Mutation controls use the real backend. They must fail the same
             # oracle, rather than passing just because a mocked hook was called.
             # MoK receives the backend's cached shared FC1 gate/up views; swap them.
-            shared_gate, shared_up = backend.shared_fc1_gate_up()
+            shared_gate, shared_up = megakernel.shared_fc1_gate_up()
             swapped = (shared_up, shared_gate)
-            with patch.object(backend, "shared_fc1_gate_up", lambda: swapped), torch.no_grad():
+            with patch.object(megakernel, "shared_fc1_gate_up", lambda: swapped), torch.no_grad():
                 wrong = ddp(x, probs)
             with pytest.raises(AssertionError, match="swapped gate/up"):
                 _assert_numerics(wrong, reference_updated, "swapped gate/up")

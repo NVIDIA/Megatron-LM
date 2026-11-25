@@ -1197,10 +1197,16 @@ def test_gpt_forward_step_uses_dataset_length_for_packed_metadata(monkeypatch):
         None,
         tokens,
         torch.tensor(8),
+        None,  # padding_mask: dev-only BATCH_KEYS entry, sorted between max_seqlen and position_ids
         tokens,
         tokens,
     )
     model = MagicMock(vp_stage=None, pg_collection=None)
+    # dev keeps post-pack THD padding and CP-route finalization (prepare_packed_seq_params)
+    # in forward_step. Both need initialized process groups and are outside what this test
+    # checks, so disable the padding path and stub the finalization hook.
+    model.config.pad_packed_seq_alignment = None
+    monkeypatch.setattr(pretrain_gpt, "prepare_packed_seq_params", lambda *a, **kw: None)
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
     monkeypatch.setattr(pretrain_gpt, "get_run_config", lambda: cfg)
     monkeypatch.setattr(pretrain_gpt, "get_batch", lambda *a, **kw: batch)

@@ -53,6 +53,17 @@ def serialize_dataclass(
         if field.name.startswith("_") or field.name in skip_fields:
             continue
         value = getattr(config, field.name)
+        if (
+            field.name == "linear_cp_layout"
+            and isinstance(config, TransformerConfig)
+            and getattr(config, "_linear_cp_layout_explicit", True) is False
+            and value == "zigzag"
+        ):
+            # TransformerConfig fills an unset linear_cp_layout with zigzag and records that
+            # it was implicit in a private field, which is not serialized. Emit the unset value
+            # so deserialization re-derives the implicit layout instead of making zigzag
+            # explicit, which would change hybrid CP behavior or fail chunkwise validation.
+            value = None
         if encode_callables and callable(value) and (
             isinstance(value, type) or not is_dataclass(value)
         ):

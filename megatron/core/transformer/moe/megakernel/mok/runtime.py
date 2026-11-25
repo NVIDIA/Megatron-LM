@@ -251,7 +251,8 @@ class _MoKAutograd(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         """Run MOK backward and return gradients for its autograd inputs."""
         # Shared FC1 stays saved for autograd's version check; MOK reads it through cached views.
-        x, router_weights, shared_output_gate_weight, _, shared_fc2 = ctx.saved_tensors
+        # Routed-only MoK saves None for both shared FC weights.
+        x, router_weights, shared_output_gate_weight, shared_fc1, shared_fc2 = ctx.saved_tensors
         fc1_weight_view, fc2_weight_view = ctx.routed_weight_views
         if ctx.module.use_mxfp8_weights and ctx.module.native_single_grouped_weights:
             # FC1 backward may need rowwise weights for recompute and columnwise weights for

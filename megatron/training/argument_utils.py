@@ -27,6 +27,7 @@ from megatron.core.distributed import (
     TorchFullyShardedDataParallelConfig,
 )
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy

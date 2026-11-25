@@ -183,7 +183,7 @@ def _mok_composition_layer(
             super().__init__()
             self.shared = shared_module
 
-        def forward(self, hidden, probs, routes):
+        def forward(self, hidden, probs, routes, padding_mask=None):
             seen["backend"].append(hidden.shape)
             assert routes.all()
             scale = (probs[:, :1] + 2 * probs[:, 1:]).view(*hidden.shape[:-1], 1)

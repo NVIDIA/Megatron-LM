@@ -43,14 +43,17 @@ Use MLM's GPU development environment with Transformer Engine and the SSM/Gated
 DeltaNet dependencies required by these Hybrid models. Add conversion dependencies:
 
 ```bash
-uv sync --extra training --extra dev --extra ssm --extra bridge --group test
+uv sync --extra training --extra dev --extra ssm --group test
 ```
 
-The optional `bridge` extra declares Transformers, safetensors, Accelerate,
-OmegaConf, PyYAML, Pydantic, einops and Rich. Transformers follows Bridge's
-`>=5.21.1,<5.24` range, with 5.23.0 in the lockfile. The NeMo Run launcher additionally
-uses `nemo-run`, included in MLM's test dependency group; direct worker invocation
-does not require that launcher.
+NOTE(nightly-sync 24_11_2026): this branch does not define the optional `bridge`
+extra yet. On main the extra declares Transformers, safetensors, Accelerate,
+OmegaConf, PyYAML, Pydantic, einops and Rich, with Transformers at Bridge's
+`>=5.21.1,<5.24` range. Here it lands together with the dev Transformers upgrade,
+because dev's lockfile still pins Transformers 5.19.0; until then Bridge conversions
+run against dev's locked Transformers, below Bridge's declared range. The NeMo Run
+launcher additionally uses `nemo-run`, included in MLM's test dependency group;
+direct worker invocation does not require that launcher.
 
 Use a pinned HF revision for remote inputs. `--trust-remote-code` explicitly
 permits executing the checkpoint's custom Python code; use it only for trusted

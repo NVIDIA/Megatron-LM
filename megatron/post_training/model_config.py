@@ -72,6 +72,52 @@ def distillation_config_from_args(
     return distillation
 
 
+def _normalize_nemo_teacher_config(config: dict) -> dict:
+    """Translate NeMo-format teacher fields to the ``get_args()`` names they configure.
+
+    NOTE(nightly-sync 24_11_2026): dev's teacher loader accepted NeMo-format YAML, while main
+    #8340's loader reads ``get_args()`` names. Accept both. A ``get_args()`` name set in the YAML
+    takes precedence over its NeMo alias. NeMo's null ``position_embedding_type`` is the
+    legacy rotary form and is translated to the canonical ``'rope'``.
+    """
+    aliases = {}
+    if "encoder_seq_length" in config:
+        aliases["seq_length"] = config["encoder_seq_length"]
+    if "bias" in config:
+        aliases["disable_bias_linear"] = not config["bias"]
+    if config.get("activation") == "swiglu":
+        aliases["swiglu"] = True
+    if config.get("position_embedding_type", False) is None:
+        # NeMo's null form is the legacy rotary path: dev's loader restored the two
+        # legacy flags and validate_args converted use_rotary_position_embeddings to
+        # position_embedding_type='rope'. The stock teacher builder reads the canonical
+        # field directly and never runs that conversion, so translate the null form to
+        # it here. An explicit non-null choice skips this branch and wins through the
+        # merge below, as does an explicit legacy flag.
+        aliases["use_rotary_position_embeddings"] = True
+        aliases["no_position_embedding"] = True
+        aliases["position_embedding_type"] = "rope"
+        config = {
+            key: value for key, value in config.items() if key != "position_embedding_type"
+        }
+    if "share_embeddings_and_output_weights" in config:
+        aliases["untie_embeddings_and_output_weights"] = not config[
+            "share_embeddings_and_output_weights"
+        ]
+    if isinstance(config.get("tokenizer"), dict):
+        aliases["tokenizer_type"] = config["tokenizer"]["type"]
+        aliases["tokenizer_model"] = config["tokenizer"]["model"]
+    if "masked_softmax_fusion" in config:
+        aliases["no_masked_softmax_fusion"] = not config["masked_softmax_fusion"]
+    if config.get("normalization") == "layernorm1p":
+        aliases["apply_layernorm_1p"] = True
+    if "precision" in config:
+        aliases[config["precision"]] = True
+    if "mcore_gpt" in config:
+        aliases["use_mcore_models"] = config["mcore_gpt"]
+    return {**aliases, **config}
+
+
 def _load_teacher_model_config(
     args: Namespace, teacher_load: str, teacher_model_config: str | None = None
 ) -> Namespace:
@@ -81,6 +127,7 @@ def _load_teacher_model_config(
     or as ``model_config.yaml`` in the ``teacher_load`` checkpoint dir, should specify any model
     architecture settings which differ from the main student model's.
     The field names should match those returned by get_args() and not TransformerConfig.
+    NeMo-format field names (e.g. ``activation: swiglu``) are translated to them.
     """
     if teacher_model_config is not None:
         config_path = teacher_model_config
@@ -99,7 +146,7 @@ def _load_teacher_model_config(
 
     if config_path is not None:
         with open(config_path) as f:
-            config = yaml.safe_load(f) or {}
+            config = _normalize_nemo_teacher_config(yaml.safe_load(f) or {})
 
         del args_dict["kv_channels"]  # not recalculated if present
         # Setting teacher Flextron fields to false if training with Flextron, can be overridden

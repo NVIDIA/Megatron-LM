@@ -271,5 +271,9 @@ class TestLoaderSettingsFromTheDataSection:
         section = _section(run_config, dataset=config, dataset_type=MockSFTDataset)
         assert is_packed_sequence(MockSFTDataset, config) and not section.yields_unpacked_samples()
         batch = _batch(dataset)
-        assert isinstance(batch, dict) and tuple(batch["tokens"].shape) == (1, 16)
-        assert "cu_seqlens" in batch
+        # On dev, THD samples pad only to the CP/TP padding divisor rather than to seq_length
+        # (#7615), so the collated width is the sample's own width. Every sample here has the
+        # same length, so dataset[0] gives the width each rank's micro-batch must have.
+        width = dataset[0]["tokens"].numel()
+        assert isinstance(batch, dict) and tuple(batch["tokens"].shape) == (1, width)
+        assert "cu_seqlens" in batch and tuple(batch["cu_seqlens"].shape) == (1, 2)

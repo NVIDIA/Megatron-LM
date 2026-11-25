@@ -38,7 +38,7 @@ def test_precomputed_mtp_mask_uses_embedding_shard_and_runtime_cp(
         assert sp_group is tp_group and cp_group is runtime_cp_group
         assert tensor.shape[0] == decoder_input.shape[0]
         roll_calls.append(tensor.clone())
-        return tensor.clone(), None
+        return tensor.clone()
 
     def layer(**kwargs):
         layer_masks.append(kwargs["padding_mask"].clone())
@@ -51,7 +51,9 @@ def test_precomputed_mtp_mask_uses_embedding_shard_and_runtime_cp(
         )
 
     block = SimpleNamespace(
-        config=SimpleNamespace(mtp_detach_heads=False, mtp_hsm=False, mtp_num_layers=2),
+        config=SimpleNamespace(
+            mtp_detach_heads=False, mtp_hsm=False, mtp_num_layers=2, attention_cp_layout="zigzag"
+        ),
         cp_group=base_cp_group,
         tp_group=tp_group,
         sequence_parallel=True,

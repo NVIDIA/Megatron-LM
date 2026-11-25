@@ -13,7 +13,7 @@ forwarded, requests they silently downgraded), the difference is listed here as 
 import ast
 import inspect
 import json
-from dataclasses import fields
+from dataclasses import fields, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -71,13 +71,19 @@ def test_sft_preserves_pack_level_truncation():
 
     # Mock samples also retain tokens beyond sequence_length when the pack fits them.
     mock_dataset = object.__new__(MockSFTDataset)
-    mock_dataset.config = config
+    # NOTE(nightly-sync 2026-11-24): dev's MockSFTDataset derives its THD pad granularity from
+    # the config's parallel sizes (_calculate_padding_divisor) instead of reading
+    # padding_divisor, so give the mock a single-rank config; the divisor is 1 either way.
+    mock_dataset.config = replace(
+        config, context_parallel_size=1, sequence_parallel_size=1, dynamic_context_parallel=False
+    )
     mock_dataset.dataset = [torch.arange(1, 11).numpy()]
     mock_dataset.indices = [0]
     mock_dataset.padding_divisor = 1
     sample = mock_dataset[0]
-    assert sample["tokens"].tolist() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 99, 0]
-    assert sample["labels"].tolist() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 99, 0, 0]
+    # Dev's THD mock pads to padding_divisor only, not to the pack length.
+    assert sample["tokens"].tolist() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    assert sample["labels"].tolist() == [2, 3, 4, 5, 6, 7, 8, 9, 10, 99]
 
 
 MODEL_ARGV = (

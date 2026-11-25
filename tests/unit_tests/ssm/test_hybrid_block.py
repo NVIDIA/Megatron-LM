@@ -49,6 +49,7 @@ from megatron.core.ssm.gated_delta_product import HAVE_FLA as HAVE_GDP
 from megatron.core.ssm.gated_delta_product import HAVE_MAMBA_SSM as HAVE_GDP_MAMBA
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
+from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -1620,8 +1621,12 @@ class TestHybridBlock:
         assert block_ends[-1] is True
 
     @pytest.mark.timeout(60)
-    def test_hyper_connection_mhc_recompute_bitwise(self):
+    def test_hyper_connection_mhc_recompute_bitwise(self, monkeypatch):
         """mHC selective recompute is bitwise identical to the eager path."""
+        # mHC recompute keeps the Mamba mixer sequence-first (main #8696), while the eager path
+        # may run it batch-first, which changes the in_proj reduction order. Pin both runs to
+        # the sequence-first layout so the comparison isolates mHC recompute.
+        monkeypatch.setattr(MambaMixer, "_use_batch_first_ssm", lambda self, inference_mode: False)
         seed = 123
         layer_pattern = Symbols.MAMBA + Symbols.ATTENTION + Symbols.MLP
         layer_type_list = validate_segment_layers(layer_pattern)

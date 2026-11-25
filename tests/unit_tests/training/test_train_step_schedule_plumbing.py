@@ -655,6 +655,8 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         ),
         # Without MPU, the batch-size guard reads the DP size from the config (#8234).
         get_batch_parallel_size=lambda: 1,
+        # The model-builder path checks for ModelOpt distillation on the container (#8340).
+        distillation=None,
     )
     pg_collection = mock.Mock()
 

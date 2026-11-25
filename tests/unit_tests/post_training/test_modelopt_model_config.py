@@ -679,7 +679,9 @@ class TestModelOptMtpSpec:
                 mtp_spec = mtp_block_spec(config, decoder_spec, pp_rank=0)
             select_mtp_spec.assert_called_once_with(config.transformer)
             layer = mtp_spec.layer_specs[0].submodules.mtp_model_layer
-            assert layer is expected
+            # dev's get_gpt_mtp_block_spec_for_backend shallow-copies the layer spec and its
+            # submodules before wiring hyper connections, so compare the selected spec by value.
+            assert layer == expected
             assert layer.module is TransformerLayer
             if quant_cfg != "None":
                 assert decoder_spec.layer_specs[0].module is not TransformerLayer
@@ -884,3 +886,167 @@ class TestConfigurationDrivenKDLoss:
         assert tokens.item() == 2
         assert report["total loss"][0].item() == 7.0
         model.compute_kd_loss.assert_called_once()
+
+
+class TestTeacherModelConfigAliases:
+    """NOTE(nightly-sync 24_11_2026): dev's teacher loader translated NeMo-format YAML.
+
+    Main #8340's loader reads ``get_args()`` names; both formats must configure the teacher.
+    """
+
+    NEMO = {
+        "activation": "swiglu",
+        "bias": False,
+        "encoder_seq_length": 8192,
+        "normalization": "layernorm1p",
+    }
+    CLI = {
+        "swiglu": True,
+        "disable_bias_linear": True,
+        "seq_length": 8192,
+        "apply_layernorm_1p": True,
+    }
+
+    @staticmethod
+    def _student(**overrides):
+        fields = dict(
+            kv_channels=None,
+            swiglu=False,
+            disable_bias_linear=False,
+            seq_length=4096,
+            apply_layernorm_1p=False,
+            hybrid_layer_pattern=None,
+            hybrid_override_pattern=None,
+        )
+        fields.update(overrides)
+        return Namespace(**fields)
+
+    def _load(self, tmp_path, config, source):
+        if source == "file":
+            path = tmp_path / "teacher.yaml"
+            path.write_text(yaml.safe_dump(config))
+            return mc._load_teacher_model_config(self._student(), str(tmp_path), str(path))
+        (tmp_path / "model_config.yaml").write_text(yaml.safe_dump(config))
+        return mc._load_teacher_model_config(self._student(), str(tmp_path))
+
+    @pytest.mark.parametrize("source", ["file", "checkpoint_dir"])
+    @pytest.mark.parametrize("fmt", ["nemo", "cli"])
+    def test_teacher_fields_override_opposite_student_defaults(self, tmp_path, source, fmt):
+        teacher = self._load(tmp_path, self.NEMO if fmt == "nemo" else self.CLI, source)
+        assert teacher.swiglu is True
+        assert teacher.disable_bias_linear is True
+        assert teacher.seq_length == 8192
+        assert teacher.apply_layernorm_1p is True
+
+    def test_explicit_cli_name_takes_precedence_over_nemo_alias(self, tmp_path):
+        config = {
+            "activation": "swiglu",
+            "swiglu": False,
+            "bias": False,
+            "disable_bias_linear": False,
+        }
+        teacher = self._load(tmp_path, config, "file")
+        assert teacher.swiglu is False
+        assert teacher.disable_bias_linear is False
+
+    def test_teacher_without_alias_inherits_student_field(self, tmp_path):
+        teacher = mc._load_teacher_model_config(
+            self._student(swiglu=True), str(tmp_path), self._write(tmp_path, {"num_layers": 4})
+        )
+        assert teacher.swiglu is True
+        assert teacher.num_layers == 4
+
+    @staticmethod
+    def _write(tmp_path, config):
+        path = tmp_path / "teacher.yaml"
+        path.write_text(yaml.safe_dump(config))
+        return str(path)
+
+    def test_missing_checkpoint_config_falls_back_to_student(self, tmp_path):
+        teacher = mc._load_teacher_model_config(self._student(swiglu=True), str(tmp_path))
+        assert teacher.swiglu is True
+        assert teacher.seq_length == 4096
+
+    def test_missing_explicit_config_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            mc._load_teacher_model_config(
+                self._student(), str(tmp_path), str(tmp_path / "missing.yaml")
+            )
+
+
+class TestTeacherPositionEmbeddingType:
+    """NOTE(nightly-sync 24_11_2026): NeMo teacher YAMLs write
+    ``position_embedding_type: null`` for rotary models. Dev's loader restored the legacy
+    rotary flags and validate_args converted them to ``position_embedding_type='rope'``;
+    main #8340's stock builder reads the canonical field directly and never runs that
+    conversion, so the null form is translated to it (review 6073017294, finding
+    4707446414).
+    """
+
+    def _distillation(self, tmp_path, config, source):
+        kwargs = {"export_kd_teacher_load": str(tmp_path)}
+        if source == "file":
+            path = tmp_path / "teacher.yaml"
+            path.write_text(yaml.safe_dump(config))
+            kwargs["export_kd_teacher_model_config"] = str(path)
+        else:
+            (tmp_path / "model_config.yaml").write_text(yaml.safe_dump(config))
+        args = make_modelopt_test_args(**kwargs)
+        student = mc.modelopt_model_config_from_args(args)
+        return mc.distillation_config_from_args(args, student)
+
+    @pytest.mark.parametrize("source", ["file", "checkpoint_dir"])
+    def test_nemo_null_position_type_yields_rope_teacher(self, tmp_path, source):
+        distillation = self._distillation(
+            tmp_path, {"num_layers": 2, "position_embedding_type": None}, source
+        )
+        assert distillation.teacher_model.position_embedding_type == "rope"
+
+    def test_absent_position_type_inherits_student(self, tmp_path):
+        # The student helper pins rope; a YAML without the field leaves the teacher on it.
+        distillation = self._distillation(tmp_path, {"num_layers": 2}, "file")
+        assert distillation.teacher_model.position_embedding_type == "rope"
+
+    @pytest.mark.parametrize("position_type", ["rope", "none", "learned_absolute"])
+    def test_explicit_position_type_is_retained(self, tmp_path, position_type):
+        distillation = self._distillation(
+            tmp_path, {"num_layers": 2, "position_embedding_type": position_type}, "file"
+        )
+        assert distillation.teacher_model.position_embedding_type == position_type
+
+    @pytest.mark.parametrize(
+        "yaml_value, expect_rotary",
+        [(None, True), ("rope", True), ("none", False), ("learned_absolute", False)],
+    )
+    def test_teacher_position_type_drives_rotary_construction(
+        self, tmp_path, monkeypatch, yaml_value, expect_rotary
+    ):
+        import megatron.core.models.common.language_module.language_module as lm_module
+        import megatron.core.models.gpt.gpt_model as gpt_module
+
+        distillation = self._distillation(
+            tmp_path, {"num_layers": 2, "position_embedding_type": yaml_value}, "file"
+        )
+        teacher = distillation.teacher_model
+
+        constructed = []
+
+        class FakeRotary:
+            def __init__(self, **kwargs):
+                constructed.append(kwargs)
+
+        monkeypatch.setattr(gpt_module, "RotaryEmbedding", FakeRotary)
+        monkeypatch.setattr(gpt_module, "TransformerBlock", lambda *a, **k: Mock())
+        monkeypatch.setattr(lm_module, "set_attention_backend", lambda config: None)
+        model = gpt_module.GPTModel(
+            config=teacher.transformer,
+            transformer_layer_spec=Mock(),
+            vocab_size=32000,
+            max_sequence_length=128,
+            pre_process=False,
+            post_process=False,
+            position_embedding_type=teacher.position_embedding_type,
+            pg_collection=Mock(),
+        )
+        assert len(constructed) == (1 if expect_rotary else 0)
+        assert hasattr(model, "rotary_pos_emb") is expect_rotary

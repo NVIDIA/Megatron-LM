@@ -480,7 +480,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 prepare_packed_seq_params(
                     packed_seq_params,
                     model_config,
-                    capacity=args.seq_length if raw_metadata else None,
+                    capacity=get_dataset_input_length(cfg.data.dataset) if raw_metadata else None,
                     cp_group=static_cp_group,
                 )
 

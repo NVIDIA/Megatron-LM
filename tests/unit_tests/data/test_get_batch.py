@@ -142,7 +142,9 @@ def test_gpt_dataset_config_preserves_inter_document_masking():
     )
     args.dataloader_inter_document_masking = True
     try:
-        config = pretrain_gpt.core_gpt_dataset_config_from_args(args)
+        # main #8978 removed the legacy wrapper; the entry point builds cfg.data with
+        # gpt_data_config_from_args, whose dataset section carries the flag.
+        config = pretrain_gpt.gpt_data_config_from_args(args).dataset
         assert config.inter_document_masking is True
     finally:
         Utils.destroy_model_parallel()
