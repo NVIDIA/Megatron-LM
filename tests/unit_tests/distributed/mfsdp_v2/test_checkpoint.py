@@ -496,6 +496,7 @@ def test_metadata_attach_issues_no_collectives(
     assert model_state_dict.keys() == dict(model.named_parameters()).keys()
 
 
+@pytest.mark.parametrize("topology", ["fsdp", "hsdp", "hfsdp", "pp2"])
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
 @pytest.mark.parametrize("activation", ["gelu", "swiglu"])
 @pytest.mark.parametrize(
@@ -503,29 +504,52 @@ def test_metadata_attach_issues_no_collectives(
     [("adam", "*E"), ("muon", "*-*E"), ("angular_muown", "*-*E")],
 )
 def test_ep_fsdp_checkpoint_roundtrip(
-    distributed_setup, tmp_path_dist_ckpt, ep_size, optimizer_name, layer_pattern, activation
+    distributed_setup,
+    tmp_path_dist_ckpt,
+    ep_size,
+    optimizer_name,
+    layer_pattern,
+    activation,
+    topology,
 ):
     """MCore checkpoint save/load reproduces uninterrupted BF16 MoE training.
 
     Use MCore's existing global expert names and optimizer checkpoint format.
     EP=1 is the positive control; EP>1 exercises separate dense and expert-DP meshes.
+    HSDP and HFSDP add a dense outer DP axis that replicates or shards the optimizer state; PP=2
+    gives each stage its own layers, which the checkpoint must name globally.
     """
     world_size, rank = Utils.world_size, Utils.rank
-    if world_size % ep_size:
-        pytest.skip(f"world_size {world_size} is incompatible with EP={ep_size}.")
+    outer_size = 2 if topology in ("hsdp", "hfsdp") else 1
+    pp_size = 2 if topology == "pp2" else 1
+    if topology != "fsdp" and ep_size == 4:
+        pytest.skip("HSDP, HFSDP, and PP are covered with EP=1 and EP=2.")
+    if world_size % (ep_size * outer_size * pp_size):
+        pytest.skip(f"world_size {world_size} is incompatible with {topology} and EP={ep_size}.")
     if optimizer_name in ("muon", "angular_muown"):
         pytest.importorskip("emerging_optimizers")
+    # Each PP stage holds one copy of the layer pattern.
+    layer_pattern = "|".join([layer_pattern] * pp_size)
 
-    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=ep_size)
+    Utils.initialize_model_parallel(
+        1,
+        pp_size,
+        expert_model_parallel_size=ep_size,
+        num_distributed_optimizer_instances=outer_size,
+    )
     try:
         device = torch.device("cuda", torch.cuda.current_device())
         groups = ProcessGroupCollection.use_mpu_process_groups()
+        is_first_stage = groups.pp.rank() == 0
+        is_last_stage = groups.pp.rank() == pp_size - 1
 
         def build(seed):
             torch.manual_seed(seed)
             model_parallel_cuda_manual_seed(seed)
             config = TransformerConfig(
-                num_layers=len(layer_pattern),
+                num_layers=len(layer_pattern.replace("|", "")),
+                pipeline_model_parallel_size=pp_size,
+                pipeline_dtype=torch.bfloat16,
                 hidden_size=64,
                 num_attention_heads=4,
                 num_moe_experts=8,
@@ -555,6 +579,8 @@ def test_ep_fsdp_checkpoint_roundtrip(
                 vocab_size=128,
                 max_sequence_length=8,
                 hybrid_layer_pattern=layer_pattern,
+                pre_process=is_first_stage,
+                post_process=is_last_stage,
                 pg_collection=groups,
             ).cuda()
             model = FullyShardedDataParallel(
@@ -567,6 +593,8 @@ def test_ep_fsdp_checkpoint_roundtrip(
                     megatron_fsdp_main_params_dtype=torch.float32,
                     megatron_fsdp_main_grads_dtype=torch.bfloat16,
                     fsdp_all_gather_in_start_param_sync=False,
+                    num_distributed_optimizer_instances=outer_size,
+                    outer_dp_sharding_strategy="optim" if topology == "hfsdp" else "no_shard",
                 ),
                 module=model,
                 pg_collection=groups,
@@ -616,11 +644,16 @@ def test_ep_fsdp_checkpoint_roundtrip(
         ids = torch.randint(0, 128, (2, 8), device=device)
         pos = torch.arange(8, device=device).repeat(2, 1)
         target = torch.randn(2, 8, 128, device=device)
+        # Later PP stages train on their own input and target, so every stage trains alone.
+        stage_input = torch.randn(8, 2, 64, device=device, dtype=torch.bfloat16)
 
         def train(model, optimizer):
             def forward():
+                if not is_first_stage:
+                    model.module.set_input_tensor(stage_input)
                 output = model(input_ids=ids, position_ids=pos, attention_mask=None)
-                return torch.nn.functional.mse_loss(output.float(), target)
+                expected = target if is_last_stage else torch.zeros_like(output)
+                return torch.nn.functional.mse_loss(output.float(), expected.float())
 
             losses = []
             for _ in range(5):
@@ -647,7 +680,8 @@ def test_ep_fsdp_checkpoint_roundtrip(
 
         train(source, source_optimizer)
         with TempNamedDir(
-            tmp_path_dist_ckpt / f"ep{ep_size}_{optimizer_name}_{activation}_mcore_roundtrip",
+            tmp_path_dist_ckpt
+            / f"{topology}_ep{ep_size}_{optimizer_name}_{activation}_mcore_roundtrip",
             sync=True,
         ) as path:
             dcp.save(
