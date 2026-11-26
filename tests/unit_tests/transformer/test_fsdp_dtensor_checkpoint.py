@@ -1410,3 +1410,46 @@ class TestPipelineLayerNames:
     def test_first_stage_keys_unchanged(self):
         state_dict = {"module.decoder.layers.0.inner_layer.weight": 0}
         assert handle_pipeline_layers_in_state_dict(_wrapped_chunk(1), state_dict) == state_dict
+
+
+def test_loader_returns_virtual_chunk_sections(run_config, tmp_path_dist_ckpt):
+    """The fsdp_dtensor loader hands each virtual chunk its own section under local names."""
+    import torch.distributed.checkpoint as dcp
+
+    from megatron.training.checkpointing import (
+        _load_base_checkpoint,
+        preprocess_fsdp_dtensor_state_dict,
+    )
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
+
+    # Two chunks whose local layer 0 is global layer 2 and 6.
+    chunks = [_wrapped_chunk(3), _wrapped_chunk(7)]
+    sections = ["model0", "model1"]
+    with torch.no_grad():
+        for value, chunk in enumerate(chunks, start=1):
+            chunk.module.decoder.layers[0].inner_layer.weight.fill_(value)
+    config = run_config.model.transformer
+    with TempNamedDir(tmp_path_dist_ckpt / "vpp_loader_sections", sync=True) as load_dir:
+        state = {s: c.state_dict() for s, c in zip(sections, chunks)}
+        dcp.save(
+            preprocess_fsdp_dtensor_state_dict(config, state, chunks),
+            checkpoint_id=load_dir / "iter_0000001",
+        )
+        (load_dir / "latest_checkpointed_iteration.txt").write_text("1")
+        with torch.no_grad():
+            for chunk in chunks:
+                chunk.module.decoder.layers[0].inner_layer.weight.zero_()
+
+        state = {s: c.state_dict() for s, c in zip(sections, chunks)}
+        state, *_ = _load_base_checkpoint(
+            load_dir,
+            args=SimpleNamespace(),
+            sharded_state_dict={**state, "_model": chunks},
+            use_megatron_fsdp=True,
+        )
+
+    for value, (section, chunk) in enumerate(zip(sections, chunks), start=1):
+        chunk.load_state_dict(state[section], strict=True)
+        assert torch.equal(
+            chunk.module.decoder.layers[0].inner_layer.weight, torch.full((2, 2), float(value))
+        )
