@@ -73,6 +73,7 @@ from megatron.training.global_vars import get_run_config, get_tokenizer, get_tra
 from megatron.training.utils.checkpoint_utils import (
     file_exists,
     get_checkpoint_train_state_filename,
+    join_paths,
     read_train_state,
 )
 
