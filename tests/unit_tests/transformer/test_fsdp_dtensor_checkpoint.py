@@ -1418,7 +1418,9 @@ def test_loader_returns_virtual_chunk_sections(run_config, tmp_path_dist_ckpt):
     assert list(state["model1"]) == [k.replace("layers.0.", "layers.6.") for k in saved[1]]
     with TempNamedDir(tmp_path_dist_ckpt / "vpp_loader_sections", sync=True) as load_dir:
         dcp.save(state, checkpoint_id=load_dir / "iter_0000001")
-        (load_dir / "latest_checkpointed_iteration.txt").write_text("1")
+        if torch.distributed.get_rank() == 0:
+            (load_dir / "latest_checkpointed_iteration.txt").write_text("1")
+        torch.distributed.barrier()
 
         chunks = [_wrapped_chunk(1), _wrapped_chunk(7)]
         state = {f"model{i}": chunk.state_dict() for i, chunk in enumerate(chunks)}

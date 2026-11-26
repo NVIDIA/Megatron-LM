@@ -2027,7 +2027,7 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     # Each model chunk has its own section: model, or model0, model1, ... with virtual pipeline
     # stages. Pipeline layers get their global names, as in torch_dist.
     for i, chunk in enumerate(model):
-        section = 'model' if len(model) == 1 else f'model{i}'
+        section = "model" if len(model) == 1 else f"model{i}"
         if section not in state_dict:
             continue
         state_dict[section] = handle_pipeline_layers_in_state_dict(chunk, state_dict[section])
@@ -2515,7 +2515,7 @@ def _load_base_checkpoint(
             state_dict['optimizer'].copy() if 'optimizer' in state_dict else None
         )
         raw_model_state_dicts = {
-            key: value.copy() for key, value in state_dict.items() if re.fullmatch(r'model\d*', key)
+            key: value.copy() for key, value in state_dict.items() if re.fullmatch(r"model\d*", key)
         }
         model = state_dict.pop('_model')
         cfg = get_run_config()
