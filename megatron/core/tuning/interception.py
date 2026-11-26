@@ -58,10 +58,13 @@ def _scope(autotuner, policy: AutotunePolicy):
         module = selection.kernel_module(autotuner)
         name = selection.kernel_name(autotuner)
         qualified = f"{module}.{name}"
-        in_scope = any(
-            module == prefix or module.startswith(prefix + ".") for prefix in policy.modules
+        scope = (
+            module,
+            name,
+            qualified,
+            policy.covers(module),
+            qualified in policy.config_invariant,
         )
-        scope = (module, name, qualified, in_scope, qualified in policy.config_invariant)
         _scopes[autotuner] = scope
     return scope
 
@@ -130,6 +133,12 @@ def _dump_records() -> None:
         logger.error("Could not write Triton autotune recording %s: %s", path, exc)
         return
     logger.info("Wrote Triton autotune recording %s", path)
+
+
+# Winners reach ``_tune_records`` from the Triton patch and from the cuTile hooks alike, and a
+# process without Triton never applies the patch, so the writer is not tied to it. Without a
+# recording policy it writes nothing.
+atexit.register(_dump_records)
 
 
 def choice_digest() -> str:
@@ -247,6 +256,8 @@ def _reset_runtime_state() -> None:
     _record_rank = None
     _enumerated.clear()
     selection.reset_warnings()
+    # Launch picks cudnn-frontend cached under the previous policy must not outlive it.
+    cutile.invalidate()
 
 
 def _autotuner_class():
@@ -382,7 +393,6 @@ def _install(policy: AutotunePolicy) -> None:
             self.nargs = nargs
 
     autotuner_class.run = policy_run
-    atexit.register(_dump_records)
     _installed = True
 
 

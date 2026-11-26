@@ -159,73 +159,477 @@
     "num_warps": 4
    }
   },
-  "cudnn.linear_attention.cutile.kernels.gdn.chunk_bwd_kernel_dqkwg": {
+  "cudnn.linear_attention.cutile.kernels.common.l2norm_bwd_kernel": {
+   "l2norm_bwd_kernel|128|128|32|bfloat16|0": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "l2norm_bwd_kernel|128|128|32|bfloat16|1": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "l2norm_bwd_kernel|128|128|32|float16|0": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "l2norm_bwd_kernel|128|128|32|float16|1": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "l2norm_bwd_kernel|64|64|32|bfloat16|0": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
+   "l2norm_bwd_kernel|64|64|32|bfloat16|1": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
+   "l2norm_bwd_kernel|64|64|32|float16|0": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
+   "l2norm_bwd_kernel|64|64|32|float16|1": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
    "*": {
     "num_worker_warps": 4,
     "occupancy": 4
    }
   },
+  "cudnn.linear_attention.cutile.kernels.common.l2norm_fwd_kernel": {
+   "l2norm_fwd_kernel|128|128|32|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
+   "l2norm_fwd_kernel|128|128|32|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
+   "l2norm_fwd_kernel|64|64|32|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
+   "l2norm_fwd_kernel|64|64|32|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
+   "*": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   }
+  },
+  "cudnn.linear_attention.cutile.kernels.gdn.chunk_bwd_kernel_dqkwg": {
+   "16|16|128|128|64|64|64|1|0|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "16|16|128|128|64|64|64|1|0|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|128|128|64|64|64|1|0|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "32|32|128|128|64|64|64|1|0|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "32|32|64|64|64|64|64|1|0|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "32|32|64|64|64|64|64|1|0|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "*": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   }
+  },
   "cudnn.linear_attention.cutile.kernels.gdn.chunk_bwd_kernel_dv_local": {
+   "16|16|128|128|64|64|64|1|0|0|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "16|16|128|128|64|64|64|1|0|0|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|128|128|64|64|64|1|0|0|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|128|128|64|64|64|1|0|0|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|64|64|64|64|64|1|0|0|bfloat16": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   },
+   "32|32|64|64|64|64|64|1|0|0|float16": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   },
    "*": {
     "num_worker_warps": 4,
     "occupancy": 4
    }
   },
   "cudnn.linear_attention.cutile.kernels.gdn.chunk_fwd_kernel_o": {
+   "16|16|128|128|64|64|64|1|0|1|bfloat16": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   },
+   "16|16|128|128|64|64|64|1|0|1|float16": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   },
+   "32|32|128|128|64|64|64|1|0|1|bfloat16": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   },
+   "32|32|128|128|64|64|64|1|0|1|float16": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   },
+   "32|32|64|64|64|64|64|1|0|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|64|64|64|64|64|1|0|1|float16": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   },
    "*": {
     "num_worker_warps": 8,
     "occupancy": 4
    }
   },
   "cudnn.linear_attention.cutile.kernels.gdn.chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64": {
-   "*": {
+   "16|16|128|128|64|64|1|0|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "16|16|128|128|64|64|1|0|1|float16": {
     "num_worker_warps": 8,
+    "occupancy": 4
+   },
+   "32|32|128|128|64|64|1|0|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|128|128|64|64|1|0|1|float16": {
+    "num_worker_warps": 4,
     "occupancy": 1
+   },
+   "32|32|64|64|64|64|1|0|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "32|32|64|64|64|64|1|0|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "*": {
+    "num_worker_warps": 4,
+    "occupancy": 4
    }
   },
   "cudnn.linear_attention.cutile.kernels.gdn.chunk_gated_delta_rule_fwd_kernel_h_blockdim64": {
-   "*": {
+   "16|16|128|128|64|32|1|0|0|0|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "16|16|128|128|64|32|1|0|0|0|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "16|16|128|128|64|32|1|0|0|1|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "16|16|128|128|64|32|1|0|0|1|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "16|16|128|128|64|64|1|0|0|0|1|1|bfloat16": {
     "num_worker_warps": 8,
+    "occupancy": 1
+   },
+   "16|16|128|128|64|64|1|0|0|0|1|1|float16": {
+    "num_worker_warps": 8,
+    "occupancy": 1
+   },
+   "16|16|128|128|64|64|1|0|0|1|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "16|16|128|128|64|64|1|0|0|1|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "32|32|128|128|64|64|1|0|0|0|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "32|32|128|128|64|64|1|0|0|0|1|1|float16": {
+    "num_worker_warps": 8,
+    "occupancy": 1
+   },
+   "32|32|128|128|64|64|1|0|0|1|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "32|32|128|128|64|64|1|0|0|1|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "32|32|64|64|64|32|1|0|0|0|1|1|bfloat16": {
+    "num_worker_warps": 8,
+    "occupancy": 1
+   },
+   "32|32|64|64|64|32|1|0|0|0|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "32|32|64|64|64|32|1|0|0|1|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "32|32|64|64|64|32|1|0|0|1|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "*": {
+    "num_worker_warps": 4,
     "occupancy": 1
    }
   },
   "cudnn.linear_attention.cutile.kernels.gdn.chunk_gated_delta_rule_fwd_kkt_solve_kernel": {
+   "16|16|128|64|16|64|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "16|16|128|64|16|64|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|128|64|16|64|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|128|64|16|64|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|64|64|16|64|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|64|64|16|64|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
    "*": {
     "num_worker_warps": 4,
     "occupancy": 4
    }
   },
   "cudnn.linear_attention.cutile.kernels.gdn.prepare_wy_repr_bwd_kernel": {
+   "16|16|128|128|64|64|64|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "16|16|128|128|64|64|64|1|float16": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   },
+   "32|32|128|128|64|64|64|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "32|32|128|128|64|64|64|1|float16": {
+    "num_worker_warps": 8,
+    "occupancy": 1
+   },
+   "32|32|64|64|64|64|64|1|bfloat16": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   },
+   "32|32|64|64|64|64|64|1|float16": {
+    "num_worker_warps": 8,
+    "occupancy": 1
+   },
    "*": {
     "num_worker_warps": 8,
     "occupancy": 4
    }
   },
   "cudnn.linear_attention.cutile.kernels.gdn.recompute_w_u_fwd_kernel": {
-   "*": {
+   "16|16|128|128|64|64|64|1|bfloat16": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   },
+   "16|16|128|128|64|64|64|1|float16": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   },
+   "32|32|128|128|64|64|64|1|bfloat16": {
     "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|128|128|64|64|64|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|64|64|64|64|64|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "32|32|64|64|64|64|64|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "*": {
+    "num_worker_warps": 8,
     "occupancy": 4
    }
   },
   "cudnn.linear_attention.cutile.kernels.kda.chunk_gla_fwd_kernel_o": {
+   "chunk_gla_fwd_kernel_o|16|16|128|128|64|64|128|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "chunk_gla_fwd_kernel_o|16|16|128|128|64|64|128|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "chunk_gla_fwd_kernel_o|32|32|128|128|64|64|128|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 2
+   },
+   "chunk_gla_fwd_kernel_o|32|32|128|128|64|64|128|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 2
+   },
+   "chunk_gla_fwd_kernel_o|32|32|64|64|64|64|128|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 2
+   },
+   "chunk_gla_fwd_kernel_o|32|32|64|64|64|64|128|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 2
+   },
    "*": {
     "num_worker_warps": 4,
     "occupancy": 2
    }
   },
   "cudnn.linear_attention.cutile.kernels.kda.chunk_kda_fwd_kernel_inter_diag_compute_solve": {
+   "chunk_kda_fwd_kernel_inter_diag_compute_solve|16|16|128|64|32|128|1|bfloat16|0": {
+    "num_worker_warps": 8,
+    "occupancy": 4
+   },
+   "chunk_kda_fwd_kernel_inter_diag_compute_solve|16|16|128|64|32|128|1|float16|0": {
+    "num_worker_warps": 8,
+    "occupancy": 3
+   },
+   "chunk_kda_fwd_kernel_inter_diag_compute_solve|32|32|128|64|32|128|1|bfloat16|0": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "chunk_kda_fwd_kernel_inter_diag_compute_solve|32|32|128|64|32|128|1|float16|0": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "chunk_kda_fwd_kernel_inter_diag_compute_solve|32|32|64|64|32|64|1|bfloat16|0": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "chunk_kda_fwd_kernel_inter_diag_compute_solve|32|32|64|64|32|64|1|float16|0": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
    "*": {
     "num_worker_warps": 4,
     "occupancy": 4
    }
   },
   "cudnn.linear_attention.cutile.kernels.kda.chunk_kda_fwd_kernel_inter_solve_fused": {
+   "chunk_kda_fwd_kernel_inter_solve_fused|16|16|128|64|32|2|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 2
+   },
+   "chunk_kda_fwd_kernel_inter_solve_fused|16|16|128|64|32|2|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 2
+   },
+   "chunk_kda_fwd_kernel_inter_solve_fused|32|32|128|64|32|2|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "chunk_kda_fwd_kernel_inter_solve_fused|32|32|128|64|32|2|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "chunk_kda_fwd_kernel_inter_solve_fused|32|32|64|64|32|2|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "chunk_kda_fwd_kernel_inter_solve_fused|32|32|64|64|32|2|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
    "*": {
     "num_worker_warps": 4,
     "occupancy": 4
    }
   },
   "cudnn.linear_attention.cutile.kernels.kda.recompute_w_u_fwd_kda_kernel": {
+   "recompute_w_u_fwd_kda_kernel|16|16|128|128|64|32|32|0|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
+   "recompute_w_u_fwd_kda_kernel|16|16|128|128|64|32|32|0|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "recompute_w_u_fwd_kda_kernel|16|16|128|128|64|32|32|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
+   "recompute_w_u_fwd_kda_kernel|16|16|128|128|64|32|32|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 1
+   },
+   "recompute_w_u_fwd_kda_kernel|32|32|128|128|64|32|32|0|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
+   "recompute_w_u_fwd_kda_kernel|32|32|128|128|64|32|32|0|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
+   "recompute_w_u_fwd_kda_kernel|32|32|128|128|64|32|32|1|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "recompute_w_u_fwd_kda_kernel|32|32|128|128|64|32|32|1|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 4
+   },
+   "recompute_w_u_fwd_kda_kernel|32|32|64|64|64|32|32|0|1|bfloat16": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
+   "recompute_w_u_fwd_kda_kernel|32|32|64|64|64|32|32|0|1|float16": {
+    "num_worker_warps": 4,
+    "occupancy": 8
+   },
    "*": {
     "num_worker_warps": 4,
     "occupancy": 8
@@ -604,6 +1008,6 @@
   }
  },
  "packages": {},
- "source": "mamba_ssm kernels: nemotron_3_ultra 96-GPU recording, majority vote over ranks; megatron.core MLA RoPE and mHC kernels: two sweeps timing every candidate at 2k, 8k and 32k tokens, smallest worst-case slowdown; cudnn-frontend cuTile GDN/KDA launch hints: GB300 record sweep (cudnn-frontend#1735 hooks) over 8 shapes (T 512..8192, B 1..4, H 16/32, ragged, head dim 64/128) x bf16/fp16 x 3 repeats, per-kernel majority vote written as a wildcard entry",
+ "source": "mamba_ssm kernels: nemotron_3_ultra 96-GPU recording, majority vote over ranks; megatron.core MLA RoPE and mHC kernels: two sweeps timing every candidate at 2k, 8k and 32k tokens, smallest worst-case slowdown; cudnn-frontend cuTile GDN/KDA and Q/K L2-norm launch hints: GB300 record sweep (cudnn-frontend#1735 hooks) over 8 shapes (T 512..8192, B 1..4, H 16/32, ragged, head dim 64/128) x bf16/fp16 x 15 repeats, use_qk_l2norm_in_kernel on; the launch key carries heads, head dims, tiles and dtype, not T or B, so every recorded key is listed with its majority over the 15 repeats (the recording keeps one winner per key per repeat, the last shape of the sweep that used it) and the wildcard is the majority over the head-dim-128 keys",
  "triton": ""
 }

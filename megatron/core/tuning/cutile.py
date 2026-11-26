@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 
 HOOKS = ("select_hints", "record_hint")
 _unhookable_warned = False
+# Per hook, what this adapter displaced (a host's callback, or None), put back when the policy lets go.
+_previous: dict = {name: None for name in HOOKS}
 
 
 def _common():
@@ -79,10 +81,6 @@ def config_signature(config) -> str:
     return json.dumps(config_data(config), sort_keys=True)
 
 
-def in_scope(module: str, policy: AutotunePolicy) -> bool:
-    return any(module == prefix or module.startswith(prefix + ".") for prefix in policy.modules)
-
-
 def select(kernel, cache_key, configs):
     """``select_hints``: the pinned candidate, or ``None`` to let cudnn-frontend time them."""
     from megatron.core.tuning import interception
@@ -91,11 +89,7 @@ def select(kernel, cache_key, configs):
     if policy is None or not policy.intercepts:
         return None
     module, qualified = qualified_name(kernel)
-    pinned = (
-        policy.mode == "pinned"
-        and in_scope(module, policy)
-        and qualified not in policy.config_invariant
-    )
+    pinned = policy.mode == "pinned" and policy.governs(module, qualified)
     if policy.enumerate_autotuners and len(configs) > 1:
         interception._enumerate(qualified, len(configs), "PINNED" if pinned else "UNPINNED")
     if not pinned:
@@ -103,9 +97,7 @@ def select(kernel, cache_key, configs):
     arch = selection.arch_tag()
     key = shape_key(cache_key)
     if policy.chaos:
-        import random
-
-        chosen = random.choice(configs)
+        chosen = selection.chaos_pick(configs, qualified, key)
     else:
         if arch not in interception._tables:
             interception._tables[arch] = table_mod.load(arch, policy.table_path)
@@ -142,7 +134,7 @@ def record(kernel, cache_key, config):
     if policy is None or not policy.intercepts:
         return
     module, qualified = qualified_name(kernel)
-    if not in_scope(module, policy):
+    if not policy.governs(module, qualified):
         return
     arch = selection.arch_tag()
     key = shape_key(cache_key)
@@ -152,14 +144,49 @@ def record(kernel, cache_key, config):
 
 
 def apply(policy: AutotunePolicy) -> bool:
-    """Bind or clear the hooks for ``policy``; ``True`` when cudnn-frontend is hooked."""
+    """Take the hooks for an intercepting ``policy``, or give back what was displaced; ``True`` when held.
+
+    Ownership is tracked per hook: a host that replaces one of them while the policy holds
+    both keeps that one, and the other is still restored. Taking a hook over drops the launch
+    cache, since the picks in it were made by someone else.
+    """
     common = _common()
     if common is None:
         return False
-    hooked = policy.intercepts
-    common.select_hints = select if hooked else None
-    common.record_hint = record if hooked else None
-    return hooked
+    ours = dict(zip(HOOKS, (select, record)))
+    taken = False
+    for name in HOOKS:
+        current = getattr(common, name)
+        if policy.intercepts:
+            if current is not ours[name]:
+                _previous[name] = current
+                taken = True
+                if current is not None:
+                    logger.warning(
+                        "Megatron's autotune policy takes over cudnn-frontend's cuTile hook %s "
+                        "that another host installed; it returns when the policy stops "
+                        "intercepting.",
+                        name,
+                    )
+            setattr(common, name, ours[name])
+        elif current is ours[name]:
+            setattr(common, name, _previous[name])
+            _previous[name] = None
+    if taken:
+        common.launch_hint_cache.clear()
+    return policy.intercepts
 
 
-__all__ = ["apply", "config_data", "qualified_name", "record", "select", "shape_key"]
+def invalidate() -> None:
+    """Drop cudnn-frontend's cached launch picks, so the next launch of every shape consults the hooks.
+
+    cudnn-frontend asks ``select_hints`` only when a shape misses its launch cache; a pick
+    timed under the previous policy would otherwise outlive the policy change on every rank
+    that made it.
+    """
+    common = _common()
+    if common is not None:
+        common.launch_hint_cache.clear()
+
+
+__all__ = ["apply", "config_data", "invalidate", "qualified_name", "record", "select", "shape_key"]

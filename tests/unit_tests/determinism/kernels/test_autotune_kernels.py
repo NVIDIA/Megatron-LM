@@ -2,16 +2,15 @@
 
 """Bit-exact replay through the Triton autotuner policy and architecture tables."""
 
-import inspect
 import sys
-from weakref import WeakKeyDictionary, WeakSet
 
 import pytest
 import torch
 
-from megatron.core.tuning import interception, selection, table
+from megatron.core.tuning import cutile, interception, selection, table
 from megatron.core.tuning.policy import DEFAULT_CONFIG_INVARIANT, AutotunePolicy
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
+from tests.unit_tests.tuning.isolation import reset_tuning_state
 
 triton = pytest.importorskip("triton")
 import triton.language as tl
@@ -23,24 +22,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 @pytest.fixture
 def isolated_policy(monkeypatch):
     """Restore the prior process-wide adapter, policy, and diagnostics after each replay."""
-    monkeypatch.setattr(Autotuner, "run", inspect.unwrap(Autotuner.run))
-    for name, value in {
-        "_installed": False,
-        "_policy": None,
-        "_tables": {},
-        "_selected_configs": WeakKeyDictionary(),
-        "_scopes": WeakKeyDictionary(),
-        "_logged_singletons": WeakSet(),
-        "_choice_log": {},
-        "_unverified": {},
-        "_verified": {},
-        "_tune_records": {},
-        "_record_rank": None,
-        "_enumerated": set(),
-    }.items():
-        monkeypatch.setattr(interception, name, value)
-    monkeypatch.setattr(selection, "_untuned_kernels_warned", set())
-    monkeypatch.setattr(interception.atexit, "register", lambda *_: None)
+    reset_tuning_state(monkeypatch)
 
 
 @pytest.mark.parametrize("use_table", [False, True], ids=["min_cost", "tuned_table"])
@@ -201,18 +183,35 @@ def test_config_invariant_kernels_are_invariant(monkeypatch):
     )
 
 
+def _cutile_or_skip(monkeypatch):
+    """cudnn-frontend's linear-attention ops and cuTile launch module with the hooks and launch cache
+    reset for the test. Skips without the hooks, and on a CUDA runtime older than the cuTile engine
+    accepts (the same check the engine makes at plan selection, where it would fail instead)."""
+    la_ops = pytest.importorskip("cudnn.linear_attention.ops")
+    engine = pytest.importorskip("cudnn.linear_attention.cutile.engine")
+    common = cutile._common()
+    if common is None:
+        pytest.skip("cudnn-frontend without the cuTile autotune hooks (NVIDIA/cudnn-frontend#1735)")
+    runtime = pytest.importorskip("cuda.bindings.runtime")
+    err, cudart = runtime.cudaRuntimeGetVersion()
+    if int(err) != 0 or cudart < engine.CUTILE_MIN_CUDART:
+        pytest.skip(
+            f"the cuTile engine needs CUDA runtime {engine.CUTILE_MIN_CUDART}, found {cudart}"
+        )
+    for name in cutile.HOOKS:
+        monkeypatch.setattr(common, name, None)
+    common.launch_hint_cache.clear()
+    return la_ops, common
+
+
 def test_cutile_gdn_pinned_pick_replays(isolated_policy, monkeypatch, tmp_path):
     """cudnn-frontend's cuTile GDN engine under the policy: a record run captures the timed
-    launch picks, the merged table pins them, and the pinned op replays bit-exactly from cold
-    launch caches. The cuTile plan is forced through ``plan_name``; on SM100 the default
-    engine is FROST, which has no launch autotune."""
-    la_ops = pytest.importorskip("cudnn.linear_attention.ops")
-    common = pytest.importorskip("cudnn.linear_attention.cutile.kernels.common")
-    if not all(hasattr(common, name) for name in ("select_hints", "record_hint")):
-        pytest.skip("cudnn-frontend without the cuTile autotune hooks (NVIDIA/cudnn-frontend#1735)")
-    for name in ("select_hints", "record_hint"):
-        monkeypatch.setattr(common, name, None)
-    from megatron.core.tuning import table
+    launch picks, the merged table pins them, and the pinned op replays bit-exactly. The launch
+    cache stays warm from the record run: installing the pinned policy must drop the timed picks,
+    or the pinned run would silently keep them. The cuTile plan is forced through ``plan_name``;
+    on SM100 the default engine is FROST, which has no launch autotune."""
+    la_ops, common = _cutile_or_skip(monkeypatch)
+    from megatron.core._rank_utils import safe_get_rank
 
     seeded()
     T, H, K, V = 2048, 16, 128, 128
@@ -225,7 +224,6 @@ def test_cutile_gdn_pinned_pick_replays(isolated_policy, monkeypatch, tmp_path):
     cu_seqlens = torch.tensor([0, T], device="cuda", dtype=torch.int32)
 
     def gdn(q, k, v, g, beta):
-        common.launch_hint_cache.clear()  # every call tunes, or is handed the pinned pick
         return la_ops.gated_delta_net(
             q, k, v, g, beta, cu_seqlens, output_final_state=True, plan_name="gdn_cutile"
         )
@@ -242,13 +240,19 @@ def test_cutile_gdn_pinned_pick_replays(isolated_policy, monkeypatch, tmp_path):
     }
     assert recorded, "the record run captured no cuTile launch pick"
     interception._dump_records()
-    merged = table.merge_records([tmp_path / "rec.rank0.json"])
+    merged = table.merge_records(
+        [interception._record_file(str(tmp_path / "rec"), safe_get_rank())]
+    )
     (arch,) = merged
     table.write(arch, merged[arch], tmp_path / "tables" / f"{arch}.json")
 
+    assert common.launch_hint_cache, "the record run left no warm launch picks to invalidate"
     interception.install(
         AutotunePolicy(mode="pinned", table_path=(str(tmp_path / "tables"),), on_miss="error")
     )
+    assert (
+        common.launch_hint_cache == {}
+    ), "installing a new policy must drop the cached launch picks"
     assert_replays_bit_exact(
         gdn, (q, k, v, g, beta), replays=3, what="cuTile GDN pinned from table"
     )
@@ -261,18 +265,11 @@ def test_cutile_gdn_pinned_pick_replays(isolated_policy, monkeypatch, tmp_path):
 
 
 def test_cutile_packaged_table_pins_gdn_and_kda(isolated_policy, monkeypatch):
-    """The packaged table pins every cuTile GDN and KDA launch on this architecture with no user table:
-    ``on_miss="error"`` would raise on the first miss."""
-    la_ops = pytest.importorskip("cudnn.linear_attention.ops")
-    common = pytest.importorskip("cudnn.linear_attention.cutile.kernels.common")
-    if not all(hasattr(common, name) for name in ("select_hints", "record_hint")):
-        pytest.skip("cudnn-frontend without the cuTile autotune hooks (NVIDIA/cudnn-frontend#1735)")
-    from megatron.core.tuning import selection
-
+    """The packaged table pins every cuTile GDN and KDA launch on this architecture with no user table,
+    in-kernel Q/K normalization included: ``on_miss="error"`` would raise on the first miss."""
+    la_ops, common = _cutile_or_skip(monkeypatch)
     if selection.arch_tag() != "sm103":
         pytest.skip("packaged cuTile entries exist for sm103 only")
-    for name in ("select_hints", "record_hint"):
-        monkeypatch.setattr(common, name, None)
     interception.install(AutotunePolicy(mode="pinned", on_miss="error"))
     seeded()
     T, H, K, V = 2048, 16, 128, 128
@@ -293,9 +290,19 @@ def test_cutile_packaged_table_pins_gdn_and_kda(isolated_policy, monkeypatch):
         ("gdn_cutile", la_ops.gated_delta_net, ((T, H), (T, H))),
         ("kda_cutile", la_ops.kimi_delta_attention, ((T, H, K), (T, H))),
     ):
-        common.launch_hint_cache.clear()
         q, k, v, g, beta = leaves(*shapes)
-        o, state = op(q, k, v, g, beta, cu_seqlens, output_final_state=True, plan_name=name)
+        # In-kernel Q/K normalization launches every kernel of the plain path plus the two l2norm ones.
+        o, state = op(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+            plan_name=name,
+        )
         (o.float().sum() + state.float().sum()).backward()
         torch.cuda.synchronize()
     pinned = {
@@ -303,5 +310,10 @@ def test_cutile_packaged_table_pins_gdn_and_kda(isolated_policy, monkeypatch):
         for entry, value in interception.choice_log().items()
         if "cudnn.linear_attention.cutile." in entry and value.endswith(";pinned")
     }
-    assert pinned, "no cuTile launch was pinned from the packaged table"
-    assert all(".kernels.gdn." in k or ".kernels.kda." in k for k in pinned), pinned
+    packaged = {
+        kernel
+        for kernel in table.load("sm103", ()).kernels
+        if kernel.startswith("cudnn.linear_attention.cutile.")
+    }
+    # Every packaged cuTile entry was used, and nothing was pinned that the table does not carry.
+    assert pinned == packaged, pinned ^ packaged

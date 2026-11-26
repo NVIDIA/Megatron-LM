@@ -126,13 +126,27 @@ kernels alike; every choice is logged for the agreement check. Kernels are
 keyed by their qualified name (`cudnn.linear_attention.cutile.kernels.gdn.<kernel>`)
 and the launch's shape key, which carries no device. The scope prefix is `cudnn`.
 A cudnn-frontend without the hooks keeps its timed picks, with one warning.
-The packaged `sm103` table carries one wildcard entry per cuTile GDN and KDA
-kernel, the majority winner of a GB300 record sweep over eight shapes, two
-dtypes and three repeats, so a pinned run on GB300 never falls back to the
-first candidate (the fallback costs up to 28% on the GDN forward output kernel
-at 4k tokens). `sm100` has no cuTile entries yet: record one on a B200 and
-merge it. A shape-keyed entry from a user table takes precedence over the
-wildcard.
+cudnn-frontend consults the hooks only when a shape misses its launch cache, so
+every policy change drops that cache: a pick timed before `install(mode="pinned")`
+does not outlive the installation on any rank. Hooks another host installed
+before Megatron are left in place while the policy does not intercept, and
+restored when an intercepting policy is replaced by one that does not.
+The packaged `sm103` table carries entries for every cuTile kernel the GDN
+and KDA plans launch, the Q/K normalization kernels of `use_qk_l2norm_in_kernel`
+included. The launch key names the heads, head dims, tile sizes and dtype, not
+the token count or batch, so a GB300 record sweep over eight shapes, two dtypes
+and 15 repeats covers a kernel with few keys: each recorded key carries its
+majority winner over the repeats (one timing per key and repeat), and a wildcard carries the majority over the head-dim-128
+keys for any other. Several winners follow the head dim (for the l2norm
+backward kernel occupancy 4 wins the vote of every head-dim-128 key and
+occupancy 8 wins every head-dim-64 key, 15 of 15 for all but one key; the
+forward kernel is 8 at head dim 64 in every repeat and a near-even split at
+head dim 128, where occupancy 8 won 18 of 30), which is why the keys are listed
+rather than one wildcard. A pinned run on GB300
+therefore never falls back to the first candidate (the fallback costs up to
+28% on the GDN forward output kernel at 4k tokens). `sm100` has no cuTile
+entries yet: record one on a B200 and merge it. A key from a user table takes
+precedence over the packaged one.
 
 ## Modes and precedence
 
