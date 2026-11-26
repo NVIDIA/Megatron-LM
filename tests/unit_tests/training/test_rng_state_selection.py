@@ -148,3 +148,16 @@ def test_single_stored_entry_is_used_on_a_nonzero_dp_rank():
     # saved with per-rank states off, resumed with them on: DP rank 1 must not index past the list.
     states = _states(1)
     assert checkpointing._select_rng_state(states, True, _group(1, 2), _group(1, 2)) is states[0]
+
+
+def test_sidecarless_singleton_is_restored_on_dp_rank_1_regardless_of_active_flag():
+    # Older DP=2 checkpoint without run_config.yaml, saved with data_parallel_random_init=False.
+    per_dp = checkpointing._checkpoint_has_per_dp_rng_states(None, default=True)
+    states = _states(1)
+    assert checkpointing._select_rng_state(states, per_dp, _group(1, 2), _group(1, 2)) is states[0]
+
+
+def test_sidecarless_legacy_per_dp_list_is_still_indexed_by_dp_rank():
+    per_dp = checkpointing._checkpoint_has_per_dp_rng_states(None, default=True)
+    states = _states(2)
+    assert checkpointing._select_rng_state(states, per_dp, _group(1, 2), _group(1, 2)) == {"id": 1}

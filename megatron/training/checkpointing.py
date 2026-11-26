@@ -3164,7 +3164,7 @@ def load_checkpoint(
 
         load_dp_rng_states = _checkpoint_has_per_dp_rng_states(
             checkpoint_config,
-            default=cfg.checkpoint.save_rng_state_per_dp_rank or cfg.rng.data_parallel_random_init,
+            default=True,
         )
 
         # Determine if RNG state will be loaded
@@ -3415,11 +3415,11 @@ def load_checkpoint(
         load_kwargs['sharded_state_dict'] = sharded_state_dict
     elif load_format == 'fsdp_dtensor':
         reader = FileSystemReader(get_load_checkpoint_path(load_dir, checkpoint))
-        # Layout comes from the checkpoint's saved run config; checkpoints without one fall back
-        # to the active run's policy.
+        # Layout comes from the checkpoint's saved run config; checkpoints without one are read
+        # by stored list length (see _select_rng_state), never by the active save policy.
         load_dp_rng_states = _checkpoint_has_per_dp_rng_states(
             checkpoint_config,
-            default=cfg.checkpoint.save_rng_state_per_dp_rank or cfg.rng.data_parallel_random_init,
+            default=True,
         )
         try:
             state_dict_metadata = reader.read_metadata().state_dict_metadata
@@ -3539,7 +3539,7 @@ def load_checkpoint(
     # Legacy ('torch') loads skip the torch_dist/fsdp_dtensor branches that set this earlier.
     load_dp_rng_states = _checkpoint_has_per_dp_rng_states(
         checkpoint_config,
-        default=cfg.checkpoint.save_rng_state_per_dp_rank or cfg.rng.data_parallel_random_init,
+        default=True,
     )
     validate_glu_layout(state_dict, release)
     state_dict = prepare_glu_checkpoint_for_load(state_dict, args)
@@ -4045,7 +4045,9 @@ def _checkpoint_has_per_dp_rng_states(run_config: Optional[dict[str, Any]], defa
     """Return whether a checkpoint stores one RNG state per DP/CP rank.
 
     ``run_config`` is the run config saved with the checkpoint (None for checkpoints written
-    before it was saved, in which case ``default`` is returned).
+    before it was saved, in which case ``default`` is returned). Callers pass ``default=True``
+    there: the active run's save flags say nothing about an older checkpoint, and
+    ``_select_rng_state`` reads a singleton list as a single shared state either way.
     """
     if run_config is None:
         return bool(default)
