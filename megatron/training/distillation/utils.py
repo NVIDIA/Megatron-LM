@@ -288,7 +288,7 @@ def compute_dataset_hash(
     """Compute the dataset-identity hash for the current training run.
 
     The fields included are exactly those that determine the global sample
-    stream itself: ``seed``, ``train_samples`` (with a fall-back to
+    stream itself: ``seed`` (the dataset's ``random_seed``), ``train_samples`` (with a fall-back to
     ``train_iters * global_batch_size``), and the data ``blend``.
     """
     cfg = get_run_config() if cfg is None else cfg
@@ -300,7 +300,7 @@ def compute_dataset_hash(
             train_samples = int(train_iters) * int(global_batch_size)
 
     identifiers = OrderedDict()
-    identifiers["seed"] = cfg.rng.seed
+    identifiers["seed"] = cfg.data.dataset.random_seed
     identifiers["train_samples"] = train_samples
     identifiers["blend"] = _blend_identifiers(cfg.data.dataset)
 

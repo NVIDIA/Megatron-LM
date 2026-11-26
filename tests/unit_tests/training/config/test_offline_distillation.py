@@ -7,6 +7,7 @@ import copy
 import pytest
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.training import global_vars
 from megatron.training.config import LogitsLoadConfig, LogitsSaveConfig, OfflineDistillationConfig
 from megatron.training.models.distillation import DistillationConfig
 
@@ -22,6 +23,7 @@ def offline_run_config(run_config):
         reset_attention_mask=False,
         eod_mask_loss=False,
     )
+    run_config.checkpoint.save = "/save"
     run_config.checkpoint.async_save = True
     run_config.checkpoint.use_persistent_ckpt_worker = True
     return run_config
@@ -45,11 +47,18 @@ def test_valid_offline_run_validation_is_read_only(offline_run_config, phase):
 
 
 @pytest.mark.parametrize("phase", ["teacher_save", "student_load"])
-@pytest.mark.parametrize("schedule", ["rampup_batch_size", "step_batch_size_schedule"])
-def test_batch_schedules_are_rejected(offline_run_config, phase, schedule):
+@pytest.mark.parametrize(
+    "schedule,value",
+    [
+        ("rampup_batch_size", [8, 8, 1000]),
+        ("step_batch_size_schedule", "0:8 1K:16"),
+        ("decrease_batch_size_if_needed", True),
+    ],
+)
+def test_batch_schedules_are_rejected(offline_run_config, phase, schedule, value):
     cfg = offline_run_config
     cfg.offline_distillation = _phase_config(phase)
-    setattr(cfg.train, schedule, [8, 8, 1000] if schedule == "rampup_batch_size" else "0:8 1K:16")
+    setattr(cfg.train, schedule, value)
     with pytest.raises(ValueError, match="fixed global batch"):
         cfg.validate()
 
@@ -82,3 +91,24 @@ def test_offline_run_requires_a_dataset_for_cache_identity(offline_run_config):
     cfg.data.dataset = None
     with pytest.raises(ValueError, match="cfg.data.dataset"):
         cfg.validate()
+
+
+def test_saving_requires_a_checkpoint_save_directory(offline_run_config):
+    cfg = offline_run_config
+    cfg.offline_distillation = _phase_config("teacher_save")
+    cfg.checkpoint.save = None
+    with pytest.raises(ValueError, match="checkpoint.save"):
+        cfg.validate()
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_saving_from_a_trainable_model_warns_at_finalize(
+    monkeypatch, offline_run_config, caplog, frozen
+):
+    cfg = offline_run_config
+    cfg.offline_distillation = _phase_config("teacher_save")
+    cfg.train.freeze_all_layers = frozen
+    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
+    with caplog.at_level("WARNING", logger="megatron.training.config.container"):
+        cfg.finalize()
+    assert ("without train.freeze_all_layers" in caplog.text) is not frozen

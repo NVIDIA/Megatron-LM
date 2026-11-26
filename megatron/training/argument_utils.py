@@ -1215,26 +1215,13 @@ def fault_tolerance_config_from_args(args: Namespace) -> FaultToleranceConfig:
 
 
 def offline_distillation_config_from_args(args: Namespace) -> OfflineDistillationConfig | None:
-    """Translate the existing logits CLI flags once, at the run-config boundary."""
+    """Translate the ``--logits-save-*`` / ``--logits-load-*`` flags into the run's section."""
     teacher_save = None
     student_load = None
-    if getattr(args, "logits_save_dir", None) is not None:
-        teacher_save = LogitsSaveConfig(
-            directory=args.logits_save_dir,
-            top_k=args.logits_save_top_k,
-            top_p=args.logits_save_top_p,
-            min_k=args.logits_save_top_p_min_k,
-            dtype=args.logits_save_dtype,
-        )
-    if getattr(args, "logits_load_dir", None) is not None:
-        student_load = LogitsLoadConfig(
-            directory=args.logits_load_dir,
-            loss_alpha=args.logits_load_kd_loss_alpha,
-            decode_threads=args.logits_load_decode_threads,
-            msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
-            ignore_errors=args.logits_load_ignore_errors,
-            ignore_hash=args.logits_load_ignore_hash,
-        )
+    if getattr(args, "logits_save_directory", None) is not None:
+        teacher_save = _default_config_from_args(LogitsSaveConfig, args, prefix="logits_save")
+    if getattr(args, "logits_load_directory", None) is not None:
+        student_load = _default_config_from_args(LogitsLoadConfig, args, prefix="logits_load")
     if teacher_save is None and student_load is None:
         return None
     config = OfflineDistillationConfig(teacher_save=teacher_save, student_load=student_load)

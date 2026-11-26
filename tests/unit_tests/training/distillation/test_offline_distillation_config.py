@@ -96,6 +96,8 @@ def test_cli_rejects_both_phases_and_disables_kd_without_either():
     "config,message",
     [
         (LogitsSaveConfig(directory=""), "directory"),
+        (LogitsSaveConfig(), "directory"),
+        (LogitsLoadConfig(), "directory"),
         (LogitsSaveConfig(directory="/cache", top_k=0), "top_k"),
         (LogitsSaveConfig(directory="/cache", top_p=0), "top_p"),
         (LogitsSaveConfig(directory="/cache", top_k=2, min_k=3), "min_k"),
@@ -113,10 +115,13 @@ def test_invalid_cache_settings_fail_before_runtime(config, message):
 def test_dataset_identity_preserves_the_existing_cache_schema():
     cfg = SimpleNamespace(
         train=TrainingConfig(train_iters=5, micro_batch_size=1, global_batch_size=8),
-        rng=SimpleNamespace(seed=1234),
+        # The dataset's own seed orders the samples; the RNG seed may differ in a config.
+        rng=SimpleNamespace(seed=99),
         data=SimpleNamespace(
             dataset=SimpleNamespace(
-                blend=(["/new/mount/a", "/new/mount/b"], [0.25, 0.75]), blend_per_split=None
+                random_seed=1234,
+                blend=(["/new/mount/a", "/new/mount/b"], [0.25, 0.75]),
+                blend_per_split=None,
             )
         ),
     )

@@ -79,13 +79,15 @@ offline_distillation:
 
 Batch sizes stay in `train`, dataset and packing settings in `data`, and progress in
 `TrainState`; these are not duplicated in the offline KD config. Both phases require a
-fixed global batch size (no ramp-up or step batch-size schedule) and a configured
-`data.dataset`. Freezing is an independent training setting: `teacher_save` can also
+fixed global batch size (no ramp-up, step batch-size schedule or
+`decrease_batch_size_if_needed`) and a configured `data.dataset`; `teacher_save` also
+requires `checkpoint.save`, since logits flush with checkpoint saves. Freezing is an independent training setting: `teacher_save` can also
 capture logits during active training when `train.freeze_all_layers` is false.
 Frozen runs disable distributed-optimizer and parameter-gather overlap flags before
 checking their prerequisites, so a teacher dump can reuse those settings from a
 training recipe. Validation checks a temporary copy; finalization updates the run
-config and warns about settings it disables.
+config and warns about settings it disables, and about a `teacher_save` run whose layers
+are not frozen.
 
 The existing `--logits-save-*`, `--logits-load-*`, and `--freeze-all-layers` CLI flags
 remain supported. They populate these config sections once; the saver, reader, and loss
@@ -105,7 +107,7 @@ asynchronously as `.tar` shards (zstd-compressed, one shard per DP rank per flus
 through Megatron's async checkpoint queue: the flush is enqueued from
 `save_checkpoint()` (`megatron/training/checkpointing.py`), so **buffered logits are
 written to disk at the same cadence as regular checkpoints, i.e. every
-`--save-interval` iterations** — not every iteration. This requires `--async-save`
+`--save-interval` iterations** — not every iteration. This requires `--save`, `--async-save`
 and `--use-persistent-ckpt-worker` to be set, since the write itself piggybacks on
 the async checkpoint worker rather than running inline. A dedicated teacher-dump run
 should also pass `--freeze-all-layers`; without it, the model keeps training (LM loss
@@ -161,7 +163,7 @@ load-side microbatch, which saved DP-rank shard(s) and row ranges to read.
 
 | Argument | Description |
 | --- | --- |
-| `--logits-save-dir` | Directory (local path or `msc://` object-store URL) to save top-K log-probs to. Requires `--async-save` and `--use-persistent-ckpt-worker`; buffered logits are flushed as an async request on the checkpoint queue, so they hit disk on the same `--save-interval` cadence as regular checkpoints. Incompatible with `--rampup-batch-size` (the sample↔iteration mapping assumes a fixed global batch size). |
+| `--logits-save-dir` | Directory (local path or `msc://` object-store URL) to save top-K log-probs to. Requires `--save`, `--async-save` and `--use-persistent-ckpt-worker`; buffered logits are flushed as an async request on the checkpoint queue, so they hit disk on the same `--save-interval` cadence as regular checkpoints. Incompatible with `--rampup-batch-size` (the sample↔iteration mapping assumes a fixed global batch size). |
 | `--logits-save-top-k` | Number of top log-probs to save per token. Default: `128`. |
 | `--logits-save-top-p` | Optional top-P (nucleus) threshold applied after top-K selection — keeps only the smallest prefix of entries whose cumulative probability mass reaches this value. Must be in `(0, 1]`. Default: `None` (disabled). |
 | `--logits-save-top-p-min-k` | Minimum entries kept per token when top-P masking is active, regardless of cumulative mass. Default: `1`. |
@@ -181,8 +183,9 @@ load-side microbatch, which saved DP-rank shard(s) and row ranges to read.
 
 ## Assumptions and Restrictions
 
-- The student run must use the **same random seed and data pipeline** as the teacher run
-  that produced the cached log-probs, so the global sample ordering matches.
+- The student run must use the **same dataset seed (`data.dataset.random_seed`) and data
+  pipeline** as the teacher run that produced the cached log-probs, so the global sample
+  ordering matches.
 - Teacher data must be saved with payload `format_version >= 2` for full DP/MBS/GBS
   resharding support. Older `format_version == 1` shards are still readable but are
   restricted to DP-only resharding, via a legacy reader slated for removal once existing

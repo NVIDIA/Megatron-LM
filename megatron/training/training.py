@@ -3498,10 +3498,7 @@ def training_log(
 ):
     """Log training information such as losses, timing, ...."""
     callback_manager = normalize_callbacks(callback_manager)
-    args = get_args()
     train_state = get_train_state()
-    # Temporary args/config duplication during the training-loop refactor:
-    # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
     sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
