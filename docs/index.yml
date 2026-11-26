@@ -94,6 +94,9 @@ navigation:
       - page: "Distributed Optimizer"
         path: ./user-guide/features/dist_optimizer.md
         slug: dist-optimizer
+      - page: "Muon Optimizer"
+        path: ./user-guide/features/muon.md
+        slug: muon
       - page: "Checkpoint Merge"
         path: ./user-guide/features/checkpoint-merge.md
         slug: checkpoint-merge
