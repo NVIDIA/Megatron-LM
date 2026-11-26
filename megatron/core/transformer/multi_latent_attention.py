@@ -46,7 +46,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.attention import Attention, LinearProjBuilder
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module, name_kwarg_if_accepted
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
@@ -403,7 +403,9 @@ class MultiLatentAttention(Attention):
             v_channels=self.config.v_head_dim,
             cp_comm_type=cp_comm_type,
             pg_collection=self.pg_collection,
-            name=(name + ".core_attention") if name is not None else None,
+            **name_kwarg_if_accepted(
+                submodules.core_attention, (name + ".core_attention") if name is not None else None
+            ),
         )
 
         # Output.

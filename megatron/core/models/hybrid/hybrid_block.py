@@ -230,6 +230,9 @@ class HybridStack(MegatronModule):
         self.layers = nn.ModuleList()
         for i, layer_config in enumerate(self.layer_config_list):
             layer_number = i + 1 + pp_layer_offset
+            # Global, pipeline-aware name shared by every layer type, so per-module recipes and
+            # finish_init() see the same name for this layer on every pipeline stage.
+            layer_name = f"{name}.layers.{i + pp_layer_offset}" if name is not None else None
             quant_init_context = get_quantization_context(
                 layer_config, i + pp_layer_offset, is_init=True
             )
@@ -243,7 +246,7 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         is_mtp_layer=is_mtp_layer,
                         mtp_layer_number=mtp_layer_number,
-                        name=(name + f".layers.{i}") if name is not None else None,
+                        name=layer_name,
                     )
                     if (
                         layer.config is not layer_config
@@ -263,9 +266,7 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
-                        name=(
-                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
-                        ),
+                        name=layer_name,
                     )
                 elif type(layer_config) is layer_utils.AttentionLayerConfig:
                     self._assert_submodule_configured(submodules, "attention_layer")
@@ -277,9 +278,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                        name=(
-                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
-                        ),
+                        name=layer_name,
                     )
                 elif type(layer_config) is layer_utils.DSALayerConfig:
                     self._assert_submodule_configured(submodules, "dsa_layer")
@@ -291,9 +290,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                        name=(
-                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
-                        ),
+                        name=layer_name,
                     )
                 elif type(layer_config) is layer_utils.CSALayerConfig:
                     csa_layer_spec_name = (
@@ -309,9 +306,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                        name=(
-                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
-                        ),
+                        name=layer_name,
                     )
                 elif type(layer_config) is layer_utils.MLALayerConfig:
                     mla_layer_spec_name = (
@@ -329,9 +324,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                        name=(
-                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
-                        ),
+                        name=layer_name,
                     )
                 elif type(layer_config) is layer_utils.MLPLayerConfig:
                     self._assert_submodule_configured(submodules, "mlp_layer")
@@ -342,9 +335,7 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
-                        name=(
-                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
-                        ),
+                        name=layer_name,
                     )
                 elif type(layer_config) is layer_utils.MoELayerConfig:
                     self._assert_submodule_configured(submodules, "moe_layer")
@@ -356,9 +347,7 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         hash_moe_layer_threshold=hash_moe_layer_threshold,
-                        name=(
-                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
-                        ),
+                        name=layer_name,
                     )
                 elif type(layer_config) is layer_utils.GDNLayerConfig:
                     gdn_layer_spec_name = (
@@ -377,7 +366,7 @@ class HybridStack(MegatronModule):
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                        name=(name + f".layers.{i}") if name is not None else None,
+                        name=layer_name,
                     )
                 elif type(layer_config) is layer_utils.KDALayerConfig:
                     self._assert_submodule_configured(submodules, "kda_layer")
@@ -390,9 +379,7 @@ class HybridStack(MegatronModule):
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                        name=(
-                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
-                        ),
+                        name=layer_name,
                     )
                 else:
                     raise ValueError(

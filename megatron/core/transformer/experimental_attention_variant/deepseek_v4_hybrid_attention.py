@@ -29,7 +29,7 @@ from megatron.core.transformer.experimental_attention_variant.csa import (
     CompressedSparseAttentionBuilder,
 )
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module, name_kwarg_if_accepted
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import get_pg_size, is_te_min_version
@@ -209,7 +209,9 @@ class DSv4HybridAttention(Attention):
             rotary_pos_emb=self.rotary_pos_emb,
             compress_ratio=compress_ratio,
             is_mtp_layer=is_mtp_layer,
-            name=(name + ".core_attention") if name is not None else None,
+            **name_kwarg_if_accepted(
+                submodules.core_attention, (name + ".core_attention") if name is not None else None
+            ),
         )
 
         # Output.

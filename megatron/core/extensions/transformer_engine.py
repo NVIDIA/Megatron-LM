@@ -44,7 +44,7 @@ from megatron.core.process_groups_config import (
 )
 from megatron.core.quantization.custom_recipe import get_cached_custom_recipe
 from megatron.core.quantization.quant_config import QuantizationConfig
-from megatron.core.quantization.utils import get_quant_config_or_none, is_custom_recipe_selected
+from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import suspend_tensor_observations
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -623,15 +623,16 @@ def _te_name_kwarg(
     MCore uses ``name`` for its own per-module quantization matcher on every supported TE
     version, but only recent TE takes it as a constructor argument and exposes it to a custom
     recipe's quantizer factory as ``QuantizerRole.name``. Older TE raises ``TypeError`` on the
-    keyword, so BF16 and built-in FP8/FP4 runs simply omit it. A custom recipe may select
-    quantizers by module name, so dropping the name there would silently apply the wrong
-    policy; raise instead.
+    keyword, so BF16 and built-in FP8/FP4 runs simply omit it. A ``--custom-recipe`` factory
+    may select quantizers by module name, so dropping the name there would silently apply the
+    wrong policy; raise instead. The deprecated ``--fp8-recipe custom`` / ``--fp4-recipe custom``
+    factories never received module names, so they keep working on older TE without them.
     """
     if name is None:
         return {}
     if _te_constructor_accepts_name(te_class):
         return {"name": name}
-    if is_custom_recipe_selected(config):
+    if config.custom_recipe is not None:
         raise RuntimeError(
             f"Transformer Engine {get_te_version()} does not accept a 'name' argument in "
             f"{te_class.__name__}, so a custom recipe's quantizer factory cannot select "
@@ -1543,6 +1544,9 @@ class TELinear(te.pytorch.Linear):
                 tp_group_for_te = None
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
+        # Global name used to pick the per-module recipe; the model's later finish_init()
+        # pass reuses it because named_modules() paths restart on every pipeline stage.
+        self.quant_module_name = name
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
@@ -1771,6 +1775,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
+        # Global name used to pick the per-module recipe; the model's later finish_init()
+        # pass reuses it because named_modules() paths restart on every pipeline stage.
+        self.quant_module_name = name
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
@@ -3066,6 +3073,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 )
 
             self.te_quant_params: Optional[TEQuantizationParams] = None
+            # Global name used to pick the per-module recipe; the model's later finish_init()
+            # pass reuses it because named_modules() paths restart on every pipeline stage.
+            self.quant_module_name = name
             quant_config = get_quant_config_or_none(name, config.quant_recipe)
             self.finish_init(quant_config)
             init_quant_context = _get_fp8_model_init_for_quant_params(

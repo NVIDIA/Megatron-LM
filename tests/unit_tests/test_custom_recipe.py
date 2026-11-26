@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions import transformer_engine as te_extension
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -553,6 +554,65 @@ def test_te_name_kwarg_raises_for_custom_recipe_on_older_te():
 
 
 @pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize(
+    "config_kwargs",
+    [
+        pytest.param(
+            {"fp8": "hybrid", "fp8_recipe": "custom", "fp8_quantizer_factory": TEST_FACTORY_PATH},
+            id="legacy-fp8",
+        ),
+        pytest.param(
+            {"fp4": "e2m1", "fp4_recipe": "custom", "fp4_quantizer_factory": TEST_FACTORY_PATH},
+            id="legacy-fp4",
+        ),
+    ],
+)
+def test_te_name_kwarg_is_omitted_for_legacy_custom_recipe_on_older_te(config_kwargs):
+    """The deprecated custom-recipe flags never passed module names, so older TE keeps working.
+
+    Raising here would break GPT construction on TE releases whose DotProductAttention has
+    no ``name`` argument, even with FP8 attention disabled.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        warnings.simplefilter("ignore", DeprecationWarning)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, **config_kwargs
+        )
+    name = "decoder.layers.0.self_attention.core_attention"
+    assert te_extension._te_name_kwarg(_NameLessTELinear, name, config) == {}
+
+
+class _NameLessCoreAttention:
+    """Stand-in for a pluggable core attention whose constructor predates ``name``."""
+
+    def __init__(self, config, layer_number, attn_mask_type=None):
+        pass
+
+
+class _KwargsCoreAttention:
+    def __init__(self, config, **kwargs):
+        pass
+
+
+def test_name_kwarg_if_accepted_only_forwards_names_modules_can_take():
+    """Core attentions without a ``name`` parameter must still build (e.g. DSA over GQA)."""
+    from functools import partial
+
+    from megatron.core.transformer.dot_product_attention import DotProductAttention
+    from megatron.core.transformer.spec_utils import ModuleSpec, name_kwarg_if_accepted
+
+    name = "decoder.layers.0.self_attention.core_attention"
+    assert name_kwarg_if_accepted(_NameLessCoreAttention, name) == {}
+    assert name_kwarg_if_accepted(ModuleSpec(module=_NameLessCoreAttention), name) == {}
+    assert name_kwarg_if_accepted(partial(_NameLessCoreAttention, layer_number=1), name) == {}
+    assert name_kwarg_if_accepted(_KwargsCoreAttention, name) == {"name": name}
+    assert name_kwarg_if_accepted(DotProductAttention, name) == {"name": name}
+    assert name_kwarg_if_accepted(ModuleSpec(module=DotProductAttention), name) == {"name": name}
+    assert name_kwarg_if_accepted(DotProductAttention, None) == {}
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
 def test_te_name_kwarg_is_forwarded_when_supported():
     config = TransformerConfig(
         num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
@@ -611,7 +671,7 @@ def _layer_indices_in_names(names, suffix="self_attention.linear_qkv"):
 
 
 def _pp_naming_config(**kwargs):
-    return TransformerConfig(
+    settings = dict(
         num_layers=4,
         hidden_size=128,
         ffn_hidden_size=256,
@@ -620,8 +680,9 @@ def _pp_naming_config(**kwargs):
         hidden_dropout=0.0,
         params_dtype=torch.bfloat16,
         pipeline_dtype=torch.bfloat16,
-        **kwargs,
     )
+    settings.update(kwargs)
+    return TransformerConfig(**settings)
 
 
 @pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
@@ -641,7 +702,8 @@ def test_layer_names_are_global_across_pipeline_stages():
             config, get_gpt_layer_with_transformer_engine_spec(), name="decoder"
         )
         indices = _layer_indices_in_names(_te_module_names(block))
-        pp_rank = torch.distributed.get_rank()
+        # Rank within the pipeline group: several global ranks share each stage.
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         expected = [0, 1] if pp_rank == 0 else [2, 3]
         assert indices == expected, f"pp_rank={pp_rank} got {indices}, expected {expected}"
     finally:
@@ -658,7 +720,8 @@ def test_layer_names_are_global_across_virtual_pipeline_stages():
         config = _pp_naming_config(
             pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
         )
-        pp_rank = torch.distributed.get_rank()
+        # Rank within the pipeline group: several global ranks share each stage.
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         seen = {}
         for vp_stage in range(2):
             block = TransformerBlock(
@@ -674,6 +737,150 @@ def test_layer_names_are_global_across_virtual_pipeline_stages():
         # Every emitted index is unique model-wide, which is the property factories rely on.
         flat = seen[0] + seen[1]
         assert len(set(flat)) == len(flat), seen
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _record_finish_init_names(model_module, build):
+    """Build a model and return {module: name} for the names its finish_init() pass used."""
+    from megatron.core.quantization.utils import get_quant_config_or_none
+
+    seen_names = []
+
+    def record(name, recipe=None):
+        seen_names.append(name)
+        return get_quant_config_or_none(name, recipe)
+
+    with patch.object(model_module, "get_quant_config_or_none", side_effect=record):
+        model = build()
+    finish_init_modules = [
+        (path, module) for path, module in model.named_modules() if hasattr(module, "finish_init")
+    ]
+    assert len(seen_names) == len(finish_init_modules)
+    return model, [
+        (path, module, name) for (path, module), name in zip(finish_init_modules, seen_names)
+    ]
+
+
+def _layer_index(name):
+    return int(name.split(".layers.")[1].split(".")[0])
+
+
+def _build_gpt(config, mtp_num_layers=None):
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
+
+    spec = get_gpt_layer_with_transformer_engine_spec()
+    mtp_block_spec = (
+        get_gpt_mtp_block_spec(config=config, spec=spec, use_transformer_engine=True)
+        if mtp_num_layers
+        else None
+    )
+    return GPTModel(
+        config=config,
+        transformer_layer_spec=spec,
+        vocab_size=128,
+        max_sequence_length=16,
+        pre_process=parallel_state.is_pipeline_first_stage(),
+        post_process=parallel_state.is_pipeline_last_stage(),
+        mtp_block_spec=mtp_block_spec,
+    )
+
+
+def _build_hybrid(config, pattern):
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    return HybridModel(
+        config=config,
+        hybrid_stack_spec=hybrid_stack_spec,
+        vocab_size=128,
+        max_sequence_length=16,
+        hybrid_layer_pattern=pattern,
+        pre_process=parallel_state.is_pipeline_first_stage(),
+        post_process=parallel_state.is_pipeline_last_stage(),
+    )
+
+
+def _hybrid_naming_config(**kwargs):
+    # Small GDN heads keep the model cheap; GDN construction does not need FLA kernels.
+    return _pp_naming_config(
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        **kwargs,
+    )
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
+def test_finish_init_reuses_global_layer_names_across_pipeline_stages(model_type):
+    """GPTModel/HybridModel finish_init() must match recipes with the construction-time name.
+
+    named_modules() restarts layer numbering on each pipeline stage. Re-matching recipes with
+    that path would replace the recipe chosen when the weights were allocated, e.g. stage 1's
+    first layer would be treated as decoder.layers.0 instead of decoder.layers.2.
+    """
+    from megatron.core.models.gpt import gpt_model
+    from megatron.core.models.hybrid import hybrid_model
+
+    Utils.initialize_model_parallel(1, 2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        if model_type == "gpt":
+            config = _pp_naming_config(pipeline_model_parallel_size=2)
+            _, records = _record_finish_init_names(gpt_model, lambda: _build_gpt(config))
+        else:
+            # Covers the custom-layer-free GDN branch, which used stage-local names, and the
+            # attention/MLP branches. One GDN, attention and MLP layer on each stage.
+            config = _hybrid_naming_config(pipeline_model_parallel_size=2, num_layers=6)
+            _, records = _record_finish_init_names(
+                hybrid_model, lambda: _build_hybrid(config, "G*-|G*-")
+            )
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        layer_records = [record for record in records if ".layers." in record[0]]
+        assert layer_records
+        for path, module, name in layer_records:
+            assert name == module.quant_module_name, (path, name)
+            # Stage-local path index plus this stage's offset gives the global index.
+            offset = pp_rank * (2 if model_type == "gpt" else 3)
+            assert _layer_index(name) == _layer_index(path) + offset, (path, name)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("model_type", ["gpt", "gpt-mtp", "hybrid"])
+def test_finish_init_names_match_module_paths_without_pipelining(model_type):
+    """Without pipelining, construction-time names must equal named_modules() paths.
+
+    finish_init() now prefers the construction-time name; this pins that doing so cannot
+    change which recipe a module receives in single-stage models.
+    """
+    from megatron.core.models.gpt import gpt_model
+    from megatron.core.models.hybrid import hybrid_model
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        if model_type == "hybrid":
+            config = _hybrid_naming_config(num_layers=3)
+            _, records = _record_finish_init_names(
+                hybrid_model, lambda: _build_hybrid(config, "G*-")
+            )
+        else:
+            mtp_num_layers = 1 if model_type == "gpt-mtp" else None
+            config = _pp_naming_config(mtp_num_layers=mtp_num_layers)
+            _, records = _record_finish_init_names(
+                gpt_model, lambda: _build_gpt(config, mtp_num_layers)
+            )
+        named = [(path, name) for path, module, name in records if module.quant_module_name]
+        assert named
+        mismatched = [(path, name) for path, name in named if path != name]
+        assert not mismatched, mismatched
     finally:
         Utils.destroy_model_parallel()
 

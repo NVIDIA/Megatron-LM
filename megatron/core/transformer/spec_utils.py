@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import functools
+import inspect
 import types
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -77,6 +78,33 @@ def get_module(spec_or_module: Union[ModuleSpec, type], **additional_kwargs):
 
     # Otherwise, return the dynamically imported module from the module path
     return import_module(spec_or_module.module)
+
+
+def name_kwarg_if_accepted(
+    spec_or_module: Union[ModuleSpec, type, Callable[..., Any]], name: str | None
+) -> dict[str, str]:
+    """Return ``{"name": name}`` only when the module built from ``spec_or_module`` accepts it.
+
+    Semantic module names are threaded top-down so per-module quantization recipes can match
+    them, but not every pluggable module (for example a custom core attention) declares a
+    ``name`` parameter. Passing it unconditionally would raise ``TypeError`` even when no
+    quantization is configured, so modules that cannot take a name are built without one.
+    """
+    if name is None:
+        return {}
+    target = spec_or_module
+    if isinstance(target, ModuleSpec):
+        target = get_module(target)
+    try:
+        parameters = inspect.signature(target).parameters
+    except (TypeError, ValueError):
+        # Signature unavailable: keep forwarding the name, as before this check existed.
+        return {"name": name}
+    if "name" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+    ):
+        return {"name": name}
+    return {}
 
 
 def build_module(spec_or_module: Union[ModuleSpec, type], *args, **kwargs):

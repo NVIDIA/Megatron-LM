@@ -105,6 +105,7 @@ except ImportError:
     get_mla_metadata = None
     HAVE_FMLA = False
 
+from megatron.core.transformer.spec_utils import name_kwarg_if_accepted
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 try:
@@ -407,7 +408,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             # own fallback, which lets Transformer Engine defer its groups, instead of rejecting
             # this collection as an explicit one without tp.
             pg_collection=self.pg_collection if self.tp_group is not None else None,
-            name=(name + ".core_attention") if name is not None else None,
+            **name_kwarg_if_accepted(
+                submodules.core_attention, (name + ".core_attention") if name is not None else None
+            ),
         )
 
         self.checkpoint_core_attention = (
