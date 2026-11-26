@@ -216,6 +216,10 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         """
         param_groups = []
         for group in self.optimizer.param_groups:
+            if not group["params"]:
+                # No saved parameter carries an empty alignment group's metadata.
+                param_groups.append(group.copy())
+                continue
             fqns = [self._param_to_fqn[param] for param in group["params"]]
             missing = [fqn for fqn in fqns if fqn not in param_to_group_meta]
             if missing:

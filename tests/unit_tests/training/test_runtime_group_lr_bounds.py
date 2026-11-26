@@ -9,6 +9,8 @@ import pytest
 import torch
 
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.training.checkpointing import (
     _restore_optimizer_group_lr_bounds,
@@ -97,3 +99,56 @@ def test_changed_parameter_membership_is_rejected():
     optimizer.param_groups[0]["params"] = [torch.nn.Parameter(torch.ones(1))]
     with pytest.raises(ValueError, match="membership changed"):
         _restore_optimizer_group_lr_bounds(optimizer, runtime, OptimizerConfig(lr=1.0))
+
+
+@pytest.mark.parametrize("wrapper_type", [DistributedOptimizer, FullyShardedOptimizer])
+def test_fsdp_load_preserves_empty_alignment_group_policy(wrapper_type):
+    param = torch.nn.Parameter(torch.ones(2))
+    optimizer = torch.optim.SGD(
+        [
+            {"params": [param], "max_lr": 1.0, "min_lr": 0.1, "default_config": True},
+            {
+                "params": [],
+                "max_lr": 16.0,
+                "min_lr": 1.6,
+                "default_config": False,
+                "wd_mult": 0.0,
+                "lr_mult": 1.0,
+                "is_expert_parallel": True,
+            },
+        ],
+        lr=1.0,
+    )
+    runtime = _snapshot_optimizer_group_lr_bounds(optimizer)
+    wrapper = wrapper_type.__new__(wrapper_type)
+    wrapper.optimizer = optimizer
+    saved = {key: value for key, value in optimizer.param_groups[0].items() if key != "params"}
+    saved.update(max_lr=0.5, min_lr=0.05)
+    state = {"state": {}, "param_to_group_meta": {"weight": saved}}
+    if wrapper_type is DistributedOptimizer:
+        wrapper.ddp_config = SimpleNamespace(use_megatron_fsdp=True)
+        wrapper._param_name = lambda _: "weight"
+    else:
+        wrapper._param_to_fqn = {param: "weight"}
+    wrapper.load_state_dict(state)
+    _restore_optimizer_group_lr_bounds(optimizer, runtime, OptimizerConfig(lr=1.0, min_lr=0.1))
+    scheduler = OptimizerParamScheduler(
+        optimizer,
+        init_lr=0.0,
+        max_lr=1.0,
+        min_lr=0.1,
+        lr_warmup_steps=10,
+        lr_decay_steps=100,
+        lr_decay_style="linear",
+        start_wd=0.1,
+        end_wd=0.1,
+        wd_incr_steps=100,
+        wd_incr_style="constant",
+    )
+    scheduler.step(increment=42)
+    default, empty = optimizer.param_groups
+    assert default["params"][0] is param
+    assert empty["params"] == []
+    assert (empty["max_lr"], empty["min_lr"], empty["default_config"]) == (16.0, 1.6, False)
+    assert empty["lr"] == pytest.approx(16 * default["lr"])
+    assert empty["weight_decay"] == 0.0
