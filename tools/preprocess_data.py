@@ -49,6 +49,9 @@ class Encoder(object):
         self.args = args
 
     def initializer(self):
+        # Worker processes provide parallelism; avoid an additional tokenizer
+        # thread pool in each worker unless the user explicitly enables it.
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", str(self.args.tokenizer_parallelism).lower())
         # Use Encoder class as a container for global data
         Encoder.tokenizer = build_tokenizer(self.args)
         if self.args.split_sentences:
@@ -155,6 +158,8 @@ class Partition(object):
 
         startup_start = time.time()
         encoder = Encoder(self.args)
+        # Partition processes also build a tokenizer before starting their pool.
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", str(self.args.tokenizer_parallelism).lower())
         tokenizer = build_tokenizer(self.args)
         pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
         encoded_docs = pool.imap(encoder.encode, fin, 32)
@@ -213,6 +218,9 @@ def get_args():
     group.add_argument('--keep-newlines', action='store_true',
                        help='Keep newlines between sentences when splitting.')
     group = parser.add_argument_group(title='tokenization process')
+    group.add_argument('--tokenizer-parallelism', action='store_true',
+                       help=('Enable tokenizer-internal parallelism within each preprocessing worker. '
+                             'Disabled by default; TOKENIZERS_PARALLELISM, if set, takes precedence.'))
     group.add_argument('--append-eod', action='store_true',
                        help='Append an <eod> token to the end of a document.')
     group.add_argument('--lang', type=str, default='english',

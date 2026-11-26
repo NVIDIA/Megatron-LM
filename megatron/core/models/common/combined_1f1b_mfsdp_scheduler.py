@@ -1,7 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.transformer.moe.experts import TEGroupedMLP
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
@@ -42,6 +41,8 @@ def reshard_fsdp_module(module: FsdpModule) -> None:
 
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     """Install the sub-module hooks required by MCore combined 1F1B."""
+    # Keep this import local to avoid a cycle through pipeline_parallel.
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
 
     def register_hooks(submodule, owner):
         if isinstance(submodule, FsdpModule):
