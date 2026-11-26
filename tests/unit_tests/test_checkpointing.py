@@ -2320,10 +2320,7 @@ def test_the_fsdp_dtensor_reader_follows_the_train_state_tracker(
     assert readers == [wanted]
 
 
-_LOAD_GROUPS = {
-    "tp": SimpleNamespace(rank=0, size=1),
-    "pp": SimpleNamespace(rank=0, size=1),
-}
+_LOAD_GROUPS = {"tp": SimpleNamespace(rank=0, size=1), "pp": SimpleNamespace(rank=0, size=1)}
 
 
 def _dp_group(rank):
@@ -2354,10 +2351,13 @@ def _save_loader_state(path, iteration, dp_rank, iterable):
 
 
 def _load_loader_state(path, iteration, dp_rank, iterable, **kwargs):
-    with mock.patch(
-        "megatron.training.checkpointing.get_pg_rank", side_effect=lambda group: group.rank
-    ), mock.patch(
-        "megatron.training.checkpointing.get_pg_size", side_effect=lambda group: group.size
+    with (
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_rank", side_effect=lambda group: group.rank
+        ),
+        mock.patch(
+            "megatron.training.checkpointing.get_pg_size", side_effect=lambda group: group.size
+        ),
     ):
         maybe_load_dataloader_state(
             SimpleNamespace(iterable=iterable),
