@@ -269,8 +269,9 @@ class InferenceSetupConfig:
     inference_authenticate_coordinator: bool = False
     """Require every peer of the inference coordinator to present a secret generated at launch.
     The secret is carried by the coordinator address, which then must be treated as a credential.
-    Does not encrypt traffic. Off by default, which leaves the coordinator port open to anyone who
-    can reach it."""
+    Does not encrypt traffic. Also authenticates the sockets that the engine ranks open among
+    themselves, with the same secret. Off by default, which leaves the coordinator port open
+    to anyone who can reach it."""
 
     inference_shards: str | None = None
     """Partition the world using comma-separated ``key=value`` fields per shard, with

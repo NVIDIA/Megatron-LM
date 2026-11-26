@@ -11,6 +11,12 @@ launch-time secret is refused during the connection handshake and none of its
 messages ever reach the coordinator. The wire protocol is unchanged, and no
 handler has to remember to check who is calling it.
 
+The same mechanism, with the same secret, protects the sockets that the engine ranks open
+among themselves (collectives, request fan-out, KV-handoff completion), see
+``engine_socket_auth``. One secret covers the whole deployment: whoever holds the
+coordinator's secret can already submit requests and control the engines, so a separate
+rank-to-rank secret would add little.
+
 PLAIN does not encrypt traffic. It keeps unauthorized peers out; confidentiality
 on an untrusted network needs a secure transport (e.g. a VPN or TLS tunnel).
 
@@ -20,7 +26,10 @@ that opens the socket needs to split it. Without authentication the address is
 a plain endpoint. Treat an authenticated address as a credential: do not log it.
 """
 
+import hashlib
 import secrets
+import threading
+from dataclasses import dataclass, field
 from typing import Optional
 
 try:
@@ -82,11 +91,14 @@ def start_server_authentication(context: "zmq.Context", auth_token: bytes) -> "T
     return authenticator
 
 
-def require_authentication(socket: "zmq.Socket") -> None:
+def require_authentication(socket: "zmq.Socket", domain: Optional[str] = None) -> None:
     """Make ``socket`` a PLAIN server: peers without valid credentials cannot connect.
 
-    Must be called before the socket binds.
+    Must be called before the socket binds. ``domain`` selects the ZAP domain whose secret
+    the socket checks (see ``engine_socket_auth``); the default domain is the coordinator's.
     """
+    if domain is not None:
+        socket.zap_domain = domain.encode()
     socket.plain_server = True
 
 
@@ -100,3 +112,62 @@ def present_credentials(socket: "zmq.Socket", auth_token: Optional[bytes]) -> No
         return
     socket.plain_username = _PLAIN_USERNAME
     socket.plain_password = auth_token.hex().encode()
+
+
+@dataclass(frozen=True)
+class SocketAuth:
+    """The secret and ZAP domain that the engine ranks' own sockets authenticate with."""
+
+    domain: str
+    token: bytes = field(repr=False)
+
+
+# A ZeroMQ context has a single ZAP endpoint, so all of its authenticated sockets share one
+# handler, which tells secrets apart by ZAP domain.
+_context_authenticators: dict = {}
+_context_authenticators_lock = threading.Lock()
+
+
+def engine_socket_auth(context: "zmq.Context", token: bytes) -> SocketAuth:
+    """Make the sockets that the engine ranks bind on ``context`` accept only peers with ``token``.
+
+    ``token`` is the deployment's one secret, the coordinator's. Call it on every rank that
+    binds such a socket, before it binds; calling it again with the same token is harmless.
+    The domain is derived from the token, so engines in one process that hold different
+    secrets (as in tests) do not share a domain. Pair with ``stop_context_authentication``
+    before terminating ``context``.
+    """
+    domain = "engine-" + hashlib.sha256(token).hexdigest()[:16]
+    with _context_authenticators_lock:
+        authenticator = _context_authenticators.get(context)
+        if authenticator is None:
+            authenticator = ThreadAuthenticator(context)
+            authenticator.start()
+            _context_authenticators[context] = authenticator
+        authenticator.configure_plain(
+            domain=domain, passwords={_PLAIN_USERNAME.decode(): token.hex()}
+        )
+    return SocketAuth(domain, token)
+
+
+def stop_context_authentication(context: "zmq.Context") -> None:
+    """Stop the ZAP handler that ``engine_socket_auth`` started on ``context``, if any.
+
+    Must run before ``context.term()``, which otherwise waits on the handler forever.
+    """
+    with _context_authenticators_lock:
+        authenticator = _context_authenticators.pop(context, None)
+    if authenticator is not None:
+        authenticator.stop()
+
+
+def secure_server(socket: "zmq.Socket", auth: Optional[SocketAuth]) -> None:
+    """Require ``auth`` from every peer of a socket that is about to bind. None: no-op."""
+    if auth is not None:
+        require_authentication(socket, auth.domain)
+
+
+def secure_client(socket: "zmq.Socket", auth: Optional[SocketAuth]) -> None:
+    """Present ``auth`` from a socket that is about to connect. None: no-op."""
+    if auth is not None:
+        present_credentials(socket, auth.token)

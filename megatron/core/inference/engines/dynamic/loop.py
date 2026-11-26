@@ -12,6 +12,9 @@ from typing import Dict, List, Optional, Tuple, TypedDict
 import torch
 
 from megatron.core.inference.config import AsyncScheduleMode
+from megatron.core.inference.data_parallel_inference_coordinator.auth import (
+    stop_context_authentication,
+)
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.sampling_params import SamplingParams
@@ -666,6 +669,8 @@ class EngineLoopMixin:
             self.expert_parallel_zmq_communicator.close()
         if hasattr(self, "world_zmq_communicator"):
             self.world_zmq_communicator.close()
+        # The ZAP handler of authenticated sockets must stop first, or term() would wait on it.
+        stop_context_authentication(self.zmq_context)
         if not self.zmq_context.closed:
             self.zmq_context.term()
 

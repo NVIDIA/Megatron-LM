@@ -16,6 +16,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 )
 from megatron.core.inference.data_parallel_inference_coordinator.auth import (
     authenticated_address,
+    engine_socket_auth,
     generate_auth_token,
     present_credentials,
     split_authenticated_address,
@@ -189,7 +190,9 @@ class CoordinatorMixin:
                 coordinator (``launch_inference_coordinator=False``) that authenticates its
                 peers. Only the data-parallel source rank needs to supply it: it is broadcast to
                 the rest of the group, and every rank that opens a socket to the coordinator then
-                presents it. None connects without credentials. Ignored when this method
+                presents it. None connects without credentials. With
+                ``InferenceConfig.authenticate_coordinator`` it is also the secret of the
+                engine ranks' own sockets, so it is then required. Ignored when this method
                 launches the coordinator: whether that one authenticates is decided by
                 ``InferenceConfig.authenticate_coordinator``.
 
@@ -319,22 +322,45 @@ class CoordinatorMixin:
             )
             dp_addr, coordinator_auth_token = bcast
 
+        # Broadcast the coordinator address and secret to the data-parallel group. Only the
+        # data-parallel source rank is handed the secret of an external coordinator.
+        bcast = [dp_addr, coordinator_auth_token]
+        torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
+        dp_addr, coordinator_auth_token = bcast
+
+        # With authentication the engine ranks' own sockets use the coordinator's secret too.
+        # Ranks other than the model-parallel coordinator learn it from the broadcast below.
+        engine_token = coordinator_auth_token if self.authenticate_coordinator else None
+        self.engine_auth = (
+            engine_socket_auth(self.zmq_context, engine_token)
+            if self.is_mp_coordinator and engine_token is not None
+            else None
+        )
+
         # Find available ports for MP and bind to them.
+        # The request fan-out carries every prompt, so only this replica's own ranks may
+        # subscribe.
         if self.is_mp_coordinator:
-            mp_req_sock = dp_replica_mp_request_broadcast.create_publisher(self.zmq_context)
+            mp_req_sock = dp_replica_mp_request_broadcast.create_publisher(
+                self.zmq_context, self.engine_auth
+            )
             mp_req_sock.bind_to_random_port(f"tcp://{local_ip}")
             mp_req_addr = mp_req_sock.getsockopt_string(zmq.LAST_ENDPOINT)
         else:
             mp_req_addr = None
 
-        # Broadcast addresses and the coordinator secret to respective ranks. Only the
-        # data-parallel source rank is handed the secret of an external coordinator.
-        bcast = [dp_addr, coordinator_auth_token]
-        torch.distributed.broadcast_object_list(bcast, src=dp_src, group=dp_group)
-        dp_addr, coordinator_auth_token = bcast
-        bcast = [mp_req_addr]
+        bcast = [mp_req_addr, engine_token]
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
-        [mp_req_addr] = bcast
+        mp_req_addr, engine_token = bcast
+        if self.authenticate_coordinator:
+            if engine_token is None:
+                raise ValueError(
+                    "authenticate_coordinator needs the coordinator's secret: pass "
+                    "coordinator_auth_token when launch_inference_coordinator=False"
+                )
+            self.engine_auth = engine_socket_auth(self.zmq_context, engine_token)
+        else:
+            self.engine_auth = None
 
         identity = disagg_config.identity if disagg_config is not None else f'mp-coord-{dp_rank}'
         if self.is_mp_coordinator:
@@ -380,7 +406,7 @@ class CoordinatorMixin:
             ]
         # All MP ranks subscribe to the publisher socket
         self.model_parallel_subscriber_socket = dp_replica_mp_request_broadcast.create_subscriber(
-            self.zmq_context, mp_req_addr, mp_rank
+            self.zmq_context, mp_req_addr, mp_rank, self.engine_auth
         )
 
         self.zmq_sockets += [self.model_parallel_subscriber_socket]
@@ -406,7 +432,10 @@ class CoordinatorMixin:
         self._last_ep_consensus: tuple[int, bool] = (0, False)
         if self.tp_ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=tp_ep_group, hostname=hostname
+                self.zmq_context,
+                process_group=tp_ep_group,
+                hostname=hostname,
+                auth=self.engine_auth,
             )
             # Give the context a CPU-side MAX-reduction primitive so
             # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
@@ -417,7 +446,7 @@ class CoordinatorMixin:
         total_world_size = torch.distributed.get_world_size()
         if total_world_size > 1:
             self.world_zmq_communicator = AsyncZMQCommunicator(
-                self.zmq_context, process_group=None, hostname=hostname
+                self.zmq_context, process_group=None, hostname=hostname, auth=self.engine_auth
             )
 
         if spawn_coordinator:

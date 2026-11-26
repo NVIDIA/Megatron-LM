@@ -4,8 +4,15 @@ import asyncio
 import socket
 import struct
 from collections.abc import Iterable
+from typing import Optional
 
 import torch.distributed as dist
+
+from megatron.core.inference.data_parallel_inference_coordinator.auth import (
+    SocketAuth,
+    secure_client,
+    secure_server,
+)
 
 try:
     import zmq
@@ -28,15 +35,22 @@ class RankedPubSub:
         return self.readiness_topic_prefix + struct.pack("!I", rank)
 
     @staticmethod
-    def create_publisher(zmq_context: zmq.Context) -> zmq.Socket:
-        """Create an XPUB socket that exposes every subscription notification."""
+    def create_publisher(zmq_context: zmq.Context, auth: Optional[SocketAuth] = None) -> zmq.Socket:
+        """Create an XPUB socket that exposes every subscription notification.
+
+        With ``auth``, only subscribers presenting it can connect.
+        """
         publisher_socket = zmq_context.socket(zmq.XPUB)
+        secure_server(publisher_socket, auth)
         publisher_socket.setsockopt(zmq.XPUB_VERBOSE, 1)
         return publisher_socket
 
-    def create_subscriber(self, zmq_context: zmq.Context, address: str, rank: int) -> zmq.Socket:
+    def create_subscriber(
+        self, zmq_context: zmq.Context, address: str, rank: int, auth: Optional[SocketAuth] = None
+    ) -> zmq.Socket:
         """Create a connected SUB socket with a rank-specific readiness topic."""
         subscriber_socket = zmq_context.socket(zmq.SUB)
+        secure_client(subscriber_socket, auth)
         subscriber_socket.connect(address)
         # Subscribe to readiness before the empty collective topic so XPUB
         # receives an explicit identity command for this rank.
@@ -88,6 +102,7 @@ class AsyncZMQCommunicator:
         zmq_context: zmq.Context,
         process_group: dist.ProcessGroup,
         hostname: str | None = None,
+        auth: Optional[SocketAuth] = None,
     ):
         """
         Constructor for AsyncZMQCommunicator. Sets up ZMQ sockets
@@ -97,6 +112,11 @@ class AsyncZMQCommunicator:
             process_group (dist.ProcessGroup): Process group for communication.
             hostname (str | None): Hostname or IP address to use for ZMQ socket binding.
                 If None, defaults to socket.gethostname().
+            auth (SocketAuth | None): If given, the leader's sockets refuse every peer that
+                does not present its secret, and the other ranks present it. Every rank must
+                pass the same secret, made with ``engine_socket_auth`` on ``zmq_context``,
+                which must be passed to ``stop_context_authentication`` before it is
+                terminated.
         """
         # Normalize None to the default (world) group. get_rank/get_world_size
         # already treat None this way, but get_process_group_ranks below does
@@ -114,10 +134,11 @@ class AsyncZMQCommunicator:
         if self.is_leader:
             local_ip = hostname or socket.gethostname()
             self.gather_sock = zmq_context.socket(zmq.PULL)
+            secure_server(self.gather_sock, auth)
             self.gather_sock.bind_to_random_port(f"tcp://{local_ip}")
             gather_socket_addr = self.gather_sock.getsockopt_string(zmq.LAST_ENDPOINT)
 
-            self.bcast_sock = broadcast_pub_sub.create_publisher(zmq_context)
+            self.bcast_sock = broadcast_pub_sub.create_publisher(zmq_context, auth)
             self.bcast_sock.bind_to_random_port(f"tcp://{local_ip}")
             bcast_socket_addr = self.bcast_sock.getsockopt_string(zmq.LAST_ENDPOINT)
 
@@ -131,9 +152,10 @@ class AsyncZMQCommunicator:
             dist.broadcast_object_list(bcast_output, src=src_rank, group=process_group)
             gather_socket_addr, bcast_socket_addr = bcast_output
             self.gather_sock = zmq_context.socket(zmq.PUSH)
+            secure_client(self.gather_sock, auth)
             self.gather_sock.connect(gather_socket_addr)
             self.bcast_sock = broadcast_pub_sub.create_subscriber(
-                zmq_context, bcast_socket_addr, self.rank
+                zmq_context, bcast_socket_addr, self.rank, auth
             )
 
         # Wait until every ProcessGroup peer has subscribed to the leader.

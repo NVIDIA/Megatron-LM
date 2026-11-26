@@ -127,7 +127,10 @@ class InferenceStateHandoffMixin:
         """Create the CPU path used to aggregate model-parallel transfer completion."""
 
         self._handoff_completion_tracker = HandoffCompletionTracker(
-            self.zmq_context, self.pg_collection.mp, hostname
+            self.zmq_context,
+            self.pg_collection.mp,
+            hostname,
+            auth=getattr(self, "engine_auth", None),
         )
         self.zmq_sockets.extend(self._handoff_completion_tracker.sockets)
 

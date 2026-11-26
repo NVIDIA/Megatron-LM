@@ -2231,8 +2231,10 @@ def _add_inference_args(parser):
                        help='Require every peer of the inference coordinator to present a secret '
                             'generated at launch. The secret is carried by the coordinator '
                             'address, which must then be treated as a credential. Does not '
-                            'encrypt traffic. Off by default, which leaves the coordinator port '
-                            'open to anyone who can reach it.')
+                            'encrypt traffic. Also authenticates the sockets that the engine '
+                            'ranks open among themselves, with the same secret. Off by '
+                            'default, which leaves the coordinator port open to anyone who can '
+                            'reach it.')
     group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
     group.add_argument('--inference-shards', type=str, default=None, metavar='SPEC',

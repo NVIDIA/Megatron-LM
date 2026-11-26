@@ -4,9 +4,15 @@
 
 import socket
 import struct
-from typing import Any
+from typing import Any, Optional
 
 import torch.distributed as dist
+
+from megatron.core.inference.data_parallel_inference_coordinator.auth import (
+    SocketAuth,
+    secure_client,
+    secure_server,
+)
 
 try:
     import zmq
@@ -24,7 +30,13 @@ class HandoffCompletionTracker:
 
     _REPORT_FORMAT = "!qi??"
 
-    def __init__(self, zmq_context, process_group: dist.ProcessGroup, hostname: str | None = None):
+    def __init__(
+        self,
+        zmq_context,
+        process_group: dist.ProcessGroup,
+        hostname: str | None = None,
+        auth: Optional[SocketAuth] = None,
+    ):
         if not HAVE_ZMQ:
             raise ImportError("pyzmq is required for disaggregated KV handoff")
 
@@ -41,7 +53,10 @@ class HandoffCompletionTracker:
 
         coordinator_rank = dist.get_process_group_ranks(process_group)[0]
         if self.is_coordinator:
+            # Anyone able to push here could forge "source is safe to free" reports, so with
+            # ``auth`` peers must present its secret.
             self._socket = zmq_context.socket(zmq.PULL)
+            secure_server(self._socket, auth)
             self._socket.bind_to_random_port(f"tcp://{hostname or socket.gethostname()}")
             address = self._socket.getsockopt_string(zmq.LAST_ENDPOINT)
             dist.broadcast_object_list([address], src=coordinator_rank, group=process_group)
@@ -49,6 +64,7 @@ class HandoffCompletionTracker:
             address_holder = [None]
             dist.broadcast_object_list(address_holder, src=coordinator_rank, group=process_group)
             self._socket = zmq_context.socket(zmq.PUSH)
+            secure_client(self._socket, auth)
             self._socket.connect(address_holder[0])
         self.sockets.append(self._socket)
 

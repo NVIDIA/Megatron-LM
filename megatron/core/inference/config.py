@@ -886,6 +886,9 @@ class InferenceConfig:
     must be given that full address and treat it as a credential. Authentication does not
     encrypt traffic. Off by default, which leaves the coordinator open to anyone who can reach
     its port: only leave it off on a trusted network.
+
+    The sockets that the engine ranks open among themselves (collectives, request fan-out and
+    KV-handoff completion) are authenticated too, with the same secret.
     """
 
     ep_consensus_interval: int = 20
