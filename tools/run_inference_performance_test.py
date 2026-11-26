@@ -24,6 +24,7 @@ from megatron.inference.utils import (
     add_inference_args,
     get_dynamic_inference_engine,
     get_model_for_inference,
+    inference_config_from_args,
 )
 
 sys.path.append(
@@ -160,7 +161,7 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
-    set_run_config(inference_cfg_container_from_args(args))
+    set_run_config(inference_config_from_args(args))
     initialize_megatron()
 
     args = get_args()

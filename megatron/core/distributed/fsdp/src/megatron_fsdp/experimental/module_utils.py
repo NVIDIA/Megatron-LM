@@ -41,12 +41,15 @@ def get_parameter_owner(root_module: nn.Module, parameter_fqn: str) -> tuple[nn.
 #   receive gradients from backward_dw(), so FsdpModule must register wgrad hooks rather
 #   than AccumulateGrad hooks. Losing it during meta materialization makes the gradient
 #   countdown complete before backward_dw() runs.
+# - muon_matrix_shape marks a Muon matrix stored as a higher-rank tensor (e.g. a grouped
+#   projection). The optimizer factory needs it to reject parameters FsdpMuon cannot update.
 _PARAMETER_ATTRIBUTES_TO_PRESERVE = (
     "is_embedding_or_output_parameter",
     "is_embedding_parameter",
     "use_muon",
     "is_wide_residual_retention_parameter",
     "skip_backward_post_hook",
+    "muon_matrix_shape",
 )
 
 

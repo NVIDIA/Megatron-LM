@@ -53,6 +53,17 @@ def serialize_dataclass(
         if field.name.startswith("_") or field.name in skip_fields:
             continue
         value = getattr(config, field.name)
+        if (
+            field.name == "linear_cp_layout"
+            and isinstance(config, TransformerConfig)
+            and getattr(config, "_linear_cp_layout_explicit", True) is False
+            and value == "zigzag"
+        ):
+            # TransformerConfig fills an unset linear_cp_layout with zigzag and records that
+            # it was implicit in a private field, which is not serialized. Emit the unset value
+            # so deserialization re-derives the implicit layout instead of making zigzag
+            # explicit, which would change hybrid CP behavior or fail chunkwise validation.
+            value = None
         if encode_callables and callable(value) and (
             isinstance(value, type) or not is_dataclass(value)
         ):
@@ -130,7 +141,9 @@ def sanitize_dataclass_config(
     target class specified in the config's _target_ field. This handles cases where
     older checkpoints serialized computed fields that should not be passed to __init__.
 
-    The function recursively processes nested dicts that may also be dataclass configs.
+    The function recursively processes nested dicts that may also be dataclass configs. A target
+    class may define a static ``upgrade_cfg_dict(config) -> config`` hook, applied first
+    (``DataConfig`` upgrades the sections of older SFT checkpoints).
 
     Args:
         config: A configuration dictionary, potentially with a _target_ field.
@@ -156,6 +169,9 @@ def sanitize_dataclass_config(
         target_class = _resolve_target_class(target)
         if target_class is not None:
             init_false_fields = _get_init_false_fields(target_class)
+            upgrade = getattr(target_class, "upgrade_cfg_dict", None)
+            if upgrade is not None:
+                config = upgrade(config)
 
     # Process all values, filtering init=False fields and recursing into nested dicts
     sanitized = {}

@@ -1615,6 +1615,17 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             seq_len = rotary_pos_emb.shape[0]
             rotary_pos_emb = self.rotary_pos_emb(seq_len)
 
+        if (
+            self.config.attention_cp_layout == "contiguous"
+            and runtime_cp_group is not None
+            and runtime_cp_group.size() > 1
+            and any(
+                value is not None
+                for value in (rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin)
+            )
+        ):
+            raise ValueError("Contiguous attention CP does not yet support rotary embeddings.")
+
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if inference_context and inference_context.is_dynamic_batching():

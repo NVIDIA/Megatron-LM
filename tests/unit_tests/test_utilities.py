@@ -76,6 +76,9 @@ def reset_cuda_graph_global_state():
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         cuda_graphs.delete_cuda_graphs()
+    # The first CudaGraphManager switches to the capture stream; clear it so the next test's
+    # first manager does so again (the previous capture returned to the default stream).
+    cuda_graphs.CudaGraphManager.global_capture_stream = None
 
 
 def _snapshot_torch_settings():

@@ -1,7 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import sys
-from types import SimpleNamespace
 
 from megatron.training.arguments import parse_args
 
@@ -29,8 +28,8 @@ def test_core_gpt_dataset_config_forwards_sft_mock_dataset_config(monkeypatch, r
         "megatron.training.utils.get_blend_and_blend_per_split", lambda _: (None, None)
     )
 
-    config = pretrain_gpt.core_gpt_dataset_config_from_args(
-        args, tokenizer=SimpleNamespace(vocab_size=2048)
-    )
+    # main #8978 removed the legacy wrapper; the entry point builds cfg.data with
+    # gpt_data_config_from_args and binds the tokenizer later (DataConfig.bind_tokenizer).
+    config = pretrain_gpt.gpt_data_config_from_args(args).dataset
 
     assert config.sft_mock_dataset_config_json == config_json

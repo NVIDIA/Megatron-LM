@@ -1,0 +1,343 @@
+# Redirects from the legacy Sphinx site to this Fern site.
+# The first matching rule wins, so specific rules come first.
+# "source" is matched without the site base path; "destination" must include it.
+# Pattern sources must not start with the text of the base path (/megatron), and
+# /megatron-core does, so the first segment is captured as `:dir(megatron\-core)`.
+# Hyphens inside a parameter regex are escaped, and each pattern source starts with
+# a parameter. Keep every rule a single hop to a real page.
+#
+# - legacy /latest/  -> the default Fern version (unprefixed /megatron/<page>).
+#   If the default version changes, review that its slugs still match.
+# - legacy /nightly/ -> the Fern "nightly" version (/megatron/nightly/<page>),
+#   which stays valid whether or not nightly is the default version.
+#
+# Older numbered versions (0.15.0 - 0.20.0) are served from archive.docs.nvidia.com
+# and are intentionally not redirected. `fern docs dev` cannot test redirects,
+# so verify them on a preview deployment.
+redirects:
+
+  # ===== legacy /latest/ =====
+  # Site root
+  - source: '/:dir(megatron\-core)/developer-guide/latest/index.html'
+    destination: /megatron
+  - source: '/:dir(megatron\-core)/developer-guide/latest'
+    destination: /megatron
+  - source: '/:dir(megatron\-core)/developer-guide/latest/'
+    destination: /megatron
+  - source: '/:dir(megatron\-core)/developer-guide/latest/advanced/index.html'
+    destination: /megatron/advanced
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-backwards-compatibility-check.html'
+    destination: /megatron/api-backwards-compatibility-check
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/core/datasets.html'
+    destination: /megatron/api-guide/core/datasets
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/core/dist_checkpointing.html'
+    destination: /megatron/api-guide/core/dist-checkpointing
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/core/dist_checkpointing.strategies.html'
+    destination: /megatron/api-guide/core/dist-checkpointing/dist-checkpointing-strategies
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/core/distributed.html'
+    destination: /megatron/api-guide/core/distributed
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/core/fusions.html'
+    destination: /megatron/api-guide/core/fusions
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/core/generalized_tensor_parallel.html'
+    destination: /megatron/parallelism-guide/generalized-tensor-parallel
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/core/index.html'
+    destination: /megatron/api-guide/core
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/core/pipeline_parallel.html'
+    destination: /megatron/api-guide/core/pipeline-parallel
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/core/tensor_parallel.html'
+    destination: /megatron/api-guide/core/tensor-parallel
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/core/transformer.html'
+    destination: /megatron/api-guide/core/transformer
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/index.html'
+    destination: /megatron/api-guide
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/internal/index.html'
+    destination: /megatron/api-guide/internal
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/internal/num_microbatches_calculator.html'
+    destination: /megatron/api-guide/internal/num-microbatches-calculator
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/internal/optimizer_param_scheduler.html'
+    destination: /megatron/api-guide/internal/optimizer-param-scheduler
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/models/index.html'
+    destination: /megatron/api-guide/models
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/models/models.html'
+    destination: /megatron/api-guide/models/models
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/models/models.bert.html'
+    destination: /megatron/api-guide/models/models/models-bert
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/models/models.gpt.html'
+    destination: /megatron/api-guide/models/models/models-gpt
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/models/models.t5.html'
+    destination: /megatron/api-guide/models/models/models-t5
+  - source: '/:dir(megatron\-core)/developer-guide/latest/api-guide/router_replay.html'
+    destination: /megatron/moe/router-replay
+  - source: '/:dir(megatron\-core)/developer-guide/latest/developer/contribute.html'
+    destination: /megatron/contribute
+  - source: '/:dir(megatron\-core)/developer-guide/latest/developer/determinism/README.html'
+    destination: /megatron/determinism
+  - source: '/:dir(megatron\-core)/developer-guide/latest/developer/determinism/glossary.html'
+    destination: /megatron/glossary
+  - source: '/:dir(megatron\-core)/developer-guide/latest/developer/determinism/op-catalog.html'
+    destination: /megatron/op-catalog
+  - source: '/:dir(megatron\-core)/developer-guide/latest/developer/determinism/status.html'
+    destination: /megatron/status
+  - source: '/:dir(megatron\-core)/developer-guide/latest/developer/determinism/testing.html'
+    destination: /megatron/testing
+  - source: '/:dir(megatron\-core)/developer-guide/latest/developer/gdn_ew_fusion.html'
+    destination: /megatron/gdn-ew-fusion
+  - source: '/:dir(megatron\-core)/developer-guide/latest/developer/generate_docs.html'
+    destination: /megatron/generate-docs
+  - source: '/:dir(megatron\-core)/developer-guide/latest/developer/oncall.html'
+    destination: /megatron/oncall
+  - source: '/:dir(megatron\-core)/developer-guide/latest/developer/submit.html'
+    destination: /megatron/submit
+  - source: '/:dir(megatron\-core)/developer-guide/latest/discussions/README.html'
+    destination: /megatron/discussions
+  - source: '/:dir(megatron\-core)/developer-guide/latest/documentation.html'
+    destination: /megatron/documentation
+  - source: '/:dir(megatron\-core)/developer-guide/latest/get-started/install.html'
+    destination: /megatron/install
+  - source: '/:dir(megatron\-core)/developer-guide/latest/get-started/overview.html'
+    destination: /megatron/overview
+  - source: '/:dir(megatron\-core)/developer-guide/latest/get-started/quickstart.html'
+    destination: /megatron/quickstart
+  - source: '/:dir(megatron\-core)/developer-guide/latest/get-started/releasenotes.html'
+    destination: /megatron/releasenotes
+  - source: '/:dir(megatron\-core)/developer-guide/latest/llama_mistral.html'
+    destination: /megatron/models/llama-mistral
+  - source: '/:dir(megatron\-core)/developer-guide/latest/mcore-inference-user-guide.html'
+    destination: /megatron/mcore-inference-user-guide
+  - source: '/:dir(megatron\-core)/developer-guide/latest/models/index.html'
+    destination: /megatron/models
+  - source: '/:dir(megatron\-core)/developer-guide/latest/models/llms.html'
+    destination: /megatron/models/llms
+  - source: '/:dir(megatron\-core)/developer-guide/latest/models/multimodal.html'
+    destination: /megatron/models/multimodal
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/data-loading.html'
+    destination: /megatron/data-loading
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/data-preparation.html'
+    destination: /megatron/data-preparation
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/deterministic-training.html'
+    destination: /megatron/deterministic-training
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/checkpoint-merge.html'
+    destination: /megatron/checkpoint-merge
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/context_parallel.html'
+    destination: /megatron/parallelism-guide/context-parallel
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/cuda_graph.html'
+    destination: /megatron/user-guide/features/cuda-graph
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/dist_optimizer.html'
+    destination: /megatron/dist-optimizer
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/fine_grained_activation_offloading.html'
+    destination: /megatron/fine-grained-activation-offloading
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/index.html'
+    destination: /megatron/user-guide/features
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/low_precision_training.html'
+    destination: /megatron/user-guide/features/low-precision-training
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/megatron_energon.html'
+    destination: /megatron/megatron-energon
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/megatron_fsdp.html'
+    destination: /megatron/megatron-fsdp
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/megatron_rl.html'
+    destination: /megatron/megatron-rl
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/moe.html'
+    destination: /megatron/moe
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/multi_latent_attention.html'
+    destination: /megatron/moe/multi-latent-attention
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/multi_token_prediction.html'
+    destination: /megatron/moe/multi-token-prediction
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/optimizer_cpu_offload.html'
+    destination: /megatron/optimizer-cpu-offload
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/paged_stash.html'
+    destination: /megatron/user-guide/features/paged-stash
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/pipeline_parallel_layout.html'
+    destination: /megatron/parallelism-guide/pipeline-parallel-layout
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/features/tokenizers.html'
+    destination: /megatron/tokenizers
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/hybrid-model-migration.html'
+    destination: /megatron/hybrid-model-migration
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/index.html'
+    destination: /megatron/user-guide
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/msc_integration.html'
+    destination: /megatron/user-guide/msc-integration
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/observability/configuration.html'
+    destination: /megatron/configuration
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/observability/extending.html'
+    destination: /megatron/extending
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/observability/index.html'
+    destination: /megatron/observability
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/observability/metrics.html'
+    destination: /megatron/metrics
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/observability/pipeline-parallel.html'
+    destination: /megatron/pipeline-parallel
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/observability/span-groups.html'
+    destination: /megatron/span-groups
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/parallelism-guide.html'
+    destination: /megatron/parallelism-guide
+  - source: '/:dir(megatron\-core)/developer-guide/latest/user-guide/training-examples.html'
+    destination: /megatron/training-examples
+  # Sphinx autodoc reference (apidocs/, 561 pages) has no Fern equivalent; send to the API Guide
+  - source: '/:dir(megatron\-core)/developer-guide/latest/apidocs/:path*'
+    destination: /megatron/api-guide
+  # Sphinx-generated utility pages
+  - source: '/:dir(megatron\-core)/developer-guide/latest/:page(search|genindex|py\-modindex).html'
+    destination: /megatron
+
+  # ===== legacy /nightly/ =====
+  # Site root
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/index.html'
+    destination: /megatron/nightly
+  - source: '/:dir(megatron\-core)/developer-guide/nightly'
+    destination: /megatron/nightly
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/'
+    destination: /megatron/nightly
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/advanced/index.html'
+    destination: /megatron/nightly/advanced
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-backwards-compatibility-check.html'
+    destination: /megatron/nightly/api-backwards-compatibility-check
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/core/datasets.html'
+    destination: /megatron/nightly/api-guide/core/datasets
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/core/dist_checkpointing.html'
+    destination: /megatron/nightly/api-guide/core/dist-checkpointing
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/core/dist_checkpointing.strategies.html'
+    destination: /megatron/nightly/api-guide/core/dist-checkpointing/dist-checkpointing-strategies
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/core/distributed.html'
+    destination: /megatron/nightly/api-guide/core/distributed
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/core/fusions.html'
+    destination: /megatron/nightly/api-guide/core/fusions
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/core/generalized_tensor_parallel.html'
+    destination: /megatron/nightly/parallelism-guide/generalized-tensor-parallel
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/core/index.html'
+    destination: /megatron/nightly/api-guide/core
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/core/pipeline_parallel.html'
+    destination: /megatron/nightly/api-guide/core/pipeline-parallel
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/core/tensor_parallel.html'
+    destination: /megatron/nightly/api-guide/core/tensor-parallel
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/core/transformer.html'
+    destination: /megatron/nightly/api-guide/core/transformer
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/index.html'
+    destination: /megatron/nightly/api-guide
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/internal/index.html'
+    destination: /megatron/nightly/api-guide/internal
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/internal/num_microbatches_calculator.html'
+    destination: /megatron/nightly/api-guide/internal/num-microbatches-calculator
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/internal/optimizer_param_scheduler.html'
+    destination: /megatron/nightly/api-guide/internal/optimizer-param-scheduler
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/models/index.html'
+    destination: /megatron/nightly/api-guide/models
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/models/models.html'
+    destination: /megatron/nightly/api-guide/models/models
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/models/models.bert.html'
+    destination: /megatron/nightly/api-guide/models/models/models-bert
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/models/models.gpt.html'
+    destination: /megatron/nightly/api-guide/models/models/models-gpt
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/models/models.t5.html'
+    destination: /megatron/nightly/api-guide/models/models/models-t5
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/api-guide/router_replay.html'
+    destination: /megatron/nightly/moe/router-replay
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/developer/contribute.html'
+    destination: /megatron/nightly/contribute
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/developer/determinism/README.html'
+    destination: /megatron/nightly/determinism
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/developer/determinism/glossary.html'
+    destination: /megatron/nightly/glossary
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/developer/determinism/op-catalog.html'
+    destination: /megatron/nightly/op-catalog
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/developer/determinism/status.html'
+    destination: /megatron/nightly/status
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/developer/determinism/testing.html'
+    destination: /megatron/nightly/testing
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/developer/gdn_ew_fusion.html'
+    destination: /megatron/nightly/gdn-ew-fusion
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/developer/generate_docs.html'
+    destination: /megatron/nightly/generate-docs
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/developer/oncall.html'
+    destination: /megatron/nightly/oncall
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/developer/submit.html'
+    destination: /megatron/nightly/submit
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/discussions/README.html'
+    destination: /megatron/nightly/discussions
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/documentation.html'
+    destination: /megatron/nightly/documentation
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/get-started/install.html'
+    destination: /megatron/nightly/install
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/get-started/overview.html'
+    destination: /megatron/nightly/overview
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/get-started/quickstart.html'
+    destination: /megatron/nightly/quickstart
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/get-started/releasenotes.html'
+    destination: /megatron/nightly/releasenotes
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/llama_mistral.html'
+    destination: /megatron/nightly/models/llama-mistral
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/mcore-inference-user-guide.html'
+    destination: /megatron/nightly/mcore-inference-user-guide
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/models/index.html'
+    destination: /megatron/nightly/models
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/models/llms.html'
+    destination: /megatron/nightly/models/llms
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/models/multimodal.html'
+    destination: /megatron/nightly/models/multimodal
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/data-loading.html'
+    destination: /megatron/nightly/data-loading
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/data-preparation.html'
+    destination: /megatron/nightly/data-preparation
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/deterministic-training.html'
+    destination: /megatron/nightly/deterministic-training
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/checkpoint-merge.html'
+    destination: /megatron/nightly/checkpoint-merge
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/context_parallel.html'
+    destination: /megatron/nightly/parallelism-guide/context-parallel
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/cuda_graph.html'
+    destination: /megatron/nightly/user-guide/features/cuda-graph
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/dist_optimizer.html'
+    destination: /megatron/nightly/dist-optimizer
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/fine_grained_activation_offloading.html'
+    destination: /megatron/nightly/fine-grained-activation-offloading
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/index.html'
+    destination: /megatron/nightly/user-guide/features
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/low_precision_training.html'
+    destination: /megatron/nightly/user-guide/features/low-precision-training
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/megatron_energon.html'
+    destination: /megatron/nightly/megatron-energon
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/megatron_fsdp.html'
+    destination: /megatron/nightly/megatron-fsdp
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/megatron_rl.html'
+    destination: /megatron/nightly/megatron-rl
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/moe.html'
+    destination: /megatron/nightly/moe
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/multi_latent_attention.html'
+    destination: /megatron/nightly/moe/multi-latent-attention
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/multi_token_prediction.html'
+    destination: /megatron/nightly/moe/multi-token-prediction
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/optimizer_cpu_offload.html'
+    destination: /megatron/nightly/optimizer-cpu-offload
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/paged_stash.html'
+    destination: /megatron/nightly/user-guide/features/paged-stash
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/pipeline_parallel_layout.html'
+    destination: /megatron/nightly/parallelism-guide/pipeline-parallel-layout
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/features/tokenizers.html'
+    destination: /megatron/nightly/tokenizers
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/hybrid-model-migration.html'
+    destination: /megatron/nightly/hybrid-model-migration
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/index.html'
+    destination: /megatron/nightly/user-guide
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/msc_integration.html'
+    destination: /megatron/nightly/user-guide/msc-integration
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/observability/configuration.html'
+    destination: /megatron/nightly/configuration
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/observability/extending.html'
+    destination: /megatron/nightly/extending
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/observability/index.html'
+    destination: /megatron/nightly/observability
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/observability/metrics.html'
+    destination: /megatron/nightly/metrics
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/observability/pipeline-parallel.html'
+    destination: /megatron/nightly/pipeline-parallel
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/observability/span-groups.html'
+    destination: /megatron/nightly/span-groups
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/parallelism-guide.html'
+    destination: /megatron/nightly/parallelism-guide
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/user-guide/training-examples.html'
+    destination: /megatron/nightly/training-examples
+  # Sphinx autodoc reference (apidocs/, 561 pages) has no Fern equivalent; send to the API Guide
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/apidocs/:path*'
+    destination: /megatron/nightly/api-guide
+  # Sphinx-generated utility pages
+  - source: '/:dir(megatron\-core)/developer-guide/nightly/:page(search|genindex|py\-modindex).html'
+    destination: /megatron/nightly

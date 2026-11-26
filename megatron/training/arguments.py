@@ -1177,9 +1177,8 @@ def validate_args(args, defaults={}):
                 "GroupedTensor param buffers."
             )
         # Optimizer compatibility check.
-        assert args.optimizer in (
-            'sgd',
-            'adam',
+        assert args.optimizer in ('sgd', 'adam') or (
+            args.megatron_fsdp_version == 2 and args.optimizer == 'muon'
         ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         # Expert parameters may be sharded differently from non-expert parameters, in which
@@ -1353,9 +1352,14 @@ def validate_args(args, defaults={}):
         assert args.hidden_size % args.num_attention_heads == 0
         args.kv_channels = args.hidden_size // args.num_attention_heads
 
-    if args.seq_length is not None and args.context_parallel_size > 1:
-        assert args.seq_length % (args.context_parallel_size * 2) == 0, (
-            f"seq-length ({args.seq_length}) must be a multiple of 2 * the resolved "
+    # SFT alignment applies to the physical pack, which can override --seq-length.
+    input_length = args.max_seq_length_per_sample if args.sft else None
+    input_length = input_length if input_length is not None else args.seq_length
+    if input_length is None:
+        input_length = args.encoder_seq_length
+    if input_length is not None and args.context_parallel_size > 1:
+        assert input_length % (args.context_parallel_size * 2) == 0, (
+            f"input sequence length ({input_length}) must be a multiple of 2 * the resolved "
             f"context-parallel group size ({args.context_parallel_size}), "
             "including GTP sequence shards."
         )
@@ -1373,13 +1377,27 @@ def validate_args(args, defaults={}):
         assert args.encoder_seq_length is not None
         args.seq_length = args.encoder_seq_length
 
-    if args.seq_length is not None:
-        assert args.max_position_embeddings >= args.seq_length, (
-            f"max_position_embeddings ({args.max_position_embeddings}) must be greater than "
-            f"or equal to seq_length ({args.seq_length})."
+    # Only learned position tables impose this capacity limit. The legacy RoPE
+    # flag is normalized below and also overrides position_embedding_type.
+    if args.position_embedding_type == 'learned_absolute' and not args.use_rotary_position_embeddings:
+        if args.seq_length is not None:
+            assert args.max_position_embeddings >= args.seq_length, \
+                f"max_position_embeddings ({args.max_position_embeddings}) must be greater than " \
+                f"or equal to seq_length ({args.seq_length})."
+        if args.decoder_seq_length is not None:
+            assert args.max_position_embeddings >= args.decoder_seq_length
+        if args.max_seq_length_per_sample is not None:
+            assert args.max_position_embeddings >= args.max_seq_length_per_sample, \
+                f"max_position_embeddings ({args.max_position_embeddings}) must be greater than " \
+                f"or equal to max_seq_length_per_sample ({args.max_seq_length_per_sample})."
+    elif args.max_position_embeddings < max(
+        args.seq_length or 0, args.decoder_seq_length or 0, args.max_seq_length_per_sample or 0
+    ):
+        warn_rank_0(
+            "--max-position-embeddings is smaller than the run sequence length. RoPE/YaRN "
+            "does not require a learned position table, but checkpoint/export context-length "
+            "metadata retains --max-position-embeddings; set it explicitly for the intended export."
         )
-    if args.decoder_seq_length is not None:
-        assert args.max_position_embeddings >= args.decoder_seq_length
     if args.save is not None and args.save_params_interval is not None:
         assert not args.overlap_param_gather, \
             '--save-params-interval is not supported with --overlap-param-gather'
@@ -1833,7 +1851,7 @@ def validate_args(args, defaults={}):
         else:
             total_cp_ranks = args.data_parallel_size * args.context_parallel_size
         # Match SFTDataset's CP/SP alignment: schedulers pack padded lengths,
-        # which can exceed seq_length even for a single truncated sample.
+        # which can exceed the physical sample length even for one truncated sample.
         cp_divisor = (
             args.data_parallel_size * args.context_parallel_size * 2
             if args.dynamic_context_parallel
@@ -1842,7 +1860,7 @@ def validate_args(args, defaults={}):
         sp_divisor = args.tensor_model_parallel_size if args.sequence_parallel else 1
         padding_divisor = cp_divisor * sp_divisor
         max_padded_length = (
-            (args.seq_length + padding_divisor - 1) // padding_divisor * padding_divisor
+            (input_length + padding_divisor - 1) // padding_divisor * padding_divisor
         )
         if args.max_seqlen_per_dp_cp_rank is None:
             args.max_seqlen_per_dp_cp_rank = getattr(args, "max_seqlen_per_cp_rank", None)
@@ -1943,13 +1961,12 @@ def validate_args(args, defaults={}):
             )
 
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        assert (
-            not args.use_megatron_fsdp
-        ), "Emerging optimizer does not support Megatron-FSDP for now."
-        assert args.ckpt_format in [
-            "torch",
-            "torch_dist",
-        ], "Emerging optimizer supports torch and torch_dist checkpoint format."
+        if args.use_megatron_fsdp:
+            # The Megatron-FSDP checks above already cover v2, Muon and fsdp_dtensor checkpoints.
+            assert not args.muon_split_qkv, \
+                "MFSDP v2 Muon requires --muon-no-split-qkv."
+        else:
+            assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     if will_be_layer_wise:
         if not args.use_layer_wise_param_layout:
@@ -2970,8 +2987,6 @@ def _add_network_size_args(parser):
         "fp4_param",
         # already generated by data args
         "create_attention_mask_in_dataloader",
-        # filled from the explicit --seq-length argument below
-        "max_seq_length_per_sample",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",
@@ -3836,13 +3851,6 @@ def _add_training_args(parser):
         'CUDA graphs are unsupported.',
     )
     group.add_argument(
-        '--dataloader-type',
-        type=str,
-        default=None,
-        choices=['single', 'cyclic', 'external'],
-        help='Single pass vs multiple pass data loader',
-    )
-    group.add_argument(
         '--no-persist-layer-norm',
         action='store_true',
         help='Disable using persistent fused layer norm kernel. '
@@ -4323,7 +4331,8 @@ def _add_distributed_args(parser):
         choices=['no_shard', 'optim'],
         help='Sharding strategy for the outer expert data-parallel group in MFSDP v2. '
         'Valid values are "no_shard" (HSDP) and "optim" (HFSDP). '
-        'Defaults to --outer-dp-sharding-strategy when omitted.',
+        'Defaults to --outer-dp-sharding-strategy, or "no_shard" if only dense parameters have '
+        'an outer axis.',
     )
     group.add_argument(
         '--hfsdp-param-gather-overlap',
@@ -4379,6 +4388,13 @@ def _add_distributed_args(parser):
         type=int,
         default=1,
         help='Number of Distributed Optimizer copies across Data Parallel domain.',
+    )
+    group.add_argument(
+        '--expert-num-distributed-optimizer-instances',
+        type=int,
+        default=None,
+        help='Number of Distributed Optimizer copies across the expert Data Parallel domain. '
+        'Defaults to --num-distributed-optimizer-instances; only MFSDP v2 supports a different value.',
     )
     group.add_argument(
         '--torch-fsdp2-no-reshard-after-forward',
@@ -4472,6 +4488,13 @@ def _add_tokenizer_args(parser):
 
 
 def _add_data_args(parser):
+    from megatron.training.config import DataloaderConfig
+
+    # The loader options (--dataloader-type, --num-workers, --no-data-sharding, --no-pin-memory,
+    # --no-persistent-workers) come from DataloaderConfig's fields; drop_last stays config-only
+    # until the loader consumers read it.
+    ArgumentGroupFactory(DataloaderConfig, exclude=["drop_last"]).build_group(parser, "dataloader")
+
     group = parser.add_argument_group(title='data and dataloader')
 
     group.add_argument(
@@ -4603,7 +4626,6 @@ def _add_data_args(parser):
         default=0.1,
         help='Probability of producing a short sequence.',
     )
-    group.add_argument('--num-workers', type=int, default=2, help="Dataloader number of workers.")
     group.add_argument(
         '--reset-position-ids',
         action='store_true',
@@ -4735,12 +4757,6 @@ def _add_vision_args(parser):
         type=float,
         default=1.0,
         help='training with fraction of data per class.',
-    )
-    group.add_argument(
-        '--no-data-sharding',
-        action='store_false',
-        help='Disable data sharding.',
-        dest='data_sharding',
     )
     group.add_argument(
         '--head-lr-mult',

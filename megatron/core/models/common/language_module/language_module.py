@@ -485,7 +485,6 @@ class LanguageModule(MegatronModule):
 
         Returns: None, acts in-place
         """
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
         if not self.post_process:
             # No output layer
             assert output_layer_weight_key not in sharded_state_dict, sharded_state_dict.keys()
@@ -503,6 +502,10 @@ class LanguageModule(MegatronModule):
             # No output layer
             assert output_layer_weight_key not in sharded_state_dict, sharded_state_dict.keys()
             return
+
+        # Resolve the DP-CP group only on the branch that builds the tied replica, so the
+        # early-return paths above do not require initialized parallel state.
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
 
         # Replace the default output layer with a one sharing the weights with the embedding
         del sharded_state_dict[output_layer_weight_key]

@@ -187,3 +187,68 @@ def test_hybrid_forward_step_leaves_scheduler_batches_to_the_scheduler(
         assert prepare.call_args.args[0] is packed
     else:
         prepare.assert_not_called()
+
+
+def test_gpt_forward_step_prepares_raw_metadata_with_run_config_width(monkeypatch):
+    """An imported forward_step prepares metadata-only middle stages from cfg, not ``args``.
+
+    NOTE(nightly-sync 24_11_2026): main #8978 removed forward_step's local ``args`` binding,
+    while dev's raw-capacity preparation hook (#6058) still needs the physical pack width.
+    """
+    from megatron.training.datasets.sft_dataset import SFTDatasetConfig
+
+    module = pretrain_gpt
+    module_globals = vars(module)
+    if "args" in module_globals:
+        monkeypatch.delitem(module_globals, "args")
+
+    def no_args():
+        pytest.fail("forward_step must read the run config, not get_args()")
+
+    monkeypatch.setattr(module, "get_args", no_args)
+    dataset = object.__new__(SFTDatasetConfig)
+    dataset.sequence_length = 8
+    dataset.packed_sequence_length = 16
+    monkeypatch.setattr(
+        module,
+        "get_run_config",
+        lambda: SimpleNamespace(
+            data=SimpleNamespace(dataset=dataset),
+            model=SimpleNamespace(
+                transformer=SimpleNamespace(overlap_moe_expert_parallel_comm=False)
+            ),
+        ),
+    )
+    cp_group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+    output, iterator = object(), object()
+    model_config = SimpleNamespace(pad_packed_seq_alignment=None)
+    inner = Mock(
+        spec=[],
+        vp_stage=0,
+        pg_collection=SimpleNamespace(cp=cp_group),
+        config=model_config,
+        return_value=output,
+    )
+    model = _Wrapper(_Wrapper(inner))
+    cu_seqlens = torch.tensor([[0, 5, 12]], dtype=torch.int32)
+    # Middle pipeline stage: boundaries only, no tokens, labels or padding mask.
+    batch = (None, cu_seqlens, None, None, None, None, None, torch.tensor(7), None, None, None)
+    monkeypatch.setattr(module, "get_batch", Mock(return_value=batch))
+    monkeypatch.setattr(module, "get_timers", lambda: Mock())
+    stimer = MagicMock()
+    stimer.return_value = stimer
+    monkeypatch.setattr(module, "stimer", stimer)
+    monkeypatch.setattr(module, "update_seqlen_stats_from_cu_seqlens", Mock())
+    prepare = Mock()
+    monkeypatch.setattr(module, "prepare_packed_seq_params", prepare)
+
+    forward_output, loss = module.forward_step(iterator, model)
+
+    assert forward_output is output
+    assert callable(loss)
+    prepare.assert_called_once()
+    assert prepare.call_args.args[1] is model_config
+    assert prepare.call_args.kwargs["capacity"] == 16
+    assert prepare.call_args.kwargs["cp_group"] is cp_group
+    assert prepare.call_args.args[0].tokens_per_sample == 16
+    inner.assert_called_once()

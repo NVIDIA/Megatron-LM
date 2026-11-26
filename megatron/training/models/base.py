@@ -62,7 +62,10 @@ class ModelConfig:
 
     # === ModelOpt ===
     restore_modelopt_state: bool = False
-    """Restore ModelOpt quantization/sparsity state."""
+    """Megatron-Bridge compatibility only: select the ModelOpt layer spec so Bridge can restore
+    ModelOpt quantization/sparsity state itself. Megatron-LM never sets this; its GPT/Hybrid
+    configs use ``transformations``. Remove together with its spec branches once Bridge no
+    longer needs it."""
 
     extra_checkpoint_metadata: dict[str, Any] | None = None
     """Store for additional model-related metadata to save in the checkpoint. This 
@@ -232,6 +235,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
         use_layer_wise_param_layout: bool | None = None,
+        device: Any | None = None,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 
@@ -252,6 +256,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
                 is the single layout source (True: padded, False: compact). ``None`` defers to
                 it; with DDP and the layer-wise distributed optimizer, an explicit value that
                 disagrees with it raises ``ValueError``.
+            device: Explicit model placement requested by the run configuration.
 
         Returns:
             List of model stages. If the model does not support virtual pipeline parallelism,

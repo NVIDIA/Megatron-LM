@@ -22,6 +22,8 @@ import torch
 # Import via the public module path so this test gets discovered through the
 # regular pytest entry point. The functions under test are pure Python and do
 # not require torch.distributed.
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.training.config import DataConfig, DataloaderConfig
 from megatron.training.datasets.sft_dataset import (
     IGNORE_INDEX,
     MockSFTDataset,
@@ -1327,11 +1329,15 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
     # NOTE(nightly-sync 2026-11-12): main's d8ef5cca9 made get_batch read the normalized
     # TransformerConfig from get_run_config() instead of core_transformer_config_from_args, so
     # stub the run config, as test_get_batch.py does for the hybrid entrypoint.
-    monkeypatch.setattr(
-        pretrain_gpt,
-        "get_run_config",
-        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
+    # NOTE(nightly-sync 2026-11-24): main's 24afe41b2 (#8978) made get_batch read the data
+    # section's predicates and the dataset length from get_run_config().data, and the micro
+    # batch size from its train section, so the stub carries both: the same SBHD varlen data
+    # section the loader tests below build, without inter-document masking (no cu_seqlens).
+    stub_run_config = SimpleNamespace(
+        model=SimpleNamespace(transformer=config), train=SimpleNamespace(micro_batch_size=1)
     )
+    _loader_section(stub_run_config, seq_length=4, sbhd=True)
+    monkeypatch.setattr(pretrain_gpt, "get_run_config", lambda: stub_run_config)
     # Exercise an intermediate PP stage: it must not take the legacy early return.
     monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
     # Merged pretrain_gpt carries main's aliased import, so patch the alias.
@@ -1528,6 +1534,9 @@ def _build_varlen_for_loader(items, config, num_samples):
 
 
 def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None, num_workers=0):
+    """The legacy namespace these tests register (the runtime still expects one); the loader reads
+    none of it: the loader-owned values come from the data section, the model-parallel values
+    from the run config's model section."""
     return SimpleNamespace(
         dataloader_type='single',
         micro_batch_size=mbs,
@@ -1535,9 +1544,32 @@ def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None
         full_validation=False,
         dynamic_context_parallel=dynamic_cp,
         num_workers=num_workers,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
         use_varlen_dataset=use_varlen,
         varlen_sbhd_validation=sbhd,
         sequence_packing_scheduler=scheduler,
+    )
+
+
+def _loader_section(run_config, *, seq_length, sbhd, num_workers=0):
+    """The data section the loader reads: a varlen dataset config (a source, so the resolver
+    accepts the real class) with the SBHD flag of the run, the single loader and, by default, no
+    workers."""
+    dataset = GPTDatasetConfig(
+        sequence_length=seq_length,
+        random_seed=1,
+        blend=(["prefix"], None),
+        split="9,1,0",
+        varlen_sbhd_validation=sbhd,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
+    run_config.data = DataConfig(
+        dataset=dataset,
+        dataset_type=VarlenDataset,
+        dataloader=DataloaderConfig(dataloader_type="single", num_workers=num_workers),
     )
 
 
@@ -1572,6 +1604,7 @@ def test_sbhd_validation_dataloader_uses_default_collate(run_config, loader_mode
         n = mbs * dp * 4
         cfg = _make_config(tok, seq_length=seq_len, sbhd=True)
         ds = _build_varlen_for_loader(["hello world"] * n, cfg, num_samples=n)
+        _loader_section(run_config, seq_length=seq_len, sbhd=True)
         set_args(_loader_args(use_varlen=True, sbhd=True, scheduler=None, mbs=mbs))
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
@@ -1607,6 +1640,7 @@ def test_thd_dataloader_uses_identity_collate(run_config, loader_model_config):
         variable = ["a", "abcdef", "xy", "qwerty"]
         items = [variable[i % len(variable)] for i in range(n)]
         ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        _loader_section(run_config, seq_length=64, sbhd=False)
         set_args(_loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs))
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
@@ -1687,6 +1721,7 @@ def test_packing_scheduler_dataloader_yields_microbatches(run_config, loader_mod
         variable = ["a", "abcdef", "xy", "qwerty"]
         items = [variable[i % len(variable)] for i in range(n)]
         ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        _loader_section(run_config, seq_length=64, sbhd=False)
         set_args(
             _loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs, gbs=gbs)
         )
@@ -1708,7 +1743,7 @@ def test_packing_scheduler_dataloader_yields_microbatches(run_config, loader_mod
     [("dp_balanced", 5), ("default_dynamic_cp", 5), (None, 2)],
 )
 def test_packing_scheduler_dataloader_prefetches_next_global_batch(
-    scheduler, expected_prefetch_factor, run_config
+    scheduler, expected_prefetch_factor, run_config, loader_model_config
 ):
     from megatron.core import parallel_state
     from megatron.core.datasets.utils import Split
@@ -1717,6 +1752,12 @@ def test_packing_scheduler_dataloader_prefetches_next_global_batch(
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel(1, 1)
+    # NOTE(nightly-sync 2026-11-24): main's 24afe41b2 (#8978) made the loader read the scheduler
+    # and dynamic-CP settings from the run's model section and the worker count from its data
+    # section, so set them there; the legacy args below are no longer read.
+    dynamic_cp = scheduler == "default_dynamic_cp"
+    loader_model_config.dynamic_context_parallel = dynamic_cp
+    loader_model_config.sequence_packing_scheduler = scheduler
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs, num_microbatches, num_workers = 2, 9, 2
@@ -1725,9 +1766,9 @@ def test_packing_scheduler_dataloader_prefetches_next_global_batch(
         run_config.train.micro_batch_size = mbs
         run_config.train.global_batch_size = gbs
         run_config.validation.eval_micro_batch_size = mbs
-        dynamic_cp = scheduler == "default_dynamic_cp"
         cfg = _make_config(tok, seq_length=64, dp=dp, dynamic_cp=dynamic_cp)
         ds = _build_varlen_for_loader(["abc"] * gbs * 2, cfg, num_samples=gbs * 2)
+        _loader_section(run_config, seq_length=64, sbhd=False, num_workers=num_workers)
         set_args(
             _loader_args(
                 use_varlen=True,

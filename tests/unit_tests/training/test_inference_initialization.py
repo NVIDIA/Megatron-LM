@@ -188,20 +188,43 @@ def test_runtime_services_initialize_training_only_when_requested(
     assert vars(args) == {"enable_experimental": enable_runtime_flags}
 
 
-def test_inference_telemetry_does_not_read_training_fields(monkeypatch, run_config):
+@pytest.mark.parametrize("external_mapping", [False, True])
+def test_inference_telemetry_does_not_read_training_fields(
+    monkeypatch, run_config, external_mapping
+):
     class InferenceArgs(Namespace):
         def __getattribute__(self, name):
             if name in {"micro_batch_size", "global_batch_size", "train_iters"}:
                 raise AssertionError(f"Inference read training field {name}")
             return super().__getattribute__(name)
 
-    monkeypatch.setattr(global_vars, "_detect_gpu_identity", Mock(return_value={}))
+    run_config.dist.local_rank = 3
+    run_config.dist.external_gpu_device_mapping = external_mapping
+    detect = Mock(return_value={})
+    monkeypatch.setattr(global_vars, "_detect_gpu_identity", detect)
     attrs = global_vars.build_telemetry_resource_attrs(
         InferenceArgs(local_rank=0), include_training=False
     )
+    detect.assert_called_once_with(0 if external_mapping else 3)
+    assert attrs["dl.local_rank"] == 3
     assert "dl.batch_size" not in attrs
     assert "megatron.micro_batch_size" not in attrs
     assert "megatron.train_iters" not in attrs
+
+
+def test_inference_telemetry_keeps_the_cli_sequence_length(monkeypatch, run_config):
+    """Inference has no data section: its sequence-length tag is args.seq_length, whether or not
+    the model config carries Megatron Core's per-sample maximum."""
+    monkeypatch.setattr(global_vars, "_detect_gpu_identity", Mock(return_value={}))
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=1024,
+    )
+    assert run_config.model.transformer.max_seq_length_per_sample is None
+    attrs = global_vars.build_telemetry_resource_attrs(
+        Namespace(local_rank=0, seq_length=32), include_training=False
+    )
+    assert attrs["dl.sequence_length"] == 32
 
 
 @pytest.mark.parametrize("training_kwargs", [{}, {"training": False}])
@@ -293,7 +316,11 @@ def test_distributed_training_services_require_explicit_opt_in(
     if native_model:
         run_config.model = model_config_cls(
             transformer=TransformerConfig(
-                num_layers=4, hidden_size=128, num_attention_heads=8, tp_comm_overlap=True
+                num_layers=4,
+                hidden_size=128,
+                num_attention_heads=8,
+                tp_comm_overlap=True,
+                max_seq_length_per_sample=96 if vlm else 64,
             ),
             seq_length=1024,  # Position capacity must not be used for buffer sizing.
             tp_comm_overlap_cfg={"qkv_fprop": {"method": "ring_exchange"}},
@@ -354,6 +381,139 @@ def test_distributed_training_services_require_explicit_opt_in(
         assert tp_call.kwargs["tp_comm_overlap_cfg"] == args.tp_comm_overlap_cfg
 
 
+@pytest.mark.parametrize("use_mcore,first_rank", [(False, True), (True, True), (True, False)])
+def test_vlm_evaluation_uses_resolved_execution_width(
+    monkeypatch, run_config, use_mcore, first_rank
+):
+    from megatron.training.config.training_config import MultiModalTokenizerConfig
+    from megatron.training.models import LLaVAModelConfig
+
+    # As in the legacy GPT startup test above, isolate the already-removed
+    # generation package and wrapper config; this checks the example's inputs.
+    generation = ModuleType("megatron.inference.text_generation")
+    api = ModuleType(f"{generation.__name__}.api")
+    api.generate_and_post_process = Mock()
+    forward = ModuleType(f"{generation.__name__}.forward_step")
+    forward.ForwardStep = object
+    wrapper_config = ModuleType(
+        "megatron.core.inference.model_inference_wrappers.inference_wrapper_config"
+    )
+    wrapper_config.InferenceWrapperConfig = Mock()
+    for module in (generation, api, forward, wrapper_config):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    script_dir = Path(__file__).resolve().parents[3] / "examples/multimodal"
+    monkeypatch.syspath_prepend(str(script_dir))
+    spec = importlib.util.spec_from_file_location(
+        "vlm_generation_inputs", script_dir / "run_text_generation.py"
+    )
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    transformer = run_config.model.transformer
+    transformer.max_seq_length_per_sample = 128
+    run_config.model = LLaVAModelConfig(transformer=transformer, seq_length=256)
+    run_config.tokenizer = MultiModalTokenizerConfig()
+    # No decoder_seq_length: the canonical execution-width flag alone is supported.
+    args = Namespace(
+        use_mcore_inference=use_mcore,
+        use_tiling=False,
+        max_num_tiles=1,
+        use_thumbnail=False,
+        num_frames=1,
+        num_workers=0,
+        vision_model_type="clip",
+        pixel_shuffle=False,
+        use_tile_tags=False,
+        hidden_size=32,
+        inference_batch_times_seqlen_threshold=512,
+        fp32_residual_connection=False,
+        params_dtype=torch.float32,
+        inference_max_seq_length=128,
+    )
+    monkeypatch.setattr(script, "get_args", lambda: args)
+    monkeypatch.setattr(
+        script, "get_evaluation_dataloader", lambda *a: [(Mock(), Mock(), 0, "?", [], {})]
+    )
+    monkeypatch.setattr(script, "get_num_image_embeddings", lambda *a: 4)
+    monkeypatch.setattr(script, "get_conversation", lambda *a: "prompt")
+    monkeypatch.setattr(script, "is_first_rank", lambda: first_rank)
+    monkeypatch.setattr(script, "StaticInferenceContext", Mock())
+    monkeypatch.setattr(script, "get_tokenizer", Mock())
+    for name in ("InferenceWrapperConfig", "VLMInferenceWrapper", "VLMTextGenerationController"):
+        monkeypatch.setattr(script, name, Mock())
+    engine = Mock()
+    engine.get_new_request_id.return_value = "0"
+    engine.generate.return_value = []
+    monkeypatch.setattr(script, "StaticInferenceEngine", Mock(return_value=engine))
+    generate = Mock(return_value=([], None, None, None))
+    monkeypatch.setattr(script, "generate_and_post_process", generate)
+
+    assert (
+        list(script.generate_samples(Mock(), script.EvaluationConfig(task="inference"), False))
+        == []
+    )
+    if use_mcore:
+        request = engine.generate.call_args.kwargs["inference_requests"][0]
+        assert request.decoder_seq_length == 128
+    else:
+        forward_step = generate.call_args.kwargs["forward_step"]
+        assert forward_step.args[3] == 128
+
+
+@pytest.mark.parametrize("entrypoint", ["mock_vlm", "energon_vlm"])
+@pytest.mark.parametrize("position_type", ["learned_absolute", "rope"])
+def test_vlm_length_resolution_does_not_resize_learned_tables(
+    monkeypatch, entrypoint, position_type
+):
+    if entrypoint == "mock_vlm":
+        import pretrain_vlm as script
+
+        resolve = script.resolve_vlm_sequence_lengths
+        monkeypatch.setattr(script.context_parallel, "get_padding", lambda *a: 0)
+    else:
+        script_dir = Path(__file__).resolve().parents[3] / "examples/multimodal"
+        monkeypatch.syspath_prepend(str(script_dir))
+        spec = importlib.util.spec_from_file_location("vlm_model_inputs", script_dir / "model.py")
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        resolve = script.resolve_multimodal_sequence_lengths
+    monkeypatch.setattr(script, "get_num_image_embeddings", lambda *a, **kw: 4)
+    args = Namespace(
+        seq_length=64,
+        decoder_seq_length=None,
+        max_seq_length_per_sample=128 if entrypoint == "energon_vlm" else None,
+        max_position_embeddings=64,
+        position_embedding_type=position_type,
+        img_h=16,
+        img_w=16,
+        patch_dim=4,
+        disable_vision_class_token=True,
+        context_parallel_size=1,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+        dynamic_resolution=False,
+        pixel_shuffle=False,
+        vision_model_type="clip",
+        use_tile_tags=False,
+        max_num_tiles=1,
+        tokenizer_prompt_format="mistral",
+        use_thumbnail=False,
+        num_frames=1,
+    )
+    if position_type == "learned_absolute":
+        with pytest.raises(
+            ValueError, match="--max-position-embeddings.*--max-seq-length-per-sample"
+        ):
+            resolve(args)
+        assert args.max_position_embeddings == 64
+        args.max_position_embeddings = 256
+        resolve(args)
+        assert args.max_position_embeddings == 256
+    else:
+        resolve(args)
+        assert args.max_position_embeddings == (128 if entrypoint == "energon_vlm" else 68)
+
+
 @pytest.mark.parametrize("is_vlm,is_mimo", [(False, False), (True, False), (True, True)])
 def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, run_config, is_vlm, is_mimo):
     from examples.inference.advanced import vlm_dynamic_inference
@@ -401,3 +561,85 @@ def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, run_config
     else:
         check.assert_not_called()
     model.eval.assert_called_once()
+
+
+@pytest.mark.parametrize("is_mimo", [False, True])
+def test_dynamic_server_builds_vlm_shards_with_local_parallel_sizes(
+    monkeypatch, run_config, is_mimo
+):
+    """A TP=1 inference shard of a TP=2 launch builds and loads with shard-local sizes."""
+    from examples.inference.advanced import vlm_dynamic_inference
+
+    global_config = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        tensor_model_parallel_size=2,
+        expert_tensor_parallel_size=2,
+        sequence_parallel=True,
+    )
+    run_config.model.transformer = global_config
+    run_config.checkpoint.load = "checkpoint"
+    args = Namespace(inference_ckpt_non_strict=False)
+    if is_mimo:
+        args.mimo_checkpoint_prefix_map = {"language_model.": "language_model.module.module."}
+    provider_module = ModuleType("model")
+    provider_module.model_provider = Mock(return_value=Mock())
+    monkeypatch.setitem(sys.modules, "model", provider_module)
+    monkeypatch.setitem(sys.modules, "mimo_checkpoint_model", provider_module)
+    monkeypatch.setattr(vlm_dynamic_inference, "get_args", lambda: args)
+    monkeypatch.setattr(vlm_dynamic_inference, "_check_mimo_checkpoint_fully_loaded", Mock())
+    load = Mock()
+    monkeypatch.setattr(vlm_dynamic_inference, "load_checkpoint", load)
+
+    def get_model(provider, wrap_with_ddp, config=None, pg_collection=None):
+        # Like training.get_model: the provider receives the config passed here.
+        assert not wrap_with_ddp
+        return [
+            provider(
+                pre_process=True, post_process=True, config=config, pg_collection=pg_collection
+            )
+        ]
+
+    monkeypatch.setattr(vlm_dynamic_inference, "_get_model", get_model)
+    # Every group of the TP=1 shard, e.g. 'tp=1,role=prefill+tp=1,role=decode', has one rank.
+    group_names = ("tp", "pp", "cp", "ep", "expt_tp", "dp_cp", "dp", "expt_dp")
+    pg_collection = SimpleNamespace(**{name: object() for name in group_names})
+    monkeypatch.setattr(vlm_dynamic_inference, "get_pg_size", lambda group: 1)
+    checkpoint_group = object()
+
+    model = vlm_dynamic_inference.get_model(
+        is_vlm=True, pg_collection=pg_collection, checkpoint_group=checkpoint_group
+    )
+
+    kwargs = provider_module.model_provider.call_args.kwargs
+    assert kwargs["pg_collection"] is pg_collection
+    shard_config = kwargs["config"]
+    assert shard_config is not global_config
+    # The sizes the disaggregated coordinator checks against the shard's groups.
+    assert (
+        shard_config.tensor_model_parallel_size,
+        shard_config.pipeline_model_parallel_size,
+        shard_config.context_parallel_size,
+        shard_config.expert_model_parallel_size,
+        shard_config.expert_tensor_parallel_size,
+    ) == (1, 1, 1, 1, 1)
+    assert not shard_config.sequence_parallel
+    assert shard_config.hidden_size == global_config.hidden_size
+    # The launch-wide config is unchanged.
+    assert run_config.model.transformer is global_config
+    assert global_config.tensor_model_parallel_size == 2
+    assert global_config.expert_tensor_parallel_size == 2
+    assert global_config.sequence_parallel
+    load.assert_called_once_with(
+        ddp_model=[model],
+        optimizer=None,
+        opt_param_scheduler=None,
+        strict=True,
+        tp_group=pg_collection.tp,
+        pp_group=pg_collection.pp,
+        dp_cp_group=pg_collection.dp_cp,
+        dp_group=pg_collection.dp,
+        expt_dp_group=pg_collection.expt_dp,
+        checkpoint_group=checkpoint_group,
+    )
