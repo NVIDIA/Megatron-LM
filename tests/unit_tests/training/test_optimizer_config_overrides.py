@@ -12,7 +12,7 @@ import torch
 
 from megatron.core.optimizer import OptimizerConfig, _get_param_groups, merge_config_overrides
 from megatron.core.optimizer.optimizer import FP32Optimizer, get_param_group_identifier_tuple
-from megatron.core.optimizer.optimizer_config import ParamKey
+from megatron.core.optimizer.optimizer_config import ParamKey, ParamPredicate
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -360,3 +360,40 @@ def test_lora_plus_shared_builder_preserves_explicit_legacy_groups():
 @pytest.mark.parametrize("overrides", [None, {}])
 def test_lora_plus_warmup_accepts_absent_policies(overrides):
     validate_lora_plus_warmup(overrides, OptimizerConfig(lr=0.001), 0.0001)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_warmup_does_not_infer_lora_from_general_selectors(mixed):
+    selector = (
+        ParamKey(
+            name="*.linear_out.weight", predicate=ParamPredicate("matrix", lambda p: p.ndim == 2)
+        )
+        if mixed
+        else ParamKey(name="*out*.weight")
+    )
+    validate_lora_plus_warmup({selector: {"max_lr": 0.016}}, OptimizerConfig(lr=0.001), 1e-5)
+
+
+def test_lora_b_and_decoupled_embedding_share_a_safe_group(distributed_groups):
+    config = OptimizerConfig(lr=0.001, min_lr=0.0, decoupled_lr=0.016)
+    model = torch.nn.Module()
+    model.embedding = torch.nn.Parameter(torch.ones(4, 4))
+    model.embedding.is_embedding_or_output_parameter = True
+    model.adapter = torch.nn.Module()
+    model.adapter.linear_in = torch.nn.Linear(4, 4, bias=False)
+    model.adapter.linear_out = torch.nn.Linear(4, 4, bias=False)
+    policy = build_optimizer_config_overrides(config, [model], LoRAPlusOptimizerOverrides(16.0))
+    groups = _get_param_groups([model], config, policy)
+    assert len(groups) == len({get_param_group_identifier_tuple(group) for group in groups})
+    inner = torch.optim.AdamW(groups, lr=config.lr)
+    for index, param in enumerate(model.parameters()):
+        param.grad = torch.full_like(param, index + 1)
+    inner.step()
+    expected = {param: deepcopy(inner.state[param]) for param in model.parameters()}
+    wrapper = FP32Optimizer.__new__(FP32Optimizer)
+    wrapper.optimizer = inner
+    wrapper.load_state_dict(deepcopy(inner.state_dict()))
+    members = [param for group in inner.param_groups for param in group["params"]]
+    assert len(members) == len({id(param) for param in members}) == 3
+    for param in model.parameters():
+        torch.testing.assert_close(inner.state[param]["exp_avg"], expected[param]["exp_avg"])

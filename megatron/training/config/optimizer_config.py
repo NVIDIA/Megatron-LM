@@ -5,7 +5,6 @@
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, fields, replace
-from fnmatch import fnmatchcase
 from typing import Literal
 
 from megatron.core.optimizer import (
@@ -75,7 +74,9 @@ class LoRAPlusOptimizerOverrides:
         if self.ratio == 1.0:
             return {}
         key = ParamKey(name="*.linear_out.weight")
-        return {key: overrides[key]}
+        defaults = {"max_lr": optimizer_config.lr, "min_lr": optimizer_config.min_lr}
+        values = {name: value for name, value in overrides[key].items() if value != defaults[name]}
+        return {key: values} if values else {}
 
 
 def validate_lora_plus_warmup(
@@ -84,17 +85,21 @@ def validate_lora_plus_warmup(
     """Reject unequal named A/B bounds with a shared nonzero initial warmup LR.
 
     Check the policy rather than local parameter presence so pipeline ranks agree.
-    This covers hand-written mappings and callables using standard adapter globs.
+    This covers name-only mappings using the exact standard adapter globs.
+    More general selectors must supply their own validation.
     """
     if not overrides or initial_lr == 0:
         return
+    # Only the explicit standard adapter policy establishes LoRA intent. Arbitrary
+    # globs and OR-combined predicates may describe ordinary model parameters.
+    # Their authors own validation; do not invent parameters to evaluate them.
     bounds = []
-    for parameter in ("adapter.linear_in.weight", "adapter.linear_out.weight"):
-        matched = []
-        for selector, value in overrides.items():
-            patterns = (selector.name,) if isinstance(selector.name, str) else selector.name
-            if any(fnmatchcase(parameter, pattern) for pattern in patterns):
-                matched.append(value)
+    for pattern in ("*.linear_in.weight", "*.linear_out.weight"):
+        matched = [
+            value
+            for selector, value in overrides.items()
+            if selector in (ParamKey(name=pattern), ParamKey(name=(pattern,)))
+        ]
         policy = combine_param_group_overrides(matched)
         bounds.append(
             (
