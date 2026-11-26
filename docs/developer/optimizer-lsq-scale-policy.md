@@ -39,3 +39,8 @@ Bridge's LSQ callable and legacy provider already delegate to this helper. They
 continue to use the same API and receive the additional input validation; no
 second Bridge policy implementation or separate adoption is required here. Bridge
 retains its ModelOpt gradient-support check.
+
+Comparisons involving inherited LR bounds run after model and recipe contributions
+are composed. A scale maximum below the global minimum remains valid when the
+recipe supplies a lower scale minimum. Explicit negative or nonfinite scale fields
+are rejected immediately; inverted final bounds are rejected before optimizer construction.
