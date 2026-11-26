@@ -185,8 +185,19 @@ def test_mhc_fused_backend_defaults_to_auto():
     assert config.mhc_fused_backend == "auto"
 
 
-@pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
-def test_mhc_fused_rejects_unsupported_precision_at_construction(flag):
+def test_mhc_fused_accepts_eps_inside_sqrt_at_construction():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        use_fused_mhc=True,
+        mhc_norm_eps_inside_sqrt=True,
+    )
+    assert config.mhc_norm_eps_inside_sqrt is True
+
+
+def test_mhc_fused_rejects_fp32_mappings_at_construction():
     with pytest.raises(ValueError, match="use_fused_mhc does not support"):
         TransformerConfig(
             num_layers=1,
@@ -194,7 +205,7 @@ def test_mhc_fused_rejects_unsupported_precision_at_construction(flag):
             num_attention_heads=4,
             enable_mhc_connections=True,
             use_fused_mhc=True,
-            **{flag: True},
+            mhc_keep_mappings_in_fp32=True,
         )
 
 

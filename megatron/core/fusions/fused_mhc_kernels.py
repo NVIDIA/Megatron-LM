@@ -1664,9 +1664,8 @@ if _CUTILE_AVAILABLE:
         r_out = torch.empty(M, 1, dtype=out_dtype, device=dev)
         proj_out = torch.empty(M, N, dtype=proj_acc.dtype, device=dev)
 
-        default_tm = _default_reduce_compute_h_tile_m(M)
         cache_key = (M, N, K, n, split_k)
-        cached = _reduce_compute_h_best_cfg.get(cache_key)
+        tm = _reduce_compute_h_best_cfg.get(cache_key)
 
         def _make_args(tm):
             return (
@@ -1693,26 +1692,25 @@ if _CUTILE_AVAILABLE:
                 split_k,
             )
 
-        if cached is not None or not _CUTILE_EXPERIMENTAL_AVAILABLE:
-            tm = cached if cached is not None else default_tm
-            ct.launch(stream, (math.ceil(M / tm),), _ct_reduce_compute_h_kernel, _make_args(tm))
-        else:
+        if tm is None and _CUTILE_EXPERIMENTAL_AVAILABLE:
             from types import SimpleNamespace
 
             configs = [SimpleNamespace(TILE_M=tm) for tm in _reduce_compute_h_autotune_configs(M)]
-            tuned = ct_experimental.autotune_launch(
-                stream,
-                grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M),),
-                kernel=_ct_reduce_compute_h_kernel,
-                args_fn=lambda cfg: _make_args(cfg.TILE_M),
-                search_space=configs,
-            )
-            best_tm = tuned.tuned_config.TILE_M
-            _reduce_compute_h_best_cfg[cache_key] = best_tm
-            ct.launch(
-                stream, (math.ceil(M / best_tm),), _ct_reduce_compute_h_kernel, _make_args(best_tm)
-            )
+            if configs:
+                tuned = ct_experimental.autotune_launch(
+                    stream,
+                    grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M),),
+                    kernel=_ct_reduce_compute_h_kernel,
+                    args_fn=lambda cfg: _make_args(cfg.TILE_M),
+                    search_space=configs,
+                )
+                tm = tuned.tuned_config.TILE_M
+                _reduce_compute_h_best_cfg[cache_key] = tm
 
+        # Row counts such as 129 have no candidate divisor and use one-row tiles.
+        if tm is None:
+            tm = _default_reduce_compute_h_tile_m(M)
+        ct.launch(stream, (math.ceil(M / tm),), _ct_reduce_compute_h_kernel, _make_args(tm))
         return h_pre_out, h_post_out, h_res_out, r_out, proj_out
 
     # -- Combined proj_rms + compute_h forward --------------------------------
@@ -2774,7 +2772,10 @@ def _torch_proj_rms_compute_h(
         else nullcontext()
     )
     with precision_context:
-        x = x.to(torch.promote_types(x.dtype, weight.dtype))
+        promoted_dtype = torch.promote_types(x.dtype, weight.dtype)
+        x = x.to(promoted_dtype)
+        if eps_inside_sqrt:
+            weight = weight.to(promoted_dtype)
         proj = torch.matmul(x, weight.t())
         r = (
             torch.sqrt(x.square().mean(dim=-1, keepdim=True) + eps)

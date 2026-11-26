@@ -86,7 +86,6 @@ def test_mhc_fused_rejects_unsupported_precision():
 
 
 def test_mhc_fused_accepts_eps_inside_sqrt():
-    torch.manual_seed(42)
     config = TransformerConfig(
         num_layers=1,
         hidden_size=32,
@@ -97,15 +96,21 @@ def test_mhc_fused_accepts_eps_inside_sqrt():
     )
     layer = HyperConnectionModule(config, layer_number=1).cuda()
     with torch.no_grad():
-        layer.mapping_proj.weight.normal_(std=0.02)
-    residual = (torch.randn(2, 1, 128, device="cuda") * 0.001).to(torch.bfloat16)
+        layer.mapping_proj.weight.zero_()
+        layer.mapping_proj.weight[:4, 0].fill_(1.0)
+        layer.alpha_pre.fill_(1.0)
+        layer.bias.zero_()
+    residual = torch.zeros(2, 1, 128, device="cuda", dtype=torch.bfloat16)
+    residual[:, :, 0] = 1e-3
     residual.requires_grad_()
     pre, _, _ = layer.compute_mappings(residual)
-    x = residual.float()
-    projected = x @ layer.mapping_proj.weight.T
-    rms = torch.rsqrt(x.square().mean(-1, keepdim=True) + config.layernorm_epsilon)
-    expected = (projected[..., :4] * rms * layer.alpha_pre + layer.bias[:4]).sigmoid()
-    torch.testing.assert_close(pre, (expected + 1e-6).to(pre.dtype), atol=0.01, rtol=0.01)
+    # The fixed input gives a pre gate near 0.58 with inside-sqrt epsilon
+    # and near 1 if the fused op reverts to outside-sqrt epsilon.
+    x = residual.detach().float()
+    projected = x[..., :1].expand_as(pre)
+    rms = torch.sqrt(x.square().mean(-1, keepdim=True) + config.layernorm_epsilon)
+    expected = ((projected / rms).sigmoid() + 1e-6).to(pre.dtype)
+    torch.testing.assert_close(pre, expected, atol=1e-3, rtol=1e-3)
     pre.float().sum().backward()
     assert torch.isfinite(residual.grad).all()
     assert torch.isfinite(layer.mapping_proj.weight.grad).all()

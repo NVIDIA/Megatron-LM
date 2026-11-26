@@ -838,6 +838,27 @@ class TestFusedProjRmsComputeH:
         )
         _assert_cosine_similar(bf.grad, br.grad, COSINE_SIM_THRESH, msg="backward mismatch on bias")
 
+    def test_eps_inside_sqrt_promotes_bf16_weight_under_autocast(self):
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
+
+        torch.manual_seed(42)
+        n, k = 4, 512
+        out_size = n * n + 2 * n
+        eps = 1e-5
+        x = torch.randn(32, k, device=DEVICE, dtype=torch.float32) * 0.001
+        weight = (torch.randn(out_size, k, device=DEVICE) * 0.02).to(torch.bfloat16)
+        alpha = torch.full((1,), 0.1, device=DEVICE)
+        bias = torch.zeros(out_size, device=DEVICE)
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            actual = fused_proj_rms_compute_h(
+                x, weight, alpha, alpha, alpha, bias, n, eps, backend="native", eps_inside_sqrt=True
+            )
+        expected = _ref_proj_rms_compute_h(
+            x, weight.float(), alpha, alpha, alpha, bias, n, eps, eps_inside_sqrt=True
+        )
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
     @pytest.mark.parametrize("backend", ["native", "cutile"])
     @pytest.mark.parametrize(
         "input_scale,m,k", [(1.0, 32, 512), (0.001, 32, 512), (0.001, 129, 8192)]
@@ -859,17 +880,23 @@ class TestFusedProjRmsComputeH:
         grad_h = [torch.randn(m, width, device=DEVICE) for width in (n, n, n * n)]
         grad_r = torch.randn(m, 1, device=DEVICE)
 
-        def run(fn):
+        def run(fn, *, check_r_grad=False):
             inputs = [
                 t.detach().clone().requires_grad_()
                 for t in (x_data, w_data, *alpha_data, bias_data)
             ]
+            if check_r_grad:
+                r_only = fn(*inputs, n, eps, eps_inside_sqrt=True)[-1]
+                (r_grad,) = torch.autograd.grad(r_only.sum(), inputs[0])
+                expected_r_grad = x_data / (k * r_only.detach())
+                torch.testing.assert_close(r_grad, expected_r_grad, atol=1e-8, rtol=1e-5)
             outputs = fn(*inputs, n, eps, eps_inside_sqrt=True)
             sum((out * grad).sum() for out, grad in zip(outputs, (*grad_h, grad_r))).backward()
             return outputs, [t.grad for t in inputs]
 
         actual, actual_grads = run(
-            lambda *args, **kwargs: fused_proj_rms_compute_h(*args, backend=backend, **kwargs)
+            lambda *args, **kwargs: fused_proj_rms_compute_h(*args, backend=backend, **kwargs),
+            check_r_grad=True,
         )
         expected, expected_grads = run(_ref_proj_rms_compute_h)
         for name, got, want in zip(("pre", "post", "res", "r"), actual, expected):
