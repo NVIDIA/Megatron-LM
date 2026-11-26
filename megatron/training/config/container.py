@@ -549,8 +549,11 @@ class PretrainConfigContainer(ConfigContainerBase):
             moe_single_grouped_weight=transformer.moe_single_grouped_weight,
             virtual_pipeline_model_parallel_size=transformer.virtual_pipeline_model_parallel_size,
         )
+        # Finalizing a sample-based horizon derives train_iters from train_samples
+        # (update_train_iters); the horizon rule checks the one the user chose.
+        derived_train_iters = self._finalized and bool(self.train.train_samples)
         self.scheduler.validate_run(
-            train_iters=self.train.train_iters,
+            train_iters=None if derived_train_iters else self.train.train_iters,
             train_samples=self.train.train_samples,
             skip_train=self.validation.skip_train,
             weight_decay=self.optimizer.weight_decay,

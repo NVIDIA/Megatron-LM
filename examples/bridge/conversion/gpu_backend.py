@@ -39,6 +39,7 @@ from megatron.bridge.models.conversion.checkpoint import resolve_checkpoint_path
 from megatron.bridge.models.decorators import torchrun_main
 from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
 from megatron.training.models.base import ModelConfig
+from megatron.training.utils.checkpoint_utils import run_config_sections
 from megatron.training.utils.common_utils import print_rank_0
 
 _IGNORE_PRECISION_PARAMS = (
@@ -125,7 +126,7 @@ def _maybe_restore_pipeline_layout(
     config_path = config_root / "run_config.yaml"
     if config_path.exists():
         with config_path.open() as config_file:
-            config = yaml.safe_load(config_file) or {}
+            config = run_config_sections(yaml.safe_load(config_file)) or {}
         saved_model_config = config.get("model", {})
         # Builder-backed model configs serialize the Megatron-Core fields under ``transformer``.
         saved_model_config = {**(saved_model_config.get("transformer") or {}), **saved_model_config}

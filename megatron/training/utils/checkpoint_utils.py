@@ -179,8 +179,17 @@ def _prepare_run_config(config_dict: Any) -> dict[str, Any]:
     return apply_run_config_backward_compat(config_dict)
 
 
-def read_run_config(run_config_filename: str) -> dict[str, Any]:
-    """Read the run configuration from a YAML file (rank 0 only).
+def read_run_config(run_config_filename: str) -> Optional[dict[str, Any]]:
+    """Read a checkpoint's run config: the sections of the container the saving process ran on.
+
+    The result is the same for a root container's document and for a document saved before
+    the root container. `read_root_config` returns the whole document.
+    """
+    return run_config_sections(read_root_config(run_config_filename))
+
+
+def read_root_config(run_config_filename: str) -> dict[str, Any]:
+    """Read the saved run configuration document from a YAML file (rank 0 only).
 
     Reads the file on rank 0 and broadcasts the result to other ranks.
 
@@ -188,7 +197,7 @@ def read_run_config(run_config_filename: str) -> dict[str, Any]:
         run_config_filename: Path to the run config YAML file.
 
     Returns:
-        A dictionary containing the run configuration.
+        A dictionary containing the whole saved document.
 
     Raises:
         ImportError: If PyYAML is not installed.

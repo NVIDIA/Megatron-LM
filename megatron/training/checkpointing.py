@@ -239,7 +239,7 @@ def _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type) -> Optio
         return run_config_sections(state_dict.get('run_config'))
     config_filename = get_checkpoint_run_config_filename(_checkpoint_dir(checkpoint_name, ckpt_type))
     if maybe_msc.os.path.exists(config_filename):
-        return run_config_sections(read_run_config(config_filename))
+        return read_run_config(config_filename)
     return None
 
 
