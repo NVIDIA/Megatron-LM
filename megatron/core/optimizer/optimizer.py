@@ -9,7 +9,7 @@ import warnings
 from abc import ABC, abstractmethod
 from itertools import chain
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple, TypeVar, Union
 
 import torch
 from typing_extensions import override
@@ -190,7 +190,7 @@ def _is_dsa_indexer_identifier(identifier: tuple) -> bool:
     return bool(identifier[_IS_DSA_INDEXER_INDEX])
 
 
-def _missing_param_group_message(identifier: tuple, saved_groups: Dict[tuple, Dict]) -> str:
+def _missing_param_group_message(identifier: tuple, saved_groups: Mapping[tuple, object]) -> str:
     """The 'no such group' error, listing what the checkpoint did contain."""
     available_keys = '\n'.join(str(k) for k in saved_groups.keys())
     return (
@@ -246,7 +246,12 @@ def _expand_pre_split_param_groups(
     return final_groups
 
 
-def find_saved_param_group(identifier: tuple, saved_groups: Dict[tuple, Dict]) -> Optional[Dict]:
+_SavedGroup = TypeVar("_SavedGroup")
+
+
+def find_saved_param_group(
+    identifier: tuple, saved_groups: Mapping[tuple, _SavedGroup]
+) -> Optional[_SavedGroup]:
     """Find the saved group for ``identifier``, falling back across the DSA indexer split.
 
     A checkpoint written before the indexer had its own parameter group holds one group where
@@ -351,7 +356,7 @@ def match_param_groups(
 
         current_metadata = retained_metadata(current)
 
-        def compatible(group):
+        def compatible(group: Dict) -> bool:
             metadata = retained_metadata(group)
             # Step and scheduled weight decay belong to the checkpoint's progress,
             # not the freshly built configuration. Checkpoint-only metadata cannot

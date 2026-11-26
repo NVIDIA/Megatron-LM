@@ -187,7 +187,7 @@ class TwoWeights(torch.nn.Module):
         }
 
 
-def _build(rates):
+def _build(rates, *, redundant_default=False):
     raw = TwoWeights()
     model = DistributedDataParallel(
         raw.config, DistributedDataParallelConfig(use_distributed_optimizer=True), raw
@@ -203,10 +203,14 @@ def _build(rates):
             clip_grad=0.0,
         ),
         [model],
-        config_overrides={
-            ParamKey(name=(name, "*." + name)): {"max_lr": lr, "min_lr": lr / 10}
-            for name, lr in zip(("a", "b"), rates)
-        },
+        config_overrides=(
+            {ParamKey(name=("b", "*.b")): {"max_lr": 0.001, "min_lr": 0.0}}
+            if redundant_default
+            else {
+                ParamKey(name=(name, "*." + name)): {"max_lr": lr, "min_lr": lr / 10}
+                for name, lr in zip(("a", "b"), rates)
+            }
+        ),
     )
     while isinstance(optimizer, ChainedOptimizer):
         assert len(optimizer.chained_optimizers) == 1
@@ -238,17 +242,20 @@ def _step(model, optimizer, scheduler):
 
 @pytest.mark.parametrize("format_name", ["dp_reshardable", "fully_reshardable"])
 @pytest.mark.parametrize(
-    "old_rates,new_rates",
+    "old_rates,new_rates,redundant_default",
     [
-        ((0.001, 0.002), (0.003, 0.001)),
-        ((0.001, 0.002), (0.004, 0.004)),
-        ((0.001, 0.001), (0.002, 0.003)),
+        ((0.001, 0.002), (0.003, 0.001), False),
+        ((0.001, 0.002), (0.004, 0.004), False),
+        ((0.001, 0.001), (0.002, 0.003), False),
+        ((0.001, 0.001), (0.001, 0.001), True),
     ],
 )
-def test_disk_resume_preserves_parameter_state_and_next_updates(format_name, old_rates, new_rates):
+def test_disk_resume_preserves_parameter_state_and_next_updates(
+    format_name, old_rates, new_rates, redundant_default
+):
     Utils.initialize_model_parallel(1, 1)
     try:
-        raw, model, source, scheduler = _build(old_rates)
+        raw, model, source, scheduler = _build(old_rates, redundant_default=redundant_default)
         for _ in range(3):
             _step(model, source, scheduler)
         # Use the existing checkpoint key version; no new group schema is written.
@@ -268,7 +275,10 @@ def test_disk_resume_preserves_parameter_state_and_next_updates(format_name, old
                 },
                 directory,
             )
-            new_raw, new_model, resumed, new_scheduler = _build(new_rates)
+            new_raw, new_model, resumed, new_scheduler = _build(
+                new_rates, redundant_default=redundant_default
+            )
+            expected_logging = [g["default_config"] for g in resumed.param_groups]
             new_model_sd = new_raw.sharded_state_dict()
             loaded = dist_checkpointing.load(
                 {
@@ -281,10 +291,15 @@ def test_disk_resume_preserves_parameter_state_and_next_updates(format_name, old
             )
             new_raw.load_state_dict(loaded["model"])
             resumed.load_state_dict(loaded["optimizer"], override_lr=True)
+            assert [g["default_config"] for g in resumed.param_groups] == expected_logging
+            if redundant_default:
+                assert expected_logging == [True, False]
             new_scheduler.load_state_dict(loaded["scheduler"])
 
         # Independent reference: transfer tensors by model parameter, with no group matcher.
-        ref_raw, ref_model, reference, ref_scheduler = _build(new_rates)
+        ref_raw, ref_model, reference, ref_scheduler = _build(
+            new_rates, redundant_default=redundant_default
+        )
         ref_raw.load_state_dict(raw.state_dict())
         reference.load_state_dict(reference.state_dict())
         for group in reference.param_groups:
