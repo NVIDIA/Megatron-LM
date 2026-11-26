@@ -1352,7 +1352,9 @@ class TestMegatronNetworkArgumentGeneration:
     )
     def test_balanced_indexer_policy(self, argv, expected):
         """The bare flag retains its boolean semantics alongside explicit auto selection."""
-        assert self._parser().parse_args(argv).dsa_cp_balance_indexer == expected
+        args = self._parser().parse_args(argv)
+        assert args.dsa_cp_balance_indexer == expected
+        assert not any(name.startswith("dsa_cp_indexer_auto_") for name in vars(args))
 
     def test_transformer_callback_fields_are_not_registered_as_cli_args(self):
         """Callback fields are runtime hooks, not CLI-provided values."""

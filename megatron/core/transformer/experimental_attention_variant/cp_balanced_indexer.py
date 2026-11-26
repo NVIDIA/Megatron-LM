@@ -2107,7 +2107,10 @@ def prebuild_balanced_layouts(
         if (
             no_work
             or not zigzag_fused
-            or (contiguous_fused and not prefer_zigzag(seq_lens_list, N, l_local, auto_config))
+            or (
+                contiguous_fused
+                and not prefer_zigzag(seq_lens_list, cp_group, l_local, auto_config)
+            )
         ):
             _stash_verdict(eligible)
             return

@@ -5,7 +5,11 @@
 from collections import Counter
 from typing import TYPE_CHECKING
 
+from .indexer_hardware import group_layout_costs
+
 if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
+
     from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 
@@ -17,13 +21,14 @@ def _candidate_prefix(rows: int) -> int:
 
 
 def prefer_zigzag(
-    lengths: list[int], cp_size: int, local_rows: int, config: "MLATransformerConfig"
+    lengths: list[int], cp_group: "ProcessGroup", local_rows: int, config: "MLATransformerConfig"
 ) -> bool:
     """Compare the critical rank for the two eligible fused paths without enumerating tokens.
 
     The last length is the physical capacity tail. It travels with other rows but has no
     compressed keys. All other lengths are the padded segments actually scored by the kernel.
     """
+    cp_size = cp_group.size()
     contiguous = [0] * cp_size
     retained = [0] * cp_size
     chunk_counts: Counter[int] = Counter()
@@ -51,6 +56,10 @@ def prefer_zigzag(
     if peak_contiguous * cp_size == sum(contiguous):
         return False
 
+    costs = group_layout_costs(cp_group)
+    if costs is None:
+        return False
+
     zigzag = [0] * cp_size
     for chunk, count in chunk_counts.items():
         for rank in range(cp_size):
@@ -66,11 +75,8 @@ def prefer_zigzag(
             "CSA auto layout requires the indexer head count, head dimension and top-k width."
         )
     flops_per_candidate = 2 * heads * dim
-    saved_us = (
-        (peak_contiguous - max(zigzag))
-        * flops_per_candidate
-        / (config.dsa_cp_indexer_auto_compute_tflops * 1e6)
-    )
+    compute_tflops = costs.compute_tflops * (2 if config.dsa_indexer_precision == "mxfp8" else 1)
+    saved_us = (peak_contiguous - max(zigzag)) * flops_per_candidate / (compute_tflops * 1e6)
 
     # Dispatch the low-rank query and head weights. The inverse sends int32 IDs and,
     # for sparse-loss training, their paired fp32 predictions. Price that payload even
@@ -84,6 +90,6 @@ def prefer_zigzag(
     # Equal-sized source/destination shards give each rank identical send/receive row
     # counts. Local permutations still process the full shard, including retained rows.
     remote_rows = local_rows - min(retained)
-    route_us = remote_rows * row_bytes / (config.dsa_cp_indexer_auto_exchange_gbps * 1e3)
-    copy_us = local_rows * row_bytes / (config.dsa_cp_indexer_auto_copy_gbps * 1e3)
-    return saved_us > route_us + copy_us + config.dsa_cp_indexer_auto_overhead_us
+    route_us = remote_rows * row_bytes / (costs.exchange_gbps * 1e3)
+    copy_us = local_rows * row_bytes / (costs.copy_gbps * 1e3)
+    return saved_us > route_us + copy_us + costs.overhead_us

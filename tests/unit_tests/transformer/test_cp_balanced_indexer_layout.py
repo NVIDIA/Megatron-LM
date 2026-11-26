@@ -1668,13 +1668,17 @@ def _make_balanced_transformer_config(monkeypatch, **overrides):
 def test_auto_decision_is_shared_across_ranks_and_layers(monkeypatch, boundaries, eligible, zigzag):
     """Same capacity, different packs; direct Core callers build at most one route."""
     from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
-
-    config = _make_balanced_transformer_config(
-        monkeypatch,
-        dsa_cp_balance_indexer="auto",
-        dsa_cp_indexer_auto_compute_tflops=1.0,
-        dsa_cp_indexer_auto_overhead_us=0.0,
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        indexer_layout_cost,
     )
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.indexer_hardware import (
+        LayoutCosts,
+    )
+
+    monkeypatch.setattr(
+        indexer_layout_cost, "group_layout_costs", lambda group: LayoutCosts(1, 200, 2000, 0)
+    )
+    config = _make_balanced_transformer_config(monkeypatch, dsa_cp_balance_indexer="auto")
     for rank in range(2):
         group = _StubGroup(2, rank)
         pack = _packed_params(boundaries, boundaries[-1])
@@ -1691,13 +1695,72 @@ def test_auto_decision_is_shared_across_ranks_and_layers(monkeypatch, boundaries
             assert auto_use_zigzag(pack, group, 128, config) is zigzag
 
 
+def test_auto_costs_follow_cp_group_membership():
+    """A shared fabric can span hosts, and a host can contain separate fabric cliques."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils.indexer_hardware import (
+        _DeviceInfo,
+        _group_costs,
+    )
+
+    a = _DeviceInfo(2500, 8000, 900, host=1, fabric=123)
+    b = _DeviceInfo(2250, 7700, 900, host=2, fabric=123)
+    rack = _group_costs([a, b])
+    assert rack == _group_costs([b, a])
+    assert rack.compute_tflops == 1250 and rack.copy_gbps == 1925
+    local = _group_costs([a, b._replace(host=1, fabric=456)])
+    network = _group_costs([a, b._replace(fabric=456)])
+    assert rack.exchange_gbps > local.exchange_gbps > network.exchange_gbps
+    assert rack.overhead_us < local.overhead_us < network.overhead_us
+    assert _group_costs([a._replace(fabric=0), b._replace(fabric=0)]) == network
+    assert _group_costs([a, b._replace(bf16_tflops=0)]) is None
+
+
+def test_auto_hardware_discovery_runs_once_per_group(monkeypatch):
+    """A cached unsupported device must also avoid another metadata collective."""
+    from unittest.mock import Mock
+
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import indexer_hardware
+
+    groups = [Mock(spec=torch.distributed.ProcessGroup) for _ in range(2)]
+    costs = indexer_hardware.LayoutCosts(500, 200, 2000, 20)
+    discover = Mock(side_effect=[costs, None])
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(indexer_hardware, "_discover_costs", discover)
+    for group, expected in zip(groups, [costs, None]):
+        assert indexer_hardware.group_layout_costs(group) is expected
+        assert indexer_hardware.group_layout_costs(group) is expected
+    assert discover.call_count == 2
+
+
+def test_auto_gpu_probe_uses_visible_device_and_memory_clock(monkeypatch):
+    """Properties belong to the assigned ordinal, including under CUDA_VISIBLE_DEVICES."""
+    from types import SimpleNamespace
+
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import indexer_hardware
+
+    device = torch.device("cuda", 3)
+
+    def properties(requested):
+        assert requested == device
+        return SimpleNamespace(
+            name="NVIDIA H200", memory_clock_rate=2_000_000, memory_bus_width=4096, uuid=None
+        )
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", properties)
+    info = indexer_hardware._device_info(device)
+    assert info.bf16_tflops == 989 and info.hbm_gbps == 2048
+
+
 def test_auto_prices_routing_only_when_both_fused_paths_fit(monkeypatch):
     """Respect the fused row bound and MXFP8's fused-only scoring contract."""
     from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
-
-    config = _make_balanced_transformer_config(
-        monkeypatch, dsa_cp_balance_indexer="auto", dsa_cp_indexer_auto_overhead_us=1e6
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        indexer_layout_cost,
     )
+
+    # Unknown hardware keeps contiguous when both fused implementations fit.
+    monkeypatch.setattr(indexer_layout_cost, "group_layout_costs", lambda group: None)
+    config = _make_balanced_transformer_config(monkeypatch, dsa_cp_balance_indexer="auto")
     group = _StubGroup(2, 0)
     assert not auto_use_zigzag(_packed_params([0, 256], 256), group, 128, config)
     monkeypatch.setattr(cp_balanced_indexer, "FUSED_INDEXER_MAX_SAFE_ROWS", 64)

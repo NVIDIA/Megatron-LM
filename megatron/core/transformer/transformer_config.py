@@ -644,19 +644,6 @@ class TransformerConfig(ModelParallelConfig):
     instances sized for the largest future schedule entry. Other graph configurations retain the
     static-composition behavior."""
 
-    dsa_cp_indexer_auto_compute_tflops: float = 500.0
-    """Effective indexer dot-product TFLOP/s per rank for automatic layout selection."""
-
-    dsa_cp_indexer_auto_exchange_gbps: float = 200.0
-    """Effective GB/s for exposed remote dispatch and return traffic in auto mode."""
-
-    dsa_cp_indexer_auto_copy_gbps: float = 2000.0
-    """Effective GB/s for packing and restoring all local query rows in auto mode."""
-
-    dsa_cp_indexer_auto_overhead_us: float = 20.0
-    """Extra microseconds per zigzag use for launches, amortized preparation, and headroom.
-    The auto cost parameters are initial estimates that can be calibrated for a deployment."""
-
     @property
     def dsa_cp_balance_indexer_graph_dynamic_packs(self) -> bool:
         """Whether CUDA-graphed balanced DSA routing supports varying pack compositions.
@@ -3038,20 +3025,6 @@ class TransformerConfig(ModelParallelConfig):
             and self.dsa_cp_balance_indexer != "auto"
         ):
             raise ValueError("dsa_cp_balance_indexer must be False, True, or 'auto'.")
-        if self.dsa_cp_balance_indexer == "auto":
-            for name in (
-                "dsa_cp_indexer_auto_compute_tflops",
-                "dsa_cp_indexer_auto_exchange_gbps",
-                "dsa_cp_indexer_auto_copy_gbps",
-            ):
-                value = getattr(self, name)
-                if not math.isfinite(value) or value <= 0:
-                    raise ValueError(f"{name} must be finite and positive.")
-            if (
-                not math.isfinite(self.dsa_cp_indexer_auto_overhead_us)
-                or self.dsa_cp_indexer_auto_overhead_us < 0
-            ):
-                raise ValueError("dsa_cp_indexer_auto_overhead_us must be finite and nonnegative.")
         if self.dsa_cp_balance_indexer and self.experimental_attention_variant != "dsv4_hybrid":
             # The flag is consumed only by the CSA indexer; on any other model the
             # data-step prebuild would burn per-microbatch host syncs for nothing.
