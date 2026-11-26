@@ -710,7 +710,7 @@ class ModelParallelConfig:
             # configured CP, DP (GTPParallelLayout), so they are consecutive unless batch
             # shards and configured CP are both present. Dynamic CP regroups the ranks per
             # microbatch and is not covered.
-            if self.sequence_packing_scheduler != 'dp_balanced':
+            if self.sequence_packing_scheduler != "dp_balanced":
                 raise ValueError(
                     "GTP sequence sharding supports only the dp_balanced "
                     "sequence_packing_scheduler, got "
