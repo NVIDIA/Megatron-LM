@@ -156,7 +156,10 @@ the local work on both sides:
    moments of `g` and the raw-sum momentum, and write the (Nesterov) momentum
    as the Newton–Schulz input.
 2. After the scatter: rotate `U <- rownorm(U - lr kappa_t O)`, take the Adam
-   step on `g` with decoupled decay, and rewrite `W = g U`.
+   step on `g`, and rewrite `W = g U`.
+
+The update follows the reference AngularMuown implementation, with Emerging
+Optimizers' Newton–Schulz for the orthogonalization.
 
 The row states (`row_scale` and its two Adam moments) are `(m, 1)` DTensors
 sharded like their parameters, so they add no communication.
