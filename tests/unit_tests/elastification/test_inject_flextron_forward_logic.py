@@ -39,12 +39,14 @@ def _make_original_forward(log):
         inference_context=None,
         runtime_gather_output=None,
         inference_params=None,
+        recurrence_step=None,
     ):
         log.note(
             "original_forward",
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
+            recurrence_step=recurrence_step,
         )
         return "forward-result"
 
@@ -150,7 +152,13 @@ class TestManagerOrdering:
         model = _attach_forward(_StubModelWithManager, original)
         model._flextron_manager = _make_manager(log)
 
-        model.forward(input_ids="ids", position_ids="pos", attention_mask="mask", budget=0.697)
+        model.forward(
+            input_ids="ids",
+            position_ids="pos",
+            attention_mask="mask",
+            budget=0.697,
+            recurrence_step=0,
+        )
 
         names = [e[0] for e in log.events]
         # Exact expected sequence.
@@ -161,6 +169,7 @@ class TestManagerOrdering:
         ]
         # Sanity: the budget actually used is the one passed in kwargs.
         assert log.events[0][1]["budget_item"] == 0.697
+        assert log.events[2][1]["recurrence_step"] == 0
 
     def test_loss_func_invoked_when_returned(self):
         log = _CallLog()

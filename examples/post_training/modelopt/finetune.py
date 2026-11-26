@@ -25,7 +25,7 @@ from megatron.post_training.model_config import (
     modelopt_model_config_from_args,
 )
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
-from megatron.training import get_args, get_timers, pretrain
+from megatron.training import get_args, get_timers, get_train_state, pretrain
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.utils import print_rank_0
 
@@ -583,7 +583,12 @@ def forward_step(data_iterator, model: GPTModel):
     if offline:
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels, aux_hidden_states=aux_hidden_states, hidden_states=hidden_states,)
     else:
-        output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
+        recurrence_kwargs = {}
+        if ":" in (getattr(get_run_config().model, "hybrid_layer_pattern", None) or ""):
+            train_state = get_train_state()
+            if train_state is not None:
+                recurrence_kwargs["recurrence_step"] = train_state.iteration
+        output_tensor = model(tokens, position_ids, attention_mask, labels=labels, **recurrence_kwargs)
 
     return output_tensor, partial(loss_func, loss_mask, model=model)
 

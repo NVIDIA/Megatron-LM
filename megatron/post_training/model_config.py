@@ -96,10 +96,11 @@ def _load_teacher_model_config(
             config_path = None
 
     args_dict = vars(args).copy()
+    teacher_overrides = {}
 
     if config_path is not None:
         with open(config_path) as f:
-            config = yaml.safe_load(f) or {}
+            teacher_overrides = yaml.safe_load(f) or {}
 
         del args_dict["kv_channels"]  # not recalculated if present
         # Setting teacher Flextron fields to false if training with Flextron, can be overridden
@@ -110,7 +111,7 @@ def _load_teacher_model_config(
         if "freeze_model" in args_dict:
             args_dict["freeze_model"] = False
 
-        args_dict.update(config)
+        args_dict.update(teacher_overrides)
 
     # Backward compat: old checkpoints have hybrid_override_pattern but not hybrid_layer_pattern
     if (
@@ -118,6 +119,13 @@ def _load_teacher_model_config(
         and args_dict.get('hybrid_layer_pattern') is None
     ):
         args_dict['hybrid_layer_pattern'] = args_dict['hybrid_override_pattern']
+
+    # A teacher that removes recurrence boundaries must not inherit the student's
+    # loop policy. Leave explicit teacher settings to normal model validation.
+    if ":" not in (args_dict.get("hybrid_layer_pattern") or ""):
+        for name in ("n_loops_distribution", "inference_n_loops"):
+            if name not in teacher_overrides:
+                args_dict.pop(name, None)
 
     return Namespace(**args_dict)
 

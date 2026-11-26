@@ -17,6 +17,13 @@ from megatron.core.models.gpt.moe_module_specs import (
     get_moe_module_spec,
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.layers.loop_conditioned_layer import (
+    LoopConditionedMambaLayer,
+    LoopConditionedMoETransformerLayer,
+    LoopConditionedTransformerLayer,
+)
+from megatron.core.models.hybrid.loop_conditioning import LoopConditioner
+from megatron.core.models.hybrid.recurrence_gate import AdaptiveDeltaGate
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
 from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention, KimiDeltaAttentionSubmodules
 from megatron.core.ssm.gated_delta_product import (
@@ -408,6 +415,26 @@ gated_delta_product_stack_spec = ModuleSpec(
 )
 
 
+# Exact adaptive-delta updates with input re-injection at every marked region.
+# MTP remains an ordinary, unlooped stack with its original layer recipes.
+adaptive_delta_hybrid_stack_spec = replace(
+    hybrid_stack_spec,
+    submodules=replace(
+        hybrid_stack_spec.submodules,
+        recurrence_gate=ModuleSpec(module=AdaptiveDeltaGate),
+        mtp_stack_submodules=hybrid_stack_spec.submodules,
+    ),
+)
+adaptive_delta_gated_delta_product_stack_spec = replace(
+    gated_delta_product_stack_spec,
+    submodules=replace(
+        gated_delta_product_stack_spec.submodules,
+        recurrence_gate=ModuleSpec(module=AdaptiveDeltaGate),
+        mtp_stack_submodules=gated_delta_product_stack_spec.submodules,
+    ),
+)
+
+
 hybrid_inference_stack_spec = ModuleSpec(
     module=HybridStack,
     submodules=HybridStackSubmodules(
@@ -639,6 +666,140 @@ gated_delta_product_inference_stack_spec = ModuleSpec(
         moe_layer=hybrid_inference_stack_spec.submodules.moe_layer,
         mtp_block_spec=hybrid_inference_stack_spec.submodules.mtp_block_spec,
     ),
+)
+
+
+# Preserve the gated architecture when inference builders resolve a training spec.
+# These do not enable recurrent KV caching; HybridModel still rejects inference contexts.
+adaptive_delta_hybrid_inference_stack_spec = replace(
+    hybrid_inference_stack_spec,
+    submodules=replace(
+        hybrid_inference_stack_spec.submodules,
+        recurrence_gate=ModuleSpec(module=AdaptiveDeltaGate),
+        mtp_stack_submodules=hybrid_inference_stack_spec.submodules,
+    ),
+)
+adaptive_delta_gated_delta_product_inference_stack_spec = replace(
+    gated_delta_product_inference_stack_spec,
+    submodules=replace(
+        gated_delta_product_inference_stack_spec.submodules,
+        recurrence_gate=ModuleSpec(module=AdaptiveDeltaGate),
+        mtp_stack_submodules=gated_delta_product_inference_stack_spec.submodules,
+    ),
+)
+
+
+def _get_loop_conditioned_layer_spec(spec):
+    """Compose explicit post-normalization modulation with ordinary branch projections."""
+    if not isinstance(spec, ModuleSpec):
+        return spec
+    is_mamba = issubclass(spec.module, MambaLayer)
+    if not is_mamba and not issubclass(spec.module, TransformerLayer):
+        raise TypeError("Loop-conditioned specs require TransformerLayer or MambaLayer")
+    submodules = spec.submodules
+    sharded_map = dict(submodules.sharded_state_dict_keys_map)
+    norm_import_map = {}
+    linear_types = {
+        TELayerNormColumnParallelLinear: TEColumnParallelLinear,
+        InferenceLayerNormColumnParallelLinear: InferenceColumnParallelLinear,
+    }
+    mixer_name = "mixer" if is_mamba else "self_attention"
+    mixer = getattr(submodules, mixer_name)
+    replacements = {}
+    if isinstance(mixer, ModuleSpec):
+        projections = {}
+        for name in ("in_proj", "linear_qkv", "linear_qkv_down_proj"):
+            old = getattr(mixer.submodules, name, None)
+            if old in linear_types:
+                projections[name] = linear_types[old]
+                external = "norm." if is_mamba else "input_layernorm."
+                fused = f"{mixer_name}.{name}.layer_norm_"
+                norm_import_map[fused] = external
+                storage = submodules.sharded_state_dict_keys_map.get(fused, fused)
+                for parameter in ("weight", "bias"):
+                    sharded_map[external + parameter] = storage + parameter
+                replacements["norm" if is_mamba else "input_layernorm"] = TENorm
+        if projections:
+            replacements[mixer_name] = replace(
+                mixer, submodules=replace(mixer.submodules, **projections)
+            )
+    if not is_mamba and isinstance(submodules.mlp, partial):
+        mlp = submodules.mlp
+        mlp_submodules = mlp.keywords.get("submodules")
+        if isinstance(mlp_submodules, MLPSubmodules) and mlp_submodules.linear_fc1 in linear_types:
+            replacements["mlp"] = partial(
+                mlp.func,
+                *mlp.args,
+                **{
+                    **mlp.keywords,
+                    "submodules": replace(
+                        mlp_submodules, linear_fc1=linear_types[mlp_submodules.linear_fc1]
+                    ),
+                },
+            )
+            replacements["pre_mlp_layernorm"] = TENorm
+            norm_import_map["mlp.linear_fc1.layer_norm_"] = "pre_mlp_layernorm."
+            storage = submodules.sharded_state_dict_keys_map.get(
+                "mlp.linear_fc1.layer_norm_", "mlp.linear_fc1.layer_norm_"
+            )
+            for parameter in ("weight", "bias"):
+                sharded_map["pre_mlp_layernorm." + parameter] = storage + parameter
+    layer_type = (
+        LoopConditionedMambaLayer
+        if is_mamba
+        else (
+            LoopConditionedMoETransformerLayer
+            if issubclass(spec.module, MoETransformerLayer)
+            else LoopConditionedTransformerLayer
+        )
+    )
+    return replace(
+        spec,
+        module=layer_type,
+        params={**spec.params, "loop_conditioning_norm_key_map": norm_import_map},
+        submodules=replace(submodules, sharded_state_dict_keys_map=sharded_map, **replacements),
+    )
+
+
+def _get_loop_conditioned_stack_spec(stack_spec):
+    """Keep prefix/MTP recipes ordinary and declare conditioned recurrent/output layers."""
+    submodules = stack_spec.submodules
+    names = (
+        "mamba_layer",
+        "gdn_layer",
+        "gdn2_layer",
+        "kda_layer",
+        "attention_layer",
+        "dsa_layer",
+        "csa_layer",
+        "csa_qk_layernorm_layer",
+        "mla_layer",
+        "mla_fused_down_proj_layer",
+        "mlp_layer",
+        "moe_layer",
+    )
+    return replace(
+        stack_spec,
+        submodules=replace(
+            submodules,
+            **{name: _get_loop_conditioned_layer_spec(getattr(submodules, name)) for name in names},
+            loop_conditioning=ModuleSpec(module=LoopConditioner),
+            unconditioned_submodules=submodules,
+        ),
+    )
+
+
+loop_conditioned_adaptive_delta_hybrid_stack_spec = _get_loop_conditioned_stack_spec(
+    adaptive_delta_hybrid_stack_spec
+)
+loop_conditioned_adaptive_delta_gated_delta_product_stack_spec = _get_loop_conditioned_stack_spec(
+    adaptive_delta_gated_delta_product_stack_spec
+)
+loop_conditioned_adaptive_delta_hybrid_inference_stack_spec = _get_loop_conditioned_stack_spec(
+    adaptive_delta_hybrid_inference_stack_spec
+)
+loop_conditioned_adaptive_delta_gated_delta_product_inference_stack_spec = (
+    _get_loop_conditioned_stack_spec(adaptive_delta_gated_delta_product_inference_stack_spec)
 )
 
 

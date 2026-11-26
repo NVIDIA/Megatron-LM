@@ -7,7 +7,11 @@ import importlib
 import sys
 from argparse import Namespace
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
+
+import pytest
+
+from megatron.training.state import TrainState
 
 
 def test_missing_modelopt_plugin_uses_stock_hybrid_builder(monkeypatch, request):
@@ -30,7 +34,9 @@ def test_missing_modelopt_plugin_uses_stock_hybrid_builder(monkeypatch, request)
         use_legacy_models=False,
         spec=["stock.module", "stock_spec"],
         max_position_embeddings=16,
-        hybrid_layer_pattern="M*",
+        hybrid_layer_pattern=":M*:",
+        n_loops_distribution="1:1,4:1",
+        inference_n_loops=2,
         fp16_lm_cross_entropy=False,
         untie_embeddings_and_output_weights=False,
         position_embedding_type="rope",
@@ -56,6 +62,8 @@ def test_missing_modelopt_plugin_uses_stock_hybrid_builder(monkeypatch, request)
     import_spec.assert_called_once_with(args.spec)
     assert build_stock.call_args.kwargs["hybrid_stack_spec"] is stock_spec
     assert build_stock.call_args.kwargs["vocab_size"] == 128
+    assert build_stock.call_args.kwargs["n_loops_distribution"] == "1:1,4:1"
+    assert build_stock.call_args.kwargs["inference_n_loops"] == 2
     build_modelopt.assert_not_called()
 
 
@@ -83,3 +91,31 @@ def test_modelopt_stage_binds_the_tokenizer_vocab_size():
 
     assert model_config.vocab_size == 128
     kd_hooks.assert_called_once_with(model_config, None)
+
+
+@pytest.mark.parametrize("pattern", ["M*", ":M*:"])
+def test_flextron_forward_step_keeps_recurrence_step_across_microbatches(monkeypatch, pattern):
+    module = importlib.import_module("megatron.elastification.pretrain_hybrid_flex")
+    args = Namespace(hybrid_layer_pattern=pattern, original_model_sample_prob=1.0)
+    train_state = TrainState(iteration=11)
+    stimer = MagicMock()
+    stimer.return_value = stimer
+    monkeypatch.setattr(module, "get_args", lambda: args)
+    monkeypatch.setattr(module, "get_train_state", lambda: train_state)
+    monkeypatch.setattr(module, "get_timers", Mock)
+    monkeypatch.setattr(module, "get_batch", lambda _: (None,) * 7)
+    monkeypatch.setattr(module, "get_grad_acc_based_random_choice", lambda **kwargs: 0.0)
+    monkeypatch.setattr(module, "_logged_params_norm", True)
+    monkeypatch.setattr(module, "stimer", stimer)
+    model = Mock(training=True)
+
+    module.forward_step(None, model)
+    module.forward_step(None, model)
+    train_state.iteration += 1
+    module.forward_step(None, model)
+
+    assert all(call.kwargs["budget"] == 1.0 for call in model.call_args_list)
+    if pattern == ":M*:":
+        assert [call.kwargs["recurrence_step"] for call in model.call_args_list] == [11, 11, 12]
+    else:
+        assert all("recurrence_step" not in call.kwargs for call in model.call_args_list)

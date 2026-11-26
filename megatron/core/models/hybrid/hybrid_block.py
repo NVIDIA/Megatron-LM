@@ -28,6 +28,13 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.hybrid.loop_conditioning import LoopConditioningConfig
+from megatron.core.models.hybrid.recurrence import (
+    LoopDistribution,
+    recurrent_layer_indices,
+    validate_loop_count,
+    validate_recurrence_config,
+)
 from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
@@ -88,6 +95,9 @@ class HybridStackSubmodules:
     moe_layer: ModuleSpec | type | None = None
     mtp_block_spec: ModuleSpec | None = None
     mtp_stack_submodules: "HybridStackSubmodules | None" = None
+    recurrence_gate: ModuleSpec | None = None
+    loop_conditioning: ModuleSpec | None = None
+    unconditioned_submodules: Optional["HybridStackSubmodules"] = None
 
 
 class HybridStack(MegatronModule):
@@ -121,6 +131,8 @@ class HybridStack(MegatronModule):
         mtp_layer_number (int, optional): enclosing MTP depth for nested MoE metrics.
         hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
             to select hash-routed MoE layers.
+        recurrent_layer_ranges: Half-open physical layer ranges to repeat with tied weights.
+        n_loops_distribution: Training loop-count policy, e.g., "1:0.5,4:0.5".
     """
 
     def __init__(
@@ -141,6 +153,9 @@ class HybridStack(MegatronModule):
         name: str | None = None,
         layer_config_list: Sequence[TransformerConfig] | None = None,
         boundary_layout: CPLayout | None = None,
+        recurrent_layer_ranges: tuple[tuple[int, int], ...] = (),
+        n_loops_distribution: str | None = None,
+        loop_conditioning_config: LoopConditioningConfig | None = None,
     ) -> None:
         """
         Args:
@@ -171,6 +186,33 @@ class HybridStack(MegatronModule):
                 segment = ""
             layer_utils.validate_tp_comm_overlap(layer_config, segment, has_mtp=is_mtp_layer)
 
+        self.recurrent_layer_ranges = tuple(recurrent_layer_ranges)
+        self.loop_distribution = LoopDistribution.from_string(n_loops_distribution)
+        if self.recurrent_layer_ranges:
+            validate_recurrence_config(config)
+            tuple(recurrent_layer_indices(len(layer_config_list), self.recurrent_layer_ranges, 1))
+            if pp_layer_offset != 0 or is_mtp_layer:
+                raise ValueError("Hybrid recurrence requires a non-pipelined decoder stack")
+            for layer_config in layer_config_list:
+                validate_recurrence_config(layer_config)
+            for start, end in self.recurrent_layer_ranges:
+                for layer_config in layer_config_list[start:end]:
+                    if (
+                        type(layer_config) is layer_utils.MoELayerConfig
+                        and layer_config.moe_enable_routing_replay
+                    ):
+                        raise ValueError("Routing replay is not supported for recurrent MoE layers")
+        elif n_loops_distribution is not None:
+            raise ValueError("n_loops_distribution requires recurrent_layer_ranges")
+
+        if submodules.recurrence_gate is not None:
+            if not self.recurrent_layer_ranges:
+                raise ValueError("An adaptive-delta gated spec requires ':' recurrence boundaries")
+            if config.wide_residual is not None or config.enable_mhc_connections:
+                raise ValueError(
+                    "Adaptive-delta recurrence currently requires ordinary residual width"
+                )
+
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
@@ -191,6 +233,11 @@ class HybridStack(MegatronModule):
         self.tp_group = pg_collection.tp
         self.cp_group = pg_collection.cp
         self.tp_cp_group = pg_collection.tp_cp
+        if self.recurrent_layer_ranges:
+            if (
+                self.pp_group is not None and self.pp_group.size() != 1
+            ) or self.cp_group.size() != 1:
+                raise ValueError("Hybrid recurrence requires PP=1 and CP=1 process groups")
 
         # Required for pipeline parallel schedules
         self.input_tensor = None
@@ -226,9 +273,38 @@ class HybridStack(MegatronModule):
                 tp_group=self.tp_group,
                 tp_cp_group=self.tp_cp_group,
             )
-        # Build layers from the pre-selected segment
+        self.loop_conditioning = None
+        self.loop_conditioning_config = None
+        if submodules.loop_conditioning is not None:
+            if submodules.recurrence_gate is None or submodules.unconditioned_submodules is None:
+                raise ValueError("Loop conditioning requires an adaptive gate and prefix recipes")
+            self.loop_conditioning_config = loop_conditioning_config or LoopConditioningConfig()
+            self.loop_conditioning = build_module(
+                submodules.loop_conditioning,
+                config=config,
+                pg_collection=pg_collection,
+                conditioning_config=self.loop_conditioning_config,
+                num_regions=len(self.recurrent_layer_ranges),
+            )
+        elif loop_conditioning_config is not None:
+            raise ValueError("loop_conditioning_config requires a loop-conditioned stack spec")
+
+        def build_layer(spec, **kwargs):
+            if self.loop_conditioning is not None and i >= self.recurrent_layer_ranges[0][0]:
+                if not getattr(getattr(spec, "module", spec), "supports_loop_conditioning", False):
+                    raise ValueError("The selected layer recipe does not support loop conditioning")
+                kwargs["loop_conditioning_config"] = self.loop_conditioning_config
+            return build_module(spec, **kwargs)
+
+        # Build layers from the pre-selected segment, leaving the prefix ordinary.
         self.layers = nn.ModuleList()
+        stack_submodules = submodules
         for i, layer_config in enumerate(self.layer_config_list):
+            submodules = (
+                stack_submodules.unconditioned_submodules
+                if self.loop_conditioning is not None and i < self.recurrent_layer_ranges[0][0]
+                else stack_submodules
+            )
             layer_number = i + 1 + pp_layer_offset
             if layer_config.fp8:
                 quant_init_context = get_fp8_context(
@@ -263,7 +339,7 @@ class HybridStack(MegatronModule):
                         raise ValueError("Custom layers must retain the supplied tp_group.")
                 elif type(layer_config) is layer_utils.MambaLayerConfig:
                     self._assert_submodule_configured(submodules, "mamba_layer")
-                    layer = build_module(
+                    layer = build_layer(
                         submodules.mamba_layer,
                         config=layer_config,
                         layer_number=layer_number,
@@ -274,7 +350,7 @@ class HybridStack(MegatronModule):
                     )
                 elif type(layer_config) is layer_utils.AttentionLayerConfig:
                     self._assert_submodule_configured(submodules, "attention_layer")
-                    layer = build_module(
+                    layer = build_layer(
                         submodules.attention_layer,
                         config=layer_config,
                         layer_number=layer_number,
@@ -286,7 +362,7 @@ class HybridStack(MegatronModule):
                     )
                 elif type(layer_config) is layer_utils.DSALayerConfig:
                     self._assert_submodule_configured(submodules, "dsa_layer")
-                    layer = build_module(
+                    layer = build_layer(
                         submodules.dsa_layer,
                         config=layer_config,
                         layer_number=layer_number,
@@ -302,7 +378,7 @@ class HybridStack(MegatronModule):
                     )
                     self._assert_submodule_configured(submodules, csa_layer_spec_name)
                     csa_layer_spec = getattr(submodules, csa_layer_spec_name)
-                    layer = build_module(
+                    layer = build_layer(
                         csa_layer_spec,
                         config=layer_config,
                         layer_number=layer_number,
@@ -320,7 +396,7 @@ class HybridStack(MegatronModule):
                     )
                     self._assert_submodule_configured(submodules, mla_layer_spec_name)
                     mla_layer_spec = getattr(submodules, mla_layer_spec_name)
-                    layer = build_module(
+                    layer = build_layer(
                         mla_layer_spec,
                         config=layer_config,
                         layer_number=layer_number,
@@ -331,7 +407,7 @@ class HybridStack(MegatronModule):
                     )
                 elif type(layer_config) is layer_utils.MLPLayerConfig:
                     self._assert_submodule_configured(submodules, "mlp_layer")
-                    layer = build_module(
+                    layer = build_layer(
                         submodules.mlp_layer,
                         config=layer_config,
                         layer_number=layer_number,
@@ -342,7 +418,7 @@ class HybridStack(MegatronModule):
                     )
                 elif type(layer_config) is layer_utils.MoELayerConfig:
                     self._assert_submodule_configured(submodules, "moe_layer")
-                    layer = build_module(
+                    layer = build_layer(
                         submodules.moe_layer,
                         config=layer_config,
                         layer_number=layer_number,
@@ -360,7 +436,7 @@ class HybridStack(MegatronModule):
                     )
                     self._assert_submodule_configured(submodules, gdn_layer_spec_name)
                     gdn_layer_spec = getattr(submodules, gdn_layer_spec_name)
-                    layer = build_module(
+                    layer = build_layer(
                         gdn_layer_spec,
                         config=layer_config,
                         layer_number=layer_number,
@@ -373,7 +449,7 @@ class HybridStack(MegatronModule):
                     )
                 elif type(layer_config) is layer_utils.KDALayerConfig:
                     self._assert_submodule_configured(submodules, "kda_layer")
-                    layer = build_module(
+                    layer = build_layer(
                         submodules.kda_layer,
                         config=layer_config,
                         layer_number=layer_number,
@@ -403,6 +479,7 @@ class HybridStack(MegatronModule):
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
             self.layers.append(layer)
 
+        submodules = stack_submodules
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
 
@@ -435,6 +512,25 @@ class HybridStack(MegatronModule):
                     setattr(self.hc_head_fn, 'sequence_parallel', True)
                     setattr(self.hc_head_base, 'sequence_parallel', True)
                     setattr(self.hc_head_scale, 'sequence_parallel', True)
+
+        self.recurrence_gates = nn.ModuleList(
+            [
+                build_module(submodules.recurrence_gate, config=config, pg_collection=pg_collection)
+                for _ in self.recurrent_layer_ranges
+            ]
+            if submodules.recurrence_gate is not None
+            else []
+        )
+        self._gate_region_starts = (
+            {start: index for index, (start, _) in enumerate(self.recurrent_layer_ranges)}
+            if self.recurrence_gates
+            else {}
+        )
+        self._gate_region_ends = (
+            {end - 1: index for index, (_, end) in enumerate(self.recurrent_layer_ranges)}
+            if self.recurrence_gates
+            else {}
+        )
 
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
@@ -615,6 +711,8 @@ class HybridStack(MegatronModule):
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
         input_ids: Optional[Tensor] = None,
+        n_loops: int | None = None,
+        recurrence_step: int | None = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -630,6 +728,9 @@ class HybridStack(MegatronModule):
             inference_context (BaseInferenceContext): the inference parameters.
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
+            n_loops (int, optional): Positive loop-count override for this forward only.
+            recurrence_step (int, optional): Shared logical minibatch step for stochastic
+                training. All microbatches in an accumulation step must pass the same value.
             input_ids (Tensor, optional): Token IDs forwarded to hash-routed
                 TransformerLayer instances and custom layers. Defaults to None.
                 Custom layers must accept None; HybridModel does not forward IDs to MTP stacks.
@@ -641,7 +742,18 @@ class HybridStack(MegatronModule):
         if self._has_custom_layers and (inference_context is not None or InferenceMode.is_active()):
             raise ValueError("Custom hybrid layers do not support inference contexts yet.")
 
+        recurrent_ranges = getattr(self, "recurrent_layer_ranges", ())
+        if recurrent_ranges:
+            # Configs are mutable; never let a later recompute/graph setting bypass recurrence.
+            validate_recurrence_config(self.config)
+            if inference_context is not None:
+                raise ValueError("Hybrid recurrence does not yet support cached inference")
+        if n_loops is not None and not recurrent_ranges:
+            raise ValueError("n_loops requires recurrent_layer_ranges")
+
         runtime_cp_group, cp_layout_manager = self._resolve_runtime_cp_layout(packed_seq_params)
+        if recurrent_ranges and runtime_cp_group.size() != 1:
+            raise ValueError("Hybrid recurrence requires CP=1 for every microbatch")
 
         cp_layout_state = None
         if cp_layout_manager is not None:
@@ -672,6 +784,12 @@ class HybridStack(MegatronModule):
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
+
+        execution_indices = range(len(self.layers))
+        if recurrent_ranges:
+            if n_loops is None:
+                n_loops = self.loop_distribution.sample(self.training, step=recurrence_step)
+            execution_indices = recurrent_layer_indices(len(self.layers), recurrent_ranges, n_loops)
 
         if self.config.enable_mhc_connections and self.pre_process and not self.is_mtp_layer:
             hidden_states = HyperConnectionModule.input_expand(
@@ -750,6 +868,18 @@ class HybridStack(MegatronModule):
             else [None] * self.num_layers_per_pipeline_rank
         )
 
+        # Per-forward state only: each region retains its own entry activations
+        # across its loops, but never across microbatches or evaluation calls.
+        active_region = None
+        region_input = previous_state = loop_input = None
+        region_pass = 0
+        gate_starts = getattr(self, "_gate_region_starts", {})
+        gate_ends = getattr(self, "_gate_region_ends", {})
+        conditioner = getattr(self, "loop_conditioning", None)
+        conditions = None
+        if conditioner is not None:
+            validate_loop_count(n_loops)
+            conditions = [conditioner(index, n_loops) for index in range(n_loops)]
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
@@ -769,14 +899,34 @@ class HybridStack(MegatronModule):
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
-                for layer_idx, (physical_layer_idx, layer_config, layer) in enumerate(
-                    zip(
-                        self._execution_layer_indices,
-                        self._execution_layer_config_list,
-                        self.layers,
-                        strict=True,
-                    )
-                ):
+                for layer_idx in execution_indices:
+                    if layer_idx in gate_starts:
+                        index = gate_starts[layer_idx]
+                        if active_region is None:
+                            active_region = index
+                            region_input = hidden_states
+                        previous_state = hidden_states
+                        loop_input = previous_state + region_input
+                        # The gate must see the unmodified entry tensor even if a
+                        # custom body uses in-place activation operations.
+                        prepared = (
+                            conditioner.regions[active_region].entry(
+                                loop_input, region_input, conditions[region_pass], region_pass
+                            )
+                            if conditioner is not None
+                            else loop_input
+                        )
+                        hidden_states = prepared.clone()
+                        region_pass += 1
+                    layer_condition = None
+                    if conditions is not None:
+                        if active_region is not None:
+                            layer_condition = conditions[region_pass - 1]
+                        elif layer_idx >= recurrent_ranges[-1][1]:
+                            layer_condition = conditions[-1]
+                    physical_layer_idx = self._execution_layer_indices[layer_idx]
+                    layer_config = self._execution_layer_config_list[layer_idx]
+                    layer = self.layers[layer_idx]
                     layer_packed_seq_params = packed_seq_params
                     residual_stream_recompute_context = residual_stream_recompute_plan[
                         physical_layer_idx
@@ -883,6 +1033,8 @@ class HybridStack(MegatronModule):
                                     is_custom_layer or self._uses_hash_routing(layer)
                                 ):
                                     layer_kwargs["input_ids"] = layer_input_ids
+                                if getattr(layer, "supports_loop_conditioning", False):
+                                    layer_kwargs["loop_condition"] = layer_condition
                                 hidden_states, _ = layer(hidden_states, **layer_kwargs)
                             elif isinstance(layer, MambaLayer):
                                 layer_kwargs = dict(
@@ -896,6 +1048,8 @@ class HybridStack(MegatronModule):
                                     layer_kwargs["residual_stream_recompute_context"] = (
                                         residual_stream_recompute_context
                                     )
+                                if getattr(layer, "supports_loop_conditioning", False):
+                                    layer_kwargs["loop_condition"] = layer_condition
                                 hidden_states = layer(hidden_states, **layer_kwargs)
                             else:  # Expert or MLP
                                 if residual_stream_recompute_context is not None:
@@ -925,6 +1079,19 @@ class HybridStack(MegatronModule):
                         hidden_states=hidden_states,
                         is_block_end=mhc_block_ends[layer_idx],
                     )
+                    if layer_idx in gate_ends:
+                        gate_kwargs = {}
+                        if conditioner is not None:
+                            gate_kwargs["update_scale"] = conditioner.regions[active_region].exit(
+                                conditions[region_pass - 1], region_pass - 1
+                            )
+                        hidden_states = self.recurrence_gates[active_region](
+                            previous_state, hidden_states, loop_input, **gate_kwargs
+                        )
+                        previous_state = loop_input = None
+                        if region_pass == n_loops:
+                            active_region = region_input = None
+                            region_pass = 0
 
         if self.residual_stream_readout is not None:
             hidden_states = apply_module(self.residual_stream_readout)(hidden_states)
@@ -1022,9 +1189,19 @@ class HybridStack(MegatronModule):
 
             sharded_state_dict.update(layer_sharded_state_dict)
 
-        # Add modules other than self.layers
+        # ModuleList's default checkpoint path flattens its children and would
+        # bypass the gates' explicit ungated-import handling.
+        recurrence_gates = getattr(self, "recurrence_gates", ())
+        for index, gate in enumerate(recurrence_gates):
+            sharded_state_dict.update(
+                gate.sharded_state_dict(
+                    f"{prefix}recurrence_gates.{index}.", sharded_offsets, metadata
+                )
+            )
+
+        # Add modules other than the explicitly traversed module lists.
         for name, module in self.named_children():
-            if not module is self.layers:
+            if module is not self.layers and module is not recurrence_gates:
                 sharded_state_dict.update(
                     sharded_state_dict_default(
                         module,

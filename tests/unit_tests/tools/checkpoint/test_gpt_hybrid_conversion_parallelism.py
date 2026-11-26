@@ -279,6 +279,11 @@ def _run_scenario(
             )
         )
 
+        if ":" in pattern:
+            _, hybrid_args = _load_converted_dist(hybrid_dir)
+            assert hybrid_args.hybrid_layer_pattern == pattern
+            assert hybrid_args.num_layers == 2 * num_layers + pattern.count("M")
+
         # --- Hybrid -> GPT ---
         conversion_main(
             argparse.Namespace(
@@ -327,6 +332,10 @@ def _run_scenario(
 
 def test_torch_dist_roundtrip():
     _run_scenario("torch_dist roundtrip", 'torch_dist', 'torch_dist')
+
+
+def test_torch_dist_recurrent_pattern_roundtrip():
+    _run_scenario("torch_dist recurrence", 'torch_dist', 'torch_dist', num_layers=1, pattern=":*-:")
 
 
 def test_fsdp_dtensor_roundtrip():
@@ -407,6 +416,7 @@ if __name__ == '__main__':
     print("=" * 60)
 
     test_torch_dist_roundtrip()
+    test_torch_dist_recurrent_pattern_roundtrip()
     test_fsdp_dtensor_roundtrip()
     test_fsdp_dtensor_prefix()
     test_torch_dist_alternating_pattern()
