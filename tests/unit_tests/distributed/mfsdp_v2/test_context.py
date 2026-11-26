@@ -119,9 +119,7 @@ def test_recorded_execution_order(distributed_setup):
 
     inputs = torch.ones(2, 4, device=device)
     assert context.is_recording_execution_order
-    # Recording ends after this microbatch even while outer reduction is skipped.
-    with context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER):
-        model(inputs).sum().backward()
+    model(inputs).sum().backward()
     assert not context.is_recording_execution_order
     assert list(context.execution_order) == [
         ExecutionEvent(module, Phase.FORWARD) for module in [model, model.first, model.second]
@@ -140,31 +138,20 @@ def test_recorded_execution_order(distributed_setup):
 
 
 @pytest.mark.parametrize("prefetch_order", [PrefetchOrder.REGISTRATION, PrefetchOrder.RECORDED])
-@pytest.mark.parametrize("autograd_completes_execution", [True, False])
-def test_repeated_evaluation_between_training_steps(
-    distributed_setup, prefetch_order, autograd_completes_execution
-):
+def test_repeated_evaluation_between_training_steps(distributed_setup, prefetch_order):
     """Repeated evaluation must leave the training execution order ready for backward."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     model = MultiChildModel(dim=16, num_children=2).to(device)
     with fully_shard_context(
-        FsdpContext(
-            device=device,
-            runtime_policy=RuntimePolicy(
-                prefetch_order=prefetch_order,
-                autograd_completes_execution=autograd_completes_execution,
-            ),
-        )
-    ) as context:
+        FsdpContext(device=device, runtime_policy=RuntimePolicy(prefetch_order=prefetch_order))
+    ):
         for layer in model.layers:
             fully_shard(layer, mesh, _default_placements())
         fully_shard(model, mesh, _default_placements())
 
     inputs = torch.ones(2, 16, device=device)
     model(inputs).sum().backward()
-    if not autograd_completes_execution:
-        context.post_backward()
 
     model.eval()
     # Evaluation must leave the trace untouched with or without autograd enabled.
@@ -175,8 +162,6 @@ def test_repeated_evaluation_between_training_steps(
     model.train()
     model.zero_grad(set_to_none=True)
     model(inputs).sum().backward()
-    if not autograd_completes_execution:
-        context.post_backward()
     assert all(parameter.grad is not None for parameter in model.parameters())
 
 

@@ -45,17 +45,10 @@ class RuntimePolicy:
     prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION
     """``REGISTRATION`` expects a forward/backward pass matching module
     registration order. ``RECORDED`` gathers parameters on demand and records
-    module calls until the first ``context.post_backward()``. Subsequent schedules
-    must repeat the complete sequence consistently across data-parallel ranks.
+    module calls until the first ``post_backward()``. Subsequent passes must
+    repeat the complete sequence consistently across data-parallel ranks.
     The first iteration must be a training forward/backward pass.
     Evaluation mode is treated as forward-only and does not replay the training trace.
-    Recording requires the ordinary module hooks; combined 1F1B bypasses them.
-    Discard the context if the recorded pass raises.
-    """
-
-    autograd_completes_execution: bool = True
-    """Complete the execution order after each autograd backward.
-
-    Pipeline schedulers disable this and call ``context.post_backward()``
-    explicitly after the complete schedule. Deferred cleanup still runs per backward.
+    Recording currently requires the ordinary module hooks; combined 1F1B
+    bypasses them. Discard the context if the recorded pass raises.
     """

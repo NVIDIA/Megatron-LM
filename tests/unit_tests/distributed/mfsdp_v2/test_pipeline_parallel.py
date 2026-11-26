@@ -12,27 +12,16 @@ loop. This test drives the helper directly and asserts that all wrapped chunks
 share the same ``FsdpContext``.
 """
 
-from contextlib import nullcontext
-
 import pytest
 import torch
 import torch.nn as nn
 
 from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallel
-from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    GradientFinalizationMode,
-    PrefetchOrder,
-)
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
-    ExecutionEvent,
-)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
     current_fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.training.training import wrap_model_chunks_with_ddp
@@ -42,15 +31,9 @@ from tests.unit_tests.test_utilities import Utils
 class _VirtualPipelineChunk(nn.Module):
     """One virtual-pipeline stage: a tiny dense block with its own parameters."""
 
-    def __init__(self, config: TransformerConfig) -> None:
+    def __init__(self, dim: int = 16) -> None:
         super().__init__()
-        # finalize_model_grads reads the model config and embedding-sharing contract.
-        self.config = config
-        # This dense chunk has no input embeddings. The finalizer also uses this
-        # attribute to locate the underlying MCore model through its wrappers.
-        self.pre_process = False
-        self.share_embeddings_and_output_weights = False
-        self.fc = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.fc = nn.Linear(dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(x)
@@ -65,13 +48,18 @@ def _mfsdp_v2_ddp_config() -> DistributedDataParallelConfig:
     )
 
 
+def _compute_config() -> TransformerConfig:
+    """A minimal TransformerConfig accepted by MFSDP v2 validation."""
+    return TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1)
+
+
 class TestMfsdpV2PipelineSharedContext:
     """MFSDP v2 virtual-pipeline chunks share a single FSDP context."""
 
     def setup_method(self):
-        """Initialize two pipeline stages for the wrapping call."""
+        """Initialize the single-stage process groups the wrapping call needs."""
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=2
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -81,27 +69,18 @@ class TestMfsdpV2PipelineSharedContext:
 
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices.")
     def test_shared_context_across_virtual_pipeline_chunks(self, distributed_setup):
-        """Shared chunks record their complete execution across separate backward calls."""
+        """Multiple virtual-pipeline chunks wrapped in one call share one FsdpContext."""
         device = distributed_setup.device
 
-        # The ambient context is shared for both ordinary PP and VPP wrapping.
-        config = TransformerConfig(
-            num_layers=4,
-            hidden_size=16,
-            num_attention_heads=1,
-            bf16=True,
-            params_dtype=torch.bfloat16,
-            pipeline_dtype=torch.bfloat16,
-            pipeline_model_parallel_size=2,
-            virtual_pipeline_model_parallel_size=2,
-        )
+        # virtual_pipeline_model_parallel_size > 1 yields multiple chunks on this
+        # rank; model two virtual-pipeline sub-stages here. The ambient
+        # fully_shard_context is opened for every MFSDP v2 wrap, regardless of the
+        # chunk count.
+        chunks = [_VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)]
 
-        chunks = [
-            _VirtualPipelineChunk(config).to(device=device, dtype=torch.bfloat16) for _ in range(2)
-        ]
         wrapped_chunks = wrap_model_chunks_with_ddp(
             chunks,
-            config,
+            _compute_config(),
             _mfsdp_v2_ddp_config(),
             DP=FullyShardedDataParallel,
             pg_collection=self.pg_collection,
@@ -116,42 +95,14 @@ class TestMfsdpV2PipelineSharedContext:
 
         # The whole point of the feature: all chunks share ONE context, so each chunk
         # must report the same context object as the first one.
-        context = wrapped_chunks[0].module.context
+        first_context = wrapped_chunks[0].module.context
         for wrapped_chunk in wrapped_chunks:
-            assert wrapped_chunk.module.context is context
+            assert wrapped_chunk.module.context is first_context
 
         # The shared context was finalized exactly once after the loop, so it is
         # ready to drive forward/backward without an extra finalize.
-        context.ensure_finalized()
+        first_context.ensure_finalized()
 
         # The helper left no ambient context behind: the chunks joined its scope and
         # that scope, which owned the only finalize call, has since exited.
         assert current_fully_shard_context() is None
-
-        assert context.prefetch_order is PrefetchOrder.RECORDED
-        inputs = torch.ones(2, 16, device=device, dtype=torch.bfloat16)
-        expected = (
-            [ExecutionEvent(chunk.module, Phase.FORWARD) for chunk in wrapped_chunks]
-            + [ExecutionEvent(chunk.module, Phase.BACKWARD) for chunk in reversed(wrapped_chunks)]
-        ) * 2
-        with context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
-            for _ in range(2):
-                for chunk in wrapped_chunks:
-                    chunk.zero_grad(set_to_none=True)
-                for microbatch in range(2):
-                    with wrapped_chunks[0].no_sync() if microbatch == 0 else nullcontext():
-                        outputs = [chunk(inputs) for chunk in wrapped_chunks]
-                        for output in reversed(outputs):
-                            output.float().sum().backward()
-                # Exercise production schedule completion so a missing context.post_backward()
-                # in finalize_model_grads cannot be hidden by calling it directly in the test.
-                finalize_model_grads(wrapped_chunks, pg_collection=self.pg_collection)
-                assert not context.is_recording_execution_order
-                assert list(context.execution_order) == expected
-                assert context.execution_order.position == 0
-                # Each of two microbatches contributes two to every weight gradient.
-                for chunk in wrapped_chunks:
-                    for parameter in chunk.parameters():
-                        torch.testing.assert_close(
-                            parameter.grad, torch.full_like(parameter.grad, 4), rtol=0, atol=0
-                        )

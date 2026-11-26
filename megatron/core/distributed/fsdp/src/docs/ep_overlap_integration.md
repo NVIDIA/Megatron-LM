@@ -65,7 +65,6 @@ sequenceDiagram
     S->>U: Remaining units: reshard() then post_accumulate_grad()
 
     Note over S,C: All microbatch backward work completes
-    S->>C: post_backward() via finalize_model_grads()
     S->>C: finish_grad_sync() via the adapter
 ```
 
@@ -86,7 +85,7 @@ their assigned schedule boundary are outside this integration's contract.
 
 ## Schedule completion and gradient visibility
 
-The MCore adapter sets `autograd_completes_execution=False` because one schedule contains multiple autograd backward calls. After all microbatch backward work finishes, `finalize_model_grads()` calls `FsdpContext.post_backward()` once on the shared context to complete execution-order tracking. This is separate from completing an individual unit's gradients.
+After all scheduled backward work finishes, including delayed weight gradients, MCore's `finalize_model_grads()` calls the adapter's `finish_grad_sync()`. Individual FSDP units have already submitted their completed gradients at the layer or chunk boundary.
 
 Unit completion submits the reductions allowed by the current gradient-finalization mode. With `SKIP_OUTER`, outer-DP reduction is skipped during accumulation, so the final microbatch must submit it. The adapter's `finish_grad_sync()` then makes the current stream wait on all submitted inner and outer reductions before gradients are consumed. It only enqueues GPU stream dependencies, so it does not block the CPU, and it does not launch reductions that were skipped earlier.
 
