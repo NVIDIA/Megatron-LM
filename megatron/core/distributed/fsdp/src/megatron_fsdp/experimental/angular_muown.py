@@ -136,7 +136,8 @@ class FsdpAngularMuOwn(FsdpMuon):
                 shape=torch.Size((param.shape[0], 1)),
                 stride=(1, 1),
             )
-        state["step"] = 0
+        # A tensor, like torch Adam's step, so that checkpoint loads restore it in place.
+        state["step"] = torch.zeros((), dtype=torch.int64)
 
     @torch.no_grad()
     def _init_group(self, group: dict, skip_non_grad_params: bool = True) -> None:
@@ -226,7 +227,7 @@ class FsdpAngularMuOwn(FsdpMuon):
             state: dict[str, Any] = self.state[param]
             # Every rank counts the step, including ranks without rows of the tensor.
             state["step"] += 1
-            step: int = state["step"]
+            step: int = int(state["step"])
             weight: torch.Tensor = param.to_local()
             if weight.numel() == 0:
                 # This rank holds no rows of the tensor.
