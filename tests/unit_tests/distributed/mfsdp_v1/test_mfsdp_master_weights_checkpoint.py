@@ -133,6 +133,28 @@ class TestMasterWeightsCheckpoint:
                 param.decoupled_grad.fill_(0.125)
         optimizer.step()
 
+    @staticmethod
+    def _checkpoint_args():
+        return SimpleNamespace(
+            swiglu=True,
+            num_experts=None,
+            use_megatron_fsdp=True,
+            non_persistent_global_ckpt_dir=None,
+            non_persistent_ckpt_type=None,
+            strict_fsdp_dtensor_load=True,
+            dist_ckpt_strictness="raise_unexpected",
+            finetune=False,
+        )
+
+    @staticmethod
+    def _save_checkpoint(tmp_path_dist_ckpt, checkpoint_state):
+        checkpoint_dir = tmp_path_dist_ckpt / "iter_0000001"
+        dcp.save(checkpoint_state, checkpoint_id=checkpoint_dir)
+        if Utils.rank == 0:
+            (tmp_path_dist_ckpt / "latest_checkpointed_iteration.txt").write_text("1")
+        torch.distributed.barrier()
+        return dcp.FileSystemReader(checkpoint_dir).read_metadata().state_dict_metadata
+
     def test_scaled_fp16_masters_fall_back_to_model_weights(self):
         with pytest.warns(UserWarning, match="disables TE master weights"):
             model, optimizer = self._build_model_and_optimizer(torch.float16, False)
@@ -144,47 +166,60 @@ class TestMasterWeightsCheckpoint:
         finally:
             model.stop_communication()
 
-    def test_save_load(self, tmp_path_dist_ckpt):
+    @pytest.mark.parametrize(
+        "model_dtype,store_param_remainders",
+        [
+            pytest.param(torch.float16, False, id="fp16_fp32_master"),
+            pytest.param(torch.bfloat16, False, id="bf16_fp32_master"),
+            pytest.param(torch.bfloat16, True, id="bf16_remainder"),
+        ],
+    )
+    def test_save_load(self, tmp_path_dist_ckpt, model_dtype, store_param_remainders):
         torch.manual_seed(1234)
-        model, optimizer = self._build_model_and_optimizer(torch.float32, True)
+        model, optimizer = self._build_model_and_optimizer(
+            torch.float32, store_param_remainders, model_dtype=model_dtype
+        )
         restored_model = None
         try:
             assert optimizer.optimizer.master_weights
             assert optimizer.state
             for state in optimizer.state.values():
-                remainder = state["master_param"].to_local()
-                assert remainder.dtype == torch.int16
-                remainder.random_(1, 32768)
+                master = state["master_param"].to_local()
+                if store_param_remainders:
+                    assert master.dtype == torch.int16
+                    master.random_(1, 32768)
+                else:
+                    assert master.dtype == torch.float32
+                    master.add_(0.00001)
 
             saved_state = {
                 "model": model.state_dict(),
                 "optimizer": optimizer.sharded_param_state_fsdp_dtensor(),
             }
-            checkpoint_state = preprocess_fsdp_dtensor_state_dict(
-                SimpleNamespace(swiglu=True, num_experts=None), saved_state, model.module
-            )
+            args = self._checkpoint_args()
+            checkpoint_state = preprocess_fsdp_dtensor_state_dict(args, saved_state, model.module)
             for state in checkpoint_state["optimizer"]["state"].values():
                 assert state["master_param"].shape == state["exp_avg"].shape
-            dcp.save(checkpoint_state, checkpoint_id=tmp_path_dist_ckpt)
+            metadata = self._save_checkpoint(tmp_path_dist_ckpt, checkpoint_state)
+            assert any(key.endswith(".master_param") for key in metadata)
 
-            restored_model, restored_optimizer = self._build_model_and_optimizer(torch.float32, True, zero_init=True)
+            restored_model, restored_optimizer = self._build_model_and_optimizer(
+                torch.float32, store_param_remainders, zero_init=True, model_dtype=model_dtype
+            )
             restored_state = {
                 "model": restored_model.state_dict(),
-                "optimizer": restored_optimizer.sharded_param_state_fsdp_dtensor(),
+                "optimizer": restored_optimizer.sharded_param_state_fsdp_dtensor(is_loading=True),
+                "_model": [restored_model.module],
             }
             for parameter in restored_state["model"].values():
                 assert torch.count_nonzero(parameter.to_local()) == 0
             for state in restored_optimizer.state.values():
                 assert torch.count_nonzero(state["master_param"].to_local()) == 0
 
-            dcp.load(
-                preprocess_fsdp_dtensor_state_dict(
-                    SimpleNamespace(swiglu=True, num_experts=None),
-                    restored_state,
-                    restored_model.module,
-                ),
-                checkpoint_id=tmp_path_dist_ckpt,
+            restored_state, _, _, _ = _load_base_checkpoint(
+                str(tmp_path_dist_ckpt), args, sharded_state_dict=restored_state
             )
+            assert "_fsdp_missing_master_params" not in restored_state["optimizer"]
             restored_model.load_state_dict(restored_state["model"])
             restored_optimizer.load_state_dict(restored_state["optimizer"])
 
