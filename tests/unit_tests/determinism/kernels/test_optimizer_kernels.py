@@ -9,14 +9,22 @@ whole trajectory even when the model kernels are deterministic.
 import pytest
 import torch
 
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.fp8_utils import HAVE_TE
 from megatron.core.optimizer import (
     Adam,
     OptimizerConfig,
     _get_param_groups,
+    get_megatron_optimizer,
     get_standard_config_overrides,
 )
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32, get_grad_norm_fp32
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.module import Float16Module
+from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.tensor_metrics.definitions import L2NormMetric, _fused_l2_norm_impl
 from megatron.training.utils.common_utils import _get_param_data
 from tests.unit_tests.determinism.kernels.harness import (
@@ -211,3 +219,140 @@ def test_sharded_param_norm_owner_selection_replays(non_owner_has_main_param):
     model_data, model_sharded = _get_param_data(non_owner, True, True)
     assert not model_sharded
     assert torch.equal(model_data, non_owner.detach().float())
+
+
+@pytest.mark.skipif(
+    not is_torch_min_version("2.4.0"), reason="Megatron FSDP requires torch >= 2.4.0"
+)
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("2.1.0")), reason="Precision-aware Adam requires TE >= 2.1"
+)
+class TestFSDPPrecisionAwareAdam:
+    def setup_method(self, method):
+        Utils.initialize_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "model_dtype,master_dtype,store_param_remainders",
+        [
+            pytest.param(torch.float16, torch.float32, False, id="fp16_fp32_master"),
+            pytest.param(torch.bfloat16, torch.float32, False, id="bf16_fp32_master"),
+            pytest.param(torch.bfloat16, torch.float32, True, id="bf16_int16_remainder"),
+            pytest.param(torch.bfloat16, torch.float16, False, id="scaled_fp16_fallback"),
+        ],
+    )
+    def test_step_replays(self, model_dtype, master_dtype, store_param_remainders):
+        """Replay FSDP v1's decoupled Adam updates without an FSDP main buffer."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            bf16=model_dtype == torch.bfloat16,
+            fp16=model_dtype == torch.float16,
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+        def run_steps():
+            seeded()
+            module = torch.nn.Sequential(
+                torch.nn.Linear(256, 512, bias=False), torch.nn.Linear(512, 16, bias=False)
+            ).cuda()
+            model = FullyShardedDataParallel(
+                config=config,
+                ddp_config=DistributedDataParallelConfig(
+                    use_megatron_fsdp=True,
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    megatron_fsdp_main_params_dtype=None,
+                    megatron_fsdp_main_grads_dtype=torch.float32,
+                    megatron_fsdp_use_decoupled_grad=True,
+                ),
+                module=Float16Module(config, module),
+                fsdp_unit_modules=[torch.nn.Linear],
+                pg_collection=pg_collection,
+            )
+            try:
+                optimizer_config = OptimizerConfig(
+                    lr=1e-3,
+                    bf16=config.bf16,
+                    fp16=config.fp16,
+                    loss_scale=1.0 if config.fp16 else None,
+                    use_distributed_optimizer=True,
+                    use_precision_aware_optimizer=True,
+                    main_params_dtype=master_dtype,
+                    store_param_remainders=store_param_remainders,
+                )
+
+                def build_optimizer():
+                    return get_megatron_optimizer(
+                        optimizer_config,
+                        [model],
+                        use_gloo_process_groups=False,
+                        pg_collection=pg_collection,
+                    )
+
+                if master_dtype == torch.float16:
+                    with pytest.warns(UserWarning, match="disables TE master weights"):
+                        optimizer = build_optimizer()
+                else:
+                    optimizer = build_optimizer()
+                assert optimizer.optimizer.master_weights == (master_dtype == torch.float32)
+                assert optimizer.optimizer.use_decoupled_grad
+                snapshots = []
+                for step in range(3):
+                    optimizer.zero_grad()
+                    model(torch.zeros(1, 256, device="cuda", dtype=model_dtype)).sum().backward()
+                    model.finish_grad_sync()
+                    for group in optimizer.optimizer.param_groups:
+                        for param in group["params"]:
+                            gradient = param.decoupled_grad
+                            local_gradient = (
+                                gradient.to_local() if hasattr(gradient, "to_local") else gradient
+                            )
+                            values = torch.arange(local_gradient.numel(), device="cuda")
+                            local_gradient.copy_(
+                                ((values % 17 - 8).float() * (step + 1) / 128).view_as(
+                                    local_gradient
+                                )
+                            )
+                    success, _, _ = optimizer.step()
+                    assert success
+                    assert optimizer.state
+                    for param, state in optimizer.state.items():
+                        assert {"exp_avg", "exp_avg_sq"} <= state.keys()
+                        assert ("master_param" in state) == optimizer.optimizer.master_weights
+                        for key in ("exp_avg", "exp_avg_sq"):
+                            moment = state[key]
+                            if hasattr(moment, "to_local"):
+                                moment = moment.to_local()
+                            assert torch.count_nonzero(moment) > 0
+                        tensors = {"param": param, **state}
+                        if optimizer.optimizer.master_weights:
+                            assert state["master_param"].dtype == (
+                                torch.int16 if store_param_remainders else torch.float32
+                            )
+                            tensors["unscaled_master"] = optimizer.optimizer.get_unscaled_state(
+                                param, "master_param"
+                            )
+                        snapshots.append(
+                            {
+                                key: (value.to_local() if hasattr(value, "to_local") else value)
+                                .detach()
+                                .clone()
+                                for key, value in tensors.items()
+                                if torch.is_tensor(value)
+                            }
+                        )
+                return snapshots
+            finally:
+                model.stop_communication()
+
+        assert_replays_bit_exact(
+            run_steps,
+            (),
+            replays=4,
+            backward=False,
+            contention=True,
+            what="FSDP precision-aware Adam",
+        )
