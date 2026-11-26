@@ -112,15 +112,20 @@ def _dsa_indexer_flops(
     ``1 + 2 * sparse_scale`` for sparse KL. This counts model FLOPs, excluding
     zero-padded work in the dense reference implementation of sparse backward.
 
-    KPool is forward only: add its gate and complete-pool key reduction, and
-    score complete pools instead of individual keys. Pool softmax, positional
-    bias, top-k selection, teacher recomputation and KL operations are excluded.
+    KPool adds its gate and complete-pool key reduction, and scores complete
+    pools instead of individual keys. A frozen KPool selector is forward only.
+    A trainable one (the sparse pool-level loss; KPool rejects the dense loss)
+    follows the token loss's convention: the gate pays fwd + wgrad (x2), the
+    key reduction fwd + dk + dprob (x3), and scoring pays the forward over
+    every visible pool plus dq + dk over the selected pools. Pool softmax,
+    positional bias, top-k selection, teacher recomputation and KL operations
+    are excluded.
 
     Returns ``(token_linear, core)`` including FMA x2 and backward factors;
     the caller multiplies by total tokens and sum(L^2), respectively.
     """
     if dsa_indexer_kpool > 1:
-        if dsa_indexer_loss_enabled:
+        if dsa_indexer_loss_enabled and not dsa_indexer_use_sparse_loss:
             raise ValueError("KPool FLOPs require indexer loss to be disabled, as in DSAttention.")
         if (
             dsa_indexer_topk is None
@@ -159,7 +164,7 @@ def _dsa_indexer_flops(
     token_linear = token_expansion * fma_expansion_factor * token_linear
     core = core_expansion * fma_expansion_factor * core
     if dsa_indexer_kpool > 1:
-        indexer_scale = compression_scale = 0.0
+        indexer_scale = selected_scale = compression_scale = 0.0
         if total_tokens > 0 and seqlen_squared_sum > 0:
             mean_seqlen = seqlen_squared_sum / total_tokens
             length = math.floor(mean_seqlen)
@@ -168,10 +173,30 @@ def _dsa_indexer_flops(
             pools, next_pools = length // pool_size, (length + 1) // pool_size
             dense_pairs = length * (length + 1) / 2 + fraction * (length + 1)
             indexer_scale = _dsa_kpool_pairs(mean_seqlen, pool_size) / dense_pairs
+            if dsa_indexer_loss_enabled:
+                # dq + dk of the sparse KPool loss cover the selected pools only.
+                selected_scale = (
+                    _dsa_kpool_pairs(mean_seqlen, pool_size, dsa_indexer_topk // pool_size)
+                    / dense_pairs
+                )
             compression_scale = pool_size * (pools + fraction * (next_pools - pools)) / mean_seqlen
-        # Gate on every token; one FMA per key component in complete pools.
-        token_linear += 2 * num_indexer_layers * head_dim * (hidden_size + compression_scale)
-        core *= indexer_scale
+        if dsa_indexer_loss_enabled:
+            # Gate fwd + wgrad on every token; key reduction fwd + dk + dprob in complete pools.
+            token_linear += (
+                2 * num_indexer_layers * head_dim * (2 * hidden_size + 3 * compression_scale)
+            )
+            # Scoring: forward over every visible pool, dq + dk over the selected pools.
+            core = (
+                fma_expansion_factor
+                * num_indexer_layers
+                * index_dim
+                / 2
+                * (indexer_scale + 2 * selected_scale)
+            )
+        else:
+            # Gate on every token; one FMA per key component in complete pools.
+            token_linear += 2 * num_indexer_layers * head_dim * (hidden_size + compression_scale)
+            core *= indexer_scale
     return token_linear, core
 
 
@@ -298,7 +323,9 @@ def dsa_indexer_flops(
     zero returns zero FLOPs. ``mtp_num_layers`` is the standard MTP depth,
     already included in that total; hybrid MTP is derived from the pattern.
     Positive ``dsa_indexer_loss_coeff`` enables indexer backward work.
-    ``dsa_indexer_kpool > 1`` pools keys and requires disabled indexer loss.
+    ``dsa_indexer_kpool > 1`` pools keys; with the indexer loss enabled it
+    requires the sparse loss (``dsa_indexer_use_sparse_loss``), which trains the
+    KPool indexer.
     """
     if num_dsa_layers == 0:
         return 0.0
