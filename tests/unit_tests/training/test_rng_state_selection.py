@@ -110,16 +110,22 @@ def test_either_flag_makes_the_save_gather_per_rank_states(
         lambda: SimpleNamespace(get_states=lambda: {}),
     )
     monkeypatch.setattr(checkpointing.torch.distributed, "is_initialized", lambda: True)
-    monkeypatch.setattr(checkpointing, "get_pg_size", lambda group: 2)
-    monkeypatch.setattr(checkpointing, "get_pg_rank", lambda group: 0)
-    gather = Mock(
-        side_effect=lambda output, state, *, group: output.__setitem__(slice(None), [state, state])
-    )
+    dp_group, dp_cp_group = _group(1, 2), _group(3, 4)  # DP=2, CP=2; this rank is DP x CP rank 3
+
+    def fake_gather(output, state, *, group):
+        assert group is dp_cp_group  # gathering over DP only would drop the CP peers
+        output[:] = [{"id": i} for i in range(len(output))]
+
+    gather = Mock(side_effect=fake_gather)
     monkeypatch.setattr(checkpointing.torch.distributed, "all_gather_object", gather)
-    group = object()
-    state = checkpointing.get_rng_state("torch", group, group, dp_cp_group=group)
+    state = checkpointing.get_rng_state(
+        "torch", object(), object(), dp_cp_group=dp_cp_group, dp_group=dp_group
+    )
     assert gather.call_count == int(gathers)
-    assert len(state) == (2 if gathers else 1)
+    assert len(state) == (4 if gathers else 1)
+    if gathers:
+        selected = checkpointing._select_rng_state(state, True, dp_cp_group, dp_group)
+        assert selected == {"id": 3}
 
 
 def _stored_names(key, n):
