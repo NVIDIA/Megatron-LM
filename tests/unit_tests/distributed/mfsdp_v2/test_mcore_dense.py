@@ -24,9 +24,13 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import ShardLayout
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_decoder_layer_specs,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -106,6 +110,128 @@ def test_mxfp8_parameters(process_group_collection):
             for parameter in group.fsdp_parameters:
                 parameters.append(parameter.unsharded)
     assert any(isinstance(p, MXFP8Tensor) for p in parameters)
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 10,
+    reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",
+)
+@pytest.mark.parametrize(
+    "model_kwargs, recompute_kwargs, fsdp_unit_modules",
+    [
+        pytest.param(
+            {},
+            dict(recompute_granularity="selective", recompute_modules=["mlp"]),
+            None,
+            id="selective_mlp",
+        ),
+        pytest.param(
+            {},
+            dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1),
+            None,
+            id="full",
+        ),
+        pytest.param(
+            {},
+            dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1),
+            [TransformerBlock],
+            id="full_block_unit",
+        ),
+        pytest.param(
+            dict(
+                num_moe_experts=4,
+                moe_router_topk=2,
+                moe_grouped_gemm=True,
+                moe_ffn_hidden_size=128,
+                moe_shared_expert_intermediate_size=128,
+                moe_token_dispatcher_type="alltoall",
+                # MXFP8 grouped GEMMs need token counts padded per expert.
+                moe_router_padding_for_quantization=True,
+            ),
+            dict(recompute_granularity="selective", recompute_modules=["moe"]),
+            None,
+            id="selective_moe",
+        ),
+    ],
+)
+def test_mxfp8_recompute_matches_no_recompute(
+    process_group_collection, model_kwargs, recompute_kwargs, fsdp_unit_modules
+):
+    """MXFP8 recomputation using weights of a unit it does not re-enter matches no recompute."""
+    batch_size, sequence_length = 2, 32
+    torch.manual_seed(1234)
+    input_ids = torch.randint(0, 128, (batch_size, sequence_length), device="cuda")
+    position_ids = torch.arange(sequence_length, device="cuda").expand(batch_size, -1)
+    labels = torch.roll(input_ids, shifts=-1, dims=1)
+
+    def train(recompute_kwargs):
+        """Return the loss and the local gradient shards of one training step."""
+        # Reseed so both builds initialize identical weights.
+        torch.manual_seed(1234)
+        model_parallel_cuda_manual_seed(1234)
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            ffn_hidden_size=256,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            mtp_num_layers=1,
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            # Selective MLP recompute with linear biases fails in TE checkpoint even without FSDP.
+            add_bias_linear=False,
+            **model_kwargs,
+            **recompute_kwargs,
+        )
+        # Build the GPT model as gpt_builder does.
+        mtp_layer_spec = get_gpt_decoder_layer_specs(config, use_transformer_engine=True)[-1]
+        gpt_model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_decoder_block_spec(config, use_transformer_engine=True),
+            mtp_block_spec=get_gpt_mtp_block_spec(
+                config, mtp_layer_spec, use_transformer_engine=True
+            ),
+            vocab_size=128,
+            max_sequence_length=32,
+        ).to(device="cuda", dtype=config.params_dtype)
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+                fp8_param_gather=True,
+            ),
+            module=gpt_model,
+            fsdp_unit_modules=fsdp_unit_modules,
+            pg_collection=process_group_collection,
+        )
+
+        def forward():
+            loss = model(
+                input_ids=input_ids, position_ids=position_ids, attention_mask=None, labels=labels
+            )
+            return loss.float().mean()
+
+        (loss,) = run_forward_backward_on_microbatches(model, forward)
+        grads = {
+            name: parameter.grad.to_local().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        return loss, grads
+
+    expected_loss, expected_grads = train({})
+    loss, grads = train(recompute_kwargs)
+    assert expected_grads
+    torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+    torch.testing.assert_close(grads, expected_grads, rtol=0, atol=0)
 
 
 def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_group_collection):

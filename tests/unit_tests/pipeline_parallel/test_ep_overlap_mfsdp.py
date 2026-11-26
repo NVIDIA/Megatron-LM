@@ -90,9 +90,8 @@ def test_rejects_tied_weights_before_sharding(overlap, mtp_num_layers, error):
         )
 
 
-@pytest.mark.parametrize(
-    "delay_wgrad,mtp_num_layers", [(False, 1), (True, 2)], ids=["mtp1", "mtp2_delayed_wgrad"]
-)
+@pytest.mark.parametrize("delay_wgrad", [False, True], ids=["wgrad", "delayed_wgrad"])
+@pytest.mark.parametrize("mtp_num_layers", [1, 2], ids=["mtp1", "mtp2"])
 def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad, mtp_num_layers):
     """Complete each FSDP unit once per backward, including repeated MTP head uses."""
     setup = distributed_setup

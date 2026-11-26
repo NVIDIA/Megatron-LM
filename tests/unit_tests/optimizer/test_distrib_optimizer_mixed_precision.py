@@ -74,13 +74,18 @@ def test_mixed_precision_checkpoint_state_roundtrip(low_precision_dtype, fp32_bu
 
     # Restore through the same mapping used by checkpoint loading, then verify
     # actual optimizer tensors; a wrong index must not silently target a peer.
+    # The step comes from common param_groups and must survive the nonpersistent
+    # placeholder in the per-parameter checkpoint state.
     for group in optimizer.optimizer.param_groups:
         for parameter in group['params']:
             parameter.zero_()
-            for value in optimizer.optimizer.state[parameter].values():
-                value.zero_()
+            for key, value in optimizer.optimizer.state[parameter].items():
+                if key != 'step':
+                    value.zero_()
     for parameter, state in saved.items():
-        optimizer._set_main_param_and_optimizer_states(parameter, state)
+        optimizer._set_main_param_and_optimizer_states(
+            parameter, {**state, 'step': torch.zeros_like(state['step'])}
+        )
     checkpoint = optimizer.get_parameter_state_dp_reshardable()
     for buffer_index, buffer in enumerate(ranges):
         for dtype, buckets in buffer.items():

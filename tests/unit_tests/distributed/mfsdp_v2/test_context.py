@@ -139,33 +139,45 @@ def test_recorded_execution_order(distributed_setup):
     model(inputs).sum().backward()
 
 
-def test_recorded_evaluation_order(distributed_setup):
-    """An evaluation-only execution can be recorded and replayed."""
+@pytest.mark.parametrize("prefetch_order", [PrefetchOrder.REGISTRATION, PrefetchOrder.RECORDED])
+@pytest.mark.parametrize("autograd_completes_execution", [True, False])
+def test_repeated_evaluation_between_training_steps(
+    distributed_setup, prefetch_order, autograd_completes_execution
+):
+    """Repeated evaluation must leave the training execution order ready for backward."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = (
-        nn.Sequential(nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)).to(device).eval()
-    )
+    model = MultiChildModel(dim=16, num_children=2).to(device)
     with fully_shard_context(
         FsdpContext(
-            device=device, runtime_policy=RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
+            device=device,
+            runtime_policy=RuntimePolicy(
+                prefetch_order=prefetch_order,
+                autograd_completes_execution=autograd_completes_execution,
+            ),
         )
     ) as context:
-        for layer in model.children():
+        for layer in model.layers:
             fully_shard(layer, mesh, _default_placements())
         fully_shard(model, mesh, _default_placements())
 
-    inputs = torch.ones(2, 4, device=device)
-    with torch.no_grad():
-        expected = model(inputs)
-        assert list(context.execution_order) == [
-            ExecutionEvent(module, Phase.FORWARD) for module in [model, *model.children()]
-        ]
-        # Evaluation has no autograd callback; explicitly complete the recorded execution.
+    inputs = torch.ones(2, 16, device=device)
+    model(inputs).sum().backward()
+    if not autograd_completes_execution:
         context.post_backward()
-        for _ in range(2):
-            torch.testing.assert_close(model(inputs), expected)
-            assert context.execution_order.position == 0
+
+    model.eval()
+    # Evaluation must leave the trace untouched with or without autograd enabled.
+    with torch.no_grad():
+        model(inputs)
+    model(inputs)
+
+    model.train()
+    model.zero_grad(set_to_none=True)
+    model(inputs).sum().backward()
+    if not autograd_completes_execution:
+        context.post_backward()
+    assert all(parameter.grad is not None for parameter in model.parameters())
 
 
 def test_registration_order_rejects_reordered_execution(distributed_setup):
