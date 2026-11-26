@@ -197,23 +197,25 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
         for param in layers.parameters():
             if not param_is_not_gtp_duplicate(param):
                 continue
-            if isinstance(param, GTPShardedParam):
-                grad = param.main_grad
-            else:
-                grad = param.grad if param.grad is not None else param.main_grad
-            assert grad is not None
-            grads.append(grad)
+            grads.append(trained_grad(param))
         return float(get_grad_norm_fp32(grads, grad_stats_parallel_group=grad_stats_group))
 
-    def apply_sgd_step(layers, gtp_size):
+    def trained_grad(param):
+        """The gradient DDP would reduce for ``param``.
+
+        GTP params and params with fused wgrad accumulation keep the real gradient in main_grad;
+        their ``.grad`` is TE's uninitialized dummy (DDP discards it, see grad_added_to_main_grad).
+        The GTP reduce-scatter already returns the gtp mean, so main_grad is the full gradient.
+        """
+        if isinstance(param, GTPShardedParam) or param.grad_added_to_main_grad:
+            return param.main_grad
+        return param.grad if param.grad is not None else param.main_grad
+
+    def apply_sgd_step(layers):
         with torch.no_grad():
             for param in layers.parameters():
-                if isinstance(param, GTPShardedParam):
-                    param.data.sub_((learning_rate / gtp_size) * param.main_grad)
-                else:
-                    grad = param.grad if param.grad is not None else param.main_grad
-                    param.data.sub_(learning_rate * grad)
-                    param.grad = None
+                param.data.sub_(learning_rate * trained_grad(param))
+                param.grad = None
 
     # Eager reference: GTP2 x DP2.
     ps.destroy_model_parallel()
@@ -248,7 +250,7 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
         loss.backward()
         wait_for_gtp_grad_reduction_on_current_stream()
         eager_grad_norms.append(global_grad_norm(eager, eager_gtp_group))
-        apply_sgd_step(eager, eager_gtp_group.size())
+        apply_sgd_step(eager)
 
     del eager, loss, x
     torch.cuda.synchronize()
@@ -357,7 +359,7 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
             loss.backward()
             wait_for_gtp_grad_reduction_on_current_stream()
             partial_cg_grad_norms.append(global_grad_norm(partial_cg, gtp_group))
-            apply_sgd_step(partial_cg, gtp_size)
+            apply_sgd_step(partial_cg)
         del loss, x
     finally:
         torch.cuda.synchronize()
@@ -383,28 +385,19 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
                 f"Step {step:2d}: eager={eager_loss:.6f}  partial_cg={partial_cg_loss:.6f}",
                 flush=True,
             )
-    # latent-proj case uses gradient_accumulation_fusion; suspected (unconfirmed) GEMM
-    # algorithm-selection variance compounds over 10 SGD steps into eager/graph drift that
-    # a busy shared process exposes but isolation doesn't.
-    traj_rtol = 2e-2 if latent_projection_case else 5e-3
-    traj_atol = 1e-4 if latent_projection_case else 1e-6
     torch.testing.assert_close(
-        torch.tensor(partial_cg_losses), torch.tensor(eager_losses), atol=traj_atol, rtol=traj_rtol
+        torch.tensor(partial_cg_losses), torch.tensor(eager_losses), atol=1e-6, rtol=5e-3
     )
     torch.testing.assert_close(
-        torch.tensor(partial_cg_grad_norms),
-        torch.tensor(eager_grad_norms),
-        atol=traj_atol,
-        rtol=traj_rtol,
+        torch.tensor(partial_cg_grad_norms), torch.tensor(eager_grad_norms), atol=1e-6, rtol=5e-3
     )
 
 
 class TestGTPPartialCGCorrectness:
-    @pytest.mark.flaky_in_dev
     @pytest.mark.parametrize(
         "partial_cg_modules,opt_in_modules",
         [
-            pytest.param(["attn"], [], id="attention"),
+            pytest.param(["attn"], [], id="attention", marks=pytest.mark.flaky_in_dev),
             pytest.param(["moe_router"], ["moe_latent_proj"], id="moe-router-latent-projections"),
         ],
     )
@@ -413,8 +406,8 @@ class TestGTPPartialCGCorrectness:
     ):
         """Local-CG loss trajectory and global grad norm must match eager execution.
 
-        Flaky in the full H100 dev bucket: the attention case's first replay after capture can
-        differ from eager while later replays match. It does not reproduce alone or after the
+        The attention case is flaky in the full H100 dev bucket: its first replay after capture
+        can differ from eager while later replays match. It does not reproduce alone or after the
         preceding GTP files; cause unconfirmed.
         """
         if torch.cuda.device_count() < 4:
