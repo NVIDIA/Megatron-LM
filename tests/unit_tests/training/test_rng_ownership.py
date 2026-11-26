@@ -289,11 +289,14 @@ def test_cached_logits_identity_uses_dataset_seed_not_legacy_args(monkeypatch, r
 
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     run_config.train.train_samples = 16
-    run_config.data.dataset = SimpleNamespace(blend=None, blend_per_split=None)
+    run_config.data.dataset = SimpleNamespace(random_seed=123, blend=None, blend_per_split=None)
     run_config.rng.seed = 123
     first_hash, first_fields = utils.compute_dataset_hash()
     assert utils.compute_dataset_hash() == (first_hash, first_fields)
     assert first_fields["seed"] == 123
     run_config.rng.seed = 124
-    second_hash, _ = utils.compute_dataset_hash()
+    assert utils.compute_dataset_hash() == (first_hash, first_fields)
+    run_config.data.dataset.random_seed = 124
+    second_hash, second_fields = utils.compute_dataset_hash()
+    assert second_fields["seed"] == 124
     assert first_hash != second_hash

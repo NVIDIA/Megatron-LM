@@ -28,13 +28,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
+from megatron.training.global_vars import get_run_config, get_tokenizer, set_run_config
+from megatron.training.losses import build_loss_func, language_model_loss
 from megatron.training.vocab_utils import model_vocab_size
-from megatron.training.global_vars import (
-    get_run_config,
-    get_tokenizer,
-    set_run_config,
-)
-from pretrain_gpt import loss_func
 
 """
 Pipeline parallelism for T5
@@ -182,7 +178,7 @@ def get_batch(data_iterator, use_local):
     return tokens_enc, tokens_dec, loss_mask, labels, enc_mask, dec_mask, enc_dec_mask
 
 
-def forward_step(data_iterator, model: T5Model):
+def forward_step(data_iterator, model: T5Model, *, loss_func=language_model_loss):
     """Forward training step.
 
     Args:
@@ -206,7 +202,7 @@ def forward_step(data_iterator, model: T5Model):
         tokens_enc, tokens_dec, enc_mask, dec_mask, enc_dec_mask, lm_labels=lm_labels
     )
 
-    return output_tensor, partial(loss_func, loss_mask)
+    return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples: int):
@@ -296,7 +292,7 @@ if __name__ == "__main__":
         full_config,
         train_valid_test_datasets_provider,
         ModelType.encoder_or_decoder,
-        forward_step,
+        partial(forward_step, loss_func=build_loss_func(full_config)),
         model_provider,
         get_embedding_ranks=t5_embedding_ranks,
         get_position_embedding_ranks=t5_position_embedding_ranks,

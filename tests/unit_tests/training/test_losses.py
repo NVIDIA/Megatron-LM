@@ -3,8 +3,10 @@
 """Algorithm selection, explicit callback ownership and shared training-loss checks."""
 
 import builtins
+import importlib
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -184,3 +186,38 @@ def test_unconfigured_loss_does_not_inspect_model_or_import_modelopt(monkeypatch
     model = SimpleNamespace(compute_kd_loss=lambda **kwargs: pytest.fail('unexpected KD'))
     callback = losses.build_loss_func(_config())
     assert callback(torch.ones(1), torch.tensor([3.0]), model=model)[0].item() == 3
+
+
+@pytest.mark.parametrize('module_name', ['pretrain_vlm', 'examples.t5.pretrain_t5'])
+@pytest.mark.parametrize('custom', [False, True])
+def test_vlm_and_t5_forward_steps_accept_loss_callbacks(monkeypatch, module_name, custom):
+    with patch('logging.basicConfig'):
+        entrypoint = importlib.import_module(module_name)
+    output = torch.tensor([2.0, 5.0])
+    mask = torch.tensor([1.0, 0.0])
+    if module_name == 'pretrain_vlm':
+        # VLM expands the text mask; the loss must consume the model-returned mask.
+        model = Mock(return_value=(output, torch.tensor([0.0, 1.0])))
+        batch = (None, None, None, None, mask, None, None)
+        expected = 5.0
+    else:
+        model = Mock(return_value=output)
+        batch = (None, None, mask, None, None, None, None)
+        monkeypatch.setattr(
+            entrypoint, 'get_args', lambda: SimpleNamespace(transformer_impl='local')
+        )
+        expected = 2.0
+    monkeypatch.setattr(entrypoint, 'get_batch', lambda *a, **kw: batch)
+    monkeypatch.setattr(entrypoint, 'get_timers', Mock())
+
+    def custom_loss(loss_mask, output_tensor, *, model):
+        assert model is expected_model
+        return losses.language_model_loss(loss_mask, output_tensor * 3)
+
+    expected_model = model
+    kwargs = {'loss_func': custom_loss} if custom else {}
+    tensor, callback = entrypoint.forward_step(None, model, **kwargs)
+    loss, tokens, report = callback(tensor)
+    assert loss.item() == expected * (3 if custom else 1)
+    assert tokens.item() == 1
+    torch.testing.assert_close(report['lm loss'], torch.stack([loss.detach(), tokens]))

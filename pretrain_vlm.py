@@ -41,9 +41,9 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.config.container import InferenceConfigContainer
 from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.losses import build_loss_func, language_model_loss
 from megatron.training.models import LLaVAModelConfig
 from megatron.training.vocab_utils import model_vocab_size
-from pretrain_gpt import loss_func
 
 
 def model_provider(
@@ -413,7 +413,7 @@ def get_batch(data_iterator):
     return tokens, position_ids, labels, images, loss_mask, attention_mask, packed_seq_params
 
 
-def forward_step(data_iterator, model: LLaVAModel):
+def forward_step(data_iterator, model: LLaVAModel, *, loss_func=language_model_loss):
     """Forward training step.
 
     Args:
@@ -443,7 +443,7 @@ def forward_step(data_iterator, model: LLaVAModel):
         packed_seq_params=packed_seq_params,
     )
 
-    return output_tensor, partial(loss_func, loss_mask)
+    return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
 def add_vlm_extra_args(parser):
@@ -574,7 +574,7 @@ if __name__ == "__main__":
         full_config,
         train_valid_test_datasets_provider,
         ModelType.encoder_or_decoder,
-        forward_step,
+        partial(forward_step, loss_func=build_loss_func(full_config)),
         model_provider,
         get_embedding_ranks=llava_embedding_ranks,
         get_position_embedding_ranks=llava_position_embedding_ranks,
