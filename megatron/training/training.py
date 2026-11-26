@@ -79,11 +79,7 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
     update_num_microbatches,
 )
-from megatron.core.optimizer import (
-    OptimizerConfig,
-    ParamKey,
-    get_megatron_optimizer,
-)
+from megatron.core.optimizer import OptimizerConfig, ParamKey, get_megatron_optimizer
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
     LayerWiseDistributedOptimizer,
@@ -154,12 +150,12 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
-from megatron.training.config import (
-    TrainingConfig,
-    ValidationConfig,
-)
+from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.config.container import PretrainConfigContainer
-from megatron.training.config.optimizer_config import build_optimizer_config_overrides
+from megatron.training.config.optimizer_config import (
+    build_optimizer_config_overrides,
+    validate_lora_plus_warmup,
+)
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.datasets.utils import get_training_data_sequence_length
 from megatron.training.initialize import (
@@ -2646,6 +2642,7 @@ def setup_model_and_optimizer(
         # Legacy callers may supply a model/optimizer config without finalized scheduler
         # horizons. As in get_optimizer_param_scheduler, use the finalized run settings.
         run_cfg = get_run_config()
+        validate_lora_plus_warmup(optim_cfg_overrides, optim_cfg, run_cfg.scheduler.lr_warmup_init)
         optimizer, opt_param_scheduler = setup_optimizer(
             run_cfg.optimizer,
             run_cfg.scheduler,

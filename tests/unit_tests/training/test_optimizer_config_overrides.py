@@ -12,12 +12,18 @@ import torch
 
 from megatron.core.optimizer import OptimizerConfig, _get_param_groups, merge_config_overrides
 from megatron.core.optimizer.optimizer import FP32Optimizer, get_param_group_identifier_tuple
-from megatron.core.optimizer.optimizer_config import ParamKey
+from megatron.core.optimizer.optimizer_config import ParamKey, ParamPredicate
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.training import training
 from megatron.training.config import PretrainConfigContainer, target_allowlist
-from megatron.training.config.optimizer_config import build_optimizer_config_overrides
+from megatron.training.config.optimizer_config import (
+    LoRAPlusOptimizerOverrides,
+    build_optimizer_config_overrides,
+    get_lora_plus_lr_overrides,
+    validate_lora_plus_warmup,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -126,12 +132,16 @@ def test_callable_configuration_round_trip(run_config, tmp_path, yaml_round_trip
         target_allowlist.remove_exact(target)
 
 
-def test_setup_calls_hook_with_the_built_model(monkeypatch, run_config):
+@pytest.mark.parametrize("reject_nonzero_warmup", [False, True])
+def test_setup_calls_hook_with_the_built_model(monkeypatch, run_config, reject_nonzero_warmup):
     model = _model()
     model[0].pg_collection = ProcessGroupCollection()
     hook = Mock(return_value={ParamKey(name="weight"): {"max_lr": 0.008}})
     run_config.optimizer_config_overrides = hook
     run_config.optimizer.lr = 0.001
+    if reject_nonzero_warmup:
+        hook.return_value = {ParamKey(name="*.linear_out.weight"): {"max_lr": 0.016}}
+        run_config.scheduler.lr_warmup_init = 1e-5
     monkeypatch.setattr(
         training,
         "get_args",
@@ -149,6 +159,11 @@ def test_setup_calls_hook_with_the_built_model(monkeypatch, run_config):
 
     factory = Mock(side_effect=ReachedOptimizer)
     monkeypatch.setattr(training, "get_megatron_optimizer", factory)
+    if reject_nonzero_warmup:
+        with pytest.raises(ValueError, match="lr_warmup_init=0"):
+            training.setup_model_and_optimizer(None, lambda: None, cfg_container=run_config)
+        factory.assert_not_called()
+        return
     with pytest.raises(ReachedOptimizer):
         training.setup_model_and_optimizer(None, lambda: None, cfg_container=run_config)
     hook.assert_called_once_with(optimizer_config=run_config.optimizer, model=model)
@@ -211,3 +226,185 @@ def test_redundant_overrides_keep_unique_parameter_state_on_resume(
     for param in model.parameters():
         for key, value in expected[param].items():
             torch.testing.assert_close(inner.state[param][key], value)
+
+
+@pytest.mark.parametrize("ratio", [1.0, 16.0, 0.25])
+def test_lora_plus_groups_schedule_and_resume(distributed_groups, ratio):
+    config = OptimizerConfig(lr=1e-3, min_lr=1e-4, weight_decay=0.1)
+
+    def build():
+        model = _model()[0]
+        model.adapter = torch.nn.Module()
+        model.adapter.linear_in = torch.nn.Linear(4, 2, bias=False)
+        model.adapter.linear_out = torch.nn.Linear(2, 4, bias=False)
+        policy = build_optimizer_config_overrides(
+            config, [model], LoRAPlusOptimizerOverrides(ratio)
+        )
+        groups = _get_param_groups([model], config, policy)
+        # A retains the base group, including other trainable weights. No duplicate identities.
+        identities = [get_param_group_identifier_tuple(group) for group in groups]
+        assert len(identities) == len(set(identities))
+        opt = torch.optim.AdamW(groups, lr=config.lr)
+        sched = OptimizerParamScheduler(
+            opt,
+            init_lr=0,
+            max_lr=config.lr,
+            min_lr=config.min_lr,
+            lr_warmup_steps=2,
+            lr_decay_steps=8,
+            lr_decay_style="linear",
+            start_wd=0.1,
+            end_wd=0.1,
+            wd_incr_steps=8,
+            wd_incr_style="constant",
+        )
+        return model, opt, sched
+
+    model, optimizer, scheduler = build()
+    by_param = {id(p): g for g in optimizer.param_groups for p in g["params"]}
+    a, b = (
+        by_param[id(getattr(model.adapter, name).weight)] for name in ("linear_in", "linear_out")
+    )
+    assert by_param[id(model.bias)]["wd_mult"] == 0
+
+    def step(module, opt, sched):
+        sched.step(1)
+        for i, param in enumerate(module.parameters()):
+            param.grad = torch.full_like(param, 0.1 * (i + 1))
+        opt.step()
+
+    for _ in range(3):
+        step(model, optimizer, scheduler)
+        assert b["lr"] == pytest.approx(ratio * a["lr"])
+    restored, opt2, sched2 = build()
+    restored.load_state_dict(deepcopy(model.state_dict()))
+    opt2.load_state_dict(deepcopy(optimizer.state_dict()))
+    sched2.load_state_dict(scheduler.state_dict())
+    for _ in range(3):
+        step(model, optimizer, scheduler)
+        step(restored, opt2, sched2)
+        assert b["lr"] == pytest.approx(ratio * a["lr"])
+    for expected, actual in zip(model.parameters(), restored.parameters()):
+        torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+        for key in ("exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(
+                optimizer.state[expected][key], opt2.state[actual][key], rtol=0, atol=0
+            )
+    scheduler.step(8 - scheduler.num_steps)
+    assert b["lr"] == pytest.approx(ratio * config.min_lr)
+
+
+@pytest.mark.parametrize("ratio", [0, -1, float("nan"), float("inf")])
+def test_lora_plus_rejects_invalid_ratio(ratio):
+    with pytest.raises(ValueError, match="finite and positive"):
+        LoRAPlusOptimizerOverrides(ratio)(optimizer_config=OptimizerConfig(lr=1e-3), model=[])
+
+
+@pytest.mark.parametrize("initial_lr,ratio", [(0, 16.0), (1e-5, 1.0), (1e-5, 16.0)])
+def test_lora_plus_warmup_policy_is_independent_of_local_parameters(initial_lr, ratio):
+    config = OptimizerConfig(lr=1e-3, min_lr=1e-4)
+    policy = LoRAPlusOptimizerOverrides(ratio)(optimizer_config=config, model=[])
+    if initial_lr and ratio != 1:
+        with pytest.raises(ValueError, match="lr_warmup_init=0"):
+            validate_lora_plus_warmup(policy, config, initial_lr)
+    else:
+        validate_lora_plus_warmup(policy, config, initial_lr)
+
+
+def test_manual_lora_mapping_obeys_the_same_warmup_guard():
+    with pytest.raises(ValueError, match="lr_warmup_init=0"):
+        validate_lora_plus_warmup(
+            {ParamKey(name=("*.linear_in.weight",)): {"min_lr": 0.0}},
+            OptimizerConfig(lr=1e-3, min_lr=1e-4),
+            1e-5,
+        )
+
+
+def test_lora_plus_callable_roundtrips_with_recipe(run_config, tmp_path):
+    run_config.optimizer.lr = 1e-3
+    run_config.optimizer.min_lr = 1e-4
+    run_config.optimizer_config_overrides = LoRAPlusOptimizerOverrides(16.0)
+    path = tmp_path / "lora.yaml"
+    run_config.to_yaml(str(path))
+    restored = PretrainConfigContainer.from_yaml(str(path))
+    policy = restored.optimizer_config_overrides(optimizer_config=restored.optimizer, model=[])
+    assert policy[ParamKey(name="*.linear_out.weight")] == {"max_lr": 0.016, "min_lr": 0.0016}
+
+
+def test_lora_plus_does_not_silently_change_ratio_under_mup():
+    with pytest.raises(ValueError, match="explicit combined"):
+        build_optimizer_config_overrides(
+            OptimizerConfig(lr=1e-3), _model(use_mup=True), LoRAPlusOptimizerOverrides(0.5)
+        )
+
+
+@pytest.mark.parametrize(
+    "lr,minimum",
+    [(None, 0.0), (float("inf"), 0.0), (0.001, -0.1), (0.001, 0.01), (0.001, float("nan"))],
+)
+def test_lora_plus_shared_builder_rejects_invalid_bounds(lr, minimum):
+    with pytest.raises(ValueError, match="finite base LR bounds"):
+        get_lora_plus_lr_overrides(OptimizerConfig(lr=lr, min_lr=minimum), 16.0)
+
+
+def test_lora_plus_shared_builder_preserves_explicit_legacy_groups():
+    overrides = get_lora_plus_lr_overrides(OptimizerConfig(lr=0.001, min_lr=None), 1.0)
+    assert overrides == {
+        ParamKey(name="*.linear_in.weight"): {"max_lr": 0.001, "min_lr": 0.0},
+        ParamKey(name="*.linear_out.weight"): {"max_lr": 0.001, "min_lr": 0.0},
+    }
+    with pytest.raises(ValueError, match="scaled learning rate must be finite"):
+        get_lora_plus_lr_overrides(OptimizerConfig(lr=1e308), 16.0)
+
+
+@pytest.mark.parametrize("overrides", [None, {}])
+def test_lora_plus_warmup_accepts_absent_policies(overrides):
+    validate_lora_plus_warmup(overrides, OptimizerConfig(lr=0.001), 0.0001)
+
+
+@pytest.mark.parametrize("name", ["*linear_out.weight", ("*.linear_out.weight", "*.other")])
+def test_warmup_composes_all_matching_name_selectors(name):
+    config = OptimizerConfig(lr=0.001, min_lr=0.0001)
+    raised = {"max_lr": 0.004}
+    mapping = {ParamKey(name=name): raised}
+    with pytest.raises(ValueError, match="lr_warmup_init=0"):
+        validate_lora_plus_warmup(mapping, config, 1e-5)
+    mapping[ParamKey(name="*.weight")] = raised
+    validate_lora_plus_warmup(mapping, config, 1e-5)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_warmup_does_not_infer_lora_from_general_selectors(mixed):
+    selector = (
+        ParamKey(
+            name="*.linear_out.weight", predicate=ParamPredicate("matrix", lambda p: p.ndim == 2)
+        )
+        if mixed
+        else ParamKey(name="*out*.weight")
+    )
+    validate_lora_plus_warmup({selector: {"max_lr": 0.016}}, OptimizerConfig(lr=0.001), 1e-5)
+
+
+def test_lora_b_and_decoupled_embedding_share_a_safe_group(distributed_groups):
+    config = OptimizerConfig(lr=0.001, min_lr=0.0, decoupled_lr=0.016)
+    model = torch.nn.Module()
+    model.embedding = torch.nn.Parameter(torch.ones(4, 4))
+    model.embedding.is_embedding_or_output_parameter = True
+    model.adapter = torch.nn.Module()
+    model.adapter.linear_in = torch.nn.Linear(4, 4, bias=False)
+    model.adapter.linear_out = torch.nn.Linear(4, 4, bias=False)
+    policy = build_optimizer_config_overrides(config, [model], LoRAPlusOptimizerOverrides(16.0))
+    groups = _get_param_groups([model], config, policy)
+    assert len(groups) == len({get_param_group_identifier_tuple(group) for group in groups})
+    inner = torch.optim.AdamW(groups, lr=config.lr)
+    for index, param in enumerate(model.parameters()):
+        param.grad = torch.full_like(param, index + 1)
+    inner.step()
+    expected = {param: deepcopy(inner.state[param]) for param in model.parameters()}
+    wrapper = FP32Optimizer.__new__(FP32Optimizer)
+    wrapper.optimizer = inner
+    wrapper.load_state_dict(deepcopy(inner.state_dict()))
+    members = [param for group in inner.param_groups for param in group["params"]]
+    assert len(members) == len({id(param) for param in members}) == 3
+    for param in model.parameters():
+        torch.testing.assert_close(inner.state[param]["exp_avg"], expected[param]["exp_avg"])

@@ -2,8 +2,10 @@
 
 """Recipe integration for Core's existing optimizer override mappings."""
 
+import math
 from collections.abc import Callable
-from dataclasses import fields, replace
+from dataclasses import dataclass, fields, replace
+from fnmatch import fnmatchcase
 from typing import Literal
 
 from megatron.core.optimizer import (
@@ -22,6 +24,105 @@ from megatron.core.utils import unwrap_model
 
 OptimizerConfigOverrides = dict[ParamKey, ParamGroupOverride]
 OptimizerConfigOverrideHook = Callable[..., OptimizerConfigOverrides]
+
+
+def get_lora_plus_lr_overrides(
+    optimizer_config: OptimizerConfig, ratio: float
+) -> OptimizerConfigOverrides:
+    """Build explicit A/B learning-rate bounds, without composing standard rules.
+
+    Keeping both entries preserves the parameter-group structure of existing LoRA+
+    callers. New recipe callables may omit A's redundant contribution. ``None`` for
+    the base minimum LR is interpreted as zero, matching the legacy Bridge helper.
+    """
+    if not math.isfinite(ratio) or ratio <= 0:
+        raise ValueError("LoRA+ ratio must be finite and positive.")
+    lr = optimizer_config.lr
+    minimum = optimizer_config.min_lr if optimizer_config.min_lr is not None else 0.0
+    if lr is None or not math.isfinite(lr) or not 0 <= minimum <= lr:
+        raise ValueError("LoRA+ requires finite base LR bounds with 0 <= min_lr <= lr.")
+    if not math.isfinite(lr * ratio):
+        raise ValueError("LoRA+ scaled learning rate must be finite.")
+    return {
+        ParamKey(name="*.linear_in.weight"): {"max_lr": lr, "min_lr": minimum},
+        ParamKey(name="*.linear_out.weight"): {"max_lr": lr * ratio, "min_lr": minimum * ratio},
+    }
+
+
+@dataclass
+class LoRAPlusOptimizerOverrides:
+    """Scale adapter B's entire LR schedule relative to A through the recipe hook.
+
+    Adapter A uses the base optimizer LR. Adapter B matches ``*.linear_out.weight``;
+    A uses the corresponding ``*.linear_in.weight`` naming convention. This callable
+    configures existing adapters; it does not insert or freeze model parameters.
+    Standard WD and decoupled-LR rules are composed by the caller in extend mode.
+    """
+
+    ratio: float
+    """B-to-A learning-rate ratio; must be finite and positive."""
+
+    def __call__(
+        self, *, optimizer_config: OptimizerConfig, model: list[MegatronModule]
+    ) -> OptimizerConfigOverrides:
+        """Return only the contribution that differs from the base optimizer policy."""
+        overrides = get_lora_plus_lr_overrides(optimizer_config, self.ratio)
+        if any(
+            getattr(getattr(chunk, "config", None), "use_mup", False)
+            for chunk in unwrap_model(model)
+        ):
+            raise ValueError("LoRA+ with muP requires an explicit combined optimizer mapping.")
+        if self.ratio == 1.0:
+            return {}
+        key = ParamKey(name="*.linear_out.weight")
+        defaults = {"max_lr": optimizer_config.lr, "min_lr": optimizer_config.min_lr}
+        values = {name: value for name, value in overrides[key].items() if value != defaults[name]}
+        return {key: values} if values else {}
+
+
+def validate_lora_plus_warmup(
+    overrides: OptimizerConfigOverrides | None,
+    optimizer_config: OptimizerConfig,
+    initial_lr: float,
+    *,
+    require_adapter_selector: bool = True,
+) -> None:
+    """Check composed name-based adapter bounds without depending on rank-local parameters.
+
+    MLM can receive arbitrary model policies. By default, only check when a name-only
+    selector explicitly targets adapter A or B. Bridge historically checks all named
+    policies and can opt into that behavior. Predicates cannot be evaluated from a name.
+    """
+    if not overrides or initial_lr == 0:
+        return
+    named = [
+        (selector, (selector.name,) if isinstance(selector.name, str) else selector.name, value)
+        for selector, value in overrides.items()
+        if selector.name
+    ]
+    if require_adapter_selector and not any(
+        pattern.endswith(("linear_in.weight", "linear_out.weight"))
+        for selector, patterns, _ in named
+        if not (selector.attr or selector.predicate or selector.with_name_predicate)
+        for pattern in patterns
+    ):
+        return
+    bounds = []
+    for name in ("adapter.linear_in.weight", "adapter.linear_out.weight"):
+        matched = [
+            value
+            for _, patterns, value in named
+            if any(fnmatchcase(name, pattern) for pattern in patterns)
+        ]
+        policy = combine_param_group_overrides(matched)
+        bounds.append(
+            (
+                policy.get("max_lr", optimizer_config.lr),
+                policy.get("min_lr", optimizer_config.min_lr),
+            )
+        )
+    if bounds[0] != bounds[1]:
+        raise ValueError("LoRA+ with unequal A/B LR bounds requires lr_warmup_init=0.")
 
 
 def build_optimizer_config_overrides(
