@@ -20,6 +20,11 @@ from torch.distributed import ProcessGroup
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.factory import split_megakernel_backend_config
+from megatron.core.transformer.moe.megakernel.mok.package import (
+    cutemok_api,
+    mok_modules,
+    resolve_mok_backend,
+)
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import (
     _gate_up_main_grad_arguments,
@@ -66,6 +71,13 @@ class _MainGradArguments:
         return self.data_ptrs == tuple(map(torch.Tensor.data_ptr, self.main_grads))
 
 
+def _address_table(tensors) -> torch.Tensor:
+    """CuTe MoK's main-grad storage table: per-expert base addresses, int64 [E_local] on device."""
+    return torch.tensor(
+        [t.data_ptr() for t in tensors], dtype=torch.int64, device=tensors[0].device
+    )
+
+
 class MoKMegakernel(MegakernelBackend):
     """Execute MOK using trainable parameters owned by native MCore modules."""
 
@@ -78,16 +90,26 @@ class MoKMegakernel(MegakernelBackend):
         num_local_experts: int,
     ) -> None:
         super().__init__()
+        # "cutemok": cuDNN frontend's CuTe MoK, an optimized version of MOK, called through its
+        # public API: https://github.com/NVIDIA/cudnn-frontend/pull/2767
+        # "mok" (deprecated; runs as "cutemok" when available): our MCore-integration version of
+        # MOK: https://github.com/QiZhangNV/mixture-of-kittens/tree/qizhang/mcore-integration
+        backend = getattr(config, "moe_megakernel_backend", None)
+        self._use_cutemok = resolve_mok_backend(backend) == "cutemok"
         try:
-            # This adapter targets our MCore-integration version of MOK rather than the
-            # upstream package API:
-            # https://github.com/QiZhangNV/mixture-of-kittens/tree/qizhang/mcore-integration
-            from mok.functional import MoKConfig
+            if self._use_cutemok:
+                MoKConfig = cutemok_api().CuteMoKConfig
+            else:
+                MoKConfig = mok_modules()[0].MoKConfig
         except ImportError as exc:
             raise ImportError(
-                "moe_megakernel_backend='mok' requires the MCore integration fork of "
-                "mixture-of-kittens; see the MOK installation instructions in "
-                "megatron/core/transformer/moe/README.md"
+                "moe_megakernel_backend='cutemok' requires cuDNN frontend with CuTe MoK "
+                "(cudnn.moe_ep.cutemok, NVIDIA/cudnn-frontend#2767); see the CuTe MoK "
+                "installation instructions in megatron/core/transformer/moe/README.md"
+                if self._use_cutemok
+                else "moe_megakernel_backend='mok' requires cuDNN frontend with CuTe MoK or the "
+                "MCore integration fork of mixture-of-kittens; see the MOK installation "
+                "instructions in megatron/core/transformer/moe/README.md"
             ) from exc
 
         if not config.gradient_accumulation_fusion:
@@ -223,6 +245,11 @@ class MoKMegakernel(MegakernelBackend):
         return groups
 
     @property
+    def cutemok(self):
+        """cuDNN frontend's CuTe MoK module for the "cutemok" backend, else None ("mok")."""
+        return cutemok_api() if getattr(self, "_use_cutemok", False) else None
+
+    @property
     def routed_fc1_parameters(self) -> tuple[nn.Parameter, ...]:
         """Return the MCore-owned routed FC1 parameters."""
         return self._routed_parameter_groups()[0]
@@ -271,10 +298,13 @@ class MoKMegakernel(MegakernelBackend):
         if self.native_single_grouped_weights:
             arguments = (logical_main_grads, None)
         else:
-            from mok import ops
-
-            fc1_table = ops.make_routed_d_weight_storage_table(list(fc1_main_grads))
-            fc2_table = ops.make_routed_d_weight_storage_table(list(fc2_main_grads))
+            make_table = (
+                _address_table
+                if self.cutemok is not None
+                else mok_modules()[1].make_routed_d_weight_storage_table
+            )
+            fc1_table = make_table(list(fc1_main_grads))
+            fc2_table = make_table(list(fc2_main_grads))
             arguments = (logical_main_grads, (fc1_table, fc2_table))
         cached = _MainGradArguments(
             parameters=tuple(param for param in parameters if param is not None),
@@ -454,12 +484,15 @@ class MoKMegakernel(MegakernelBackend):
                 use_mxfp8=self.use_mxfp8_weights,
                 cached_view=cached_view,
             )
+        # The mok package's call is unchanged; CuTe MoK builds its CuteMoKSplitWeight instead.
+        api_kwargs = {} if self.cutemok is None else {"api": self.cutemok}
         return _native_split_weight_view(
             parameters,
             rows=rows,
             columns=columns,
             use_mxfp8=self.use_mxfp8_weights,
             cached_view=cached_view,
+            **api_kwargs,
         )
 
     # Checkpoint contract: native MCore expert modules own the canonical parameters,

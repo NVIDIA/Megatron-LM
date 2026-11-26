@@ -142,7 +142,8 @@ def _assert_accumulate_grad_steals_sentinel(param, backward_context=nullcontext)
     seen = []
     # MCore DDP registers its hook on the AccumulateGrad node the same way; the hook's extra
     # reference must still let AccumulateGrad steal the sentinel instead of copying it.
-    grad_accumulator = param.expand_as(param).grad_fn.next_functions[0][0]
+    param_tmp = param.expand_as(param)
+    grad_accumulator = param_tmp.grad_fn.next_functions[0][0]
 
     def hook(*unused):
         seen.append((type(param.grad), param.grad.data_ptr(), param.grad_added_to_main_grad))
@@ -900,6 +901,7 @@ def _split_module_with_main_grads(monkeypatch):
         return object()
 
     fake_mok = types.ModuleType("mok")
+    fake_mok.functional = types.ModuleType("mok.functional")
     fake_mok.ops = SimpleNamespace(
         make_routed_d_weight_storage_table=make_routed_d_weight_storage_table
     )
@@ -1019,6 +1021,7 @@ def test_mok_autograd_saves_only_backward_inputs_and_grads_every_routed_paramete
     module.ep_group = None
     module.num_local_experts = 2
     module.swiglu_limit = None
+    module.situ_beta = None
     monkeypatch.setattr(mok_backend, "_native_split_weight_view", lambda *a, **k: object())
 
     def forward(config, workspace, schedule, x, router_weights, *weights, swiglu_limit):

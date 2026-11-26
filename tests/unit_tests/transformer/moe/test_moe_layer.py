@@ -282,6 +282,38 @@ def _mok_composition_layer(
 class TestMoELayerInit:
 
     @pytest.mark.parametrize("already_sharded", [False, True])
+    def test_mok_forward_aligns_padding_for_router_and_backend(self, monkeypatch, already_sharded):
+        Utils.initialize_model_parallel(2, 1, expert_tensor_parallel_size=1)
+        model_parallel_cuda_manual_seed(123)
+        try:
+            backend = _RecordingMegakernel()
+            layer = _megakernel_moe_layer(
+                monkeypatch,
+                backend,
+                tensor_model_parallel_size=2,
+                expert_tensor_parallel_size=1,
+                sequence_parallel=True,
+                params_dtype=torch.bfloat16,
+            ).cuda()
+            hidden = torch.randn(3, 2, 128, device="cuda", dtype=torch.bfloat16)
+            mask = torch.arange(12, device="cuda").view(2, 6) % 3 == 0
+            start = layer.tp_group.rank() * 3
+            local_mask = mask[:, start : start + 3]
+            probs = torch.ones(6, 2, device="cuda")
+            routes = torch.tensor([[True, False], [False, True]], device="cuda").repeat(3, 1)
+            router = Mock(return_value=(probs, routes))
+            monkeypatch.setattr(layer.router, "forward", router)
+
+            layer(hidden, padding_mask=local_mask if already_sharded else mask)
+
+            torch.testing.assert_close(router.call_args.args[1], local_mask.T)
+            valid = ~local_mask.T.reshape(-1, 1)
+            torch.testing.assert_close(backend.routes[-1][0], probs * valid)
+            torch.testing.assert_close(backend.routes[-1][1], routes & valid)
+        finally:
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("already_sharded", [False, True])
     def test_mok_route_aligns_sequence_parallel_metadata(self, already_sharded):
         Utils.initialize_model_parallel(2, 1)
         try:

@@ -960,8 +960,11 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_megakernel_backend: Optional[str] = None
     """Optional backend that replaces MoE dispatch, expert computation, and combine.
-    Supported values: None and "mok". When set, the megakernel owns dispatch/combine;
-    moe_token_dispatcher_type and moe_flex_dispatcher_backend do not select its transport.
+    Supported values: None, "cutemok" (cuDNN frontend's CuTe MoK, an optimized version of MOK;
+    NVIDIA/cudnn-frontend#2767) and the deprecated "mok", which runs as "cutemok" when CuTe MoK is
+    available and otherwise through the standalone mok package, with a FutureWarning either way.
+    When set, the megakernel owns dispatch/combine; moe_token_dispatcher_type and
+    moe_flex_dispatcher_backend do not select its transport.
     """
 
     moe_megakernel_backend_config: Optional[dict] = None
@@ -2845,7 +2848,7 @@ class TransformerConfig(ModelParallelConfig):
             ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
 
         if self.moe_virtual_expert_load_balance:
-            if self.moe_megakernel_backend == "mok":
+            if self.moe_megakernel_backend in ("mok", "cutemok"):
                 raise ValueError("MOK does not support MoonEP (moe_virtual_expert_load_balance)")
             MAX_VIRTUAL_EXPERT_EP_SIZE = 64
 
@@ -2945,16 +2948,16 @@ class TransformerConfig(ModelParallelConfig):
                     f"moe_shared_expert_overlap only works with alltoall or flex token dispatcher."
                 )
 
-        if self.moe_megakernel_backend not in (None, "mok"):
+        if self.moe_megakernel_backend not in (None, "mok", "cutemok"):
             raise ValueError(
-                "moe_megakernel_backend must be None or 'mok', got "
+                "moe_megakernel_backend must be None, 'mok' or 'cutemok', got "
                 f"{self.moe_megakernel_backend!r}"
             )
         if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
             )
-        if self.moe_megakernel_backend == "mok":
+        if self.moe_megakernel_backend in ("mok", "cutemok"):
             from megatron.core.transformer.moe.megakernel import megakernel_fuses_shared_expert
 
             if self.moe_router_dtype == "fp64":
@@ -4342,7 +4345,7 @@ class TransformerConfig(ModelParallelConfig):
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
 
-        if self.moe_megakernel_backend == "mok":
+        if self.moe_megakernel_backend in ("mok", "cutemok"):
             if self.cuda_graph_impl in ("local", "transformer_engine"):
                 if CudaGraphModule.moe_preprocess in self.cuda_graph_modules:
                     raise ValueError(
