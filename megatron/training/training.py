@@ -2643,9 +2643,12 @@ def setup_model_and_optimizer(
         )
         optim_cfg.timers = timers
 
+        # Legacy callers may supply a model/optimizer config without finalized scheduler
+        # horizons. As in get_optimizer_param_scheduler, use the finalized run settings.
+        run_cfg = get_run_config()
         optimizer, opt_param_scheduler = setup_optimizer(
-            optim_cfg,
-            cfg.scheduler,
+            run_cfg.optimizer,
+            run_cfg.scheduler,
             model,
             config_overrides=optim_cfg_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
