@@ -21,6 +21,7 @@ from megatron.core.msc_utils import maybe_msc
 from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
 from .dict_utils import merge
+from .glu import glu_factory_layouts, glu_runtime_layout
 from .mapping import (
     CommonStateDict,
     ShardedObject,
@@ -155,13 +156,37 @@ def load(
     else:
         force_all_tensors_to_non_fp8(sharded_state_dict)
 
-    sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
-        sharded_state_dict
-    )
+    glu_layouts = glu_factory_layouts(sharded_state_dict)
     # Common (non-tensor) data is stored either as a single ShardedObject inside the
     # torch_dist checkpoint (current format) or in a legacy common.pt.
     common_state_dict = load_common_state_dict(
         checkpoint_dir, cache_metadata=getattr(sharded_strategy, "cache_metadata", False)
+    )
+    metadata = common_state_dict.get(_CONTENT_METADATA_KEY, {})
+    source_config = common_state_dict.get('args')
+    if source_config is None:
+        cfg = common_state_dict.get('cfg', {})
+        source_config = cfg.get('model') if isinstance(cfg, dict) else getattr(cfg, 'model', None)
+    source_layout = metadata.get('glu_runtime_layout', glu_runtime_layout(source_config))
+    if glu_layouts and metadata.get('glu_checkpoint_layout') != 'contiguous':
+        if (
+            metadata.get('glu_checkpoint_layout') is not None
+            or any(source_layout[k] is not None for k in ('routed', 'shared', 'dense'))
+            or (source_config is None and any(size is not None for size, _ in glu_layouts.values()))
+        ):
+            raise ValueError(
+                'Cannot establish the layout of an unmarked interleaved GLU checkpoint '
+                'before factory loading.'
+            )
+    saved_layouts = metadata.get('glu_tensor_layouts', {})
+    if 'optimizer' in sharded_state_dict and metadata.get('glu_optimizer_layout') != 'contiguous':
+        for key, layout in glu_layouts.items():
+            if key in saved_layouts and tuple(saved_layouts[key]) != layout:
+                raise ValueError(
+                    'Raw optimizer buffers require the saved GLU row layout and TP partitioning.'
+                )
+    sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
+        sharded_state_dict
     )
     merge(common_state_dict, nonpersistent_state_dict)
 
@@ -443,6 +468,27 @@ def save(
     ):
         sharded_strategy = TorchDistSaveShardedStrategy()
 
+    # Factory declarations cover direct Core writers as well as training-loop writers.
+    # All ranks participate, including PP stages without a local GLU layer.
+    local_glu_layouts = glu_factory_layouts(sharded_state_dict)
+    layouts_per_rank: list[dict[str, tuple[int | None, int]]] = [
+        {} for _ in range(torch.distributed.get_world_size())
+    ]
+    torch.distributed.all_gather_object(layouts_per_rank, local_glu_layouts)
+    glu_layouts: dict[str, tuple[int | None, int]] = {}
+    for layouts in layouts_per_rank:
+        for key, layout in layouts.items():
+            if key in glu_layouts and glu_layouts[key] != layout:
+                raise ValueError(f'Inconsistent GLU factory layout for {key}')
+            glu_layouts[key] = layout
+    if glu_layouts:
+        content_metadata = dict(content_metadata or {})
+        content_metadata['glu_checkpoint_layout'] = 'contiguous'
+        content_metadata['glu_tensor_layouts'] = glu_layouts
+        content_metadata.setdefault(
+            'glu_optimizer_layout',
+            'contiguous' if any(key.startswith('optimizer.') for key in glu_layouts) else 'runtime',
+        )
     if content_metadata is not None:
         sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata
 

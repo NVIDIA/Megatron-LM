@@ -12,12 +12,8 @@ import torch.nn.functional as F
 
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.glu import permute_glu_rows
-from megatron.core.dist_checkpointing.mapping import (
-    ReplicaId,
-    ShardedStateDict,
-    ShardedTensorFactory,
-)
+from megatron.core.dist_checkpointing.glu import GluTensorFactory, permute_glu_rows
+from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedStateDict
 from megatron.core.fusions.fused_bias_geglu import (
     bias_geglu_impl,
     quick_gelu,
@@ -53,6 +49,8 @@ except ImportError:
 
 class LinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in MLP."""
+
+    _glu_interleave_size: int | None
 
     def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward method for linear_fc1 module."""
@@ -257,6 +255,10 @@ class MLP(MegatronModule):
             self.activation_func = apply_module(submodules.activation_func(config=self.config))
         else:
             self.activation_func = self.config.activation_func
+
+        self.linear_fc1._glu_interleave_size = (
+            self._checkpoint_glu_interleave_size() if self.config.gated_linear_unit else None
+        )
 
         self.linear_fc2 = submodules.linear_fc2(
             not_none(self.config.ffn_hidden_size),
@@ -642,11 +644,13 @@ def apply_swiglu_sharded_factory(
     # Keep the original parameter identity: optimizer factories are derived from
     # this factory and therefore apply exactly the same layout to masters/moments.
     sh_ten_factory_build_function = dp_sh_ten_build_fn if is_dp_sharded else sh_ten_build_fn
-    return ShardedTensorFactory(
+    return GluTensorFactory(
         original_sh_ten.key,
         original_sh_ten.data,
         sh_ten_factory_build_function,
         merge_fn,
         original_sh_ten.replica_id,
         flattened_range=original_sh_ten.flattened_range,
+        glu_interleave_size=glu_interleave_size,
+        glu_tp_size=axis_frag,
     )

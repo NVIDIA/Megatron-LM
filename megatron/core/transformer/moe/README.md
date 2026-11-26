@@ -720,20 +720,16 @@ experts require `gtp_weight_remat_size=1`. Configuration validation rejects thes
 combinations even when optimizer state is not loaded. GTP on other modules and
 ordinary TP/ETP remain allowed.
 
-For `torch` and `torch_dist` checkpoints, model weights are saved in contiguous
-`[all gate | all up]` layout. Optimizer master weights and moments retain their
-runtime layout, described by the existing saved configuration. GLU conversion
-does not add checkpoint fields or layout metadata. Full optimizer resume
-requires the same interleave sizes and the same ETP size for routed experts
-(TP size for shared experts). To change those settings, load model weights with
-`--finetune` or `--no-load-optim` and initialize a new optimizer. This also applies
-when enabling interleaving on a checkpoint saved with a contiguous optimizer.
+Native `torch_dist` factories store canonical `[all gate | all up]` model rows.
+With `--dist-ckpt-optim-fully-reshardable`, masters and moments use the same
+factory, allowing interleave-size changes without discarding optimizer state.
+Raw optimizer buffers require the saved runtime layout and TP/ETP partitioning.
+Explicit metadata distinguishes these cases; unmarked historical interleaved
+checkpoints require verified recovery with their original writer.
 
-Model weights are always interpreted as contiguous, regardless of the interleave
-settings in the saved configuration. Legacy checkpoints with interleaved model
-weights must be converted to contiguous layout before loading; their source
-layout is not detected automatically. In-place FSDP loading and
-`torch_dcp` / `fsdp_dtensor` formats are not supported by this conversion.
+See [GLU model and optimizer checkpoint layout](../../../../docs/developer/optimizer-glu-checkpoint-layout.md)
+for the metadata contract, compatibility limits, direct Core API behavior,
+legacy formats and supported recovery procedure.
 
 ### CUDA Graph
 CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are three implementations:

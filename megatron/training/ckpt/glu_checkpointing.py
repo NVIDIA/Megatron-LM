@@ -14,6 +14,7 @@ from dataclasses import replace
 import torch
 
 from megatron.core.dist_checkpointing.glu import (
+    convert_glu_model_state,
     glu_runtime_layout,
     permute_glu_rows,
     validate_glu_checkpoint_layout,
@@ -92,8 +93,14 @@ def _convert_model_rows(model_state_dict, sizes, *, interleave):
     return convert(model_state_dict, '')
 
 
-def _convert_model_sections(state_dict, sizes, *, interleave):
+def _convert_model_sections(state_dict, sizes, *, interleave, model=None):
     result = copy(state_dict)
+    if model is not None:
+        for index, chunk in enumerate(model):
+            key = 'model' if len(model) == 1 else f'model{index}'
+            if key in result:
+                result[key] = convert_glu_model_state(result[key], chunk, interleave=interleave)
+        return result
     if any(size is not None for size in sizes.values()):
         for key, value in state_dict.items():
             if key == 'model' or (key.startswith('model') and key[5:].isdigit()):
@@ -102,20 +109,22 @@ def _convert_model_sections(state_dict, sizes, *, interleave):
 
 
 @torch.no_grad()
-def prepare_glu_checkpoint_for_save(state_dict, args, *, use_factories=False):
+def prepare_glu_checkpoint_for_save(state_dict, args, *, use_factories=False, model=None):
     """Canonicalize legacy model tensors; native factories own their conversion."""
     if use_factories:
         return state_dict
     sizes = _interleave_sizes(args)
-    return _convert_model_sections(state_dict, sizes, interleave=False)
+    return _convert_model_sections(state_dict, sizes, interleave=False, model=model)
 
 
 @torch.no_grad()
-def prepare_glu_checkpoint_for_load(state_dict, args, *, use_factories=False):
+def prepare_glu_checkpoint_for_load(state_dict, args, *, use_factories=False, model=None):
     """Restore legacy model rows; native factory merges already return runtime rows."""
     if use_factories:
         return state_dict
-    return _convert_model_sections(state_dict, _interleave_sizes(args), interleave=True)
+    return _convert_model_sections(
+        state_dict, _interleave_sizes(args), interleave=True, model=model
+    )
 
 
 def validate_glu_checkpoint_backend(args, *, ckpt_format, skip_load_to_model_and_opt=False):

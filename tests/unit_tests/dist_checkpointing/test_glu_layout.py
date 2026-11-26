@@ -11,7 +11,9 @@ import torch
 
 from megatron.core import dist_checkpointing, parallel_state
 from megatron.core.dist_checkpointing.glu import (
+    convert_glu_model_state,
     glu_checkpoint_metadata,
+    glu_runtime_layout,
     permute_glu_rows,
     validate_glu_checkpoint_layout,
 )
@@ -131,7 +133,9 @@ def distributed():
 
 
 @pytest.mark.parametrize('single_weight', [False, True])
-def test_real_grouped_mlp_factories_use_the_configured_layout(distributed, single_weight):
+def test_real_grouped_mlp_factories_use_the_configured_layout(
+    distributed, single_weight, tmp_path_dist_ckpt
+):
     model_parallel_cuda_manual_seed(123)
     config = TransformerConfig(
         num_layers=1,
@@ -159,6 +163,13 @@ def test_real_grouped_mlp_factories_use_the_configured_layout(distributed, singl
         state = module.sharded_state_dict(
             metadata={'dp_cp_group': parallel_state.get_data_parallel_group()}
         )
+        from megatron.core.dist_checkpointing.optimizer import get_param_id_to_sharded_param_map
+
+        parameters = list(module.parameters())
+        parameter_map = get_param_id_to_sharded_param_map(state, parameters)
+        assert len(parameter_map) == len(parameters), [
+            name for name, _ in module.named_parameters()
+        ]
         factories = [
             value
             for key, value in state.items()
@@ -175,6 +186,43 @@ def test_real_grouped_mlp_factories_use_the_configured_layout(distributed, singl
             torch.testing.assert_close(
                 torch.cat([part.data for part in parts]), canonical, rtol=0, atol=0
             )
+
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+
+    ddp = DistributedDataParallel(
+        config, DistributedDataParallelConfig(use_distributed_optimizer=True), layer
+    )
+    optimizer = get_megatron_optimizer(
+        OptimizerConfig(
+            lr=0.001, bf16=True, params_dtype=torch.bfloat16, use_distributed_optimizer=True
+        ),
+        [ddp],
+    )
+    for parameter in layer.parameters():
+        parameter.main_grad.fill_(0.1)
+    assert optimizer.step()[0]
+    metadata = {
+        'distrib_optim_sharding_type': 'fully_reshardable',
+        **glu_checkpoint_metadata([layer], optimizer_uses_model_layout=True),
+    }
+    model_state = layer.sharded_state_dict()
+    optimizer_state = optimizer.sharded_state_dict(model_state, metadata=metadata)
+    with TempNamedDir(tmp_path_dist_ckpt / 'real-grouped-adam') as path:
+        dist_checkpointing.save(
+            {'model': model_state, 'optimizer': optimizer_state}, path, content_metadata=metadata
+        )
+        loaded = dist_checkpointing.load(
+            {
+                'model': layer.sharded_state_dict(),
+                'optimizer': optimizer.sharded_state_dict(
+                    layer.sharded_state_dict(), metadata=metadata, is_loading=True
+                ),
+            },
+            path,
+        )
+        layer.load_state_dict(loaded['model'])
+        optimizer.load_state_dict(loaded['optimizer'])
 
 
 @pytest.mark.parametrize(
@@ -330,3 +378,132 @@ def test_distributed_adam_resume_preserves_three_updates(
                     rtol=0,
                     atol=0,
                 )
+
+
+def test_legacy_conversion_uses_built_modules_not_vision_fc1_names():
+    model = torch.nn.Module()
+    model.language = torch.nn.Module()
+    model.language.linear_fc1 = torch.nn.Linear(3, 128, bias=False)
+    model.language.linear_fc1._glu_interleave_size = 32
+    model.vision = torch.nn.Module()
+    model.vision.linear_fc1 = torch.nn.Linear(3, 4304, bias=False)
+    state = model.state_dict()
+    converted = convert_glu_model_state(state, model, interleave=False)
+    assert converted['vision.linear_fc1.weight'] is state['vision.linear_fc1.weight']
+    restored = convert_glu_model_state(converted, model, interleave=True)
+    torch.testing.assert_close(
+        restored['language.linear_fc1.weight'], state['language.linear_fc1.weight']
+    )
+
+
+def test_runtime_layout_follows_built_dense_mlp():
+    class BuiltMLP(torch.nn.Module):
+        def __init__(self, size):
+            super().__init__()
+            self.config = _config(None)
+            self.config.use_grouped_gemm_for_dense_mlp = True
+            self.size = size
+
+        def _checkpoint_glu_interleave_size(self):
+            return self.size
+
+    ordinary, fused = BuiltMLP(None), BuiltMLP(32)
+    assert glu_runtime_layout([ordinary])['dense'] is None
+    assert glu_runtime_layout([fused])['dense'] == 32
+    with pytest.raises(ValueError, match='Raw optimizer buffers'):
+        validate_glu_checkpoint_layout(
+            glu_checkpoint_metadata([ordinary], optimizer_uses_model_layout=False),
+            source_config=None,
+            target_config=[fused],
+            loading_optimizer=True,
+        )
+
+
+def test_direct_core_writer_marks_glu_and_rejects_ambiguous_old_rows(
+    tmp_path_dist_ckpt, distributed
+):
+    canonical = torch.arange(24, device='cuda').reshape(8, 3).float()
+    runtime = _runtime(canonical, 1)
+
+    def factory(size):
+        return apply_swiglu_sharded_factory(
+            ShardedTensor.from_rank_offsets('fc1', runtime.clone(), replica_id=Utils.rank),
+            (),
+            glu_interleave_size=size,
+        )
+
+    with TempNamedDir(tmp_path_dist_ckpt / 'direct-glu') as path:
+        dist_checkpointing.save({'fc1': factory(1)}, path)
+        assert (
+            dist_checkpointing.load_content_metadata(path)['glu_checkpoint_layout'] == 'contiguous'
+        )
+        torch.testing.assert_close(
+            dist_checkpointing.load({'fc1': factory(1)}, path)['fc1'], runtime
+        )
+    with TempNamedDir(tmp_path_dist_ckpt / 'old-direct-glu') as path:
+        # Reproduce the old Core writer: split runtime rows without canonicalization.
+        old = factory(None)
+        unmarked = ShardedTensorFactory(
+            old.key, old.data, old.build_fn, old.merge_fn, old.replica_id
+        )
+        dist_checkpointing.save({'fc1': unmarked}, path)
+        destination = factory(1)
+        snapshot = destination.data.clone()
+        with pytest.raises(ValueError, match='unmarked interleaved'):
+            dist_checkpointing.load({'fc1': destination}, path)
+        torch.testing.assert_close(destination.data, snapshot)
+
+
+@pytest.mark.parametrize('single_bias', [False, True])
+def test_single_grouped_parameter_is_used_by_optimizer_factories(
+    distributed, tmp_path_dist_ckpt, single_bias
+):
+    from megatron.core.dist_checkpointing.optimizer import (
+        get_param_id_to_sharded_param_map,
+        make_sharded_optimizer_tensor,
+    )
+    from megatron.core.transformer.moe.experts import _grouped_checkpoint_factory
+
+    param = torch.nn.Parameter(torch.arange(48, device='cuda').reshape(2, 8, 3).float())
+    if single_bias:
+        param = torch.nn.Parameter(param[:, :, 0].contiguous())
+    with torch.no_grad():
+        param.copy_(permute_glu_rows(param, 2, axis=1, interleave=True))
+    templates = [
+        apply_swiglu_sharded_factory(
+            ShardedTensor.from_rank_offsets(
+                'experts.fc1', view, (0, i, 2), prepend_axis_num=1, replica_id=Utils.rank
+            ),
+            ((0, i, 2),),
+            glu_interleave_size=2,
+        )
+        for i, view in enumerate(param)
+    ]
+    factory = _grouped_checkpoint_factory(
+        param, templates, lambda tensor, _: tensor.unbind(0), 'weight'
+    )
+    mapping = get_param_id_to_sharded_param_map({'weight': factory}, [param])
+    assert mapping[0].data is param
+    moment = make_sharded_optimizer_tensor(
+        mapping[0], param.detach().clone() + 100, prefix='optimizer.exp_avg'
+    )
+    with TempNamedDir(tmp_path_dist_ckpt / 'grouped-optimizer') as path:
+        dist_checkpointing.save({'weight': factory, 'moment': moment}, path)
+        loaded = dist_checkpointing.load({'weight': factory, 'moment': moment}, path)
+        torch.testing.assert_close(loaded['weight'], param)
+        torch.testing.assert_close(loaded['moment'], param + 100)
+
+
+def test_dtensor_conversion_preserves_local_sharding(distributed):
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import Shard, distribute_tensor
+
+    mesh = init_device_mesh('cuda', (torch.distributed.get_world_size(),))
+    canonical = torch.arange(96, device='cuda').reshape(32, 3).float()
+    tensor = distribute_tensor(canonical, mesh, [Shard(0)])
+    converted = permute_glu_rows(tensor, 2, interleave=True)
+    assert converted.placements == tensor.placements
+    torch.testing.assert_close(converted.full_tensor(), _runtime(canonical, 2))
+    torch.testing.assert_close(
+        permute_glu_rows(converted, 2, interleave=False).full_tensor(), canonical
+    )

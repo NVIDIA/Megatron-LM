@@ -526,8 +526,15 @@ def test_canonical_checkpoint_matches_interleaved_ddp(
 
         # Reproduce the pre-fix behavior using the same real checkpoint loader and model.
         with monkeypatch.context() as missing_conversion:
+            from megatron.core.transformer import mlp as mlp_module
+
+            real_permute = mlp_module.permute_glu_rows
             missing_conversion.setattr(
-                checkpointing, "prepare_glu_checkpoint_for_load", lambda state, args: state
+                mlp_module,
+                "permute_glu_rows",
+                lambda tensor, size, axis=0, *, interleave: (
+                    tensor if interleave else real_permute(tensor, size, axis, interleave=False)
+                ),
             )
             sync_checkpoint_config(get_args())
             checkpointing.load_checkpoint(model, optimizer, scheduler, strict=True)

@@ -9,7 +9,7 @@ import weakref
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import chain
 from math import ceil
 from typing import Optional, Protocol, Tuple
@@ -20,7 +20,8 @@ import torch.nn.functional as F
 from megatron.core import tensor_parallel
 from megatron.core._rank_utils import warn_single_rank
 from megatron.core.activations import situ_glu, squared_relu, tanh_soft_clamp
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.glu import GluTensorFactory
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensorFactory
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.extensions.transformer_engine import (
@@ -148,8 +149,60 @@ def _require_te_tanh_clamp_support(config) -> None:
     )
 
 
+def _grouped_checkpoint_factory(parameter, templates, split_tensor, param_name):
+    """Apply all expert factories to one registered parameter and its optimizer tensors."""
+    first = templates[0]
+    original_key = first.key
+    shape = parameter.shape
+
+    def build(key, tensor, replica_id, flattened_range):
+        if flattened_range is not None:
+            raise NotImplementedError(
+                'Grouped expert factories require complete parameter tensors.'
+            )
+        # Module wrappers and optimizer factories rename the common prefix only.
+        common_suffix = 0
+        for a, b in zip(reversed(original_key), reversed(key)):
+            if a != b:
+                break
+            common_suffix += 1
+        old_prefix = original_key[:-common_suffix] if common_suffix else original_key
+        new_prefix = key[:-common_suffix] if common_suffix else key
+        parts = split_tensor(tensor, param_name)
+        result = []
+        for template, part in zip(templates, parts):
+            assert template.key.startswith(old_prefix)
+            renamed = new_prefix + template.key[len(old_prefix) :]
+            shard = replace(template, key=renamed, data=part, replica_id=replica_id)
+            result.append(shard.build() if isinstance(shard, ShardedTensorFactory) else shard)
+        return result
+
+    def merge(parts):
+        values = [
+            template.merge_fn(part) if isinstance(template, ShardedTensorFactory) else part
+            for template, part in zip(templates, parts)
+        ]
+        # Grouped tensors can use [E, ...] or a flattened leading expert axis.
+        tensor = torch.stack(values) if len(shape) == values[0].ndim + 1 else torch.cat(values)
+        if tensor.shape != shape:
+            # Virtual experts have no persistent state.
+            padded = tensor.new_zeros(shape)
+            padded[: tensor.shape[0]].copy_(tensor)
+            tensor = padded
+        return tensor
+
+    kwargs = {}
+    factory_type = ShardedTensorFactory
+    if isinstance(first, GluTensorFactory):
+        factory_type = GluTensorFactory
+        kwargs = dict(glu_interleave_size=first.glu_interleave_size, glu_tp_size=first.glu_tp_size)
+    return factory_type(original_key, parameter, build, merge, first.replica_id, **kwargs)
+
+
 class GroupedLinearFc1Interface(Protocol):
     """Interface for linear_fc1 module in TEGroupedMLP."""
+
+    _glu_interleave_size: int | None
 
     def forward(
         self, permuted_local_hidden_states: torch.Tensor, tokens_per_expert: list[int], /
@@ -342,6 +395,10 @@ class TEGroupedMLP(MegatronModule):
             self.activation_func = apply_module(submodules.activation_func(config=self.config))
         else:
             self.activation_func = self.config.activation_func
+
+        self.linear_fc1._glu_interleave_size = (
+            self._checkpoint_glu_interleave_size() if self.config.gated_linear_unit else None
+        )
 
         self.linear_fc2 = submodules.linear_fc2(
             self.num_local_experts,
@@ -1333,6 +1390,10 @@ class TEGroupedMLP(MegatronModule):
 
         return output, output_bias
 
+    def _checkpoint_glu_interleave_size(self) -> int | None:
+        """Return the row layout consumed by the built routed expert activation."""
+        return self.config.moe_mlp_glu_interleave_size
+
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
@@ -1375,6 +1436,16 @@ class TEGroupedMLP(MegatronModule):
             else:
                 # Add prefix here to match sequential's keys
                 replace_prefix_for_sharding(sub_sd, f'{name}.', f'{prefix}experts.{name}.')
+            # A single registered grouped parameter must remain the factory's data.
+            # Per-expert views cannot identify that parameter in optimizer checkpoints.
+            for param_name in ('weight', 'bias'):
+                grouped = module._parameters.get(param_name)
+                keys = [f'{name}.{param_name}{i}' for i in range(self.num_local_experts)]
+                if grouped is not None and all(key in sub_sd for key in keys):
+                    templates = [sub_sd.pop(key) for key in keys]
+                    sub_sd[f'{name}.{param_name}'] = _grouped_checkpoint_factory(
+                        grouped, templates, module._split_grouped_checkpoint_tensor, param_name
+                    )
             sharded_state_dict.update({f"{prefix}{k}": v for k, v in sub_sd.items()})
         return sharded_state_dict
 
