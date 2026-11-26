@@ -111,17 +111,16 @@ The refactor of the Distributed Optimizer introduces **two checkpoint formats**:
 
 ### Workflow for Changing Model Parallelism
 
-You can combine formats to optimize both flexibility and performance:
+When any optimizer in the chain uses DistributedOptimizer (for example, Adam for
+non-Muon parameters), changing TP or PP requires a model-space optimizer checkpoint.
 
-   1. Train using ``dp_reshardable`` (default) for faster checkpointing.
-   2. When you need to change model parallelism:
+1. Resume the `dp_reshardable` checkpoint at its **original TP and PP**.
+2. Enable `--dist-ckpt-optim-fully-reshardable` and save a new checkpoint.
+3. Change TP or PP and resume from the new checkpoint. You can remove the flag
+   to write subsequent checkpoints in the faster `dp_reshardable` format.
 
-      - Stop training.
-      - Change model parallelism for train config.
-      - Resume training with ``--dist-ckpt-optim-fully-reshardable``.
-
-   3. Save at least one checkpoint under the new model parallel configuration.
-   4. (Optional) To continue the training with updated model parallelism and better checkpointing performance, stop training and switch back to ``dp_reshardable`` format by removing ``--dist-ckpt-optim-fully-reshardable``.
+For a weights-only load, you can change TP or PP directly and use `--no-load-optim`
+to initialize a fresh optimizer.
 
 ## Async Checkpoint Saving Strategy
 
