@@ -69,13 +69,23 @@ def test_policy_and_log_probs_come_from_the_section():
 
 
 def test_shared_weights_when_parallelism_matches():
-    _, pretrain, deployment = _containers()
+    args, pretrain, deployment = _containers()
     assert deployment.model is pretrain.model
     assert not rollout_model_is_separate(deployment, pretrain.model)
     assert deployment.checkpoint.load is None
     # The deployment shares the training run's process-level sections.
-    for name in ("dist", "rng", "tokenizer", "logger", "profiling"):
+    for name in ("dist", "rng", "logger", "profiling"):
         assert getattr(deployment, name) is getattr(pretrain, name)
+    # The tokenizer section is its own copy, and an RL run requires it to match training's.
+    assert deployment.tokenizer == pretrain.tokenizer
+    assert deployment.tokenizer is not pretrain.tokenizer
+    deployment.tokenizer.vocab_extra_ids = 1
+    with pytest.raises(ValueError, match="tokenizer must match"):
+        RootConfigContainer(
+            training=pretrain,
+            inference=deployment,
+            algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
+        ).validate()
 
 
 def test_override_equal_to_training_layout_shares_the_training_model():

@@ -468,6 +468,8 @@ def main():
     tokenizer_cfg = get_run_config().tokenizer
     if tokenizer_cfg.vocab_size is None:
         tokenizer_cfg.vocab_size = 50257
+        # The deployment holds its own copy of the section.
+        cfg.inference.tokenizer.vocab_size = 50257
         print_rank_0("Using default vocab_size=50257")
 
     try:

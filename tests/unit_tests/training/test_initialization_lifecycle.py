@@ -54,6 +54,7 @@ def isolated_globals(monkeypatch):
         "_GLOBAL_TRAIN_STATE",
     ):
         monkeypatch.setattr(global_vars, name, None)
+    monkeypatch.setattr(global_vars, "_GLOBAL_CONTAINER_TOKENIZERS", [])
 
 
 def _runtime_args():
@@ -1483,8 +1484,9 @@ def test_config_first_matches_legacy_tokenizer_and_model_inputs(
 )
 @pytest.mark.parametrize("pad_vocab", [False, True])
 @pytest.mark.parametrize("padded_vocab", [None, 768])
+@pytest.mark.parametrize("own_weights", [False, True])
 def test_training_tokenizer_padding_uses_model_inputs(
-    monkeypatch, isolated_globals, run_config, adapter, pad_vocab, padded_vocab
+    monkeypatch, isolated_globals, run_config, adapter, pad_vocab, padded_vocab, own_weights
 ):
     from megatron.training.config import (
         CheckpointConfig,
@@ -1519,14 +1521,18 @@ def test_training_tokenizer_padding_uses_model_inputs(
     cfg = run_config
     cfg.model = model
     cfg.tokenizer = _default_config_from_args(TokenizerConfig, args)
-    # A deployment with its own copy of the model config, taken before the tokenizer exists; it
-    # shares the run's tokenizer section (an RL rollout layout).
+    # A deployment beside training: its own tokenizer section, and its own copy of the model
+    # config under another tensor parallelism, taken before any tokenizer exists. Without a
+    # checkpoint of its own it serves the training weights (an RL rollout layout).
     deployment = InferenceConfigContainer(
         model=deepcopy(model),
-        checkpoint=CheckpointConfig(),
+        checkpoint=CheckpointConfig(load="/deployment" if own_weights else None),
         inference=InferenceSetupConfig(),
-        tokenizer=cfg.tokenizer,
+        tokenizer=deepcopy(cfg.tokenizer),
     )
+    deployment.model.transformer.tensor_model_parallel_size = 4
+    if own_weights:
+        deployment.tokenizer.vocab_size = 257
     global_vars.set_args(args)
     monkeypatch.setattr(
         global_vars,
@@ -1543,9 +1549,24 @@ def test_training_tokenizer_padding_uses_model_inputs(
     assert cfg.tokenizer.padded_vocab_size == expected
     assert args.padded_vocab_size == padded_vocab
     assert cfg.model.vocab_size == (129 if expected is None else expected)
-    # The services bound every container of the run, the deployment's copy included.
-    assert deployment.model.vocab_size == cfg.model.vocab_size
     assert global_vars.get_tokenizer().vocab_size == 129
+    tokenizer = global_vars.get_container_tokenizer(deployment)
+    if own_weights:
+        # Its own tokenizer, and a vocabulary padded for its own model (alignment 256, TP 4).
+        own_expected = padded_vocab if padded_vocab is not None else (1024 if pad_vocab else None)
+        assert tokenizer is not global_vars.get_tokenizer() and tokenizer.vocab_size == 257
+        assert deployment.tokenizer.padded_vocab_size == own_expected
+        assert deployment.model.vocab_size == (129 if own_expected is None else own_expected)
+    else:
+        # The run's tokenizer, and the training model's vocabulary whatever its own layout pads
+        # to: a model that pads 129 itself (alignment 256, TP 2) builds 512 rows.
+        training_vocab = 512 if cfg.model.should_pad_vocab else cfg.model.vocab_size
+        assert tokenizer is global_vars.get_tokenizer()
+        assert deployment.tokenizer.padded_vocab_size == expected
+        assert (deployment.model.vocab_size, deployment.model.should_pad_vocab) == (
+            training_vocab,
+            False,
+        )
     assert args.tensor_model_parallel_size == 1
     assert args.make_vocab_size_divisible_by == 128
 

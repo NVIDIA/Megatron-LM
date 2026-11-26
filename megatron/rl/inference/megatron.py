@@ -21,7 +21,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import get_pg_size, log_single_rank
 from megatron.rl.config import get_rl_config
 from megatron.training.config import InferenceConfigContainer
-from megatron.training.global_vars import get_tokenizer
+from megatron.training.global_vars import get_container_tokenizer
 from megatron.training.utils import print_rank_0
 
 from ..server.api import InferenceServer
@@ -101,7 +101,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         from megatron.inference.utils import get_dynamic_inference_engine
 
         rl_cfg = get_rl_config()
-        tokenizer = get_tokenizer()
+        tokenizer = get_container_tokenizer(inference_container)
 
         if tokenizer.bos is None:
             log_single_rank(
@@ -111,7 +111,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
             )
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(
-            model=model, setup_cfg=inference_container.inference
+            model=model, setup_cfg=inference_container.inference, tokenizer=tokenizer
         )
         inference_engine.local_metadata_ledger_enabled = True
         if inference_engine.context.config.disaggregation_shards is not None:

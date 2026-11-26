@@ -514,6 +514,7 @@ def get_dynamic_inference_engine(
     disaggregation_role: Literal["prefill", "decode"] | None = None,
     *,
     setup_cfg: InferenceSetupConfig | None = None,
+    tokenizer=None,
 ) -> DynamicInferenceEngine:
     """Build a dynamic inference engine.
 
@@ -525,11 +526,13 @@ def get_dynamic_inference_engine(
             router (not ``disaggregation_shards``) splits the work; sizes
             role-specific buffers.
         setup_cfg: `InferenceSetupConfig`; built from the parsed arguments when omitted.
+        tokenizer: Tokenizer the engine serves with; the run's when omitted.
     """
     args = get_args()
     if model is None:
         model = get_model_for_inference()
-    tokenizer = get_tokenizer()
+    if tokenizer is None:
+        tokenizer = get_tokenizer()
 
     if setup_cfg is None:
         inference_config = get_inference_config_from_model_and_args(model, args)

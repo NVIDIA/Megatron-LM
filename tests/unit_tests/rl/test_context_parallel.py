@@ -75,7 +75,10 @@ def _set_minimal_args():
         RootConfigContainer(
             training=pretrain,
             inference=InferenceConfigContainer(
-                model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+                model=None,
+                checkpoint=CheckpointConfig(),
+                inference=InferenceSetupConfig(),
+                tokenizer=TokenizerConfig(vocab_size=VOCAB),
             ),
             algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
         ),

@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+import copy
 import io
 import itertools
 import math
@@ -86,7 +87,10 @@ def _rl_run_config(args, pretrain):
     return RootConfigContainer(
         training=pretrain,
         inference=InferenceConfigContainer(
-            model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+            model=None,
+            checkpoint=CheckpointConfig(),
+            inference=InferenceSetupConfig(),
+            tokenizer=copy.deepcopy(pretrain.tokenizer),
         ),
         algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
     )

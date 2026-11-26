@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import signal
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Literal, Optional
 
 
@@ -1073,6 +1073,11 @@ class TokenizerConfig:
 
     sft_tokenizer_prompt_format: str = "nemotron-h-aligned"
     """SFT prompt format."""
+
+    def same_tokenizer(self, other: "TokenizerConfig") -> bool:
+        """Whether both sections describe one tokenizer."""
+        return replace(self, padded_vocab_size=None) == replace(other, padded_vocab_size=None)
+
 
 @dataclass(kw_only=True)
 class MultiModalTokenizerConfig(TokenizerConfig):

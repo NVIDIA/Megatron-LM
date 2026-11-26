@@ -40,7 +40,9 @@ async def test_megatron_local_preserves_explicit_greedy_temperature(
     monkeypatch, temperature, expected_temperature
 ):
     monkeypatch.setattr("megatron.rl.inference.megatron.get_rl_config", lambda: MagicMock())
-    monkeypatch.setattr("megatron.rl.inference.megatron.get_tokenizer", lambda: MagicMock(bos=None))
+    monkeypatch.setattr(
+        "megatron.rl.inference.megatron.get_container_tokenizer", lambda cfg: MagicMock(bos=None)
+    )
 
     choice = MagicMock(finish_reason="stop")
     choice.message.model_dump.return_value = {"role": "assistant", "content": "response"}

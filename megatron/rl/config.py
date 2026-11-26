@@ -104,7 +104,7 @@ def rollout_inference_container_from_args(
         inference=inference,
         dist=pretrain.dist,
         rng=pretrain.rng,
-        tokenizer=pretrain.tokenizer,
+        tokenizer=copy.deepcopy(pretrain.tokenizer),
         logger=pretrain.logger,
         profiling=pretrain.profiling,
     )

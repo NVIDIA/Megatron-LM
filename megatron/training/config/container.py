@@ -1237,6 +1237,9 @@ class RootConfigContainer(ConfigContainerBase):
         training, inference = self.training, self.inference
         if inference is None:
             raise ValueError("An RL run needs an inference container for its rollout engine.")
+        if not inference.tokenizer.same_tokenizer(training.tokenizer):
+            # For now, the rollout engine's token ids and log probabilities feed the training loss.
+            raise ValueError("The rollout deployment's tokenizer must match the training one.")
         if global_batch_size is None:
             global_batch_size = training.train.global_batch_size
         # The offload `_finalize_rl` will request, checked like the offload the DDP section

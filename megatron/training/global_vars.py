@@ -2,6 +2,7 @@
 
 """Megatron global variables."""
 
+import copy
 import os
 import re
 import signal
@@ -28,6 +29,7 @@ _GLOBAL_ARGS = None
 _GLOBAL_ROOT_CONFIG_CONTAINER = None
 _GLOBAL_TRAIN_STATE = None
 _GLOBAL_TOKENIZER = None
+_GLOBAL_CONTAINER_TOKENIZERS = []
 _GLOBAL_TENSORBOARD_WRITER = None
 _GLOBAL_WANDB_WRITER = None
 _GLOBAL_ONE_LOGGER = None
@@ -86,6 +88,21 @@ def get_tokenizer():
     """Return tokenizer."""
     _ensure_var_is_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
     return _GLOBAL_TOKENIZER
+
+
+def get_container_tokenizer(cfg):
+    """Return the tokenizer a container's section describes: the run's when the sections match,
+    else one built from the container's own section."""
+    if cfg.tokenizer.same_tokenizer(get_run_config().tokenizer):
+        return get_tokenizer()
+    for section, tokenizer in _GLOBAL_CONTAINER_TOKENIZERS:
+        if cfg.tokenizer.same_tokenizer(section):
+            return tokenizer
+    from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+
+    tokenizer = build_tokenizer(cfg.tokenizer)
+    _GLOBAL_CONTAINER_TOKENIZERS.append((copy.copy(cfg.tokenizer), tokenizer))
+    return tokenizer
 
 
 def get_tensorboard_writer():
@@ -225,13 +242,14 @@ def initialize_runtime_services(
     # Tokenizer-free bootstrap may discover the model family and rebuild the
     # tokenizer later. Bind known sizes now; otherwise defer until that rebuild.
     if build_tokenizer or cfg.tokenizer.padded_vocab_size is not None:
-        # Every container of the run that carries a model (an RL rollout deployment may hold its
-        # own copy of the model config).
+        # Every container of the run that carries a model.
         root = get_root_config_container()
         if root.training is not None:
             resolve_tokenizer_vocab_size(root.training)
-        if root.inference is not None:
+        if root.inference is cfg:
             resolve_tokenizer_vocab_size(root.inference)
+        elif root.inference is not None:
+            _resolve_deployment_vocab_size(root.training, root.inference, build_tokenizer)
     _bind_dataset_tokenizer(cfg)
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
@@ -244,6 +262,36 @@ def initialize_runtime_services(
 
     if training:
         initialize_training_runtime_services(args)
+
+
+def _resolve_deployment_vocab_size(training, deployment, build_tokenizer: bool) -> None:
+    """Bind the vocabulary of an inference deployment that sits beside training."""
+    from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+    from megatron.training.vocab_utils import model_vocab_size, resolve_padded_vocab_size
+
+    model = deployment.model
+    if deployment.checkpoint.load is None:
+        # It serves the training weights, so it takes the training model's vocabulary, whatever
+        # its own layout would pad to.
+        deployment.tokenizer.padded_vocab_size = training.tokenizer.padded_vocab_size
+        if model is not None and model is not training.model and hasattr(model, "vocab_size"):
+            model.vocab_size = model_vocab_size(
+                training.model.vocab_size,
+                should_pad_vocab=training.model.should_pad_vocab,
+                make_vocab_size_divisible_by=training.model.make_vocab_size_divisible_by,
+                tensor_model_parallel_size=training.model.transformer.tensor_model_parallel_size,
+            )
+            model.should_pad_vocab = False
+        return
+    # Its own weights: its own tokenizer section, padded for its own model.
+    if build_tokenizer and model is not None:
+        resolve_padded_vocab_size(
+            deployment.tokenizer,
+            get_container_tokenizer(deployment),
+            model.make_vocab_size_divisible_by,
+            model.transformer.tensor_model_parallel_size,
+        )
+    resolve_tokenizer_vocab_size(deployment)
 
 
 def initialize_training_runtime_services(args: Namespace) -> None:
@@ -305,6 +353,7 @@ def unset_global_variables():
     _GLOBAL_TRAIN_STATE = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     _GLOBAL_TOKENIZER = None
+    _GLOBAL_CONTAINER_TOKENIZERS.clear()
     _GLOBAL_TENSORBOARD_WRITER = None
     _GLOBAL_WANDB_WRITER = None
     _GLOBAL_ONE_LOGGER = None
@@ -773,6 +822,7 @@ def destroy_global_vars():
 
     global _GLOBAL_TOKENIZER
     _GLOBAL_TOKENIZER = None
+    _GLOBAL_CONTAINER_TOKENIZERS.clear()
 
     global _GLOBAL_TENSORBOARD_WRITER
     _GLOBAL_TENSORBOARD_WRITER = None
