@@ -59,9 +59,13 @@ jobs:
         with:
           ref: ${{ inputs.sha }}
 
-      # Keep cache transport from this workflow even if the baseline predates it.
+      # Keep the PR planner and recipe when CI checks out an older Testmon baseline.
       - name: Save CPU planner
-        run: cp .github/scripts/select_unit_tests.py "$RUNNER_TEMP/select_unit_tests.py"
+        env:
+          RECIPE_PLATFORM: ${{ inputs.platform }}
+        run: |
+          cp .github/scripts/select_unit_tests.py "$RUNNER_TEMP/"
+          cp "tests/test_utils/recipes/${RECIPE_PLATFORM#dgx_}/unit-tests.yaml" "$RUNNER_TEMP/unit-tests.yaml"
 
       - name: Restore prepared unit-test checkout
         id: testmon-checkout
