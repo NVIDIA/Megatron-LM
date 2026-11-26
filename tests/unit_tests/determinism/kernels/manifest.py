@@ -109,14 +109,6 @@ R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
-        name="mimo_embedding_alignment",
-        sources=("megatron/core/models/mimo/model/base.py",),
-        tests=(K + "test_mimo_embedding_alignment.py",),
-        kind="torch-op",
-        notes="Token-row index_copy_ with unique destination rows per modality; replays FP32/BF16 "
-        "outputs and input gradients for mask-derived and precomputed positions under contention.",
-    ),
-    KernelEntry(
         name="mtp_kl_loss",
         sources=("megatron/core/ops/mtp_kl_loss.py",),
         tests=(K + "test_mtp_kl_loss.py",),
