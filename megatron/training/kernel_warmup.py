@@ -128,9 +128,16 @@ def _warmup_activation(
 
 
 def _warmup_residual(
-    config: TransformerConfig, tp_size: int, sequence: int, micro_batch_size: int
+    config: TransformerConfig,
+    tp_size: int,
+    sequence: int,
+    micro_batch_size: int,
+    eval_micro_batch_size: int | None = None,
 ) -> None:
-    from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
+    from megatron.core.fusions.fused_bias_dropout import (
+        bias_dropout_add_fused_inference,
+        bias_dropout_add_fused_train,
+    )
 
     if config.sequence_parallel:
         sequence //= tp_size
@@ -160,6 +167,23 @@ def _warmup_residual(
                     del gradients, inputs
                 del output, residual, bias, x
 
+    # Evaluation calls the inference variant, which no training step ever runs. Compile it
+    # here: under cuda_graph_impl="full_iteration" the first evaluation step is captured, and
+    # compiling inside a capture fails.
+    with torch.no_grad():
+        for _ in range(2):
+            x = torch.zeros(
+                (sequence, eval_micro_batch_size or micro_batch_size, config.hidden_size),
+                device="cuda",
+                dtype=config.params_dtype,
+            )
+            residual = torch.zeros_like(
+                x, dtype=torch.float32 if config.fp32_residual_connection else x.dtype
+            )
+            bias = torch.zeros_like(x[0, 0]) if config.add_bias_linear else None
+            output = bias_dropout_add_fused_inference((x, bias), residual, config.hidden_dropout)
+            del output, residual, bias, x
+
 
 def _shutdown_compile_workers() -> None:
     # Do not import Inductor solely for cleanup. This version-dependent helper
@@ -179,8 +203,12 @@ def warmup_training_kernels(
     *,
     seq_length: int,
     micro_batch_size: int,
+    eval_micro_batch_size: int | None = None,
 ) -> None:
     """Warm up training kernels for a GPT or Hybrid model config at the training batch shape.
+
+    ``eval_micro_batch_size`` is the microbatch size of evaluation, for the kernels only
+    evaluation runs; None means it equals ``micro_batch_size``.
 
     Entry points that still pass a provider function instead of a model config leave
     ``model_config`` unset; there is no TransformerConfig to select kernels from, so nothing
@@ -210,6 +238,7 @@ def warmup_training_kernels(
         micro_batch_size=micro_batch_size,
         padded_vocab_size=vocab_size,
         logit_dtype=model_config.logit_dtype,
+        eval_micro_batch_size=eval_micro_batch_size,
     )
 
 
@@ -248,6 +277,7 @@ def _warmup_training_kernels(
     micro_batch_size: int,
     padded_vocab_size: int | None,
     logit_dtype: torch.dtype | None = None,
+    eval_micro_batch_size: int | None = None,
 ) -> None:
     """Compile/autotune supported kernels, then release temporary startup resources.
 
@@ -266,6 +296,8 @@ def _warmup_training_kernels(
         padded_vocab_size: Global padded vocabulary size before tensor parallel partitioning.
             May be None when native fused cross-entropy is disabled.
         logit_dtype: Model output-projection dtype; None uses config.params_dtype for warmup.
+        eval_micro_batch_size: Microbatch size used by evaluation; None means it equals
+            micro_batch_size.
     """
     sequence = seq_length // config.context_parallel_size
     if sequence <= 0 or micro_batch_size is None or micro_batch_size <= 0:
@@ -302,7 +334,7 @@ def _warmup_training_kernels(
                         flatten=flatten,
                     )
         if config.bias_dropout_fusion:
-            _warmup_residual(config, tp_size, sequence, micro_batch_size)
+            _warmup_residual(config, tp_size, sequence, micro_batch_size, eval_micro_batch_size)
 
     # Each helper has returned after invoking its kernels and waiting for their
     # compilation. Finish GPU work before releasing unused pinned blocks.

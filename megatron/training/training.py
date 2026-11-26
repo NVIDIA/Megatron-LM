@@ -1515,6 +1515,7 @@ def pretrain(
         warmup_tp_group,
         seq_length=sequence_length,
         micro_batch_size=cfg_container.train.micro_batch_size,
+        eval_micro_batch_size=cfg_container.validation.eval_micro_batch_size,
     )
     print_rank_0("Finished training-kernel warmup.")
 
