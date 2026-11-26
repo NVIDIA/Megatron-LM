@@ -71,8 +71,7 @@ def test_mhc_precision(fp32_mixing, input_scale):
         assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
 
 
-@pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
-def test_mhc_fused_rejects_unsupported_precision(flag):
+def test_mhc_fused_rejects_unsupported_precision():
     config = TransformerConfig(
         num_layers=1,
         hidden_size=32,
@@ -81,6 +80,32 @@ def test_mhc_fused_rejects_unsupported_precision(flag):
         use_fused_mhc=True,
     )
     # Keep the module-level guard for configs modified after constructor validation.
-    setattr(config, flag, True)
+    config.mhc_keep_mappings_in_fp32 = True
     with pytest.raises(ValueError, match="Fused mHC does not support"):
         HyperConnectionModule(config, layer_number=1)
+
+
+def test_mhc_fused_accepts_eps_inside_sqrt():
+    torch.manual_seed(42)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        use_fused_mhc=True,
+        mhc_norm_eps_inside_sqrt=True,
+    )
+    layer = HyperConnectionModule(config, layer_number=1).cuda()
+    with torch.no_grad():
+        layer.mapping_proj.weight.normal_(std=0.02)
+    residual = (torch.randn(2, 1, 128, device="cuda") * 0.001).to(torch.bfloat16)
+    residual.requires_grad_()
+    pre, _, _ = layer.compute_mappings(residual)
+    x = residual.float()
+    projected = x @ layer.mapping_proj.weight.T
+    rms = torch.rsqrt(x.square().mean(-1, keepdim=True) + config.layernorm_epsilon)
+    expected = (projected[..., :4] * rms * layer.alpha_pre + layer.bias[:4]).sigmoid()
+    torch.testing.assert_close(pre, (expected + 1e-6).to(pre.dtype), atol=0.01, rtol=0.01)
+    pre.float().sum().backward()
+    assert torch.isfinite(residual.grad).all()
+    assert torch.isfinite(layer.mapping_proj.weight.grad).all()

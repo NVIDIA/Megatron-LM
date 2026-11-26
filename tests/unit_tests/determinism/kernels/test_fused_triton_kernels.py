@@ -628,7 +628,8 @@ def test_mhc_h_post_bda_replays_fwd_bwd(backend, with_bias):
 
 
 @pytest.mark.parametrize("backend", [b for b in _MHC_BACKENDS if b != "triton"])
-def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
+@pytest.mark.parametrize("eps_inside_sqrt", [False, True])
+def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend, eps_inside_sqrt):
     """Projection + RMS + compute-h: cuTile fused kernel or the native ``torch.compile`` path."""
     seeded()
     n = N
@@ -641,14 +642,22 @@ def test_mhc_proj_rms_compute_h_replays_fwd_bwd(backend):
 
     def run(x, weight, alpha_pre, alpha_post, alpha_res, bias):
         return fused_mhc_kernels.fused_proj_rms_compute_h(
-            x, weight, alpha_pre, alpha_post, alpha_res, bias, n, backend=backend
+            x,
+            weight,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
+            bias,
+            n,
+            backend=backend,
+            eps_inside_sqrt=eps_inside_sqrt,
         )
 
     assert_replays_bit_exact(
         run,
         (x, weight, alpha_pre, alpha_post, alpha_res, bias),
         replays=3,
-        what=f"mhc proj_rms_compute_h[{backend}]",
+        what=f"mhc proj_rms_compute_h[{backend}, eps_inside_sqrt={eps_inside_sqrt}]",
     )
 
 

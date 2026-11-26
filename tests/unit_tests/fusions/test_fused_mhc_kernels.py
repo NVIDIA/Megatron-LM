@@ -139,15 +139,20 @@ def _ref_proj_rms_compute_h(
     n: int,
     eps: float = 1e-6,
     compute_h_eps: float = 1e-6,
+    eps_inside_sqrt: bool = False,
 ):
     """Reference: fused proj_rms + compute_h."""
     proj = torch.matmul(x, weight.t())
     norm = x.norm(dim=-1, keepdim=True)
     K = x.shape[-1]
-    r = norm / math.sqrt(K)  # [M, 1]
+    r = (
+        torch.sqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+        if eps_inside_sqrt
+        else norm / math.sqrt(K)
+    )  # [M, 1]
     N = proj.shape[-1]
     alpha = torch.cat([alpha_pre.expand(n), alpha_post.expand(n), alpha_res.expand(N - 2 * n)])
-    h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
+    h = proj * alpha.unsqueeze(0) / (r if eps_inside_sqrt else r + eps) + bias.unsqueeze(0)
     h_pre = h[..., :n].sigmoid() + compute_h_eps
     h_post = h[..., n : 2 * n].sigmoid() * 2
     h_res = h[..., 2 * n :]
@@ -832,6 +837,49 @@ class TestFusedProjRmsComputeH:
             arf.grad, arr.grad, COSINE_SIM_THRESH, msg="backward mismatch on alpha_res"
         )
         _assert_cosine_similar(bf.grad, br.grad, COSINE_SIM_THRESH, msg="backward mismatch on bias")
+
+    @pytest.mark.parametrize("backend", ["native", "cutile"])
+    @pytest.mark.parametrize(
+        "input_scale,m,k", [(1.0, 32, 512), (0.001, 32, 512), (0.001, 129, 8192)]
+    )
+    def test_eps_inside_sqrt_fwd_bwd(self, input_scale, m, k, backend):
+        """The stabilized RMS branch must match its FP32 reference, including r's gradient."""
+        from megatron.core.fusions.fused_mhc_kernels import fused_proj_rms_compute_h
+
+        if backend == "cutile" and not is_cutile_available():
+            pytest.skip("cuTile unavailable for current device")
+        torch.manual_seed(42)
+        n = 4
+        out_size = n * n + 2 * n
+        eps = 1e-5
+        x_data = torch.randn(m, k, device=DEVICE, dtype=torch.float32) * input_scale
+        w_data = torch.randn(out_size, k, device=DEVICE, dtype=torch.float32) * 0.02
+        alpha_data = [torch.tensor([0.1], device=DEVICE) for _ in range(3)]
+        bias_data = torch.zeros(out_size, device=DEVICE)
+        grad_h = [torch.randn(m, width, device=DEVICE) for width in (n, n, n * n)]
+        grad_r = torch.randn(m, 1, device=DEVICE)
+
+        def run(fn):
+            inputs = [
+                t.detach().clone().requires_grad_()
+                for t in (x_data, w_data, *alpha_data, bias_data)
+            ]
+            outputs = fn(*inputs, n, eps, eps_inside_sqrt=True)
+            sum((out * grad).sum() for out, grad in zip(outputs, (*grad_h, grad_r))).backward()
+            return outputs, [t.grad for t in inputs]
+
+        actual, actual_grads = run(
+            lambda *args, **kwargs: fused_proj_rms_compute_h(*args, backend=backend, **kwargs)
+        )
+        expected, expected_grads = run(_ref_proj_rms_compute_h)
+        for name, got, want in zip(("pre", "post", "res", "r"), actual, expected):
+            torch.testing.assert_close(got, want, atol=2e-3, rtol=2e-3, msg=name)
+        for name, got, want in zip(
+            ("x", "weight", "alpha_pre", "alpha_post", "alpha_res", "bias"),
+            actual_grads,
+            expected_grads,
+        ):
+            torch.testing.assert_close(got, want, atol=2e-2, rtol=2e-2, msg=name)
 
 
 # ============================================================================
