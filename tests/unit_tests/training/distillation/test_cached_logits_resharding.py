@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.training.config import TrainingConfig
 from megatron.training.distillation import cached_logits_loss
 from megatron.training.distillation import utils as distillation_utils
 from megatron.training.distillation.cached_logits_loss import (
@@ -512,3 +513,34 @@ def test_teacher_shorter_than_student_is_not_trimmed_known_gap(monkeypatch):
 
     # Unchanged: still the teacher's original (shorter) sequence length.
     assert captured["teacher_values"].size(0) == 2
+
+
+def test_dataset_identity_preserves_the_existing_cache_schema():
+    cfg = SimpleNamespace(
+        train=TrainingConfig(train_iters=5, micro_batch_size=1, global_batch_size=8),
+        # The dataset's own seed orders the samples; the RNG seed may differ in a config.
+        rng=SimpleNamespace(seed=99),
+        data=SimpleNamespace(
+            dataset=SimpleNamespace(
+                random_seed=1234,
+                blend=(["/new/mount/a", "/new/mount/b"], [0.25, 0.75]),
+                blend_per_split=None,
+            )
+        ),
+    )
+    digest, identifiers = distillation_utils.compute_dataset_hash(cfg)
+    assert identifiers == {
+        "seed": 1234,
+        "train_samples": 40,
+        "blend": {"kind": "blend", "blend": [[0.25, "a"], [0.75, "b"]]},
+    }
+    # The identity stored in pre-config-refactor cache metadata for this sample stream.
+    assert digest == "c80444069b8dba1182ad29ea78127ba9"
+
+
+def test_sample_position_follows_live_train_state(monkeypatch):
+    state = SimpleNamespace(consumed_train_samples=16)
+    monkeypatch.setattr(distillation_utils, "get_train_state", lambda: state)
+    assert distillation_utils.get_consumed_train_samples() == 16
+    state.consumed_train_samples = 24
+    assert distillation_utils.get_consumed_train_samples() == 24

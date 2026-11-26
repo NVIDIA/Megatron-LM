@@ -1,14 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Offline KD constraints involving other training-run sections."""
+"""Offline KD field validation, CLI/serialization compatibility and run constraints."""
 
 import copy
+from argparse import ArgumentParser
 
 import pytest
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.training import global_vars
+from megatron.training.argument_utils import offline_distillation_config_from_args
+from megatron.training.arguments import _add_logits_distillation_args
 from megatron.training.config import LogitsLoadConfig, LogitsSaveConfig, OfflineDistillationConfig
+from megatron.training.config.instantiate_utils import instantiate
+from megatron.training.config.utils import serialize_dataclass
 from megatron.training.models.distillation import DistillationConfig
 
 
@@ -112,3 +117,93 @@ def test_saving_from_a_trainable_model_warns_at_finalize(
     with caplog.at_level("WARNING", logger="megatron.training.config.container"):
         cfg.finalize()
     assert ("without train.freeze_all_layers" in caplog.text) is not frozen
+
+
+def _cli_config(*flags):
+    parser = _add_logits_distillation_args(ArgumentParser())
+    return offline_distillation_config_from_args(parser.parse_args(flags))
+
+
+@pytest.mark.parametrize("phase", ["teacher_save", "student_load"])
+def test_cli_and_native_config_round_trip(phase):
+    """The old CLI and a saved config select the same behavior, including non-default knobs."""
+    if phase == "teacher_save":
+        native = OfflineDistillationConfig(
+            teacher_save=LogitsSaveConfig(
+                directory="/cache", top_k=32, top_p=0.9, min_k=2, dtype="bf16"
+            )
+        )
+        cli = _cli_config(
+            "--logits-save-dir",
+            "/cache",
+            "--logits-save-top-k",
+            "32",
+            "--logits-save-top-p",
+            "0.9",
+            "--logits-save-top-p-min-k",
+            "2",
+            "--logits-save-dtype",
+            "bf16",
+        )
+    else:
+        native = OfflineDistillationConfig(
+            student_load=LogitsLoadConfig(
+                directory="/cache",
+                loss_alpha=0.7,
+                decode_threads=2,
+                msc_prefetch_depth=0,
+                ignore_errors=True,
+                ignore_hash=True,
+            )
+        )
+        cli = _cli_config(
+            "--logits-load-dir",
+            "/cache",
+            "--logits-load-kd-loss-alpha",
+            "0.7",
+            "--logits-load-decode-threads",
+            "2",
+            "--logits-load-msc-prefetch-depth",
+            "0",
+            "--logits-load-ignore-errors",
+            "--logits-load-ignore-hash",
+        )
+    restored = instantiate(serialize_dataclass(native))
+    restored.validate()
+    assert restored == cli == native
+
+
+@pytest.mark.parametrize("both", [False, True])
+def test_exactly_one_phase_is_required(both):
+    cfg = OfflineDistillationConfig(
+        teacher_save=LogitsSaveConfig(directory="/out") if both else None,
+        student_load=LogitsLoadConfig(directory="/in") if both else None,
+    )
+    with pytest.raises(ValueError, match="exactly one"):
+        cfg.validate()
+
+
+def test_cli_rejects_both_phases_and_disables_kd_without_either():
+    assert _cli_config() is None
+    with pytest.raises(ValueError, match="exactly one"):
+        _cli_config("--logits-save-dir", "/out", "--logits-load-dir", "/in")
+
+
+@pytest.mark.parametrize(
+    "config,message",
+    [
+        (LogitsSaveConfig(directory=""), "directory"),
+        (LogitsSaveConfig(), "directory"),
+        (LogitsLoadConfig(), "directory"),
+        (LogitsSaveConfig(directory="/cache", top_k=0), "top_k"),
+        (LogitsSaveConfig(directory="/cache", top_p=0), "top_p"),
+        (LogitsSaveConfig(directory="/cache", top_k=2, min_k=3), "min_k"),
+        (LogitsSaveConfig(directory="/cache", dtype="int8"), "dtype"),
+        (LogitsLoadConfig(directory="/cache", loss_alpha=1.1), "loss_alpha"),
+        (LogitsLoadConfig(directory="/cache", decode_threads=0), "decode_threads"),
+        (LogitsLoadConfig(directory="/cache", msc_prefetch_depth=-1), "prefetch"),
+    ],
+)
+def test_invalid_cache_settings_fail_before_runtime(config, message):
+    with pytest.raises(ValueError, match=message):
+        config.validate()
