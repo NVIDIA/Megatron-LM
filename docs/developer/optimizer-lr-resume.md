@@ -11,16 +11,18 @@ The checkpoint format, tensor-loading routines and ordinary resume behavior are
 unchanged. This option does not add group IDs or a checkpoint version. Without the
 option, matching still uses the full existing identifier and checkpoint settings.
 
-During an explicit override, matching excludes the LR bounds being replaced. If
-several saved groups match, **all retained metadata must agree**, including betas,
-epsilon, step counters and unknown backend fields. An old LR that happens to equal
-a new LR does not disambiguate conflicting metadata. Ambiguous cases raise an error;
-resume under the original configuration or explicitly choose fresh optimizer state.
+During an explicit override, exact identifiers are preferred when their configuration
+metadata remains compatible. Otherwise the lookup ignores LR bounds and uses the
+current group's other settings (including muP's epsilon) to select compatible saved
+groups. Step counters and scheduled weight decay are restored from the checkpoint,
+not compared with freshly initialized values. If several candidates remain, all
+retained metadata, including checkpoint-only fields, must agree. Ambiguous cases
+raise rather than selecting by group position.
 
-The loader builds one lookup of saved groups and records conflicting metadata while
-building it. Each current group then uses that lookup, including the existing legacy
-DSA split handling. Conflicts in saved groups that are not used by the current
-optimizer do not prevent loading.
+Separate exact and LR-independent lookups are built once. The existing pre-DSA
+split and NeMo aliases remain supported; returned weight-decay aliases are normalized
+so the scheduler sees the intended multiplier. Conflicts in unused saved groups do
+not prevent loading. Current LR logging classification survives state allocation.
 
 Moments and master parameters continue to load through the distributed optimizer's
 parameter/buffer mappings. Tests cover changing, crossing, merging and splitting LR

@@ -111,6 +111,48 @@ def test_lr_override_checks_conflicts_in_pre_split_source_group():
         match_param_groups([_group(0.03, is_dsa_indexer=True)], saved, override_lr=True)
 
 
+@pytest.mark.parametrize("lr", [0.001, 0.0005, 0.0003])
+def test_mup_exact_and_changed_lr_use_current_epsilon(lr):
+    saved = [_group(0.001, eps=1e-8), _group(0.0005, eps=5e-9)]
+    current = [_group(lr, eps=1e-8), _group(lr / 2, eps=5e-9)]
+    result = match_param_groups(current, saved, override_lr=True)
+    assert [(g["max_lr"], g["eps"], g["step"]) for g in result] == [
+        (lr, 1e-8, 7),
+        (lr / 2, 5e-9, 7),
+    ]
+
+
+def test_preallocation_keeps_logging_flags_with_duplicate_identifiers():
+    groups = [_group(0.001, default_config=True), _group(0.001, default_config=False)]
+    result = match_param_groups(groups, deepcopy(groups))
+    assert [g["default_config"] for g in result] == [True, False]
+    assert result[0] is not result[1]
+
+
+def test_legacy_no_decay_alias_remains_no_decay_after_scheduler_step():
+    saved = _group(0.001, pre_wd_mult=0.0)
+    del saved["wd_mult"]
+    current = _group(0.002, wd_mult=0.0)
+    groups = match_param_groups([current], [saved], override_lr=True)
+    assert groups[0]["wd_mult"] == 0.0
+    assert "pre_wd_mult" not in groups[0]
+    scheduler = OptimizerParamScheduler(
+        SimpleNamespace(param_groups=groups),
+        init_lr=0.0,
+        max_lr=0.002,
+        min_lr=0.0002,
+        lr_warmup_steps=0,
+        lr_decay_steps=100,
+        lr_decay_style="linear",
+        start_wd=0.1,
+        end_wd=0.1,
+        wd_incr_steps=100,
+        wd_incr_style="constant",
+    )
+    scheduler.step(increment=42)
+    assert groups[0]["weight_decay"] == 0.0
+
+
 @pytest.mark.parametrize("single", [False, True])
 def test_chained_optimizer_forwards_explicit_override_without_changing_normal_calls(single):
     children = [Mock()] if single else [Mock(), Mock()]
@@ -130,7 +172,7 @@ def test_chained_optimizer_forwards_explicit_override_without_changing_normal_ca
 class TwoWeights(torch.nn.Module):
     """Different gradients make a parameter-state mix-up observable."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.a = torch.nn.Parameter(torch.ones(128, 128, device="cuda", dtype=torch.bfloat16))
         self.b = torch.nn.Parameter(torch.full_like(self.a, 2.0))
@@ -188,10 +230,10 @@ def _build(rates):
 
 
 def _step(model, optimizer, scheduler):
-    scheduler.step(increment=1)
     for i, param in enumerate(model.parameters()):
         param.main_grad.fill_(0.25 + i * 0.5)
     assert optimizer.step()[0]
+    scheduler.step(increment=1)
 
 
 @pytest.mark.parametrize("format_name", ["dp_reshardable", "fully_reshardable"])
@@ -258,6 +300,7 @@ def test_disk_resume_preserves_parameter_state_and_next_updates(format_name, old
         ref_scheduler.step(increment=3)
         assert new_scheduler.num_steps == 3
         assert sorted({group["max_lr"] for group in resumed.param_groups}) == sorted(set(new_rates))
+        assert [g["lr"] for g in resumed.param_groups] == [g["lr"] for g in reference.param_groups]
         for _ in range(2):
             _step(new_model, resumed, new_scheduler)
             _step(ref_model, reference, ref_scheduler)

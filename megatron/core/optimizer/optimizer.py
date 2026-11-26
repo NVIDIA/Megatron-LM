@@ -323,45 +323,65 @@ def match_param_groups(
                 result[key] = get_param_group_identifier_value(group, key)
         return result
 
-    saved_map: Dict[tuple, Dict] = {}
-    ambiguous_keys: set[tuple] = set()
+    exact_map: Dict[tuple, List[Dict]] = {}
+    saved_map: Dict[tuple, List[Dict]] = {}
     for saved_group in saved_groups:
-        key = lookup_key(saved_group)
-        if override_lr and key in saved_map:
-            if key not in ambiguous_keys and not _group_metadata_equal(
-                retained_metadata(saved_map[key]), retained_metadata(saved_group)
-            ):
-                ambiguous_keys.add(key)
-        else:
-            # Ordinary resume retains the legacy last-duplicate-wins behavior.
-            saved_map[key] = saved_group
+        exact_map.setdefault(get_param_group_identifier_tuple(saved_group), []).append(saved_group)
+        saved_map.setdefault(lookup_key(saved_group), []).append(saved_group)
 
     has_saved_indexer = any(_is_dsa_indexer_identifier(key) for key in saved_map)
     matched = []
     for current in current_groups:
         key = lookup_key(current)
-        # During an override, an explicit saved indexer group rules out the
-        # pre-DSA fallback. Ordinary resume keeps the existing lookup unchanged.
-        group = (
+        candidates = (
             saved_map.get(key)
             if override_lr and has_saved_indexer
             else find_saved_param_group(key, saved_map)
         )
-        if group is None:
+        if candidates is None:
             raise ValueError(_missing_param_group_message(key, saved_map))
         if not override_lr:
+            group = dict(candidates[-1])
+            # State-target allocation loads our own state dict. Duplicate identifiers
+            # must not overwrite the current groups' LR logging classification.
+            if "default_config" in current:
+                group["default_config"] = current["default_config"]
             matched.append(group)
             continue
-        # Unused saved groups need not be compatible with this rank's groups.
-        if lookup_key(group) in ambiguous_keys:
+
+        current_metadata = retained_metadata(current)
+
+        def compatible(group):
+            metadata = retained_metadata(group)
+            # Step and scheduled weight decay belong to the checkpoint's progress,
+            # not the freshly built configuration. Checkpoint-only metadata cannot
+            # distinguish candidates, but must still agree among the selected ones.
+            return all(
+                _group_metadata_equal(value, metadata[name])
+                for name, value in current_metadata.items()
+                if name in metadata and name not in ("step", "weight_decay", "is_dsa_indexer")
+            )
+
+        exact = exact_map.get(get_param_group_identifier_tuple(current), [])
+        choices = [group for group in exact if compatible(group)]
+        if not choices:
+            choices = [group for group in candidates if compatible(group)]
+        if not choices or any(
+            not _group_metadata_equal(retained_metadata(choices[0]), retained_metadata(group))
+            for group in choices[1:]
+        ):
             raise ValueError(
                 "Ambiguous parameter group match during LR override: saved groups have "
                 "different retained optimizer metadata (for example betas, epsilon or step). "
                 "Resume with the original configuration without LR override, or explicitly "
-                "start with fresh optimizer state. Group position and old LR values cannot "
-                "disambiguate an LR override."
+                "start with fresh optimizer state."
             )
-        group = {key: value for key, value in group.items() if key not in excluded}
+        saved = choices[0]
+        group = {key: value for key, value in saved.items() if key not in excluded}
+        for name in param_group_identifier_keys:
+            if f"pre_{name}" in group:
+                group[name] = get_param_group_identifier_value(saved, name)
+                del group[f"pre_{name}"]
         group.update({key: current[key] for key in runtime_keys if key in current})
         # Preserve the runtime half of the supported pre-DSA group split.
         group["is_dsa_indexer"] = get_param_group_identifier_value(current, "is_dsa_indexer")
