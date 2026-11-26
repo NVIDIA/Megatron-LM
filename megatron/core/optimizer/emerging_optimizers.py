@@ -156,15 +156,11 @@ def _create_fsdp_emerging_optimizer(
     # OptimizerConfig.validate() has checked the MuOwn variant and scale mode.
     return FsdpAngularMuOwn(
         param_groups,
+        angular_warmup_steps=config.muown_angular_warmup_iters,
         angular_decay_scale=config.muown_angular_decay_scale,
         angular_decay_degree=config.muown_angular_decay_degree,
-        angular_plateau_degree=config.muown_angular_plateau_degree,
-        angular_warmup_steps=config.muown_angular_warmup_iters,
-        angular_horizon_steps=config.muown_angular_horizon_iters,
         row_scale_betas=(config.adam_beta1, config.adam_beta2),
         row_scale_eps=config.adam_eps,
-        norm_eps=config.muown_norm_eps,
-        weight_decay_mult=config.muown_weight_decay_mult,
         **kwargs,
     )
 

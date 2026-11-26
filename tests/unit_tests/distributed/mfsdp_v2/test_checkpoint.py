@@ -588,7 +588,7 @@ def test_ep_fsdp_checkpoint_roundtrip(
                     muown_use_angular=True,
                     muon_scale_mode="shape_scaling",
                     muown_angular_warmup_iters=2,
-                    muown_angular_horizon_iters=10,
+                    muown_angular_decay_scale=0.5,
                 )
                 if optimizer_name == "angular_muown"
                 else {}
