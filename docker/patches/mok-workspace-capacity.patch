@@ -1,0 +1,241 @@
+Variable-length MoK workspace backport for the ERNIE 5.5 recipe.
+Base: https://github.com/QiZhangNV/mixture-of-kittens/commit/ee7bdaba515fd3d557105d71809ec74cd523d5a1
+Upstream: Copyright 2026 Cursor Research, Apache License 2.0.
+
+diff --git a/README.md b/README.md
+index 32594cd..2eb574c 100644
+--- a/README.md
++++ b/README.md
+@@ -133,6 +133,20 @@ MoK relies on PyTorch symmetric memory to allocate and manage inter-GPU symmetri
+
+ Because symmetric buffers are expensive to allocate, we recommend creating a single workspace per model and reusing it across layers. For this, we provide the `get_workspace(...)` function, which automatically caches workspaces with identical properties (EP group, device, model shapes, etc.). If you prefer to manage a workspace's lifetime yourself, the `create_workspace(...)` function does not cache.
+
++For variable-length microbatches, set `MoKConfig(max_local_tokens=16384)` to
++reserve space for up to 16,384 physical input rows per EP rank on first use.
++Choose the bound after CP sharding and include local microbatch size and padding.
++Pass the **actual** local row count to `get_workspace(..., num_local_tokens=n)`
++on each call. The returned workspace exposes the current shape, and all calls
++within the bound reuse the same communication buffers for a given EP group,
++device, hidden size, top-k and schedule capacity factor. Each call must use the
++same actual row count on all ranks of its EP group. Order operations that share
++a workspace on the same CUDA stream or with stream dependencies.
++
++The default `max_local_tokens=None` caches a workspace for each distinct
++length. With a configured bound, an input above it raises an error.
++`macrobatch_size` independently controls the kernel's internal token ring.
++
+ ### MXFP8
+
+ To run MoK in MXFP8 mode, pass the activations as-is in BF16 while prequantizing the weights to MXFP8. We *could* quantize the weights inside our kernels, but prequantizing leaves better opportunities for things like FSDP, so we keep it separate and provide the `mxfp8_quantize(...)` function at the ops layer so you can prequantize the weights yourself.
+diff --git a/mok/functional.py b/mok/functional.py
+index fce3dce..b519f97 100644
+--- a/mok/functional.py
++++ b/mok/functional.py
+@@ -1,6 +1,6 @@
+ import math
+ import struct
+-from dataclasses import dataclass
++from dataclasses import dataclass, replace
+ from typing import Any
+
+ import torch
+@@ -32,6 +32,7 @@ class MoKConfig:
+     macrobatch_size: int = 131072
+     schedule_capacity_multiplier: float = 0.5
+     all_gather_top_experts_chunk_bytes: int = 2048
++    max_local_tokens: int | None = None  # optional symmetric workspace capacity per EP rank
+
+
+ @dataclass(frozen=True, slots=True)
+@@ -172,6 +173,27 @@ class MoKWorkspace:
+     barrier_buffer_multicast_ptr: int                 # () uintptr64
+     barrier_target: torch.Tensor                      # (1,) int32
+
++    def _for_tokens(self, num_local_tokens: int) -> "MoKWorkspace":
++        """Expose the active, contiguous prefix without modifying outstanding forward contexts."""
++        if num_local_tokens == self.num_local_tokens:
++            return self
++        routed_rows = num_local_tokens * self.topk
++        # The multicast kernel writes rank r at r * N * topk. A slice on the
++        # token dimension of [EP, capacity, topk] would retain the wrong rank stride.
++        gathered = self.all_gather_top_experts_buffer.view(-1, self.topk)[:self.ep_size * num_local_tokens]
++        return replace(
++            self,
++            num_local_tokens=num_local_tokens,
++            schedule_capacity=(self.schedule_capacity // self.num_local_tokens) * num_local_tokens,
++            x_buffer=self.x_buffer[:num_local_tokens],
++            combine_buffer=self.combine_buffer[:routed_rows],
++            d_y_buffer=self.d_y_buffer[:num_local_tokens],
++            d_x_routed_buffer=self.d_x_routed_buffer[:routed_rows],
++            router_weight_buffer=self.router_weight_buffer[:num_local_tokens],
++            d_router_weight_buffer=self.d_router_weight_buffer[:num_local_tokens],
++            all_gather_top_experts_buffer=gathered.view(self.ep_size, num_local_tokens, self.topk),
++        )
++
+
+ _WORKSPACE_CACHE: dict[tuple[str, int, int, int, int, int], MoKWorkspace] = {}
+
+@@ -223,6 +245,12 @@ def validate_workspace_args(
+         raise ValueError("num_local_tokens must be an integer at least 512")
+     if num_local_tokens % 256 != 0:
+         raise ValueError("num_local_tokens must be divisible by 256")
++    if config.max_local_tokens is not None:
++        capacity = config.max_local_tokens
++        if type(capacity) is not int or capacity < 512 or capacity % 256 != 0:
++            raise ValueError("max_local_tokens must be an integer at least 512 and divisible by 256")
++        if num_local_tokens > capacity:
++            raise ValueError(f"num_local_tokens ({num_local_tokens}) exceeds max_local_tokens ({capacity})")
+     if type(hidden_size) is not int or hidden_size <= 0:
+         raise ValueError("hidden_size must be a positive integer")
+     if hidden_size % 256 != 0:
+@@ -266,6 +294,21 @@ def create_workspace(
+     Outputs:
+         workspace: MoKWorkspace
+     """
++    backing = _allocate_workspace(
++        config, group, device=device, num_local_tokens=num_local_tokens, hidden_size=hidden_size, topk=topk
++    )
++    return backing._for_tokens(num_local_tokens)
++
++
++def _allocate_workspace(
++    config: MoKConfig,
++    group: dist.ProcessGroup,
++    *,
++    device: torch.device,
++    num_local_tokens: int,
++    hidden_size: int,
++    topk: int,
++) -> MoKWorkspace:
+     validate_workspace_args(
+         config,
+         group,
+@@ -282,16 +325,17 @@ def create_workspace(
+     ep_size = dist.get_world_size(group=group)
+     schedule_capacity_factor = max(2, math.ceil(ep_size * config.schedule_capacity_multiplier))
+
+-    local_shape = torch.tensor([num_local_tokens, hidden_size, topk], dtype=torch.int64, device=device)
++    capacity = config.max_local_tokens or num_local_tokens
++    local_shape = torch.tensor([num_local_tokens, capacity, hidden_size, topk], dtype=torch.int64, device=device)
+     gathered_shapes = torch.empty(ep_size * local_shape.numel(), dtype=torch.int64, device=device)
+     dist.all_gather_into_tensor(gathered_shapes, local_shape, group=group)
+     gathered_shapes = gathered_shapes.view(ep_size, local_shape.numel())
+     if not torch.all(gathered_shapes == local_shape).item():  # .item() here is fine since this is one-time setup
+-        raise ValueError("MoK requires identical token, hidden, and top-k shapes on every EP rank")
++        raise ValueError("MoK requires identical token counts, workspace capacities, hidden sizes, and top-k shapes on every EP rank")
+     if ep_size > 1:
+         symm_mem.enable_symm_mem_for_group(group_name)
+
+-    schedule_capacity = num_local_tokens * topk * schedule_capacity_factor
++    schedule_capacity = capacity * topk * schedule_capacity_factor
+
+     def allocate_buffer(*shape: int, dtype: torch.dtype, zero: bool = False) -> tuple[torch.Tensor, Any, list[int]]:
+         if ep_size == 1:
+@@ -309,14 +353,14 @@ def create_workspace(
+             ptrs = [int(handle.buffer_ptrs[peer_rank]) for peer_rank in range(ep_size)]
+         return buffer, handle, ptrs
+
+-    x_buffer, x_buffer_handle, x_buffer_ptrs = allocate_buffer(num_local_tokens, hidden_size, dtype=torch.bfloat16)
+-    combine_buffer, combine_buffer_handle, combine_buffer_ptrs = allocate_buffer(num_local_tokens * topk, hidden_size, dtype=torch.bfloat16)
+-    d_y_buffer, d_y_buffer_handle, d_y_buffer_ptrs = allocate_buffer(num_local_tokens, hidden_size, dtype=torch.bfloat16)
+-    d_x_routed_buffer, d_x_routed_buffer_handle, d_x_routed_buffer_ptrs = allocate_buffer(num_local_tokens * topk, hidden_size, dtype=torch.bfloat16)
+-    router_weight_buffer, router_weight_buffer_handle, router_weight_buffer_ptrs = allocate_buffer(num_local_tokens, topk, dtype=torch.float32)
+-    d_router_weight_buffer, d_router_weight_buffer_handle, d_router_weight_buffer_ptrs = allocate_buffer(num_local_tokens, topk, dtype=torch.float32)
++    x_buffer, x_buffer_handle, x_buffer_ptrs = allocate_buffer(capacity, hidden_size, dtype=torch.bfloat16)
++    combine_buffer, combine_buffer_handle, combine_buffer_ptrs = allocate_buffer(capacity * topk, hidden_size, dtype=torch.bfloat16)
++    d_y_buffer, d_y_buffer_handle, d_y_buffer_ptrs = allocate_buffer(capacity, hidden_size, dtype=torch.bfloat16)
++    d_x_routed_buffer, d_x_routed_buffer_handle, d_x_routed_buffer_ptrs = allocate_buffer(capacity * topk, hidden_size, dtype=torch.bfloat16)
++    router_weight_buffer, router_weight_buffer_handle, router_weight_buffer_ptrs = allocate_buffer(capacity, topk, dtype=torch.float32)
++    d_router_weight_buffer, d_router_weight_buffer_handle, d_router_weight_buffer_ptrs = allocate_buffer(capacity, topk, dtype=torch.float32)
+
+-    all_gather_top_experts_buffer, all_gather_top_experts_buffer_handle, _ = allocate_buffer(ep_size, num_local_tokens, topk, dtype=torch.int32)
++    all_gather_top_experts_buffer, all_gather_top_experts_buffer_handle, _ = allocate_buffer(ep_size, capacity, topk, dtype=torch.int32)
+     all_gather_top_experts_buffer_multicast_ptr = int(
+         all_gather_top_experts_buffer.data_ptr()
+         if all_gather_top_experts_buffer_handle is None
+@@ -335,7 +379,7 @@ def create_workspace(
+
+     workspace = MoKWorkspace(
+         group_name=group_name, ep_rank=ep_rank, ep_size=ep_size, device=device,
+-        num_local_tokens=num_local_tokens, hidden_size=hidden_size, topk=topk,
++        num_local_tokens=capacity, hidden_size=hidden_size, topk=topk,
+         schedule_capacity=schedule_capacity,
+         x_buffer=x_buffer, x_buffer_handle=x_buffer_handle, x_buffer_ptrs=x_buffer_ptrs,
+         combine_buffer=combine_buffer, combine_buffer_handle=combine_buffer_handle,
+@@ -398,21 +442,15 @@ def get_workspace(
+     ep_size = dist.get_world_size(group=group)
+     schedule_capacity_factor = max(2, math.ceil(ep_size * config.schedule_capacity_multiplier))
+
+-    cache_key = (group_name, device_index, num_local_tokens, hidden_size, topk, schedule_capacity_factor)
+-    cached_workspace = _WORKSPACE_CACHE.get(cache_key)
+-    if cached_workspace is not None:
+-        return cached_workspace
+-
+-    workspace = create_workspace(
+-        config,
+-        group,
+-        device=device,
+-        num_local_tokens=num_local_tokens,
+-        hidden_size=hidden_size,
+-        topk=topk,
+-    )
+-    _WORKSPACE_CACHE[cache_key] = workspace
+-    return workspace
++    capacity = config.max_local_tokens or num_local_tokens
++    cache_key = (group_name, device_index, capacity, hidden_size, topk, schedule_capacity_factor)
++    backing = _WORKSPACE_CACHE.get(cache_key)
++    if backing is None:
++        backing = _allocate_workspace(
++            config, group, device=device, num_local_tokens=num_local_tokens, hidden_size=hidden_size, topk=topk
++        )
++        _WORKSPACE_CACHE[cache_key] = backing
++    return backing._for_tokens(num_local_tokens)
+
+
+ def clear_workspace_cache() -> None:
+diff --git a/tests/test_workspace_capacity.py b/tests/test_workspace_capacity.py
+new file mode 100644
+index 0000000..fe78bd2
+--- /dev/null
++++ b/tests/test_workspace_capacity.py
+@@ -0,0 +1,40 @@
++import pytest
++import torch
++import torch.distributed as dist
++
++from mok import functional
++
++from .utils import generate_topk_experts, run_all_gather_top_experts_reference
++
++
++def test_variable_length_workspace(context):
++    rank, ep_size, device = context
++    config = functional.MoKConfig(max_local_tokens=1024)
++    args = dict(device=device, hidden_size=256, topk=1)
++    group = dist.group.WORLD
++    small = functional.get_workspace(config, group, num_local_tokens=512, **args)
++    large = functional.get_workspace(config, group, num_local_tokens=1024, **args)
++
++    assert small.x_buffer.shape == (512, 256)
++    assert large.x_buffer.shape == (1024, 256)
++    assert small.schedule_capacity * 2 == large.schedule_capacity
++    for name in ("x_buffer", "combine_buffer", "d_y_buffer", "d_x_routed_buffer",
++                 "router_weight_buffer", "d_router_weight_buffer",
++                 "all_gather_top_experts_buffer", "barrier_buffer", "barrier_target"):
++        assert getattr(small, name).data_ptr() == getattr(large, name).data_ptr()
++
++    # The largest call fills storage past the short call's active prefix. Each
++    # rank writes different routes so an incorrect peer stride is observable.
++    for workspace in (large, small, large, small):
++        n = workspace.num_local_tokens
++        routes = generate_topk_experts(rank, device, 2 * ep_size, 1, n).int()
++        expected = run_all_gather_top_experts_reference(routes)
++        schedule = functional.build_schedule(workspace, config, routes, num_local_experts=2)
++        torch.testing.assert_close(workspace.all_gather_top_experts_buffer, expected)
++        counts = torch.bincount(expected.flatten().long(), minlength=2 * ep_size)
++        local_counts = counts[2 * rank : 2 * rank + 2]
++        padded_counts = ((local_counts + 255) // 256) * 256
++        torch.testing.assert_close(schedule.tokens_per_expert, padded_counts.int())
++
++    with pytest.raises(ValueError, match="max_local_tokens"):
++        functional.get_workspace(config, group, num_local_tokens=1280, **args)

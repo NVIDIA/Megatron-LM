@@ -677,6 +677,17 @@ MOK_ARCH=SM103 bash docker/common/install_mok.sh \
   ee7bdaba515fd3d557105d71809ec74cd523d5a1 "$(mktemp -d)"
 ```
 
+For this revision the installer applies the bundled variable-length workspace patch.
+The same patch is included when building the ARM64 development image with
+`--build-arg MOK_COMMIT=ee7bdaba515fd3d557105d71809ec74cd523d5a1`.
+Set `max_local_tokens` in `moe_megakernel_backend_config` to the largest
+physical input row count per EP rank per microbatch, after sharding and padding.
+For the 256K, CP16, TP1, MBS1 example below, the limit is 16,384.
+Each rank reserves that capacity on first use. Dispatch, combine, and backward
+use the current row count, which must match on all ranks of the EP group for
+each call. Inputs exceeding the configured limit raise an error. The kernel's
+`macrobatch_size` independently controls internal work scheduling.
+
 On a GB300 NVL72, run the following two checks with four GPUs per node. The first exercises the physical placement of masked routes. The second compares real kernel output, input and gate gradients, and every routed expert's owner gradient through checkpoint replay.
 
 ```bash
@@ -705,6 +716,7 @@ moe_token_dispatcher_type: flex
 moe_flex_dispatcher_backend: hybridep
 moe_megakernel_backend: mok
 moe_megakernel_backend_config:
+  max_local_tokens: 16384
   macrobatch_size: 16384
   schedule_capacity_multiplier: 0.5
 moe_virtual_expert_load_balance: true

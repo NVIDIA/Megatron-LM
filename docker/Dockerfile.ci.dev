@@ -53,14 +53,15 @@ FROM base AS mok-wheel
 ARG MOK_COMMIT=7a8cfb7fdd96a1cfba506caf4756c6c86073399a
 # Include both GPU architectures supported by the pinned MoK source by default.
 ARG MOK_ARCH=ALL
-RUN --mount=type=bind,source=docker/common/install_mok.sh,target=/opt/install_mok.sh \
+RUN --mount=type=bind,source=docker/common/install_mok.sh,target=/opt/docker/common/install_mok.sh \
+    --mount=type=bind,source=docker/patches/mok-workspace-capacity.patch,target=/opt/docker/patches/mok-workspace-capacity.patch \
     bash -ex <<"EOF"
     # The mount in main requires this directory even when MoK is skipped.
     mkdir -p /opt/mok-wheels
     # The ARM64 image serves GB200/GB300; the AMD64 image serves H100.
     if [ "${TARGETARCH}" = "arm64" ]; then
         uv venv --system-site-packages "${UV_PROJECT_ENVIRONMENT}"
-        MOK_ARCH=${MOK_ARCH} bash /opt/install_mok.sh "${MOK_COMMIT}" /opt/mok-wheels
+        MOK_ARCH=${MOK_ARCH} bash /opt/docker/common/install_mok.sh "${MOK_COMMIT}" /opt/mok-wheels
     else
         echo "[MoK] skipping build for TARGETARCH=${TARGETARCH}"
     fi
@@ -218,7 +219,7 @@ EOF
 RUN --mount=type=bind,from=mok-wheel,source=/opt/mok-wheels,target=/opt/mok-wheels \
     bash -ex <<"EOF"
     if [ "${TARGETARCH}" = "arm64" ]; then
-        uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" --no-deps --no-cache /opt/mok-wheels/*.whl
+        uv pip install --python "${UV_PROJECT_ENVIRONMENT}/bin/python" --no-deps --no-cache --reinstall-package mixture-of-kittens /opt/mok-wheels/*.whl
     else
         echo "[MoK] skipping install for TARGETARCH=${TARGETARCH}"
     fi

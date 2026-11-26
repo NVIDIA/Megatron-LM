@@ -32,6 +32,12 @@ git init "${WORK_DIR}"
 git -C "${WORK_DIR}" remote add origin https://github.com/QiZhangNV/mixture-of-kittens.git
 git -C "${WORK_DIR}" fetch --depth 1 origin "${MOK_REVISION}"
 git -C "${WORK_DIR}" checkout --detach "${MOK_REVISION}"
+# The routed-only ERNIE snapshot needs the local capacity fix for variable-length input.
+if [[ "${MOK_REVISION}" == "ee7bdaba515fd3d557105d71809ec74cd523d5a1" ]]; then
+    patch_file=$(realpath "$(dirname "${BASH_SOURCE[0]}")/../patches/mok-workspace-capacity.patch")
+    git -C "${WORK_DIR}" apply --check "${patch_file}"
+    git -C "${WORK_DIR}" apply "${patch_file}"
+fi
 bash "${WORK_DIR}/scripts/prepare_thunderkittens.sh"
 
 export NVCC="${CUDA_HOME:-/usr/local/cuda}/bin/nvcc"
@@ -39,14 +45,20 @@ export MOK_NVCC="${NVCC}"
 # Docker builds have no GPU driver. Stubs are link inputs, never runtime libraries.
 export LIBRARY_PATH="${CUDA_HOME:-/usr/local/cuda}/lib64/stubs${LIBRARY_PATH:+:${LIBRARY_PATH}}"
 uv build --python "${PYTHON}" --wheel --no-build-isolation --no-cache --out-dir "${WHEEL_DIR}" "${WORK_DIR}"
-uv pip install --python "${PYTHON}" --no-deps --no-cache "${WHEEL_DIR}"/*.whl
+uv pip install --python "${PYTHON}" --no-deps --no-cache --reinstall-package mixture-of-kittens "${WHEEL_DIR}"/*.whl
 
 # Inspect the installed wheel without loading libcuda on GPU-less image builders.
-MOK_EXTENSION=$("${PYTHON}" - <<'PY'
+MOK_EXTENSION=$("${PYTHON}" - "${WORK_DIR}/mok/functional.py" <<'PY'
+import filecmp
+import sys
 from importlib.metadata import distribution
 from sysconfig import get_config_var
 
-extension = distribution("mixture-of-kittens").locate_file("mok/_C" + get_config_var("EXT_SUFFIX"))
+package = distribution("mixture-of-kittens")
+installed = package.locate_file("mok/functional.py")
+if not filecmp.cmp(sys.argv[1], installed, shallow=False):
+    raise RuntimeError(f"MoK install does not match the built source: {installed}")
+extension = package.locate_file("mok/_C" + get_config_var("EXT_SUFFIX"))
 assert extension.is_file(), f"MoK native extension missing: {extension}"
 print(extension)
 PY
