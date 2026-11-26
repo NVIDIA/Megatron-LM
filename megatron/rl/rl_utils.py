@@ -2307,8 +2307,8 @@ def prepare_trajectories(
         seq_length:  Maximum sequence length to pad to.
 
     Returns:
-        Trajectories, their generation masks, and per-row inference logprobs
-        (unpadded tensor per real row, None per PAD row).
+        Trajectories, their generation masks, per-row inference logprobs
+        (unpadded tensor per real row, None per PAD row), and pre-padding lengths (zero for PAD rows).
     """
     # Track counts for each environment ID
     env_id_counts = Counter()
@@ -2346,6 +2346,7 @@ def prepare_trajectories(
     trajs = []
     generation_masks = []
     inference_logprobs = []
+    seq_lengths = []
     single_turn_rows = []  # for the single-turn-only "one eod" sanity check below
     for row in rows:
         if row is None:
@@ -2354,6 +2355,7 @@ def prepare_trajectories(
             trajs.append([tokenizer.pad] * seq_length)
             generation_masks.append([False] * seq_length)
             inference_logprobs.append(None)
+            seq_lengths.append(0)
             single_turn_rows.append(False)
             continue
 
@@ -2390,6 +2392,7 @@ def prepare_trajectories(
 
         length = len(trajectory)
         assert length <= seq_length, "Rollout too long, how did this happen?"
+        seq_lengths.append(length)
         # Single-turn completions under seq_length must end in eod or exactly at their stamped generation cap (enforced upstream in
         # compute_group_stats); multi-turn turns may stop on a tool-call boundary.
         if length < seq_length:
@@ -2435,7 +2438,7 @@ def prepare_trajectories(
     assert (
         generated_eod.sum(axis=1) <= 1
     ).all(), "Only one eod per trajectory in single-turn generated tokens."
-    return trajs, generation_masks, inference_logprobs
+    return trajs, generation_masks, inference_logprobs, seq_lengths
 
 
 def logprobs_forward_step(data_iterator, model, is_correction, packing_context=None):
@@ -2625,8 +2628,11 @@ def prepare_data_for_update(
             # Sequence packing and reporting needs it global but non-packing wants it local.
 
         with nvtx_range("rl/prepare-trajectories", time=True):
-            trajs, generation_masks, inference_logprobs = prepare_trajectories(
-                rows, tokenizer, cfg.model.transformer.max_seq_length_per_sample, cfg.rl.rl_skip_bos_token,
+            trajs, generation_masks, inference_logprobs, seq_lengths = prepare_trajectories(
+                rows,
+                tokenizer,
+                cfg.model.transformer.max_seq_length_per_sample,
+                cfg.rl.rl_skip_bos_token,
             )
         if not has_inference_logprobs:
             inference_logprobs = None
@@ -2646,8 +2652,9 @@ def prepare_data_for_update(
                     global_advantages,
                     cfg.model.transformer.max_seq_length_per_sample,
                     cfg.rl.rl_sequence_packing_max_sequences_per_bin,
-                    cfg.rl.rl_sequence_packing_algo
-                    )
+                    cfg.rl.rl_sequence_packing_algo,
+                    seq_lengths=seq_lengths,
+                )
 
                 compute_trajs = packing_context.packed_trajs
                 compute_position_ids = packing_context.packed_position_ids
@@ -2668,8 +2675,7 @@ def prepare_data_for_update(
                     args.reset_position_ids,
                     reset_attention_mask=False,
                     eod_mask_loss=False,
-                    # With a shared ID, the generation mask below distinguishes EOD from padding.
-                    pad_mask_loss=tokenizer.pad != tokenizer.eod,
+                    pad_mask_loss=False,
                     create_attention_mask=False,
                 )
                 original_loss_mask[~generation_masks] = 0.0

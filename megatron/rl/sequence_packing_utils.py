@@ -694,23 +694,14 @@ class SequencePacker:
         trajs: torch.Tensor,
         generation_masks: Optional[torch.Tensor] = None,
         *,
-        eod_token: Optional[int] = None,
+        seq_lengths: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo]:
-        """Pack sequences into bins using a greedy first-fit algorithm."""
-        # Convert trajectories to list for packing
-        sequences = [trajs[i] for i in range(trajs.shape[0])]
-
-        sequences_tensor = torch.stack(sequences)
-
-        if self.pad_token == eod_token and generation_masks is not None:
-            # A sampled EOD occupies a slot even when it has the same ID as right padding.
-            occupied = (sequences_tensor != self.pad_token) | generation_masks.bool()
-            seq_lengths = get_actual_sequence_lengths(occupied, pad_token=False)
-        else:
-            seq_lengths = get_actual_sequence_lengths(sequences_tensor, self.pad_token)
-
-        # Trim sequences to actual lengths
-        sequences = [sequences_tensor[i, :length] for i, length in enumerate(seq_lengths)]
+        """Pack sequences into bins, using pre-padding lengths when supplied."""
+        if seq_lengths is None:
+            seq_lengths = get_actual_sequence_lengths(trajs, self.pad_token)
+        elif any(not 0 <= length <= trajs.size(1) for length in seq_lengths):
+            raise ValueError("Sequence lengths must be between zero and the padded width")
+        sequences = [row[:length] for row, length in zip(trajs, seq_lengths, strict=True)]
 
         sorted_indices = sorted(range(len(sequences)), key=lambda i: seq_lengths[i], reverse=True)
 
@@ -1015,7 +1006,17 @@ def distribute_packed_bins(
     return packed_trajs, packed_position_ids, packed_loss_mask, new_packing_info
 
 
-def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo):
+def pack_all_trajectories(
+    trajs,
+    generation_masks,
+    inference_logprobs,
+    global_advantages,
+    bin_size,
+    max_sequences_per_bin,
+    packing_algo,
+    *,
+    seq_lengths: List[int],
+):
     tokenizer = get_tokenizer()
     data_parallel_world_size = mpu.get_data_parallel_world_size()
     data_parallel_group = mpu.get_data_parallel_group()
@@ -1030,6 +1031,8 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
 
         trajs = _gather(trajs)
         generation_masks = _gather(generation_masks)
+        lengths = torch.tensor(seq_lengths, dtype=torch.long, device=trajs.device)
+        seq_lengths = _gather(lengths).tolist()
         if inference_logprobs is not None:
             inference_logprobs = _gather(inference_logprobs)
 
@@ -1048,7 +1051,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
 
         # Pack sequences with generation masks
         packed_trajs, packed_position_ids, packed_loss_mask, packing_info = packer.pack_sequences(
-            trajs, generation_masks, eod_token=tokenizer.eod
+            trajs, generation_masks, seq_lengths=seq_lengths
         )
         packing_info.packing_algo = packing_algo
 
