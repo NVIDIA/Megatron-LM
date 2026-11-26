@@ -71,11 +71,11 @@ sequenceDiagram
     S->>H: Parameter-bearing submodule backward
     H->>U: unshard()
     Note over S,U: pre_dispatch_computation.backward() completes<br/>and delayed backward_dw(), if enabled, completes
-    S->>U: Layer callback: reshard(); post_accumulate_grad()
-    Note over U,C: Gradient reductions are submitted on context streams
+    S->>U: Layer callback: reshard() then post_accumulate_grad()
+    Note over U,C: Gradient reductions are submitted<br/>on context streams
 
     Note over S,U: Chunk pre_process.backward() completes
-    S->>U: Remaining units: reshard(); post_accumulate_grad()
+    S->>U: Remaining units: reshard() then post_accumulate_grad()
 
     Note over S,C: All microbatch backward work completes
     S->>C: post_backward() via finalize_model_grads()
