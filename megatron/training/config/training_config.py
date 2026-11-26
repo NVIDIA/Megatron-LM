@@ -566,7 +566,11 @@ class CheckpointConfig:
     """Number of latest checkpoint to be saved."""
 
     save_optim: bool = True
-    """Whether to save the optimizer state with every checkpoint."""
+    """Whether to save optimizer and scheduler state with every checkpoint.
+
+    This does not disable restoring their state from an existing checkpoint;
+    that is controlled by ``load_optim`` and the load's resume/finetune policy.
+    """
 
     save_rng: bool = True
     """Whether to save the RNG state with every checkpoint."""

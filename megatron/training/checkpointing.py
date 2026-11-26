@@ -1892,8 +1892,9 @@ def generate_state_dict(
 
         state_dict[key] = model_sd
 
-    # Optimizer stuff.
-    if checkpoint.save_optim:
+    # The caller selects which state to restore. Future save policy must not
+    # suppress the optimizer or scheduler needed to construct a load template.
+    if checkpoint.save_optim or (optim_sd_kwargs or {}).get("is_loading", False):
         if optimizer is not None and not optimizer.is_stub_optimizer:
             if ckpt_format == 'torch_dist':
                 optimizer_sd = optimizer.sharded_state_dict(
