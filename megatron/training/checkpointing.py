@@ -2283,10 +2283,23 @@ def _load_base_checkpoint(
             state_dict['optimizer'].copy() if 'optimizer' in state_dict else None
         )
         raw_model_state_dict = state_dict['model'].copy() if 'model' in state_dict else None
-        model = state_dict.pop('_model')
-        state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
         fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
         state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
+
+        missing_master_params = []
+        if raw_optimizer_state_dict is not None:
+            checkpoint_has_no_master_params = not any(
+                key.startswith('optimizer.state.') and '.master_param' in key
+                for key in state_dict_metadata
+            )
+            if checkpoint_has_no_master_params:
+                for name, slots in raw_optimizer_state_dict.get('state', {}).items():
+                    if 'master_param' in slots:
+                        missing_master_params.append(name)
+                        del slots['master_param']
+
+        model = state_dict.pop('_model')
+        state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
         if gpt_compat_layer_maps is not None:
             from megatron.core.dist_checkpointing.gpt_checkpoint_interop import (
                 retarget_fsdp_state_dict_to_gpt_checkpoint,
@@ -2332,18 +2345,9 @@ def _load_base_checkpoint(
 
         if raw_optimizer_state_dict is not None:
             state_dict['optimizer'] = raw_optimizer_state_dict
-            checkpoint_has_no_master_params = not any(
-                key.startswith('optimizer.state.') and '.master_param' in key
-                for key in state_dict_metadata
-            )
-            if checkpoint_has_no_master_params and 'state' in raw_optimizer_state_dict:
+            if missing_master_params:
                 # FSDP v1 previously disabled TE masters even when FSDP had no main
                 # buffer. Record which masters must be rebuilt after model restoration.
-                missing_master_params = [
-                    name
-                    for name, slots in raw_optimizer_state_dict['state'].items()
-                    if 'master_param' in slots
-                ]
                 # This marker is local load bookkeeping, never a DCP template key.
                 state_dict['optimizer']['_fsdp_missing_master_params'] = missing_master_params
 
