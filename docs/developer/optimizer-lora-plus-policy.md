@@ -22,9 +22,10 @@ The callable contributes only B's differing bounds. Ratio one returns an empty
 mapping, and A stays in the base group. This avoids creating another group with
 the same checkpoint identity as other trainable base weights.
 
-MLM setup rejects unequal A/B bounds selected by the standard adapter name globs
-with a nonzero initial warmup LR, including hand-written mappings using those
-globs. Arbitrary layer-specific selectors require validation by their policy.
+MLM setup rejects unequal A/B bounds selected by exact, name-only standard adapter
+globs with a nonzero initial warmup LR. This includes hand-written mappings using
+those exact selectors. General globs and selectors combined with attributes or
+predicates require validation by their policy; they do not imply LoRA intent.
 The check does not depend on rank-local adapter presence. The callable serializes through the existing recipe target mechanism. Its ratio
 can be changed through recipe CLI/YAML overrides. Bridge accepts this same
 callable through its mapping/callable interface.
