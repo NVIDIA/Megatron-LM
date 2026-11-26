@@ -13,7 +13,10 @@ from megatron.core.optimizer import (
     merge_config_overrides,
 )
 from megatron.core.optimizer.optimizer_config import ParamKey
-from megatron.core.optimizer_param_scheduler import ParamGroupOverride
+from megatron.core.optimizer_param_scheduler import (
+    ParamGroupOverride,
+    combine_param_group_overrides,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import unwrap_model
 
@@ -78,7 +81,35 @@ def build_optimizer_config_overrides(
         get_lsq_config_overrides(getattr(chunk, "_lsq_scale_lr", None), base_lr=optimizer_config.lr)
         for chunk in model_chunks
     ]
-    return merge_config_overrides(standard, mup, *lsq, custom)
+    combined = merge_config_overrides(standard, mup, *lsq, custom)
+    # Validate overlapping selectors before removing no-op fields: explicitly asking
+    # for the base LR must still conflict with a matching muP/custom LR rule.
+    for chunk in model_chunks:
+        for name, param in chunk.named_parameters():
+            if param.requires_grad:
+                combine_param_group_overrides(
+                    [value for selector, value in combined.items() if selector.matches(param, name)]
+                )
+    defaults = {
+        "max_lr": optimizer_config.lr,
+        "min_lr": optimizer_config.min_lr,
+        "wd_mult": 1.0,
+        "lr_mult": 1.0,
+        "is_decoupled_lr": False,
+        "is_dsa_indexer": False,
+    }
+    # Core groups by the raw override tuple, while checkpoints use effective values.
+    # Canonicalize this new recipe API without changing legacy factory callers' groups.
+    normalized = {}
+    for selector, values in combined.items():
+        values = {
+            key: value
+            for key, value in values.items()
+            if key not in defaults or value != defaults[key]
+        }
+        if values:
+            normalized[selector] = values
+    return normalized
 
 
 def optimizer_config_overrides_from_entries(entries: list) -> OptimizerConfigOverrides:

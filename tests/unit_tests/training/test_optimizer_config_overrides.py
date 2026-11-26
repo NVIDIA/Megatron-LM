@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from megatron.core.optimizer import OptimizerConfig, _get_param_groups, merge_config_overrides
+from megatron.core.optimizer.optimizer import FP32Optimizer, get_param_group_identifier_tuple
 from megatron.core.optimizer.optimizer_config import ParamKey
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -72,9 +73,8 @@ def test_identical_selectors_merge_fields_without_mutation_or_silent_precedence(
 def test_mup_custom_conflicts_are_detected_after_selector_matching(distributed_groups):
     config = OptimizerConfig(lr=0.001, min_lr=0.0)
     model = _model(use_mup=True)
-    overrides = build_optimizer_config_overrides(config, model, WeightLRHook(8.0))
     with pytest.raises(ValueError, match="Conflicting overrides for max_lr"):
-        _get_param_groups(model, config, overrides)
+        build_optimizer_config_overrides(config, model, WeightLRHook(8.0))
     # Replacing standard WD policy does not silently disable the model's muP scaling.
     overrides = build_optimizer_config_overrides(config, model, {}, mode="replace")
     groups = _get_param_groups(model, config, overrides)
@@ -181,3 +181,33 @@ def test_plain_torch_module_needs_no_model_specific_configuration():
     overrides = build_optimizer_config_overrides(OptimizerConfig(lr=0.001), model, WeightLRHook())
     assert overrides[ParamKey(name="weight")]["max_lr"] == 0.004
     assert any(value.get("wd_mult") == 0.0 for value in overrides.values())
+
+
+@pytest.mark.parametrize(
+    "contribution", [{}, {"max_lr": 0.001}, {"wd_mult": 1.0}, {"max_lr": 0.008}]
+)
+def test_redundant_overrides_keep_unique_parameter_state_on_resume(
+    distributed_groups, contribution
+):
+    model = torch.nn.Module()
+    model.a = torch.nn.Parameter(torch.ones(4, 4))
+    model.b = torch.nn.Parameter(torch.full((4, 4), 2.0))
+    config = OptimizerConfig(lr=0.001, min_lr=0.0, clip_grad=0.0)
+    policy = build_optimizer_config_overrides(config, [model], {ParamKey(name="a"): contribution})
+    groups = _get_param_groups([model], config, policy)
+    assert len(groups) == len({get_param_group_identifier_tuple(group) for group in groups})
+    assert len(groups) == (2 if contribution.get("max_lr") == 0.008 else 1)
+    inner = torch.optim.AdamW(groups, lr=config.lr)
+    model.a.grad = torch.ones_like(model.a)
+    model.b.grad = torch.full_like(model.b, 2.0)
+    inner.step()
+    saved = deepcopy(inner.state_dict())
+    expected = {param: deepcopy(inner.state[param]) for param in model.parameters()}
+    wrapper = FP32Optimizer.__new__(FP32Optimizer)
+    wrapper.optimizer = inner
+    wrapper.load_state_dict(saved)
+    members = [param for group in inner.param_groups for param in group["params"]]
+    assert len(members) == len({id(param) for param in members}) == 2
+    for param in model.parameters():
+        for key, value in expected[param].items():
+            torch.testing.assert_close(inner.state[param][key], value)
