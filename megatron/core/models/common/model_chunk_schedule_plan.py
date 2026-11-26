@@ -320,14 +320,14 @@ class TransformerLayerSchedulePlan:
         else:
             self.mtp_post_process = NoopScheduleNode()
 
-    def set_fsdp_reshard_hooks(self, post_forward_hook, post_backward_hook):
-        """Wire FSDP parameter release callbacks for the fine-grained overlap schedule.
+    def set_fsdp_schedule_callbacks(self, post_forward_hook, post_backward_hook):
+        """Wire FSDP parameter release and backward completion into the overlap schedule.
 
         The EP overlap schedule bypasses the normal FSDP forward/backward hooks
         (registered on the FSDP unit module) because it calls sub-modules directly
         instead of going through TransformerLayer.forward(). This method attaches
-        explicit release hooks to individual schedule nodes so that all-gathered
-        parameters are freed at the right time.
+        explicit callbacks to individual schedule nodes to release gathered
+        parameters and complete gradient handling at the schedule boundaries.
 
         The post-backward callback belongs to ``pre_dispatch_computation``, the
         first forward node and last backward node. ``TransformerLayerNode`` fires

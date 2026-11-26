@@ -26,7 +26,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
-    post_fsdp_backward,
+    complete_fsdp_unit_backward,
     register_fsdp_ep_overlap_schedule_hooks,
     register_fsdp_module_hooks,
 )
@@ -258,7 +258,7 @@ def test_train_validate_train_reshards_and_matches_dense(distributed_setup):
                 actual.square().mean().backward()
                 expected.square().mean().backward()
                 for unit in units:
-                    post_fsdp_backward(unit)
+                    complete_fsdp_unit_backward(unit)
                 model.context.finish_grad_sync()
                 for parameter in reference.parameters():
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
@@ -302,7 +302,7 @@ def test_schedule_finishes_shared_and_nested_units_once():
         def __init__(self, layer):
             self.layer = layer
 
-        def set_fsdp_reshard_hooks(self, forward, backward):
+        def set_fsdp_schedule_callbacks(self, forward, backward):
             self.finish_forward = lambda: forward(self.layer)
             self.finish = lambda: backward(self.layer)
 

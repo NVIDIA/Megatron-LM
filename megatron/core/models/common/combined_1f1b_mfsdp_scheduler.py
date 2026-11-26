@@ -37,7 +37,7 @@ def _module_post_forward_hook(module: FsdpModule, _args, _output) -> None:
         module.reshard()
 
 
-def post_fsdp_backward(module: FsdpModule) -> None:
+def complete_fsdp_unit_backward(module: FsdpModule) -> None:
     """Reshard the unit and submit gradient reductions after its last backward use."""
     module.reshard()
     module.post_accumulate_grad()
@@ -91,9 +91,9 @@ def register_fsdp_ep_overlap_schedule_hooks(
 
         def finish_layer(_module, units=units):
             for unit in units:
-                post_fsdp_backward(unit)
+                complete_fsdp_unit_backward(unit)
 
-        plan.set_fsdp_reshard_hooks(reshard_fsdp_modules, finish_layer)
+        plan.set_fsdp_schedule_callbacks(reshard_fsdp_modules, finish_layer)
 
     if not remaining:
         return None
@@ -101,6 +101,6 @@ def register_fsdp_ep_overlap_schedule_hooks(
 
     def finish_chunk():
         for unit in chunk_units:
-            post_fsdp_backward(unit)
+            complete_fsdp_unit_backward(unit)
 
     return finish_chunk

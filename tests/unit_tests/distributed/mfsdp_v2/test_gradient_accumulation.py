@@ -35,7 +35,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbu
     QuantizedDBuffer,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import post_fsdp_backward
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import complete_fsdp_unit_backward
 
 
 class TinyModel(nn.Module):
@@ -449,7 +449,7 @@ def test_multiple_backward_calls_match_baseline(distributed_setup):
                     for node, node_inputs in zip(nodes, inputs):
                         losses.append(_forward_backward(module, node_inputs, node, sharded=sharded))
                     if sharded:
-                        post_fsdp_backward(module)
+                        complete_fsdp_unit_backward(module)
             if sharded:
                 context.finish_grad_sync()
             for parameter in module.parameters():
