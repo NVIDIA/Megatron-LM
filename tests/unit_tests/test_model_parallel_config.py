@@ -3,8 +3,11 @@
 import sys
 
 import pytest
+import torch
 
+import megatron.core.transformer.transformer_config as transformer_config_module
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import parse_args, validate_args
 
 
@@ -158,3 +161,71 @@ def test_packed_padding_preserves_sequence_parallel_divisibility(
     else:
         with pytest.raises(AssertionError, match="sequence-parallel TP divisibility"):
             ModelParallelConfig(sequence_parallel=True, **kwargs)
+
+
+def _fixed_p2p_shape_config(config_cls=ModelParallelConfig, **overrides):
+    kwargs = dict(
+        pipeline_p2p_fixed_shape=True,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=2048,
+        pad_packed_seq_alignment="max",
+    )
+    kwargs.update(overrides)
+    return config_cls(**kwargs)
+
+
+@pytest.mark.parametrize("alignment", ["max", 2048])
+def test_pipeline_p2p_fixed_shape_accepts_full_length_padding(alignment):
+    config = _fixed_p2p_shape_config(pad_packed_seq_alignment=alignment)
+
+    assert config.pipeline_p2p_fixed_shape
+    assert config.variable_seq_lengths
+
+
+def test_pipeline_p2p_fixed_shape_requires_sequence_packing():
+    with pytest.raises(ValueError, match="requires a sequence_packing_scheduler"):
+        _fixed_p2p_shape_config(sequence_packing_scheduler=None)
+
+
+@pytest.mark.parametrize("alignment", [None, 128])
+def test_pipeline_p2p_fixed_shape_requires_full_length_padding(alignment):
+    with pytest.raises(ValueError, match="requires pad_packed_seq_alignment='max'"):
+        _fixed_p2p_shape_config(pad_packed_seq_alignment=alignment)
+
+
+def test_pipeline_p2p_fixed_shape_rejects_dynamic_context_parallel():
+    with pytest.raises(ValueError, match="not supported with dynamic_context_parallel"):
+        _fixed_p2p_shape_config(sequence_packing_scheduler=None, dynamic_context_parallel=True)
+
+
+def test_pipeline_p2p_fixed_shape_requires_tp_divisible_length_with_sequence_parallel():
+    with pytest.raises(ValueError, match="divisible by tensor_model_parallel_size"):
+        _fixed_p2p_shape_config(
+            tensor_model_parallel_size=4,
+            sequence_parallel=True,
+            max_seqlen_per_dp_cp_rank=18,
+            pad_packed_seq_alignment=18,
+        )
+
+
+def test_pipeline_p2p_fixed_shape_warns_when_mtp_standalone():
+    with pytest.warns(UserWarning, match="no effect when mtp_standalone"):
+        _fixed_p2p_shape_config(mtp_standalone=True)
+
+
+def test_pipeline_p2p_fixed_shape_warns_for_layout_derived_standalone_mtp(monkeypatch):
+    # The flexible layout derives mtp_standalone after the base config has been validated.
+    monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _: True)
+    with pytest.warns(UserWarning, match="no effect when mtp_standalone"):
+        config = _fixed_p2p_shape_config(
+            TransformerConfig,
+            num_layers=3,
+            hidden_size=64,
+            num_attention_heads=4,
+            pipeline_model_parallel_size=4,
+            pipeline_dtype=torch.bfloat16,
+            pipeline_model_parallel_layout="Et|t|tm|L",
+            mtp_num_layers=1,
+        )
+
+    assert config.mtp_standalone

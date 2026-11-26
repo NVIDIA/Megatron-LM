@@ -3685,9 +3685,13 @@ class TransformerConfig(ModelParallelConfig):
                 self.virtual_pipeline_model_parallel_size = detected_vpp_size
 
             # Check whether the layout is valid.
+            mtp_was_standalone = self.mtp_standalone
             self.mtp_standalone = self.pipeline_model_parallel_layout.validate_layer_layout(
                 num_layers=self.num_layers, mtp_num_layers=self.mtp_num_layers
             )
+            if not mtp_was_standalone:
+                # The base config validated before the layout derived mtp_standalone.
+                self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
 
         # Uneven PP
         elif (

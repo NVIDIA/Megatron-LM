@@ -678,6 +678,70 @@ def test_forward_backward_func_with_interleaving(mocker):
     Utils.destroy_model_parallel()
 
 
+def test_forward_backward_func_with_interleaving_fixed_packed_p2p_shape(mocker):
+    """Packed P2P buffers come from max_seqlen_per_dp_cp_rank without a shape exchange."""
+    from megatron.core.enums import ModelType
+    from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=4,
+        virtual_pipeline_model_parallel_size=2,
+    )
+    try:
+        packed_length, hidden_size = 16, 256
+        mocker.patch.object(
+            P2PCommunicator,
+            "_communicate_shapes",
+            side_effect=AssertionError("pipeline shape exchange should be skipped"),
+        )
+        received_shapes = []
+
+        def forward_step_func(data_iterator, model):
+            def loss_func(output_tensor):
+                return 0, {'loss_reduced': 0}
+
+            return torch.rand(packed_length, 1, hidden_size).cuda(), loss_func
+
+        def set_input_tensor(input_tensor):
+            if isinstance(input_tensor, list):
+                input_tensor = input_tensor[0]
+            if input_tensor is not None:
+                received_shapes.append(tuple(input_tensor.shape))
+
+        model = torch.nn.Linear(4, 1)
+        model.set_input_tensor = set_input_tensor
+        model.model_type = ModelType.encoder_or_decoder
+        config = ModelParallelConfig(
+            pipeline_model_parallel_size=4,
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float,
+            pipeline_p2p_fixed_shape=True,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=packed_length,
+            pad_packed_seq_alignment="max",
+        )
+        config.hidden_size = hidden_size
+        model.config = config
+
+        schedule.get_forward_backward_func()(
+            forward_step_func=forward_step_func,
+            data_iterator=[range(0, 100), range(0, 100)],
+            model=[model, model],
+            num_microbatches=8,
+            # Unrelated to the packed activation on purpose: the fixed packed shape must not
+            # be derived from seq_length or micro_batch_size.
+            seq_length=512,
+            micro_batch_size=8,
+            forward_only=True,
+        )
+
+        assert received_shapes
+        assert set(received_shapes) == {(packed_length, 1, hidden_size)}
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.internal
 def test_forward_backward_func_with_uneven_interleaving(mocker):
     from megatron.core.enums import ModelType

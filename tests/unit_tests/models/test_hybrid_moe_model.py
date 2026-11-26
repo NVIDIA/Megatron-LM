@@ -345,6 +345,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "pipeline_model_parallel_comm_backend": None,
     "pipeline_model_parallel_layout": None,
     "pipeline_model_parallel_size": 1,
+    "pipeline_p2p_fixed_shape": False,
     "qk_clip": False,
     "qk_clip_alpha": 0.5,
     "qk_clip_threshold": 100,
