@@ -1336,6 +1336,21 @@ def _get_train_full_dataset_sample_count(args, dataset_provider):
     return int(total_num_samples)
 
 
+def _finalize_async_saves_at_exit(terminate: bool) -> None:
+    """Blocking-finalize async saves through the checkpoint manager.
+
+    ``initialize_megatron`` starts Megatron's native persistent checkpoint worker regardless of
+    which manager is selected. The default manager closes it in ``finalize_async_saves``; a custom
+    manager owns an independent backend and never touches it, so close the trainer-started native
+    worker here. This is a no-op when the native queue was never created.
+    """
+    get_checkpoint_manager().finalize_async_saves(blocking=True, terminate=terminate)
+    if terminate and get_run_config().checkpoint.custom_manager_class is not None:
+        from megatron.training.async_utils import maybe_finalize_async_save
+
+        maybe_finalize_async_save(blocking=True, terminate=True)
+
+
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -1986,7 +2001,7 @@ def pretrain(
         wandb_writer.finish()
 
     ft_integration.on_checkpointing_start()
-    get_checkpoint_manager().finalize_async_saves(blocking=True, terminate=True)
+    _finalize_async_saves_at_exit(terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
     # The manager is shut down; drop it so a later run in this process builds a fresh one.
     set_checkpoint_manager(None)
@@ -5403,7 +5418,7 @@ def train(
     # async worker (if enabled) if the code is meant to exit and not return from this
     # function.
     with _otel_managed_span('checkpoint', 'megatron.checkpoint.exit_finalize', is_goodput_span=True):
-        get_checkpoint_manager().finalize_async_saves(blocking=True, terminate=should_exit)
+        _finalize_async_saves_at_exit(terminate=should_exit)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
     if cfg.logger.log_energy:

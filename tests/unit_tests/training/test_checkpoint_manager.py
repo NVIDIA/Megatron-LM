@@ -360,3 +360,30 @@ class TestCheckpointConfigValidation:
             CheckpointConfig(custom_manager_class="mypackage.module.Manager").validate()
         finally:
             target_allowlist.remove_prefix("mypackage.")
+
+
+class TestTrainerExitFinalization:
+    """The trainer closes the native worker it starts, even when a custom manager owns the backend."""
+
+    @pytest.mark.parametrize(
+        "custom_class, terminate, native_calls",
+        [
+            ("pkg.Manager", True, 1),  # normal completion / early exit with a custom manager
+            ("pkg.Manager", False, 0),  # exit-less return keeps the worker for reuse
+            (None, True, 0),  # default manager closes the native queue itself
+        ],
+    )
+    def test_native_worker_closed_for_custom_manager(self, custom_class, terminate, native_calls):
+        from megatron.training import training
+
+        manager = Mock()
+        run_config = SimpleNamespace(checkpoint=SimpleNamespace(custom_manager_class=custom_class))
+        with patch.object(training, "get_checkpoint_manager", return_value=manager), patch.object(
+            training, "get_run_config", return_value=run_config
+        ), patch("megatron.training.async_utils.maybe_finalize_async_save") as native:
+            training._finalize_async_saves_at_exit(terminate=terminate)
+
+        manager.finalize_async_saves.assert_called_once_with(blocking=True, terminate=terminate)
+        assert native.call_count == native_calls
+        if native_calls:
+            native.assert_called_once_with(blocking=True, terminate=True)
