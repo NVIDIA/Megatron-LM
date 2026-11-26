@@ -362,3 +362,44 @@ class TestMasterWeightsCheckpoint:
         finally:
             for model in models:
                 model.stop_communication()
+
+    @pytest.mark.parametrize("missing_key", ["model", "exp_avg", "exp_avg_sq", "master_param"])
+    def test_strict_resume_rejects_missing_state(self, tmp_path_dist_ckpt, missing_key):
+        source, source_optimizer = self._build_model_and_optimizer(
+            torch.float32, False, master_weights=missing_key == "master_param"
+        )
+        restored = None
+        try:
+            args = self._checkpoint_args()
+            checkpoint_state = preprocess_fsdp_dtensor_state_dict(
+                args,
+                {
+                    "model": source.state_dict(),
+                    "optimizer": source_optimizer.sharded_param_state_fsdp_dtensor(),
+                },
+                source.module,
+            )
+            if missing_key == "model":
+                name = next(iter(checkpoint_state["model"]))
+                del checkpoint_state["model"][name]
+                missing_fqn = f"model.{name}"
+            else:
+                name = next(iter(checkpoint_state["optimizer"]["state"]))
+                del checkpoint_state["optimizer"]["state"][name][missing_key]
+                missing_fqn = f"optimizer.state.{name}.{missing_key}"
+            self._save_checkpoint(tmp_path_dist_ckpt, checkpoint_state)
+            restored, restored_optimizer = self._build_model_and_optimizer(torch.float32, False)
+            template = {
+                "model": restored.state_dict(),
+                "optimizer": restored_optimizer.sharded_param_state_fsdp_dtensor(is_loading=True),
+                "_model": [restored.module],
+            }
+            with pytest.raises(
+                dcp.CheckpointException,
+                match=f"Missing key in checkpoint state_dict: {missing_fqn}",
+            ):
+                _load_base_checkpoint(str(tmp_path_dist_ckpt), args, sharded_state_dict=template)
+        finally:
+            source.stop_communication()
+            if restored is not None:
+                restored.stop_communication()
