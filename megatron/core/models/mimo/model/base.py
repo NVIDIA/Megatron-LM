@@ -373,7 +373,7 @@ class MimoModel(MegatronModule):
                 )
 
             modality_emb = modality_emb.to(dtype=dtype)
-            token_rows = mask.reshape(-1).nonzero(as_tuple=True)[0]
+            token_rows = mask.flatten().nonzero(as_tuple=True)[0]
             flat_combined_embeddings.index_copy_(0, token_rows, modality_emb)
 
         return combined_embeddings.transpose(0, 1).contiguous()  # [S, B, H]

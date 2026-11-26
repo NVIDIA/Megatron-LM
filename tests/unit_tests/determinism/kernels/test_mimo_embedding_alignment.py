@@ -21,9 +21,7 @@ def test_mimo_embedding_alignment_replays(dtype, precomputed):
         torch.arange(batch_size * seq_length, device="cuda").reshape(batch_size, seq_length) % 3
     )
     masks = {"vision": input_ids == 1, "text": input_ids == 0, "audio": input_ids == 2}
-    token_indices = {
-        name: mask.reshape(-1).nonzero(as_tuple=True)[0] for name, mask in masks.items()
-    }
+    token_indices = {name: mask.flatten().nonzero(as_tuple=True)[0] for name, mask in masks.items()}
     embeddings = {
         name: torch.randn(hidden_dim, indices.numel(), device="cuda", dtype=dtype)
         .t()
