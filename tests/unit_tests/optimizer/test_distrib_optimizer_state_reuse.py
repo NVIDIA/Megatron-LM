@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(
 class _CheckpointModel(torch.nn.Module):
     """Replicated mixed-dtype parameters with nonempty shards at any test world size."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         # Each rank owns at least 1M elements in each dtype buffer, so a duplicate
         # state copy is much larger than the allocation measurement's tolerance.
