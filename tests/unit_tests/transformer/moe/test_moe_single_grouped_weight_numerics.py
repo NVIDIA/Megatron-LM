@@ -242,6 +242,10 @@ class TestMoESingleGroupedWeightNumerics:
             if not hasattr(args, name):
                 raise ValueError(f"Unknown model argument: {name}")
             setattr(args, name, value)
+        if os.environ.get("NVTE_ALLOW_NONDETERMINISTIC_ALGO") == "1":
+            # The test explicitly opts into non-deterministic TE kernels, which
+            # deterministic mode (default) rejects.
+            args.deterministic_mode = False
         validate_args(args)
         set_args(args)
         # Temporary args/config duplication during the training-loop refactor:
