@@ -11,20 +11,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: Create PR to main with cherry-pick from release
 
-on:
-  push:
-    branches:
-      - main
+# Adapted from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53c20f81cb575f19af34ff0ae1749fb13b07999b/src/megatron/bridge/models/common/__init__.py
+# Source license: Apache-2.0.
 
-jobs:
-  cherry-pick:
-    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cherry_pick.yml@0cb71cd98aa47ba338d8e38514387d5ceecfedff # v0.65.9
-    if: github.repository == 'NVIDIA/Megatron-LM'
-    with:
-      target-branches-pattern: 'core_(*dev_)?r[0-9]+\.[0-9]+\.[0-9]+'
-    secrets:
-      PAT: ${{ secrets.PAT }}
-      SLACK_WEBHOOK_ADMIN: ${{ secrets.SLACK_TEAM_GROUP_ID }}
-      SLACK_WEBHOOK: ${{ secrets.SLACK_CI_CHANNEL_WEBHOOK }}
+from megatron.bridge.models.common.base import (
+    MLAModelConfigMixin,
+    ModelConfig,
+    ModelConfigOverrideMixin,
+    deserialize_model_config,
+)
+
+__all__ = [
+    "MLAModelConfigMixin",
+    "ModelConfig",
+    "ModelConfigOverrideMixin",
+    "deserialize_model_config",
+]

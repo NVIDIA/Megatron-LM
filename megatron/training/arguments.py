@@ -1714,11 +1714,8 @@ def validate_args(args, defaults={}):
             'restored by load_state_dict); use tensorwise, mxfp8, blockwise or nvfp4.'
         )
 
+    # The other --logits-save-dir/--logits-load-dir rules live in OfflineDistillationConfig.
     if args.logits_save_dir is not None:
-        assert args.async_save, (
-            '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
-            'Logits are flushed as an async request in the checkpoint queue.'
-        )
         if not args.freeze_all_layers:
             warn_rank_0(
                 '--logits-save-dir without --freeze-all-layers: the LM loss is still computed and '
@@ -1726,10 +1723,6 @@ def validate_args(args, defaults={}):
                 'when dumping logits during active training; for a frozen-teacher dump pass '
                 '--freeze-all-layers.'
             )
-        assert args.rampup_batch_size is None, (
-            '--logits-save-dir does not support --rampup-batch-size: the sample<->iteration '
-            'mapping assumes a fixed global batch size.'
-        )
 
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
@@ -2875,8 +2868,6 @@ def _add_learning_rate_args(parser):
     group.add_argument('--decoupled-min-lr', type=float, default=None,
                        help='Minimum value for learning rate for the input and output layer. The scheduler'
                        'clip values below this threshold')
-    group.add_argument('--freeze-all-layers', action='store_true',
-                       help='Freeze all layers of the model.')
 
     return parser
 

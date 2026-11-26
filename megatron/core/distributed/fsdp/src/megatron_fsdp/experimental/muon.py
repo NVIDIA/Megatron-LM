@@ -24,18 +24,21 @@ from emerging_optimizers import utils as eo_utils
 from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 
 from .dbuffer import DBuffer
-from .gather_scatter import gather, scatter
+from .gather_scatter import gather, get_sorted_rank_ranges, scatter
 from .owner_planning import assign_owner_work
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
+from .range import Range
 
 
 @dataclass(frozen=True)
 class _FsdpGroupAssignment:
-    """An FSDP group and its cached optimizer-group and owner-rank assignments."""
+    """An FSDP group and its cached optimizer-group and owner-rank assignments and rank ranges."""
 
     fsdp_group: FsdpParameterGroup
     tensor_to_optimizer_group_index: dict[int, int]
     tensor_to_owner_rank: dict[int, int]
+    # The layout is fixed, so the ranges are computed once instead of on every gather and scatter.
+    rank_ranges: dict[int, Range]
 
 
 class _PipelineStage(Enum):
@@ -114,7 +117,10 @@ class _GroupPipeline:
             if owner == group.mesh.get_rank()
         }
         self._gather_works = gather(
-            self._momentum_inputs, self._full_inputs, tensor_to_owner=owners
+            self._momentum_inputs,
+            self._full_inputs,
+            tensor_to_owner=owners,
+            rank_ranges=self.assignment.rank_ranges,
         )
         self._stage = _PipelineStage.GATHER_POSTED
 
@@ -140,7 +146,10 @@ class _GroupPipeline:
             buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
         )
         self._scatter_works = scatter(
-            self._full_updates, self._local_updates, tensor_to_owner=self._active_owners()
+            self._full_updates,
+            self._local_updates,
+            tensor_to_owner=self._active_owners(),
+            rank_ranges=self.assignment.rank_ranges,
         )
         self._stage = _PipelineStage.SCATTER_POSTED
 
@@ -251,6 +260,7 @@ class FsdpMuon(Muon):
                         if fp.sharded in param_to_optimizer_group_index
                     },
                     tensor_to_owner_rank=tensor_to_owner_rank,
+                    rank_ranges=get_sorted_rank_ranges(fsdp_group.main_weight),
                 )
             )
         self._validate_parameter_groups()

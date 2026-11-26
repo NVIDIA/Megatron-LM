@@ -47,6 +47,8 @@ class RuntimePolicy:
     registration order. ``RECORDED`` gathers parameters on demand and records
     module calls until the first ``post_backward()``. Subsequent passes must
     repeat the complete sequence consistently across data-parallel ranks.
+    The first iteration must be a training forward/backward pass.
+    Evaluation mode is treated as forward-only and does not replay the training trace.
     Recording currently requires the ordinary module hooks; combined 1F1B
     bypasses them. Discard the context if the recorded pass raises.
     """
