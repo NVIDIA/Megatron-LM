@@ -68,11 +68,9 @@ from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
-    _missing_param_group_message,
     _zero_grad_group_helper,
     copy_optimizer_param_metadata,
-    find_saved_param_group,
-    get_param_group_identifier_tuple,
+    match_param_groups,
 )
 from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
@@ -1201,8 +1199,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         return state_dict
 
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, *, override_lr: bool = False):
         """Load the state dict.
+
+        With override_lr, retain runtime LR fields and require all candidate saved groups
+        to agree on the remaining metadata. Tensor restoration below is unchanged.
 
         As detailed in state_dict(), the state dict contains all non-
         parameter-related variables. This method is notably longer than
@@ -1231,6 +1232,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             list.
         """
         if self.ddp_config.use_megatron_fsdp:
+            if override_lr:
+                raise NotImplementedError("Group LR reconciliation is not supported with FSDP.")
             # When using Megatron-FSDP, directly load the optimizer state
             # into the wrapped optimizer.
             if "param_to_group_meta" in state_dict:
@@ -1255,30 +1258,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Construction order isn't part of the checkpoint, so we match by a tuple of
         # per-group config (``param_group_identifier_keys``) rather than by position.
 
-        def make_needed_groups(param_group):
-            return get_param_group_identifier_tuple(param_group)
-
-        # Duplicate identifiers here silently clobber: two saved groups with the same tuple
-        # collapse to whichever was inserted last, and one current group inherits the wrong
-        # override state (``max_lr`` etc.). Params are unaffected — they come from the
-        # inner optimizer below — but the next step runs at the wrong LR / WD. Adding the
-        # distinguishing field to ``param_group_identifier_keys`` is the fix. See
-        # ``test_filter_reorder_distinguishes_groups_by_max_lr``.
-        param_groups_map = {}
-        for param_group in state_dict["optimizer"]["param_groups"]:
-            needed_groups = make_needed_groups(param_group)
-            param_groups_map[needed_groups] = param_group
         inner_state_dict = self.optimizer.state_dict()
-        state_dict_param_groups = []
-        for inner_param_group in inner_state_dict["param_groups"]:
-            needed_groups = make_needed_groups(inner_param_group)
-            # Grandfathers checkpoints written before the DSA indexer split
-            saved_param_group = find_saved_param_group(needed_groups, param_groups_map)
-            if saved_param_group is None:
-                raise ValueError(_missing_param_group_message(needed_groups, param_groups_map))
-            state_dict_param_groups.append(
-                {**saved_param_group, "params": inner_param_group['params']}
-            )
+        matched_groups = match_param_groups(
+            inner_state_dict["param_groups"],
+            state_dict["optimizer"]["param_groups"],
+            override_lr=override_lr,
+        )
+        state_dict_param_groups = [
+            {**saved, "params": current["params"]}
+            for saved, current in zip(matched_groups, inner_state_dict["param_groups"])
+        ]
 
         # Allocate or retrieve optimizer state (i.e., tensors).
         if len(self.optimizer.state) == 0:
@@ -1289,7 +1278,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             #   empty tensors (i.e., torch.empty), which in turn reduces memory
             #   fragmentation.
             # - Real data is overwritten during load_parameter_state().
-            state_dict_state = []
+            state_items = []
             for gbuf_range_maps in self.gbuf_ranges:
                 for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
                     for gbuf_range_map in gbuf_range_map_for_all_buckets:
@@ -1321,11 +1310,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                     tensors["master_param"] = init_shard(
                                         self.config.main_params_dtype
                                     )
-                            state_dict_state.append((state_order, tensors))
+                            state_items.append((state_order, tensors))
 
             # Sort by state order (see method docstring for details).
-            state_dict_state.sort(key=lambda s: s[0])
-            state_dict_state = {s[0]: s[1] for s in state_dict_state}
+            state_items.sort(key=lambda s: s[0])
+            state_dict_state = {s[0]: s[1] for s in state_items}
 
         else:
             # Retrieve existing optimizer state.

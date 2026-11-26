@@ -1227,7 +1227,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
     # fp32_from_fp16_params is list, each sub list could be empty if group is empty
     # this breaks dist checkpointing assumption since extract_sharded_base drop list structure
     # for now, we convert it to dict with index as key and convert back in load_state_dict
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, *, override_lr: bool = False):
+        if override_lr:
+            raise NotImplementedError(
+                "LR reconciliation is not supported by the layer-wise optimizer."
+            )
         if len(self.chained_optimizers) == 1:
             wrapped_state_dict = {1: state_dict}
         else:

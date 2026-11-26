@@ -178,7 +178,7 @@ class MimoOptimizer(MegatronOptimizer):
             for name, info in self.module_infos.items()
         }
 
-    def load_state_dict(self, state_dict: Dict):
+    def load_state_dict(self, state_dict: Dict, *, override_lr: bool = False):
         """Load per-module optimizer state dicts.
 
         Reassembles param_groups and grad_scaler that were extracted and saved
@@ -197,7 +197,8 @@ class MimoOptimizer(MegatronOptimizer):
                 _restore_param_state_sharding_type(sub_sd)
                 _restore_grad_scaler(sub_sd)
 
-            info.optimizer.load_state_dict(module_sd)
+            load_kwargs = {"override_lr": True} if override_lr else {}
+            info.optimizer.load_state_dict(module_sd, **load_kwargs)
 
     def sharded_state_dict(self, model_sharded_state_dict, is_loading: bool = False, **kwargs):
         """Build sharded state dict, routing param_groups and grad_scaler

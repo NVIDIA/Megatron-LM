@@ -3758,6 +3758,14 @@ def load_checkpoint(
         and load_optim
     ):
         try:
+            # Only the standard distributed optimizer separates tensor restoration from
+            # group metadata. Other backends retain their existing resume behavior.
+            override_distributed_optimizer_lr = (
+                cfg.scheduler.override_opt_param_scheduler
+                and cfg.optimizer.use_distributed_optimizer
+                and not cfg.optimizer.use_layer_wise_distributed_optimizer
+                and not cfg.ddp.use_megatron_fsdp
+            )
             # Load state dict.
             if (
                 getattr(cfg.optimizer, 'use_layer_wise_distributed_optimizer', False)
@@ -3774,13 +3782,16 @@ def load_checkpoint(
                 and optimizer is not None
                 and not optimizer.is_stub_optimizer
             ):
-                optimizer.load_state_dict(state_dict['optimizer'])
+                load_kwargs = {"override_lr": True} if override_distributed_optimizer_lr else {}
+                optimizer.load_state_dict(state_dict['optimizer'], **load_kwargs)
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
             is_torch_dist = ckpt_format == 'torch_dist'
             if (
                 cfg.optimizer.use_distributed_optimizer
+                and optimizer is not None
+                and not optimizer.is_stub_optimizer
                 and not is_torch_dist
                 and ckpt_format not in ['torch_dcp', 'fsdp_dtensor']
             ):
