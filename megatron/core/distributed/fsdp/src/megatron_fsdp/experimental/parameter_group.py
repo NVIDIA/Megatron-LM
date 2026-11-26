@@ -658,6 +658,7 @@ class FsdpParameterGroup:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
 
         has_sharded_grads = self._has_sharded_grads()
+        needs_install = not has_sharded_grads or self._main_grad_is_stale
         self._clear_stale_main_grad()
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             grad = fsdp_parameter.unsharded.grad
@@ -670,7 +671,8 @@ class FsdpParameterGroup:
                 destination.copy_(grad)
                 if self.grad_scale != 1:
                     destination.mul_(self.grad_scale)
-        self._install_sharded_grads(self.main_grad)
+        if needs_install:
+            self._install_sharded_grads(self.main_grad)
 
     def _has_sharded_grads(self) -> bool:
         """Whether installed .grad views select accumulation instead of overwrite.
@@ -719,6 +721,7 @@ class FsdpParameterGroup:
         assert self.main_grad is not None
 
         has_sharded_grads = self._has_sharded_grads()
+        needs_install = not has_sharded_grads or self._main_grad_is_stale
         self._clear_stale_main_grad()
         if can_reduce_into_main_grad := (
             not has_sharded_grads and partial_grad.dtype == self.main_grad.dtype
@@ -739,7 +742,8 @@ class FsdpParameterGroup:
             else:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
-        self._install_sharded_grads(self.main_grad)
+        if needs_install:
+            self._install_sharded_grads(self.main_grad)
 
     def reduce_outer_gradients(self) -> None:
         """Finalize the deferred DP-outer reduction into the optimizer-layout view.
