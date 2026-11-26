@@ -28,11 +28,13 @@ non-distributed components: SWiGLU key detection, SWiGLU regex splitting,
 MTP key renaming, and --swiglu-modules prefix filtering.
 """
 
+import copy
 import re
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 
 from megatron.core.dist_checkpointing.core import CheckpointingException
 from megatron.core.dist_checkpointing.validation import StrictHandling
@@ -63,6 +65,10 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     match_mla_fused_down_proj_key,
     rename_mtp_inner_layer_keys,
     validate_fsdp_dtensor_model_load,
+)
+from megatron.training.checkpointing import (
+    _load_base_checkpoint,
+    preprocess_fsdp_dtensor_state_dict,
 )
 
 
@@ -1412,44 +1418,24 @@ class TestPipelineLayerNames:
         assert handle_pipeline_layers_in_state_dict(_wrapped_chunk(1), state_dict) == state_dict
 
 
-def test_loader_returns_virtual_chunk_sections(run_config, tmp_path_dist_ckpt):
+def test_loader_returns_virtual_chunk_sections(run_config, tmp_path):
     """The fsdp_dtensor loader hands each virtual chunk its own section under local names."""
-    import torch.distributed.checkpoint as dcp
+    torch.manual_seed(0)
+    chunks = [_wrapped_chunk(3), _wrapped_chunk(7)]  # Local layer 0 is global layer 2 and 6.
+    saved = [copy.deepcopy(chunk.state_dict()) for chunk in chunks]
+    state = {f"model{i}": chunk.state_dict() for i, chunk in enumerate(chunks)}
+    state = preprocess_fsdp_dtensor_state_dict(run_config.model.transformer, state, chunks)
+    dcp.save(state, checkpoint_id=tmp_path / "iter_0000001")
+    (tmp_path / "latest_checkpointed_iteration.txt").write_text("1")
 
-    from megatron.training.checkpointing import (
-        _load_base_checkpoint,
-        preprocess_fsdp_dtensor_state_dict,
-    )
-    from tests.unit_tests.dist_checkpointing import TempNamedDir
-
-    # Two chunks whose local layer 0 is global layer 2 and 6.
     chunks = [_wrapped_chunk(3), _wrapped_chunk(7)]
-    sections = ["model0", "model1"]
-    with torch.no_grad():
-        for value, chunk in enumerate(chunks, start=1):
-            chunk.module.decoder.layers[0].inner_layer.weight.fill_(value)
-    config = run_config.model.transformer
-    with TempNamedDir(tmp_path_dist_ckpt / "vpp_loader_sections", sync=True) as load_dir:
-        state = {s: c.state_dict() for s, c in zip(sections, chunks)}
-        dcp.save(
-            preprocess_fsdp_dtensor_state_dict(config, state, chunks),
-            checkpoint_id=load_dir / "iter_0000001",
-        )
-        (load_dir / "latest_checkpointed_iteration.txt").write_text("1")
-        with torch.no_grad():
-            for chunk in chunks:
-                chunk.module.decoder.layers[0].inner_layer.weight.zero_()
-
-        state = {s: c.state_dict() for s, c in zip(sections, chunks)}
-        state, *_ = _load_base_checkpoint(
-            load_dir,
-            args=SimpleNamespace(),
-            sharded_state_dict={**state, "_model": chunks},
-            use_megatron_fsdp=True,
-        )
-
-    for value, (section, chunk) in enumerate(zip(sections, chunks), start=1):
-        chunk.load_state_dict(state[section], strict=True)
-        assert torch.equal(
-            chunk.module.decoder.layers[0].inner_layer.weight, torch.full((2, 2), float(value))
-        )
+    state = {f"model{i}": chunk.state_dict() for i, chunk in enumerate(chunks)}
+    state, *_ = _load_base_checkpoint(
+        tmp_path,
+        SimpleNamespace(),
+        sharded_state_dict={**state, "_model": chunks},
+        use_megatron_fsdp=True,
+    )
+    for i, chunk in enumerate(chunks):
+        chunk.load_state_dict(state[f"model{i}"])
+        torch.testing.assert_close(chunk.state_dict(), saved[i])
