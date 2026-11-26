@@ -52,10 +52,11 @@ from megatron.training import (
 from megatron.training.argument_utils import (
     gpt_data_config_from_args,
     hybrid_config_from_args,
+    offline_distillation_config_from_args,
     pretrain_cfg_container_from_args,
-    root_cfg_container_from_args,
 )
-from megatron.training.arguments import parse_and_validate_args
+from megatron.training.arguments import add_logits_distillation_args, parse_and_validate_args
+from megatron.training.config import AlgorithmConfigContainer, RootConfigContainer
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.datasets.utils import get_dataset_input_length
 from megatron.training.global_vars import (
@@ -488,8 +489,12 @@ if __name__ == "__main__":
     # Optionally enable inprocess restart on pretrain
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
+    def _add_entry_args(parser):
+        parser = add_logits_distillation_args(parser)
+        return add_modelopt_args(parser) if has_nvidia_modelopt else parser
+
     args = parse_and_validate_args(
-        extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
+        extra_args_provider=_add_entry_args,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
     model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
@@ -500,7 +505,14 @@ if __name__ == "__main__":
     if has_nvidia_modelopt and should_use_modelopt_config(args):
         apply_modelopt_model_config(full_config.model, args)
         distillation = distillation_config_from_args(args, full_config.model)
-    set_run_config(root_cfg_container_from_args(args, full_config, distillation=distillation))
+    offline_distillation = offline_distillation_config_from_args(args)
+    # The run's root container; it has an algorithm member only when the run distills.
+    algorithm = None
+    if distillation is not None or offline_distillation is not None:
+        algorithm = AlgorithmConfigContainer(
+            distillation=distillation, offline_distillation=offline_distillation
+        )
+    set_run_config(RootConfigContainer(training=full_config, algorithm=algorithm))
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

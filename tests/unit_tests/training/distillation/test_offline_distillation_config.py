@@ -9,7 +9,7 @@ import pytest
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.training.argument_utils import offline_distillation_config_from_args
-from megatron.training.arguments import _add_logits_distillation_args
+from megatron.training.arguments import add_logits_distillation_args
 from megatron.training.config import (
     LogitsLoadConfig,
     LogitsSaveConfig,
@@ -23,7 +23,9 @@ from megatron.training.distillation import utils
 
 
 def _cli_config(*flags):
-    parser = _add_logits_distillation_args(ArgumentParser())
+    parser = add_logits_distillation_args(ArgumentParser())
+    # The saving phase reads the common --freeze-all-layers flag for its warning.
+    parser.set_defaults(freeze_all_layers=True)
     return offline_distillation_config_from_args(parser.parse_args(flags))
 
 

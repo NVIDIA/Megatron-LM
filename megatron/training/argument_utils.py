@@ -31,7 +31,6 @@ from megatron.core.transformer import TransformerConfig, WideResidualConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.core.tuning import AutotunePolicy
 from megatron.training.config import (
-    AlgorithmConfigContainer,
     CheckpointConfig,
     DataConfig,
     DataloaderConfig,
@@ -49,7 +48,6 @@ from megatron.training.config import (
     ProfilingConfig,
     RerunStateMachineConfig,
     RNGConfig,
-    RootConfigContainer,
     SchedulerConfig,
     StragglerDetectionConfig,
     TokenizerConfig,
@@ -60,7 +58,6 @@ from megatron.training.config.dataset_config import dataset_type_from_family
 from megatron.training.datasets.sft_dataset import SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
-    DistillationConfig,
     GPTModelConfig,
     HybridModelConfig,
     LLaVAModelConfig,
@@ -1224,7 +1221,7 @@ def offline_distillation_config_from_args(args: Namespace) -> OfflineDistillatio
     """Translate the existing logits CLI flags once, at the run-config boundary."""
     teacher_save = None
     student_load = None
-    if getattr(args, "logits_save_dir", None) is not None:
+    if args.logits_save_dir is not None:
         teacher_save = LogitsSaveConfig(
             directory=args.logits_save_dir,
             top_k=args.logits_save_top_k,
@@ -1232,7 +1229,14 @@ def offline_distillation_config_from_args(args: Namespace) -> OfflineDistillatio
             min_k=args.logits_save_top_p_min_k,
             dtype=args.logits_save_dtype,
         )
-    if getattr(args, "logits_load_dir", None) is not None:
+        if not args.freeze_all_layers:
+            warn_rank_0(
+                '--logits-save-dir without --freeze-all-layers: the LM loss is still computed and '
+                'gradients will update the model while logits are dumped. This is intended only '
+                'when dumping logits during active training; for a frozen-teacher dump pass '
+                '--freeze-all-layers.'
+            )
+    if args.logits_load_dir is not None:
         student_load = LogitsLoadConfig(
             directory=args.logits_load_dir,
             loss_alpha=args.logits_load_kd_loss_alpha,
@@ -1301,23 +1305,6 @@ def pretrain_cfg_container_from_args(
     )
 
     return cfg
-
-
-def root_cfg_container_from_args(
-    args: Namespace,
-    pretrain: PretrainConfigContainer,
-    *,
-    distillation: DistillationConfig | None = None,
-) -> RootConfigContainer:
-    """Compose a training run's root container: `pretrain` and its algorithm sections, the
-    offline distillation the common arguments configure and the entry point's `distillation`."""
-    offline_distillation = offline_distillation_config_from_args(args)
-    algorithm = None
-    if distillation is not None or offline_distillation is not None:
-        algorithm = AlgorithmConfigContainer(
-            distillation=distillation, offline_distillation=offline_distillation
-        )
-    return RootConfigContainer(training=pretrain, algorithm=algorithm)
 
 
 def inference_cfg_from_args(args: Namespace) -> InferenceSetupConfig:

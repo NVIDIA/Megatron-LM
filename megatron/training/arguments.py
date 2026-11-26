@@ -70,7 +70,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
     parser = _add_logging_args(parser)
-    parser = _add_logits_distillation_args(parser)
     parser = _add_straggler_detector_args(parser)
     parser = _add_workload_inspector_server_args(parser)
     parser = _add_inference_args(parser)
@@ -1706,16 +1705,6 @@ def validate_args(args, defaults={}):
             '--stream-ckpt-dequant does not support --fp8-recipe delayed (its scale is only '
             'restored by load_state_dict); use tensorwise, mxfp8, blockwise or nvfp4.'
         )
-
-    # The other --logits-save-dir/--logits-load-dir rules live in OfflineDistillationConfig.
-    if args.logits_save_dir is not None:
-        if not args.freeze_all_layers:
-            warn_rank_0(
-                '--logits-save-dir without --freeze-all-layers: the LM loss is still computed and '
-                'gradients will update the model while logits are dumped. This is intended only '
-                'when dumping logits during active training; for a frozen-teacher dump pass '
-                '--freeze-all-layers.'
-            )
 
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
@@ -3662,7 +3651,7 @@ def _add_varlen_dataset_args(parser):
                        'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.')
     return parser
 
-def _add_logits_distillation_args(parser):
+def add_logits_distillation_args(parser):
     group = parser.add_argument_group(title='Logits Distillation')
     # -- Teacher saving --
     group.add_argument('--logits-save-dir', type=str, default=None,

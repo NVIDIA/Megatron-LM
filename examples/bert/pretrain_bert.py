@@ -17,7 +17,6 @@ from megatron.training import pretrain
 from megatron.training.utils import average_losses_across_data_parallel_group
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.argument_utils import root_cfg_container_from_args
 from megatron.training.argument_utils import model_config_from_args
 from megatron.training.models import BertModelConfig
 from megatron.training.vocab_utils import model_vocab_size
@@ -197,7 +196,7 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
-    set_run_config(root_cfg_container_from_args(args, full_config))
+    set_run_config(full_config)
     pretrain(full_config, train_valid_test_datasets_provider,
              ModelType.encoder_or_decoder,
              forward_step, model_provider)

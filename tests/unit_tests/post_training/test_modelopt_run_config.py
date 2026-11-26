@@ -11,8 +11,8 @@ from megatron.post_training import utils as modelopt_utils
 from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
-    root_cfg_container_from_args,
 )
+from megatron.training.config import AlgorithmConfigContainer, RootConfigContainer
 from megatron.training.config.instantiate_utils import InstantiationMode
 from megatron.training.models.gpt import GPTModelBuilder
 from megatron.training.models.hybrid import HybridModelBuilder
@@ -80,10 +80,10 @@ def test_whole_run_yaml_roundtrip(tmp_path, hybrid, training, kd):
     model = mc.modelopt_model_config_from_args(args)
     if training:
         # The training run's whole document is its root container's.
-        cfg = root_cfg_container_from_args(
-            args,
-            pretrain_cfg_container_from_args(args, model),
-            distillation=mc.distillation_config_from_args(args, model),
+        distillation = mc.distillation_config_from_args(args, model)
+        cfg = RootConfigContainer(
+            training=pretrain_cfg_container_from_args(args, model),
+            algorithm=None if not kd else AlgorithmConfigContainer(distillation=distillation),
         )
     else:
         cfg = mc.modelopt_inference_config_from_args(args)
@@ -137,10 +137,11 @@ def _kd_run(tmp_path):
     """A distillation run's root container, as the entry points compose it from the CLI."""
     args = make_modelopt_test_args(export_kd_teacher_load=str(tmp_path))
     model = mc.modelopt_model_config_from_args(args)
-    return root_cfg_container_from_args(
-        args,
-        pretrain_cfg_container_from_args(args, model),
-        distillation=mc.distillation_config_from_args(args, model),
+    return RootConfigContainer(
+        training=pretrain_cfg_container_from_args(args, model),
+        algorithm=AlgorithmConfigContainer(
+            distillation=mc.distillation_config_from_args(args, model)
+        ),
     )
 
 

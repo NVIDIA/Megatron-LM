@@ -51,9 +51,9 @@ from megatron.training.argument_utils import (
     gpt_data_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
-    root_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.config import AlgorithmConfigContainer, RootConfigContainer
 from megatron.training.datasets.providers import build_gpt_datasets
 from megatron.training.datasets.utils import get_dataset_input_length
 from megatron.training.global_vars import (
@@ -594,7 +594,10 @@ if __name__ == "__main__":
         distillation = distillation_config_from_args(
             args, apply_modelopt_model_config(hybrid_config_from_args(args), args)
         )
-    set_run_config(root_cfg_container_from_args(args, full_config, distillation=distillation))
+    algorithm = None
+    if distillation is not None:
+        algorithm = AlgorithmConfigContainer(distillation=distillation)
+    set_run_config(RootConfigContainer(training=full_config, algorithm=algorithm))
     pretrain(full_config,
              train_valid_test_datasets_provider,
              ModelType.encoder_or_decoder,

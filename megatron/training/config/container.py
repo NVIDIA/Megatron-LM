@@ -1180,10 +1180,10 @@ class AlgorithmConfigContainer(ConfigContainerBase):
     """The RL loop's section; `None` for a run without RL."""
 
     distillation: DistillationConfig | None = None
-    """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
+    """ModelOpt knowledge distillation (teacher and loss). `None` disables it."""
 
     offline_distillation: OfflineDistillationConfig | None = None
-    """Offline logits KD: exactly one of teacher_save or student_load. None disables it."""
+    """Offline logits KD: exactly one of teacher_save or student_load. `None` disables it."""
 
 
 @dataclass(kw_only=True)

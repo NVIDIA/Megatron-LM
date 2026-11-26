@@ -92,9 +92,11 @@ training recipe. Validation checks a temporary copy; finalization updates the ru
 config and warns about settings it disables.
 
 The existing `--logits-save-*`, `--logits-load-*`, and `--freeze-all-layers` CLI flags
-remain supported. They populate these config sections once; the saver, reader, and loss
-then use the active run config rather than the CLI namespace. Dataset hashes and the
-on-disk cache format are unchanged, so existing v1 and v2 teacher caches remain readable.
+remain supported. `pretrain_gpt.py` and `pretrain_hybrid.py` register the `--logits-*` flags;
+other entry points do not accept them. The flags populate these config sections once; the
+saver, reader, and loss then use the active run config rather than the CLI namespace. Dataset
+hashes and the on-disk cache format are unchanged, so existing v1 and v2 teacher caches remain
+readable.
 
 ## How It Works
 
