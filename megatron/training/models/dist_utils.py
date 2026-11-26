@@ -38,7 +38,11 @@ try:
 except ImportError:
     correct_amax_history_if_needed = None
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
+    RuntimePolicy,
+    fully_shard_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +62,7 @@ def unimodal_build_distributed_models(
     model_type: ModelType = ModelType.encoder_or_decoder,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    device: torch.device | str | None = None,
 ) -> list[MegatronModule]:
     """Build model stages and wrap for distributed training.
 
@@ -82,6 +87,7 @@ def unimodal_build_distributed_models(
         use_torch_fsdp2: Whether to use Torch FSDP 2.0.
         wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
         data_parallel_random_init: Whether to broadcast parameters from data-parallel rank 0.
+        device: Explicit final device. None preserves the default placement policy.
         mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
             Pass ``None`` to skip.
         pre_wrap_hook: Hook applied to the model stage list before any wrapping.
@@ -127,6 +133,7 @@ def unimodal_build_distributed_models(
         mixed_precision_wrapper=mixed_precision_wrapper,
         use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
         use_layer_wise_param_layout=use_layer_wise_param_layout,
+        device=device,
     )
 
 
@@ -143,6 +150,7 @@ def prepare_existing_model_chunks_for_distributed_training(
     mixed_precision_wrapper: Callable[[Any, MegatronModule], MegatronModule] | None = Float16Module,
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
+    device: torch.device | str | None = None,
 ) -> list[MegatronModule]:
     """Apply the shared post-build distributed lifecycle to already-built model chunks.
 
@@ -159,6 +167,7 @@ def prepare_existing_model_chunks_for_distributed_training(
         use_torch_fsdp2: Whether to use Torch FSDP 2.0.
         wrap_with_ddp: Set to False to skip the DDP/FSDP wrapper.
         data_parallel_random_init: Whether to broadcast parameters from data-parallel rank 0.
+        device: Explicit final device. None preserves the default placement policy.
         mixed_precision_wrapper: Mixed precision wrapper applied per model stage, e.g. ``Float16Module``.
             Pass ``None`` to skip.
         use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
@@ -187,16 +196,23 @@ def prepare_existing_model_chunks_for_distributed_training(
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
     use_cpu_initialization = transformer_config.use_cpu_initialization
-    if not use_torch_fsdp2 and not use_cpu_initialization and not init_model_with_meta_device:
-        for model_module in model_list:
-            model_module.cuda(torch.cuda.current_device())
+    if device is not None and (use_torch_fsdp2 or use_megatron_fsdp):
+        raise ValueError("Explicit device placement is not supported with FSDP-managed placement.")
+    target_device = torch.device(device) if device is not None else torch.device("cuda")
+    if not use_torch_fsdp2 and not init_model_with_meta_device:
+        if device is not None or not use_cpu_initialization:
+            for model_module in model_list:
+                if device is None:
+                    model_module.cuda(torch.cuda.current_device())
+                else:
+                    model_module.to(target_device)
 
     model_list = _wrap_with_mp_wrapper(model_list, transformer_config, mixed_precision_wrapper)
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
     if init_model_with_meta_device and not use_torch_fsdp2 and not use_megatron_fsdp:
         model_list = [
-            to_empty_if_meta_device(model_module, device=torch.device("cuda"))
+            to_empty_if_meta_device(model_module, device=target_device)
             for model_module in model_list
         ]
 
@@ -310,22 +326,10 @@ def _ddp_wrap(
 
 
     if not use_torch_fsdp2:
-        if ddp_config.num_buckets is not None:
-            num_parameters = sum(
-                [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
-            )
-            ddp_config.bucket_size = num_parameters // ddp_config.num_buckets
-
-        # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
-        # If bucket_size is not provided as an input, use sane default.
-        # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
-        # ring-reduce implementations are large enough to remain bandwidth-bound rather than
-        # latency-bound.
-        if ddp_config.bucket_size is None:
-            ddp_config.bucket_size = max(40000000, 1000000 * pg_collection.dp_cp.size())
-        # Set bucket_size to infinity if overlap_grad_reduce is False.
-        if not ddp_config.overlap_grad_reduce:
-            ddp_config.bucket_size = None
+        num_parameters = sum(p.nelement() for chunk in model for p in chunk.parameters())
+        ddp_config.resolve_bucket_size(
+            num_parameters=num_parameters, data_parallel_size=pg_collection.dp_cp.size()
+        )
 
     # Argument validation converts --use-distributed-optimizer into
     # use_layer_wise_distributed_optimizer and clears the original, so re-enable it here:
@@ -348,8 +352,8 @@ def _ddp_wrap(
 
     cuda_graph_impl = get_model_config(model[0]).cuda_graph_impl
     current_stream = torch.cuda.current_stream()
-    if cuda_graph_impl == "full_iteration":
-        # DDP initialization must use the full-iteration capture stream so its retained
+    if cuda_graph_impl in ("full_iteration", "local"):
+        # DDP initialization must use the CUDA graph capture stream so its retained
         # AccumulateGrad nodes do not reference a different, non-capturing stream.
         ddp_stream = get_shared_capture_stream()
     elif cuda_graph_impl == "none":
@@ -384,7 +388,14 @@ def _ddp_wrap(
             DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
         ) and ddp_config.megatron_fsdp_version == 2
         construction_context = (
-            fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True)
+            fully_shard_context(
+                FsdpContext(
+                    runtime_policy=RuntimePolicy(
+                        use_symmetric_memory=ddp_config.nccl_ub,
+                        overlap_outer_communication=ddp_config.overlap_outer_communication,
+                    )
+                )
+            )
             if is_mfsdp_v2
             else nullcontext()
         )

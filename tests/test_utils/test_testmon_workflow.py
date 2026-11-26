@@ -53,29 +53,22 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
         pytest.skip("Workflow shell validation requires jq")
     binaries = tmp_path / "bin"
     binaries.mkdir()
-    # CI provides yq. Use PyYAML for that extraction locally and execute the
-    # actual producer/build shell and jq programs unchanged.
+    # CI provides yq. Parse YAML locally and execute the workflow query with jq.
     yq = binaries / "yq"
     yq.write_text(
         f"#!{sys.executable}\n"
-        "import json, sys, yaml\n"
+        "import json, subprocess, sys, yaml\n"
         "assert sys.argv[1:3] == ['-o', 'json']\n"
-        "if len(sys.argv) == 5:\n"
-        "    assert sys.argv[3] == '[.products[].test_case[]]'\n"
-        "else:\n"
-        "    assert sys.argv[3] == "
-        "'[.products[].test_case[] | { \"bucket\": .}] | sort_by(.model, .test_case)'\n"
         "with open(sys.argv[4]) if len(sys.argv) == 5 else sys.stdin as stream:\n"
         "    recipe = yaml.safe_load(stream)\n"
-        "cases = [case for product in recipe['products'] for case in product['test_case']]\n"
-        "print(json.dumps(cases if len(sys.argv) == 5 else [{'bucket': case} for case in cases]))\n"
+        "subprocess.run(['jq', sys.argv[3]], input=json.dumps(recipe), text=True, check=True)\n"
     )
     yq.chmod(0o755)
     for platform in ("h100", "gb200"):
         relative = Path("tests/test_utils/recipes") / platform / "unit-tests.yaml"
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True)
-        destination.symlink_to(ROOT / relative)
+        shutil.copyfile(ROOT / relative, destination)
     return {"PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}"}
 
 
@@ -138,12 +131,41 @@ def test_producer_consumes_the_actual_build_matrix(
                 / "unit-tests.yaml"
             ).read_text()
         )
-        buckets = [case for product in recipe["products"] for case in product["test_case"]]
+        buckets = [
+            case
+            for product in recipe["products"]
+            if product.get("testmon") is not False
+            for case in product["test_case"]
+        ]
         assert [entry["bucket"] for entry in entries] == buckets
         assert all(
             entry["runner"] == runner and entry["image"] == f"{registry}/megatron-lm:{sha}-{cloud}"
             for entry in entries
         )
+
+
+def test_producer_filters_recipe_opt_out(tmp_path, shell_environment):
+    recipe = tmp_path / "tests/test_utils/recipes/h100/unit-tests.yaml"
+    producer = _step("populate-build-cache.yml", "parse-unit-tests", "matrix")
+    environment = {
+        **shell_environment,
+        "BUILDS": json.dumps(
+            {"include": [{"cloud": "aws-h100", "registry": "test", "runner": "h100"}]}
+        ),
+        "SOURCE_SHA": "a" * 40,
+    }
+    products = [
+        {"test_case": ["default.py"]},
+        {"test_case": ["enabled.py"], "testmon": True},
+        {"test_case": ["disabled.py"], "testmon": False},
+    ]
+    for expected_buckets in (["default.py", "enabled.py"], []):
+        recipe.write_text(json.dumps({"products": products}))
+        result, outputs = _run(producer["run"], tmp_path, environment)
+        assert result.returncode == 0, result.stderr
+        assert [entry["bucket"] for entry in json.loads(outputs["matrix"])] == expected_buckets
+        for product in products:
+            product["testmon"] = False
 
 
 def test_producer_rejects_an_unsupported_built_platform(
@@ -205,7 +227,12 @@ def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
         recipe = yaml.safe_load(
             (ROOT / "tests/test_utils/recipes" / bucket_file / "unit-tests.yaml").read_text()
         )
-        expected_buckets = [case for product in recipe["products"] for case in product["test_case"]]
+        expected_buckets = [
+            case
+            for product in recipe["products"]
+            if product.get("testmon") is not False
+            for case in product["test_case"]
+        ]
         entries = [entry for entry in matrix if entry["platform"] == platform]
         assert [entry["bucket"] for entry in entries] == expected_buckets
         assert all(
@@ -496,6 +523,167 @@ def _run_configure(
 
 
 @pytest.mark.parametrize(
+    ("labels", "overrides", "repeat", "lightweight", "functional", "cadence_bypass"),
+    [
+        pytest.param([], {}, "2", "false", "false", "false", id="default"),
+        pytest.param(["Run tests"], {}, "1", "true", "true", "true", id="lightweight"),
+        pytest.param(
+            ["Run tests", "Run functional tests"],
+            {},
+            "1",
+            "true",
+            "true",
+            "true",
+            id="existing-lightweight-precedence",
+        ),
+        pytest.param(["Run functional tests"], {}, "5", "false", "true", "true", id="five-runs"),
+        pytest.param(
+            ["Run Merge-Queue jobs"], {}, "1", "false", "true", "false", id="merge-queue-label"
+        ),
+        pytest.param(
+            [],
+            {"IS_MERGE_GROUP": "true", "EVENT_NAME": "merge_group"},
+            "1",
+            "false",
+            "true",
+            "false",
+            id="merge-group",
+        ),
+        pytest.param(
+            [],
+            {"IS_CI_WORKLOAD": "true", "EVENT_NAME": "schedule"},
+            "5",
+            "false",
+            "true",
+            "false",
+            id="schedule",
+        ),
+        pytest.param(
+            [], {"EVENT_NAME": "workflow_dispatch"}, "5", "false", "true", "false", id="dispatch"
+        ),
+    ],
+)
+def test_functional_scope_and_repetitions(
+    tmp_path: Path,
+    configure_environment: dict[str, str],
+    labels: list[str],
+    overrides: dict[str, str],
+    repeat: str,
+    lightweight: str,
+    functional: str,
+    cadence_bypass: str,
+) -> None:
+    """Exercise the actual configure shell across labels and non-PR triggers."""
+    result, outputs = _run_configure(tmp_path, {**configure_environment, **overrides}, labels)
+    assert result.returncode == 0, result.stderr
+    assert outputs["scope"] == ("L1" if functional == "true" else "L0")
+    assert outputs["n_repeat"] == repeat
+    assert outputs["lightweight"] == lightweight
+    assert outputs["run_functional"] == functional
+    assert outputs["run_h100_functional"] == "true"
+    assert outputs["cadence_bypass"] == cadence_bypass
+    assert outputs["lts"] == str("container::lts" in labels).lower()
+    if cadence_bypass == "true":
+        assert outputs["cadence"] == ""
+
+
+@pytest.mark.parametrize("traffic_mode", ["aws", "gcp", "50-50"])
+@pytest.mark.parametrize(
+    "other_labels",
+    [
+        [],
+        ["Run tests"],
+        ["Run functional tests"],
+        ["container::lts"],
+        ["Run NeMoRL tests", "Run MBridge tests"],
+        [
+            "Run tests",
+            "Run functional tests",
+            "container::lts",
+            "Run NeMoRL tests",
+            "Run MBridge tests",
+            "Run selective unit tests",
+        ],
+    ],
+)
+def test_merge_queue_label_matches_merge_group_configuration(
+    tmp_path: Path,
+    configure_environment: dict[str, str],
+    traffic_mode: str,
+    other_labels: list[str],
+) -> None:
+    """Compare every output from labeled PR and actual merge-group configuration."""
+    environment = {
+        **configure_environment,
+        "H100_TRAFFIC_MODE": traffic_mode,
+        "ENABLE_SELECTIVE_UNIT_TESTS": "true",
+    }
+    result, baseline = _run_configure(
+        tmp_path,
+        {
+            **environment,
+            "IS_MERGE_GROUP": "true",
+            "EVENT_NAME": "merge_group",
+            "REF": "refs/heads/gh-readonly-queue/main/pr-6934-abc",
+        },
+        [],
+    )
+    assert result.returncode == 0, result.stderr
+    result, outputs = _run_configure(tmp_path, environment, ["Run Merge-Queue jobs", *other_labels])
+    assert result.returncode == 0, result.stderr
+    assert outputs == baseline
+    for name, expected in {
+        "merge_queue_jobs": "true",
+        "scope": "L1",
+        "n_repeat": "1",
+        "lightweight": "false",
+        "lts": "false",
+        "dev": "true",
+        "run_functional": "true",
+        "run_h100_functional": "true",
+        "cadence": "mergegroup",
+        "cadence_bypass": "false",
+        "unit_testmon_eligible": "false",
+        "run_mbridge": "true",
+        "mbridge_suite": "L1",
+        "run_nemo_rl": "false",
+        "h100_cloud": "aws-h100",
+        "h100_build_runner": "nvidia-ci-aws-cpu",
+        "h100_use_gcp": "false",
+    }.items():
+        assert outputs[name] == expected
+
+
+@pytest.mark.parametrize("is_member", ["false", "true"])
+@pytest.mark.parametrize("is_maintainer", ["false", "true"])
+def test_merge_queue_label_preserves_ephemeral_runner_boundaries(
+    tmp_path: Path, configure_environment: dict[str, str], is_member: str, is_maintainer: str
+) -> None:
+    """Keep untrusted PRs on ephemeral runners despite selecting the queue profile."""
+    runner = "ephe-v2-example-a2"
+    result, outputs = _run_configure(
+        tmp_path,
+        {
+            **configure_environment,
+            "PREFLIGHT_IS_MEMBER": is_member,
+            "IS_MAINTAINER": is_maintainer,
+            "EPHEMERAL_RUNNER": "ephe-v2-example",
+            "RUN_ATTEMPT": "2",
+            "H100_TRAFFIC_MODE": "gcp",
+        },
+        ["Run Merge-Queue jobs"],
+    )
+    assert result.returncode == 0, result.stderr
+    if is_member == "false" or is_maintainer == "false":
+        assert outputs["h100_build_runner"] == runner
+        assert json.loads(outputs["h100_gpu_runs_on"]) == runner
+    else:
+        assert outputs["h100_build_runner"] == "nvidia-ci-aws-cpu"
+    assert outputs["h100_cloud"] == "aws-h100"
+    assert outputs["h100_use_gcp"] == "false"
+
+
+@pytest.mark.parametrize(
     ("overrides", "random_seed", "cloud", "build_runner", "gpu_runner", "registry", "use_gcp"),
     [
         pytest.param(
@@ -724,6 +912,7 @@ def test_selective_variable_and_label_precedence(
     [
         pytest.param(["Run tests"], {}, id="run-tests-label"),
         pytest.param(["Run functional tests"], {}, id="run-functional-tests-label"),
+        pytest.param(["Run Merge-Queue jobs"], {}, id="run-merge-queue-jobs-label"),
         pytest.param(["force-run-all"], {}, id="force-run-all-label"),
         pytest.param(["container::lts"], {}, id="lts-label"),
         pytest.param([], {"FORCE_RUN_ALL": "true"}, id="preflight-forces-full"),
@@ -806,7 +995,9 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     outputs = {"has_tests": str(has_tests).lower()}
     assert workflow["jobs"]["select"]["runs-on"] == "ubuntu-latest"
     assert workflow["jobs"]["select"]["name"] == "unit tests selection"
-    assert workflow["jobs"]["select"]["if"] == "inputs.unit_testmon_mode == 'enforce'"
+    assert workflow["jobs"]["select"]["if"] == (
+        "inputs.unit_testmon_mode == 'enforce' && inputs.unit_testmon_target_branch == 'main'"
+    )
     for step in workflow["jobs"]["select"]["steps"]:
         assert "unit_testmon_mode" not in step.get("if", "")
     for platform, parser_job, output in (
@@ -819,8 +1010,17 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
         recipe = yaml.safe_load(
             (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
         )
+        # Recipe opt-outs stay full in merge groups, which otherwise record baselines.
         assert json.loads(parsed[output]) == [
-            {"bucket": case} for product in recipe["products"] for case in product["test_case"]
+            {"bucket": case}
+            for product in recipe["products"]
+            if product.get("testmon") is not False
+            for case in product["test_case"]
+        ] + [
+            {"bucket": case, "mode": "testmon-disabled"}
+            for product in recipe["products"]
+            if product.get("testmon") is False
+            for case in product["test_case"]
         ]
     assert restore["env"]["BUCKETS"] == "${{ inputs.buckets }}"
     assert workflow[True]["workflow_call"]["inputs"]["buckets"]["required"] is True
@@ -831,15 +1031,13 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     needs = SimpleNamespace(
         select=SimpleNamespace(result="success", outputs=SimpleNamespace(**outputs))
     )
-    inputs = SimpleNamespace(unit_testmon_mode="enforce")
+    inputs = SimpleNamespace(unit_testmon_mode="enforce", unit_testmon_target_branch="main")
     context = {"needs": needs, "inputs": inputs}
     assert eval(expression, {"__builtins__": {}}, context) == has_tests
     assert workflow["jobs"]["run"]["strategy"]["matrix"]["include"] == (
         "${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}"
     )
-    assert workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"] == (
-        "${{ matrix.mode || 'full' }}"
-    )
+    assert "unit_testmon_plan_artifact" not in workflow["jobs"]["run"]["steps"][-1]["with"]
 
     # CPU failures stop GPU scheduling; full-suite requests bypass selection.
     needs.select.result = "failure"
@@ -899,7 +1097,49 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
 
 
 @pytest.mark.parametrize(
-    "scenario", ["mixed", "empty", "cache-error", "selector-error", "upload-error"]
+    ("requested_mode", "target_branch", "cpu_mode", "expected_mode"),
+    [
+        pytest.param("enforce", "main", "preselected", "enforce", id="cpu-selected"),
+        pytest.param("enforce", "main", "full", "enforce", id="cpu-fallback"),
+        pytest.param("enforce", "main", "testmon-disabled", "full", id="testmon-disabled"),
+        pytest.param("full", "main", "", "full", id="explicit-full"),
+        pytest.param("full", "", "", "full", id="merge-group-full"),
+        pytest.param("enforce", "dev", "preselected", "full", id="unsupported-target"),
+        pytest.param("baseline", "main", "", "baseline", id="merge-group-baseline"),
+        pytest.param("baseline", "main", "testmon-disabled", "full", id="baseline-disabled"),
+        pytest.param("baseline", "", "", "full", id="baseline-unsupported-target"),
+    ],
+)
+def test_gpu_reselection_respects_full_run_guards(
+    requested_mode, target_branch, cpu_mode, expected_mode
+):
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    mode = workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"]
+    expression = mode.removeprefix("${{").removesuffix("}}")
+    expression = expression.replace("&&", "and").replace("||", "or")
+    inputs = SimpleNamespace(
+        unit_testmon_mode=requested_mode, unit_testmon_target_branch=target_branch
+    )
+    matrix = SimpleNamespace(mode=cpu_mode)
+    assert (
+        eval(expression, {"__builtins__": {}}, {"inputs": inputs, "matrix": matrix})
+        == expected_mode
+    )
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "mixed",
+        "empty",
+        "cache-error",
+        "selector-error",
+        "upload-error",
+        "pinned",
+        "pinned-miss",
+        "pinned-other-generation",
+        "pinned-source-mismatch",
+    ],
 )
 def test_grouped_cpu_selection(
     tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -925,9 +1165,8 @@ def test_grouped_cpu_selection(
     dataset.write_text("")
     recipe = tmp_path / "tests/test_utils/recipes/h100/unit-tests.yaml"
     recipe.parent.mkdir(parents=True)
-    recipe.write_text(
-        json.dumps({"products": [{"test_case": [entry["bucket"] for entry in buckets]}]})
-    )
+    products = [{"test_case": [entry["bucket"] for entry in buckets]}]
+    recipe.write_text(json.dumps({"products": products}))
     selected = unit_tests / "selected/test_case.py"
     selected.parent.mkdir()
     selected.write_text("def test_case(): pass\n")
@@ -945,6 +1184,8 @@ def test_grouped_cpu_selection(
         "RECIPE_PLATFORM": "dgx_h100",
         "SOURCE_SHA": "a" * 40,
         "TARGET_BRANCH": "main",
+        "TESTMON_GENERATION": "111-1" if scenario.startswith("pinned") else "",
+        "TESTMON_BASE_SHA": "b" * 40 if scenario.startswith("pinned") else "",
         "PR_FILES_DIR": str(pr_files),
         "RUNNER_TEMP": str(tmp_path),
         "GITHUB_RUN_ID": "123",
@@ -982,8 +1223,32 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
         capture_output=True,
         text=True,
     )
+    disabled = []
+    if scenario in {"mixed", "pinned"}:
+        disabled.append({"bucket": "tests/unit_tests/test_opt_out.py", "timeout": 20})
+        if scenario == "pinned":
+            disabled.append({"bucket": "tests/unit_tests/test_prepared_opt_out.py", "timeout": 25})
+        environment["BUCKETS"] = json.dumps([*buckets, *disabled])
+    opt_outs = [
+        {"test_case": [entry["bucket"]], "testmon": index != 0}
+        for index, entry in enumerate(disabled)
+    ]
+    recipe.write_text(json.dumps({"products": [*products, *opt_outs]}))
+    planner = Path(".github/scripts/select_unit_tests.py")
+    (tmp_path / planner).parent.mkdir(parents=True)
+    (tmp_path / planner).symlink_to(ROOT / planner)
+    workflow = yaml.safe_load((ROOT / ".github/workflows/_unit-tests.yml").read_text())
+    stage = next(
+        step for step in workflow["jobs"]["select"]["steps"] if step["name"] == "Save CPU planner"
+    )
+    subprocess.run(["bash", "-eu", "-c", stage["run"]], cwd=tmp_path, env=environment, check=True)
+    if scenario == "pinned":
+        # Each checkout disables a different bucket. Both must bypass Testmon.
+        for product in opt_outs:
+            product["testmon"] = not product["testmon"]
+        recipe.write_text(json.dumps({"products": [*products, *opt_outs]}))
     spec = importlib.util.spec_from_file_location(
-        "select_unit_tests", ROOT / ".github/scripts/select_unit_tests.py"
+        "select_unit_tests", tmp_path / "select_unit_tests.py"
     )
     assert spec is not None and spec.loader is not None
     selector = importlib.util.module_from_spec(spec)
@@ -999,7 +1264,15 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
         if operation == "restore":
             path, key, prefix, key_file = args
             assert path == "assets_dir/testmon"
-            assert key == f"{prefix}lookup-123-2"
+            cache_prefix = json.loads((tmp_path / "unit-testmon-identity.json").read_text())[
+                "cache_prefix"
+            ]
+            if scenario.startswith("pinned"):
+                assert key == f"{cache_prefix}111-1"
+                assert prefix == "", "a pinned baseline must not use any restore-key fallback"
+            else:
+                assert prefix == cache_prefix
+                assert key == f"{prefix}lookup-123-2"
             assert not Path(path).exists(), "previous bucket cache was not cleared"
             index = restores
             restores += 1
@@ -1008,9 +1281,28 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
             if scenario == "cache-error" and index == 0:
                 raise subprocess.CalledProcessError(1, [operation])
             saved = tmp_path / "saved" / str(index)
+            if scenario == "pinned-miss" and index == 0:
+                Path(key_file).write_text("")
+                return
             if saved.exists():
                 shutil.copytree(saved, path)
-            Path(key_file).write_text(f"{prefix}111-1" if saved.exists() else "")
+            matched_generation = "111-1"
+            if scenario == "pinned-other-generation" and index == 0:
+                # Even a complete compatible generation must not substitute for
+                # the baseline used to construct the tested checkout.
+                matched_generation = "222-1"
+                manifest_path = Path(path) / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["generation"] = matched_generation
+                manifest_path.write_text(json.dumps(manifest))
+            if index == 0 and scenario == "pinned-source-mismatch":
+                manifest_path = Path(path) / "manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["source_sha"] = "c" * 40
+                manifest_path.write_text(json.dumps(manifest))
+            Path(key_file).write_text(
+                f"{cache_prefix}{matched_generation}" if saved.exists() else ""
+            )
         else:
             assert operation == "upload"
             if scenario == "upload-error":
@@ -1032,17 +1324,24 @@ for index, entry in enumerate(json.loads(os.environ['BUCKETS'])):
     assert restores == len(buckets)
     outputs = dict(line.split("=", 1) for line in (tmp_path / "outputs").read_text().splitlines())
     matrix = json.loads(outputs["matrix"])
+    for entry in reversed(disabled):
+        assert matrix.pop() == {**entry, "mode": "testmon-disabled"}
+        assert all(upload["plan"]["bucket"] != entry["bucket"] for upload in uploads)
     assert outputs["has_tests"] == str(scenario != "empty").lower()
     assert [entry["bucket"] for entry in matrix] == [
         entry["bucket"] for entry in buckets if entry["bucket"] != "tests/unit_tests/empty/**/*.py"
     ]
+    fallback = scenario in {
+        "cache-error",
+        "pinned-miss",
+        "pinned-other-generation",
+        "pinned-source-mismatch",
+    }
     assert [entry["mode"] for entry in matrix] == (
-        []
-        if scenario == "empty"
-        else ["full" if scenario == "cache-error" else "preselected", "full"]
+        [] if scenario == "empty" else [("full" if fallback else "preselected"), "full"]
     )
     assert all(entry["timeout"] == 40 for entry in matrix)
-    assert bool(caplog.records) == (scenario == "cache-error")
+    assert bool(caplog.records) == (fallback and scenario != "pinned-miss")
     for upload in uploads:
         plan = upload["plan"]
         assert re.fullmatch(r"unit-test-plan-dgx_h100-[0-9a-f]{16}-123-2", upload["name"])

@@ -44,15 +44,15 @@ else:
 try:
     import apex
 
-    from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    from megatron.core.ops.norm.fused_layer_norm import FusedLayerNorm
+    from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
     import warnings
 
-    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 
     warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
     LNImpl = WrappedTorchNorm

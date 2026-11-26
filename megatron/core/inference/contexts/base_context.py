@@ -27,6 +27,11 @@ class BaseInferenceContext(abc.ABC):
         """Return `True` if context uses dynamic batching."""
         return not self.is_static_batching()
 
+    @property
+    def max_sequence_length_for_model(self) -> int:
+        """Maximum position-bearing sequence length a model forward may execute."""
+        return self.max_sequence_length
+
     def increment_sequence_len_offset(self, increment: int) -> None:
         """Update sequence length offset. No-op for dynamic batching."""
         if self.is_static_batching():

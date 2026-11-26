@@ -7,9 +7,12 @@ the Triton kernel (from mtp_utils_triton) on the same inputs, and asserts
 that the outputs match exactly.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from megatron.core.inference.contexts.mtp_metadata import MTPMetadata
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import (
     mamba_state_selective_copy as mamba_state_selective_copy_pytorch,
 )
@@ -24,6 +27,7 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch impor
 )
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
+    mtp_draft_step_metadata,
     prepare_next_forward_pass,
     rewind_kv_cache,
     verify_speculative_tokens,
@@ -446,10 +450,11 @@ class TestPrepareNextForwardPass:
         return output_tokens, required_logit_indices, input_tokens, accepted_mask, last_one_indices
 
     @pytest.mark.parametrize(
-        "num_decode,num_prefill,num_spec", [(1, 0, 2), (3, 0, 2), (3, 2, 2), (0, 3, 2), (5, 3, 4)]
+        "num_decode,num_prefill,num_spec",
+        [(1, 0, 2), (3, 0, 2), (3, 2, 2), (2, 2, 3), (0, 3, 2), (5, 3, 4)],
     )
     def test_basic(self, num_decode, num_prefill, num_spec):
-        (output_tokens, required_logit_indices, input_tokens, accepted_mask, last_one_indices) = (
+        output_tokens, required_logit_indices, input_tokens, accepted_mask, last_one_indices = (
             self._setup(num_decode, num_prefill, num_spec)
         )
 
@@ -457,15 +462,13 @@ class TestPrepareNextForwardPass:
 
         ref_sampled = torch.zeros(active, device=DEVICE, dtype=torch.int64)
         ref_last_seq = torch.zeros(active, device=DEVICE, dtype=torch.int64)
-        ref_accepted = torch.full((num_decode, num_spec), -1, device=DEVICE, dtype=torch.int64)
-        ref_counts = torch.zeros(num_decode, device=DEVICE, dtype=torch.int64)
+        ref_accepted = torch.full((active, num_spec), 999, device=DEVICE, dtype=torch.int64)
+        ref_counts = torch.full((active,), 999, device=DEVICE, dtype=torch.int64)
 
         tri_sampled = torch.zeros(active, device=DEVICE, dtype=torch.int64)
         tri_last_seq = torch.zeros(active, device=DEVICE, dtype=torch.int64)
-        tri_accepted = torch.full(
-            (max(num_decode, 1), num_spec), -1, device=DEVICE, dtype=torch.int64
-        )
-        tri_counts = torch.zeros(max(num_decode, 1), device=DEVICE, dtype=torch.int64)
+        tri_accepted = torch.full((active, num_spec), 999, device=DEVICE, dtype=torch.int64)
+        tri_counts = torch.full((active,), 999, device=DEVICE, dtype=torch.int64)
 
         prepare_next_forward_pass_pytorch(
             num_decode,
@@ -497,9 +500,44 @@ class TestPrepareNextForwardPass:
 
         torch.testing.assert_close(tri_sampled, ref_sampled)
         torch.testing.assert_close(tri_last_seq, ref_last_seq)
-        if num_decode > 0:
-            torch.testing.assert_close(tri_accepted[:num_decode], ref_accepted[:num_decode])
-            torch.testing.assert_close(tri_counts[:num_decode], ref_counts[:num_decode])
+        torch.testing.assert_close(tri_accepted, ref_accepted)
+        torch.testing.assert_close(tri_counts, ref_counts)
+        if num_prefill > 0:
+            assert (tri_accepted[num_decode:] == -1).all()
+            assert (tri_counts[num_decode:] == 0).all()
+
+    def test_mixed_async_prefill_row_clears_false_termination_match(self):
+        """A prefill row cannot inherit a stale accepted termination token."""
+        termination_id = 91
+        accepted_tokens = torch.tensor([[7, -1], [termination_id, 92]], device=DEVICE)
+        accepted_counts = torch.tensor([1, 2], device=DEVICE)
+
+        def prefill_has_valid_termination_match() -> bool:
+            valid_count = int(accepted_counts[1].item())
+            valid_tokens = accepted_tokens[1, :valid_count]
+            return bool((valid_tokens == termination_id).any().item())
+
+        assert accepted_tokens[1].tolist() == [91, 92]
+        assert accepted_counts[1].item() == 2
+        assert prefill_has_valid_termination_match()
+
+        prepare_next_forward_pass_pytorch(
+            num_decode_requests=1,
+            output_tokens=torch.tensor([0, 40, 0, 41], device=DEVICE),
+            required_logit_indices=torch.arange(4, device=DEVICE),
+            last_one_indices=torch.tensor([1, 3], device=DEVICE),
+            accepted_tokens_mask=torch.tensor([True, True, False, True], device=DEVICE),
+            input_tokens=torch.tensor([0, 7, 0, 0], device=DEVICE),
+            sampled_tokens_buf=torch.zeros(2, dtype=torch.long, device=DEVICE),
+            last_accepted_seq_buf=torch.zeros(2, dtype=torch.long, device=DEVICE),
+            accepted_tokens_per_request=accepted_tokens,
+            accepted_token_counts=accepted_counts,
+            num_speculative_tokens=2,
+        )
+
+        assert accepted_tokens.tolist() == [[7, -1], [-1, -1]]
+        assert accepted_counts.tolist() == [1, 0]
+        assert not prefill_has_valid_termination_match()
 
     def test_empty(self):
         """Zero active requests should be a no-op."""
@@ -621,6 +659,243 @@ class TestMambaStateSelectiveCopy:
         )
 
         torch.testing.assert_close(current, current_before)
+
+
+class TestMtpDraftStepMetadata:
+    """Tests for the per-depth MTP draft metadata Triton kernel.
+
+    The reference is the eager path the kernel replaces: `stage_decode_lengths` +
+    `write_token_maps` + `write_mha_metadata`. Both write into sentinel-filled buffers, so a
+    write the reference does not make (or a missed one) shows up as a mismatch.
+    """
+
+    MAX_REQUESTS = 64
+    DUMMY_BLOCK = 999
+    SENTINEL = -7
+
+    def _make_metadata(self, block_size_tokens, num_cols, max_requests=MAX_REQUESTS):
+        meta = MTPMetadata(
+            enabled=True,
+            max_requests=max_requests,
+            max_kv_block_count=num_cols,
+            block_size_tokens=block_size_tokens,
+            dummy_block_idx=self.DUMMY_BLOCK,
+            block_table_dtype=torch.int32,
+            hidden_size=8,
+            hidden_dtype=torch.bfloat16,
+        )
+        meta.allocate(device=DEVICE)
+        return meta
+
+    def _make_gpu_view(self, num_cols, max_requests=MAX_REQUESTS):
+        r, s = max_requests, self.SENTINEL
+
+        def full(n, dtype):
+            return torch.full((n,), s, dtype=dtype, device=DEVICE)
+
+        return SimpleNamespace(
+            token_to_block_idx=full(r, torch.int64),
+            token_to_local_position_within_kv_block=full(r, torch.int32),
+            token_to_request_idx=full(r, torch.int32),
+            token_to_position_in_request=full(r, torch.int32),
+            token_to_pos_ids=full(r, torch.int64),
+            mha_query_lengths=full(r, torch.int32),
+            mha_cu_query_seq_lengths=full(r + 1, torch.int32),
+            mha_kv_seq_lengths=full(r, torch.int32),
+            mha_cu_kv_seq_lengths=full(r + 1, torch.int32),
+            mha_block_table=torch.full((r, num_cols), s, dtype=torch.int32, device=DEVICE),
+        )
+
+    @staticmethod
+    def _reference_step(meta, gpu_view):
+        n = meta.active_request_count
+        query_lengths, kv_lengths = meta.stage_decode_lengths()
+        meta.write_token_maps(
+            gpu_view=gpu_view,
+            rows=meta.row_ids[:n],
+            positions=meta.active_offsets,
+            block_table=meta.active_block_table,
+            padded_token_count=meta.padded_count,
+        )
+        meta.write_mha_metadata(
+            gpu_view=gpu_view,
+            query_lengths=query_lengths,
+            kv_lengths=kv_lengths,
+            block_table=meta.active_block_table,
+            padded_request_count=meta.padded_count,
+        )
+
+    @staticmethod
+    def _kernel_step(meta, gpu_view):
+        mtp_draft_step_metadata(
+            gpu_view=gpu_view,
+            offsets=meta.offsets,
+            block_table=meta.block_table,
+            staged_query_lengths=meta.query_lengths,
+            staged_kv_lengths=meta.kv_lengths,
+            active_request_count=meta.active_request_count,
+            padded_count=meta.padded_count,
+            block_size_tokens=meta.block_size_tokens,
+            dummy_block_idx=meta.dummy_block_idx,
+        )
+
+    def _assert_equal(self, ref_meta, ref_view, tri_meta, tri_view):
+        for name, ref in vars(ref_view).items():
+            assert torch.equal(getattr(tri_view, name), ref), name
+        n = ref_meta.active_request_count
+        assert torch.equal(tri_meta.query_lengths[:n], ref_meta.query_lengths[:n])
+        assert torch.equal(tri_meta.kv_lengths[:n], ref_meta.kv_lengths[:n])
+
+    def _run_draft_loop(
+        self,
+        active_request_count,
+        padded_count,
+        block_size_tokens,
+        num_cols,
+        start_positions,
+        num_depths,
+        max_requests=MAX_REQUESTS,
+    ):
+        block_table_src = torch.randint(
+            0, 500, (max_requests, num_cols), dtype=torch.int32, device=DEVICE
+        )
+        ref_meta = self._make_metadata(block_size_tokens, num_cols, max_requests)
+        tri_meta = self._make_metadata(block_size_tokens, num_cols, max_requests)
+        ref_view = self._make_gpu_view(num_cols, max_requests)
+        tri_view = self._make_gpu_view(num_cols, max_requests)
+        for meta in (ref_meta, tri_meta):
+            meta.begin_decode(
+                active_request_count=active_request_count,
+                padded_count=padded_count,
+                start_positions=start_positions,
+                block_table_src=block_table_src,
+                graphed=True,
+            )
+        for _ in range(num_depths):
+            self._reference_step(ref_meta, ref_view)
+            self._kernel_step(tri_meta, tri_view)
+            self._assert_equal(ref_meta, ref_view, tri_meta, tri_view)
+            ref_meta.advance_decode_step()
+            tri_meta.advance_decode_step()
+
+    @pytest.mark.parametrize(
+        "active_request_count, padded_count", [(1, 1), (5, 8), (8, 8), (13, 16), (64, 64)]
+    )
+    @pytest.mark.parametrize("block_size_tokens", [16, 64])
+    @pytest.mark.parametrize("num_cols", [4, 33, 130])
+    def test_matches_reference(
+        self, active_request_count, padded_count, block_size_tokens, num_cols
+    ):
+        torch.manual_seed(active_request_count * 1000 + num_cols)
+        max_position = block_size_tokens * num_cols - 13
+        start_positions = torch.randint(
+            0, max_position, (self.MAX_REQUESTS,), dtype=torch.int32, device=DEVICE
+        )
+        self._run_draft_loop(
+            active_request_count,
+            padded_count,
+            block_size_tokens,
+            num_cols,
+            start_positions,
+            num_depths=12,
+        )
+
+    @pytest.mark.parametrize(
+        "active_request_count, padded_count, num_cols",
+        [
+            # Many row tiles, a partial last column tile, and a scan over several chunks.
+            (3001, 3072, 130),
+            # Padding fills whole row tiles and a whole scan chunk.
+            (1000, 2048, 33),
+            # Two column tiles, padded count not a power of two.
+            (37, 40, 256),
+            # Widest row tiles; the scan carries its total across eight chunks.
+            (8192, 8192, 8),
+        ],
+    )
+    def test_matches_reference_large(self, active_request_count, padded_count, num_cols):
+        # Shapes the kernel splits across several programs (row and column tiles) and scans in
+        # several steps; the reference is shape-agnostic.
+        block_size_tokens = 16
+        torch.manual_seed(padded_count + num_cols)
+        start_positions = torch.randint(
+            0, block_size_tokens * num_cols - 4, (padded_count,), dtype=torch.int32, device=DEVICE
+        )
+        self._run_draft_loop(
+            active_request_count,
+            padded_count,
+            block_size_tokens,
+            num_cols,
+            start_positions,
+            num_depths=3,
+            max_requests=padded_count,
+        )
+
+    def test_block_boundary_crossing(self):
+        # Each request's 12 depths straddle a block boundary at a different depth.
+        block_size_tokens = 16
+        start_positions = torch.tensor(
+            [15 - i for i in range(12)] + [0] * (self.MAX_REQUESTS - 12),
+            dtype=torch.int32,
+            device=DEVICE,
+        )
+        self._run_draft_loop(12, 16, block_size_tokens, 8, start_positions, num_depths=12)
+
+    def test_all_padding(self):
+        # No request drafts, but the forward still launches over padded slots.
+        ref_meta = self._make_metadata(16, 8)
+        tri_meta = self._make_metadata(16, 8)
+        ref_view = self._make_gpu_view(8)
+        tri_view = self._make_gpu_view(8)
+        for meta in (ref_meta, tri_meta):
+            meta._enter_decode(active_request_count=0, padded_count=16, graphed=True)
+        self._reference_step(ref_meta, ref_view)
+        self._kernel_step(tri_meta, tri_view)
+        self._assert_equal(ref_meta, ref_view, tri_meta, tri_view)
+
+    def test_capture_staging(self):
+        # `begin_decode_for_capture` treats every padded slot as active at the dummy block.
+        ref_meta = self._make_metadata(16, 8)
+        tri_meta = self._make_metadata(16, 8)
+        ref_view = self._make_gpu_view(8)
+        tri_view = self._make_gpu_view(8)
+        for meta in (ref_meta, tri_meta):
+            meta.begin_decode_for_capture(padded_count=16)
+        self._reference_step(ref_meta, ref_view)
+        self._kernel_step(tri_meta, tri_view)
+        self._assert_equal(ref_meta, ref_view, tri_meta, tri_view)
+
+    def test_dispatcher_uses_kernel(self):
+        # `MTPMetadata.write_draft_step_metadata` must produce the reference result.
+        ref_meta = self._make_metadata(16, 8)
+        tri_meta = self._make_metadata(16, 8)
+        ref_view = self._make_gpu_view(8)
+        tri_view = self._make_gpu_view(8)
+        start_positions = torch.arange(3, 3 + self.MAX_REQUESTS, dtype=torch.int32, device=DEVICE)
+        block_table_src = torch.randint(
+            0, 500, (self.MAX_REQUESTS, 8), dtype=torch.int32, device=DEVICE
+        )
+        for meta in (ref_meta, tri_meta):
+            meta.begin_decode(
+                active_request_count=6,
+                padded_count=8,
+                start_positions=start_positions,
+                block_table_src=block_table_src,
+                graphed=False,
+            )
+        self._reference_step(ref_meta, ref_view)
+        kv_lengths = tri_meta.write_draft_step_metadata(tri_view)
+        self._assert_equal(ref_meta, ref_view, tri_meta, tri_view)
+        assert torch.equal(kv_lengths, ref_meta.kv_lengths[:6])
+
+    def test_padding_count_zero_is_noop(self):
+        tri_view = self._make_gpu_view(8)
+        before = {k: v.clone() for k, v in vars(tri_view).items()}
+        tri_meta = self._make_metadata(16, 8)
+        tri_meta.begin_decode_for_capture(padded_count=0)
+        self._kernel_step(tri_meta, tri_view)
+        for name, ref in before.items():
+            assert torch.equal(getattr(tri_view, name), ref), name
 
 
 class TestStressRandom:

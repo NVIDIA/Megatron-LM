@@ -8,6 +8,7 @@ import math
 import os
 import time
 from collections import defaultdict
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
@@ -16,11 +17,13 @@ from functools import partial
 from itertools import chain, zip_longest
 from math import ceil
 from typing import Any, Dict, List
+from weakref import WeakKeyDictionary, WeakSet
 
 import torch
 from torch.utils._pytree import tree_flatten as tree_flatten_pyt
 from torch.utils._pytree import tree_map as tree_map_pyt
 
+from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -31,8 +34,14 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import DSALayerConfig
+from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config import (
+    CSALayerConfig,
+)
+from megatron.core.transformer.mla_layer_config import MLALayerConfig
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     ensure_params_ready,
@@ -48,11 +57,7 @@ try:
     import transformer_engine as te  # pylint: disable=unused-import
     from transformer_engine.pytorch.distributed import is_fp8_activation_recompute_enabled
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
-    from transformer_engine.pytorch.graph import (
-        make_graphed_callables,
-        restore_fp8_tensors,
-        save_fp8_tensors,
-    )
+    from transformer_engine.pytorch.graph import restore_fp8_tensors, save_fp8_tensors
     from transformer_engine.pytorch.graph import set_capture_end as te_set_capture_end
     from transformer_engine.pytorch.graph import set_capture_start as te_set_capture_start
     from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
@@ -591,6 +596,16 @@ class _CudagraphGlobalRecord:
     _saved_tensors_observer = None
     _te_capture_started = False
 
+    # Owners are local/full-iteration graphs or TE graph callables.
+    # Weak keys avoid extending their lifetimes merely to retain their constants.
+    capture_constants: WeakKeyDictionary[torch.cuda.CUDAGraph, dict[int, torch.Tensor]] = (
+        WeakKeyDictionary()
+    )
+    active_capture_constants: dict[int, torch.Tensor] | None = None
+    # Without a graph owner these references cannot be released safely before process exit.
+    unowned_capture_constants: dict[int, torch.Tensor] = {}
+    captured_runners: WeakSet["_CudaGraphRunner"] = WeakSet()
+
     @classmethod
     def _enable_saved_tensors_observer(cls):
         """Observe Python 'save_for_backward' calls while recording and capturing graphs."""
@@ -633,6 +648,11 @@ class _CudagraphGlobalRecord:
     @classmethod
     def create_cudagraphs(cls):
         """Create recorded CUDA graphs, then remove the saved-tensor observer."""
+        # Forward-only schedules can reach this before training records any graphs.
+        # Keep observing saved tensors until there is a capture to complete.
+        if not cls.cudagraph_created and not cls.cudagraph_record:
+            return
+
         try:
             return cls._create_cudagraphs()
         finally:
@@ -785,7 +805,10 @@ class _CudagraphGlobalRecord:
             te_set_capture_end()
             cls._te_capture_started = False
 
-        torch.cuda.set_stream(torch.cuda.default_stream())
+        # Train on the default stream from here on (see CudaGraphManager.__init__).
+        default_stream = torch.cuda.default_stream()
+        default_stream.wait_stream(torch.cuda.current_stream())
+        torch.cuda.set_stream(default_stream)
 
         # Return capture time and memory usage.
         return capture_stats
@@ -804,19 +827,69 @@ def create_cudagraphs():
     return _CudagraphGlobalRecord.create_cudagraphs()
 
 
+@contextmanager
+def capture_constants(owner_graph: torch.cuda.CUDAGraph) -> Iterator[None]:
+    """Retain constants for a graph owner until teardown or owner destruction.
+
+    Wrap the capture context, not replay. For APIs that capture several graphs at
+    once (TE), the owner must outlive every graph and release its constants only
+    after destroying all of them. Failed captures discard their registrations.
+    """
+    previous = _CudagraphGlobalRecord.active_capture_constants
+    constants = {}
+    _CudagraphGlobalRecord.active_capture_constants = constants
+    try:
+        yield
+        _CudagraphGlobalRecord.capture_constants[owner_graph] = constants
+    finally:
+        _CudagraphGlobalRecord.active_capture_constants = previous
+
+
+def register_capture_constant(tensor: torch.Tensor) -> None:
+    """Retain a capture constant for its graph, or process lifetime when no owner is known."""
+    if not torch.cuda.is_current_stream_capturing():
+        return
+
+    constants = _CudagraphGlobalRecord.active_capture_constants
+    if constants is None:
+        constants = _CudagraphGlobalRecord.unowned_capture_constants
+        if not constants:
+            logger.warning(
+                "CUDA graph captured outside capture_constants(); cached positional "
+                "embeddings it reads are retained for the process lifetime."
+            )
+    constants[id(tensor)] = tensor
+
+
+def release_capture_constants(owner_graph: torch.cuda.CUDAGraph) -> None:
+    """Release an owner's constants after all of its graphs have been destroyed."""
+    _CudagraphGlobalRecord.capture_constants.pop(owner_graph, None)
+
+
 def delete_cuda_graphs():
     """Delete all CUDA graphs."""
 
     _CudagraphGlobalRecord._disable_saved_tensors_observer()
 
     # Reset runners.
+    runners = set(_CudagraphGlobalRecord.captured_runners)
     for record in [
         *_CudagraphGlobalRecord.cudagraph_record,
         *_CudagraphGlobalRecord.cudagraph_inference_record,
     ]:
-        runner = record[0]
+        runners.add(record[0])
+    if runners:
+        # Replay can still be using external constants when graph destruction is requested.
+        torch.cuda.synchronize()
+    for runner in runners:
         assert isinstance(runner, _CudaGraphRunner)
 
+        # Some callers (e.g., test_cuda_graphs.py) delete graph attributes
+        # before the global teardown runs.
+        for graph in (getattr(runner, "fwd_graph", None), getattr(runner, "bwd_graph", None)):
+            if graph is not None:
+                graph.reset()
+                release_capture_constants(graph)
         runner.cudagraph_created = False
         runner.fwd_graph_recorded = False
         runner.bwd_graph_recorded = False
@@ -829,6 +902,7 @@ def delete_cuda_graphs():
     _CudagraphGlobalRecord.cudagraph_created = False
     _CudagraphGlobalRecord.cudagraph_record = []
     _CudagraphGlobalRecord.cudagraph_inference_record = []
+    _CudagraphGlobalRecord.captured_runners.clear()
     _GTP_RUNNER_STREAMS.clear()
 
     # TODO: Optional?: Force garbage collection to clean up memory
@@ -1284,6 +1358,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 cached_aux_losses[name] = entry.values.clone()
 
         self.fwd_graph = torch.cuda.CUDAGraph()
+        _CudagraphGlobalRecord.captured_runners.add(self)
 
         # For cases with multiple active RNG states, e.g. TP.
         rng_states = get_all_rng_states()
@@ -1426,8 +1501,12 @@ class _CudaGraphRunner(torch.nn.Module):
                 )
                 with (
                     capture_comm_context as capture_comms,
+                    capture_constants(self.fwd_graph),
                     torch.cuda.graph(
-                        self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                        self.fwd_graph,
+                        pool=self.mempool,
+                        stream=CudaGraphManager.global_capture_stream,
+                        capture_error_mode="thread_local",
                     ),
                 ):
 
@@ -1565,7 +1644,10 @@ class _CudaGraphRunner(torch.nn.Module):
         with (
             capture_comm_context as capture_comms,
             _preserve_parameter_grads_during_backward_capture(self),
-            torch.cuda.graph(self.bwd_graph, pool=self.mempool),
+            capture_constants(self.bwd_graph),
+            torch.cuda.graph(
+                self.bwd_graph, pool=self.mempool, stream=CudaGraphManager.global_capture_stream
+            ),
         ):
 
             grad_inputs = torch.autograd.grad(
@@ -1618,6 +1700,11 @@ class _CudaGraphRunner(torch.nn.Module):
             if self.use_stream and not self.gtp_remat:
                 # Non-GTP path: record after the side-stream join.
                 self.bwd_completion_event.record()
+
+        # Backward reads saved forward constants without calling the embedding again.
+        _CudagraphGlobalRecord.capture_constants[self.bwd_graph].update(
+            _CudagraphGlobalRecord.capture_constants.get(self.fwd_graph, {})
+        )
 
         # Unfreeze GC.
         if FREEZE_GC:
@@ -1918,6 +2005,9 @@ class CudaGraphManager(torch.nn.Module):
     """A global mempool for when 'cuda_graph_use_single_mempool' is used."""
     global_mempool = None
 
+    """The stream local CUDA graphs warm up and capture on."""
+    global_capture_stream = None
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1986,20 +2076,33 @@ class CudaGraphManager(torch.nn.Module):
         # Therefore modules will always execute in the same order, so cudagraphs
         # can both be reused and share a single mempool.
         self.reuse_cudagraphs = self.pg_collection.pp.size() == 1
+        self._initialize_mempool()
+        if CudaGraphManager.global_capture_stream is None:
+            # Capture on the stream DDP is initialized on, so the AccumulateGrad nodes DDP retains
+            # carry the capturing stream.
+            from megatron.core.full_cuda_graph import get_shared_capture_stream
+
+            CudaGraphManager.global_capture_stream = get_shared_capture_stream()
+            # Run the rest of model, optimizer and DDP construction, the eager iterations and the
+            # warmup before capture on this stream. Training returns to the default stream after
+            # capture, whose allocator cache then holds no long-lived state to fragment it.
+            CudaGraphManager.global_capture_stream.wait_stream(torch.cuda.current_stream())
+            torch.cuda.set_stream(CudaGraphManager.global_capture_stream)
+
+        # Enable one hook for the eager recording phase. Repeated manager construction is
+        # idempotent, and graph creation removes the hook before capture begins.
+        if need_backward:
+            _CudagraphGlobalRecord._enable_saved_tensors_observer()
+
+    @staticmethod
+    def _initialize_mempool() -> None:
+        """Create and register the graph pool without changing the current CUDA stream."""
         if CudaGraphManager.global_mempool is None:
             CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
             # Register the pool so GTP allocates GRAPHED-chain buffers + quantized
             # storage directly into it (created before the first graphed forward).
             if HAVE_GTP:
                 set_cuda_graph_mempool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
-            # Cudagraph stream capture requires no operations on the default stream prior to the
-            # capture, so change to a side stream.
-            torch.cuda.set_stream(torch.cuda.Stream())
-
-        # Enable one hook for the eager recording phase. Repeated manager construction is
-        # idempotent, and graph creation removes the hook before capture begins.
-        if need_backward:
-            _CudagraphGlobalRecord._enable_saved_tensors_observer()
 
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
@@ -2023,6 +2126,11 @@ class CudaGraphManager(torch.nn.Module):
         length of 'self.cudagraph_runners'.
         Otherwise, we assign a mempool per microbatch, which allows cudagraphs to be reused
         over different microbatches by tracking their respective fwd and bwd passes.'''
+
+        self._initialize_mempool()
+        if self.need_backward and not _CudagraphGlobalRecord.cudagraph_created:
+            _CudagraphGlobalRecord._enable_saved_tensors_observer()
+
         if reuse_cudagraphs:
             if cache_key is not None:
                 runner = self.custom_cudagraphs_lookup_table[cache_key]
@@ -2081,6 +2189,8 @@ class CudaGraphManager(torch.nn.Module):
                 )
                 self.cudagraph_runners.append(runner)
 
+        if runner.mempool is None:
+            runner.mempool = CudaGraphManager.global_mempool
         return runner
 
     def __call__(self, megatron_module, args, kwargs, cache_key=None):
@@ -2100,7 +2210,8 @@ class CudaGraphManager(torch.nn.Module):
         if cache_key is None and is_inference_mode:
             inference_context = kwargs['inference_context']
             if inference_context.is_static_batching():
-                batch_size = kwargs['hidden_states'].shape[0]
+                hidden_states = args[0] if args else kwargs['hidden_states']
+                batch_size = hidden_states.shape[0]
                 cache_key = (batch_size, inference_context.is_decode_only())
             else:
                 cache_key = inference_context.padded_batch_dimensions
@@ -2143,13 +2254,17 @@ class CudaGraphManager(torch.nn.Module):
                                     getattr(r[0].base_module, 'layer_number', None)
                                     == runner.base_module.layer_number - 1
                                     and r[0].fwd_graph is not None
-                                    and ArgMetadata(r[3]['hidden_states'])
-                                    == ArgMetadata(kwargs['hidden_states'])
+                                    and ArgMetadata(r[2][0] if r[2] else r[3]['hidden_states'])
+                                    == ArgMetadata(args[0] if args else kwargs['hidden_states'])
                                 )
                             )
                             # Replace the hidden states from previous layer's output buffer
-                            local_kwargs = dict(kwargs)
-                            local_kwargs['hidden_states'] = previous_runner[0].fwd_graph_outputs[0]
+                            previous_output = previous_runner[0].fwd_graph_outputs[0]
+                            if args:
+                                local_args = (previous_output, *args[1:])
+                            else:
+                                local_kwargs = dict(kwargs)
+                                local_kwargs['hidden_states'] = previous_output
                         except StopIteration:
                             # No match found for previous layer, continue with no buffer reuse
                             pass
@@ -2192,45 +2307,456 @@ class CudaGraphManager(torch.nn.Module):
 
 
 # The following functions are for capturing CUDA Graphs using TE make_graphed_callables().
-def _layer_is_graphable(layer, config):
+def _te_cuda_graph_layer_is_graphable(layer, config):
+    """Check whether a module registered a TE graph for the requested scope."""
+    return (
+        config.cuda_graph_impl == "transformer_engine"
+        and isinstance(layer, TECudaGraphMixin)
+        and layer.config.cuda_graph_impl == "transformer_engine"
+        and layer.is_graphable_for_scope(config.cuda_graph_modules)
+    )
+
+
+@contextmanager
+def _keep_class_calls(callables) -> Iterator[None]:
+    """Give the classes of TE graphed callables back their own __call__ after capture.
+
+    make_graphed_callables wraps the __call__ of each callable's class in an FP8/FP4 autocast that
+    looks up its enabled flag by module, and afterwards assigns each class the __call__ it had read
+    through the MRO. A subclass wrapped after its base class, such as MoETransformerLayer after
+    TransformerLayer, therefore keeps the base class's wrapper. Every later call of its layers then
+    runs with FP8/FP4 off unless the layer was itself a callable of that capture, which the
+    feed-forward layer of a pair and an eager MTP layer are not.
+
+    Args:
+        callables: The modules passed to make_graphed_callables.
     """
-    Check if a layer is graphable.
+    missing = object()
+    saved_calls = {}
+    for module in callables:
+        saved_calls.setdefault(type(module), vars(type(module)).get("__call__", missing))
+    try:
+        yield
+    finally:
+        for module_class, call in saved_calls.items():
+            if call is not missing:
+                module_class.__call__ = call
+            elif "__call__" in vars(module_class):
+                del module_class.__call__
+
+
+class _TECudaGraphPairLink:
+    """Replay-time link from a Hybrid layer to the TE graphed callable it shares.
+
+    A plain object rather than a module, so assigning it to a layer leaves the layer's module tree,
+    parameter names and state dict unchanged.
+
+    Args:
+        pair (_TECudaGraphLayerPair): The callable the layer shares with its neighbor.
+        role (str): "mixer" for the layer that launches the graph, "partner" for the feed-forward
+            layer that takes the graph outputs.
     """
 
-    # Only GraphableMegatronModule can be graphed.
-    if not isinstance(layer, GraphableMegatronModule):
-        return False
+    def __init__(self, pair: "_TECudaGraphLayerPair", role: str) -> None:
+        self.pair = pair
+        self.role = role
 
-    # If cuda_graph_modules is not set, every layer is graphed.
-    if not config.cuda_graph_modules:
-        return True
 
-    # import modules here to avoid a circular import
-    from megatron.core.ssm.mamba_layer import MambaLayer
+class _TECudaGraphLayerPair(torch.nn.Module):
+    """One TE graphed callable for a Hybrid mixer layer and the feed-forward layer after it.
+
+    HybridStack runs each block as two layers: a mixer (attention, GDN, ...) without a feed-forward
+    branch, then an MoE or MLP layer (the partner) without an attention branch. Per-layer graphs
+    launch two forward and two backward graphs per block. This callable captures the mixer's graph
+    scope followed by the partner's graph scope as one graph. At replay, the mixer launches it and
+    keeps the partner's graph outputs, and the partner runs only its eager remainder, such as the
+    MoE dispatch, experts and combine.
+
+    The pair is never registered in the model, so parameter names, checkpoints and the module tree
+    stay as they are. Its ``parameters()`` are the union of both layers' parameters, which TE uses
+    as the graph's parameter inputs, so the one backward graph returns the gradients of both.
+
+    The partner takes the mixer's output in the dtype of its own graph's hidden_states input, as
+    with per-layer graphs: with fp32_residual_connection, the mixer returns an FP32 residual, and
+    the partner's graph input is BF16.
+
+    Args:
+        mixer (TransformerLayer): The attention-type layer, which launches the graph.
+        partner (TransformerLayer): The feed-forward layer that follows it.
+    """
+
+    def __init__(self, mixer: TECudaGraphMixin, partner: TECudaGraphMixin) -> None:
+        super().__init__()
+        self.mixer = mixer
+        self.partner = partner
+        # Static-input keys owned by the partner, such as its router's padding_mask.
+        self._partner_input_keys: tuple = ()
+        # The dtype of the partner's own static hidden_states input. Set with the keys above, by
+        # get_layer_static_inputs.
+        self._partner_input_dtype: torch.dtype | None = None
+        # Whether the mixer's output is appended to the graph outputs. Partial MoE scopes already
+        # return it as the partner's residual, the last output, when the partner takes it without
+        # a cast. Set at capture.
+        self._appends_mixer_output: bool | None = None
+        # (mixer output, partner graph outputs) from the mixer's replay, for the partner's call.
+        self._stash = None
+        mixer._te_cuda_graph_pair_link = _TECudaGraphPairLink(self, "mixer")
+        partner._te_cuda_graph_pair_link = _TECudaGraphPairLink(self, "partner")
+
+    @property
+    def layer_number(self) -> int:
+        """The mixer's layer number, which selects the FP8/FP4 first/last-layer status."""
+        return self.mixer.layer_number
+
+    @property
+    def te_cuda_graphs(self) -> list:
+        """The pair's graphs, one per captured microbatch."""
+        return self.mixer.te_cuda_graphs
+
+    @te_cuda_graphs.setter
+    def te_cuda_graphs(self, graphs: list) -> None:
+        # Both layers hold the same list, so both take the TE replay path.
+        self.mixer.te_cuda_graphs = graphs
+        self.partner.te_cuda_graphs = graphs
+
+    @property
+    def te_cuda_graph_manual_hooks(self) -> list:
+        """The pre-forward hooks of both layers, run by the mixer before it launches the graph."""
+        return self.mixer.te_cuda_graph_manual_hooks
+
+    @te_cuda_graph_manual_hooks.setter
+    def te_cuda_graph_manual_hooks(self, hooks: list) -> None:
+        self.mixer.te_cuda_graph_manual_hooks = hooks
+        self.partner.te_cuda_graph_manual_hooks = []
+
+    def setup_manual_hooks(self, make_hook_func) -> None:
+        """Set up the hooks of both layers' graphed parameters on the mixer."""
+        self.mixer.setup_manual_hooks(make_hook_func)
+        self.partner.setup_manual_hooks(make_hook_func)
+        self.te_cuda_graph_manual_hooks = (
+            self.mixer.te_cuda_graph_manual_hooks + self.partner.te_cuda_graph_manual_hooks
+        )
+
+    def _after_te_cuda_graphs_deleted(self) -> None:
+        """Release what the pair's graphs pinned in either layer, after the graphs were deleted."""
+        self.mixer._after_te_cuda_graphs_deleted()
+        self.partner._after_te_cuda_graphs_deleted()
+
+    def get_layer_static_inputs(self, seq_length: int, micro_batch_size: int) -> dict:
+        """Return the mixer's static inputs plus the partner's other inputs."""
+        static_inputs = self.mixer.get_layer_static_inputs(seq_length, micro_batch_size)
+        partner_inputs = self.partner.get_layer_static_inputs(seq_length, micro_batch_size)
+        # The partner takes the mixer's output instead, cast to this input's dtype; see forward.
+        self._partner_input_dtype = partner_inputs.pop("hidden_states").dtype
+        collisions = static_inputs.keys() & partner_inputs.keys()
+        if collisions:
+            raise ValueError(f"Paired TE CUDA graph inputs collide: {sorted(collisions)}.")
+        self._partner_input_keys = tuple(partner_inputs)
+        static_inputs.update(partner_inputs)
+        return static_inputs
+
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> tuple:
+        """Capture body: the mixer's graph scope, then the partner's graph scope."""
+        partner_kwargs = {key: kwargs.pop(key) for key in self._partner_input_keys if key in kwargs}
+        mixer_outputs = self.mixer._te_cuda_graph_capture(hidden_states, **kwargs)
+        if len(mixer_outputs) != 1:
+            raise RuntimeError("A paired mixer's CUDA graph must return only its layer output.")
+        mixer_output = mixer_outputs[0]
+        # The partner's own graph would copy the mixer's output into its static input, rounding an
+        # FP32 residual to BF16, and autograd would upcast that input's BF16 gradient for the
+        # mixer. The cast does the same inside the pair, and returns mixer_output itself when the
+        # dtypes already match.
+        partner_input = mixer_output.to(self._partner_input_dtype)
+        outputs = list(self.partner._te_cuda_graph_capture(partner_input, **partner_kwargs))
+        appends_mixer_output = outputs[-1] is not mixer_output
+        if self._appends_mixer_output is None:
+            self._appends_mixer_output = appends_mixer_output
+        elif self._appends_mixer_output != appends_mixer_output:
+            raise RuntimeError("Paired CUDA graph outputs changed between capture passes.")
+        if appends_mixer_output:
+            outputs.append(mixer_output)
+        return tuple(outputs)
+
+    def stash_partner_outputs(self, graph_outputs: list) -> torch.Tensor:
+        """At the mixer's replay, keep the partner's graph outputs and return the mixer output."""
+        mixer_output = graph_outputs.pop() if self._appends_mixer_output else graph_outputs[-1]
+        self._stash = (mixer_output, graph_outputs)
+        return mixer_output
+
+    def take_partner_outputs(self, hidden_states: torch.Tensor) -> list:
+        """At the partner's replay, return the graph outputs of its mixer's replay."""
+        stash, self._stash = self._stash, None
+        if stash is None or stash[0] is not hidden_states:
+            raise RuntimeError(
+                "A paired feed-forward layer must be called right after its mixer, with the "
+                "mixer's output, while replaying TE CUDA graphs."
+            )
+        return list(stash[1])
+
+
+def _te_cuda_graph_pair_supported(mixer, partner, config) -> bool:
+    """Whether two adjacent Hybrid layers can be captured as one TE graphed callable.
+
+    The mixer must be an attention-type layer whose feed-forward branch is an identity, so that its
+    graph output is its layer output, and the partner a feed-forward layer whose attention branch
+    is an identity, so that its graph starts at its layer input. Both layers must replay TE graphs
+    under their own configs: the mixer launches the pair's graph, and the partner takes its outputs.
+    """
     from megatron.core.transformer.identity_op import IdentityOp
-    from megatron.core.transformer.mlp import MLP
-    from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-    if isinstance(layer, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
-        # mamba layer.
-        return True
-    if isinstance(layer, TransformerLayer):
-        if CudaGraphModule.attn in config.cuda_graph_modules and not (
-            isinstance(layer.self_attention, IdentityOp)
-            and isinstance(layer.cross_attention, IdentityOp)
+    if not (isinstance(mixer, TransformerLayer) and isinstance(partner, TransformerLayer)):
+        return False
+    # _te_cuda_graph_layer_is_graphable also reads each layer's own cuda_graph_impl, which a
+    # hybrid_layer_config_list can set per layer. A mixer that runs eagerly never launches the
+    # graph, so its partner finds no outputs to take; a partner that runs eagerly repeats the part
+    # of its layer that the graph already ran.
+    if not (
+        _te_cuda_graph_layer_is_graphable(mixer, config)
+        and _te_cuda_graph_layer_is_graphable(partner, config)
+    ):
+        return False
+    if mixer.is_mtp_layer != partner.is_mtp_layer:
+        return False
+    mixer_is_attention_only = (
+        not isinstance(mixer.self_attention, IdentityOp)
+        and isinstance(mixer.cross_attention, IdentityOp)
+        and isinstance(mixer.pre_mlp_layernorm, IdentityOp)
+        and isinstance(mixer.mlp, IdentityOp)
+        and isinstance(mixer.mlp_bda, IdentityOp)
+    )
+    partner_is_feed_forward_only = (
+        isinstance(partner.input_layernorm, IdentityOp)
+        and isinstance(partner.self_attention, IdentityOp)
+        and isinstance(partner.cross_attention, IdentityOp)
+        and not isinstance(partner.mlp, IdentityOp)
+    )
+    if not (mixer_is_attention_only and partner_is_feed_forward_only):
+        return False
+    # Hash routing reads input_ids, which HybridStack passes to the hash-routed layer only.
+    if partner.is_moe_layer and getattr(partner.mlp.router, "is_hash_layer", False):
+        return False
+    # A graph that contains an MoE megakernel needs the layer's eager weight-view refresh
+    # (_before_te_cuda_graph_replay) before every replay, which only the layer's own graph runs.
+    if partner._cuda_graph_megakernel() is not None:
+        return False
+    # One graph runs both layers under one FP8/FP4 setting. All layers of an MTP block run under
+    # the block's setting, to which the first/last-layer BF16 rule does not apply.
+    if (config.fp8 or config.fp4) and not mixer.is_mtp_layer:
+        from megatron.core.fp8_utils import is_first_last_bf16_layer
+
+        if is_first_last_bf16_layer(config, mixer.layer_number - 1) != is_first_last_bf16_layer(
+            config, partner.layer_number - 1
         ):
-            # attn layer.
-            return True
-        if (
-            CudaGraphModule.moe in config.cuda_graph_modules
-            or CudaGraphModule.moe_router in config.cuda_graph_modules
-            or CudaGraphModule.moe_preprocess in config.cuda_graph_modules
-        ) and isinstance(layer.mlp, MoELayer):
-            # moe layer.
-            return True
-        if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(layer.mlp, MLP):
-            # mlp layer.
+            return False
+    return True
+
+
+def _pair_hybrid_layers_enabled(config: TransformerConfig) -> bool:
+    """Whether TE graphs pair adjacent Hybrid mixer and feed-forward layers.
+
+    A pair skips whatever would run between its two layers, so features that convert layouts or
+    schedule work between layers turn pairing off with a warning instead of failing.
+    """
+    if not config.cuda_graph_pair_hybrid_layers or config.cuda_graph_impl != "transformer_engine":
+        return False
+    blocking_features = [
+        name
+        for name, enabled in (
+            ("overlap_moe_expert_parallel_comm", config.overlap_moe_expert_parallel_comm),
+            ("delay_wgrad_compute", config.delay_wgrad_compute),
+            ("fine_grained_activation_offloading", config.fine_grained_activation_offloading),
+            (
+                "sequence_packing_scheduler",
+                getattr(config, "sequence_packing_scheduler", None) is not None,
+            ),
+            ("enable_mhc_connections", config.enable_mhc_connections),
+            # TransformerConfig rejects wide residual streams with TE CUDA graphs today; this
+            # keeps pairing off should that combination ever be allowed.
+            ("wide_residual", config.wide_residual is not None),
+            ("context_parallel_size > 1", config.context_parallel_size > 1),
+        )
+        if enabled
+    ]
+    if blocking_features:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f'cuda_graph_pair_hybrid_layers is ignored with {", ".join(blocking_features)}; '
+            'every layer keeps its own CUDA graph.',
+        )
+        return False
+    return True
+
+
+def _hybrid_mtp_graphs_supported(config: TransformerConfig) -> bool:
+    """Whether cuda_graph_pair_hybrid_layers can also graph the layers of Hybrid MTP blocks.
+
+    A graph keeps the activations of one call per microbatch, so a block that runs once per MTP
+    depth (mtp_use_repeated_layer) stays eager. TE graphs capture MTP layers with the model's
+    FP8/FP4 setting, so a block kept out of it (keep_mtp_in_bf16) stays eager too, and so does a
+    block whose layer configs select another recipe (see _hybrid_mtp_recipe_differences). A
+    graph's hidden_states input is BF16, so with fp32_residual_connection graphed layers would
+    round the FP32 residual stream that the block's eager layers keep, and the block stays eager
+    as well.
+    """
+    blocking_features = [
+        name
+        for name, enabled in (
+            (
+                "mtp_use_repeated_layer",
+                config.mtp_use_repeated_layer and (config.mtp_num_layers or 0) > 1,
+            ),
+            ("keep_mtp_in_bf16", config.keep_mtp_in_bf16 and bool(config.fp8 or config.fp4)),
+            ("fp32_residual_connection", config.fp32_residual_connection),
+        )
+        if enabled
+    ]
+    if blocking_features:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f'Hybrid MTP layers are not CUDA-graphed with {", ".join(blocking_features)}; '
+            'they run eagerly.',
+        )
+        return False
+    return True
+
+
+def _hybrid_mtp_moe_blocking_features(config: TransformerConfig) -> list:
+    """Return the settings with which pairing keeps an MoE layer of a Hybrid MTP block eager.
+
+    Per-layer graphs leave Hybrid MTP blocks eager, so their MoE layers never had to be capturable.
+    A graph that ends inside the MoE layer (moe_router, moe_preprocess) returns its intermediate
+    tensors, which the chunk loop of mlp_chunks_for_training cannot join. A graph that runs the
+    token dispatch (moe, or empty cuda_graph_modules for the whole layer) needs static dispatch
+    shapes. Pairing captures it only with drop-and-pad MoE or virtual-expert load balancing, the
+    settings with which TransformerConfig allows the moe scope, and never with the allgather
+    dispatcher, which copies token counts to the host in every mode. Such MoE layers stay eager,
+    and the mixers before them keep their own graphs.
+
+    Args:
+        config (TransformerConfig): The MoE layer's own config, whose graph scope, MLP chunks and
+            token dispatcher its capture uses.
+
+    Returns:
+        list: The names of the blocking settings. Empty when pairing can graph the layer.
+    """
+    modules = config.cuda_graph_modules
+    partial_moe_graph = (
+        CudaGraphModule.moe_router in modules or CudaGraphModule.moe_preprocess in modules
+    )
+    whole_moe_graph = not modules or CudaGraphModule.moe in modules
+    drop_and_pad = (
+        config.moe_expert_capacity_factor is not None and config.moe_pad_expert_input_to_capacity
+    )
+    return [
+        name
+        for name, enabled in (
+            (
+                "mlp_chunks_for_training > 1 and the moe_router scope",
+                partial_moe_graph and config.mlp_chunks_for_training > 1,
+            ),
+            (
+                "the moe or whole-layer scope with neither drop-and-pad MoE nor virtual-expert "
+                "load balancing",
+                whole_moe_graph and not (drop_and_pad or config.moe_virtual_expert_load_balance),
+            ),
+            (
+                "the moe or whole-layer scope and the allgather dispatcher",
+                whole_moe_graph and config.moe_token_dispatcher_type == "allgather",
+            ),
+        )
+        if enabled
+    ]
+
+
+# The TransformerConfig fields from which get_fp8_recipe, get_fp4_recipe, get_fp8_context and
+# get_fp4_context build a layer's FP8/FP4 recipe and amax reduction group.
+_QUANTIZATION_RECIPE_FIELDS = (
+    "fp8",
+    "fp8_recipe",
+    "fp8_margin",
+    "fp8_interval",
+    "fp8_amax_history_len",
+    "fp8_amax_compute_algo",
+    "fp8_wgrad",
+    "fp8_dot_product_attention",
+    "fp8_multi_head_attention",
+    "fp8_quantizer_factory",
+    "fp8_recipe_attrs",
+    "fp4",
+    "fp4_recipe",
+    "fp4_quantizer_factory",
+    "fp4_recipe_attrs",
+    "tp_only_amax_red",
+)
+
+
+def _hybrid_mtp_recipe_differences(mtp_block, config: TransformerConfig) -> list:
+    """Return the FP8/FP4 recipe settings in which Hybrid MTP layers differ from the model.
+
+    make_graphed_callables takes one recipe for all callables, the model's. The eager MTP block
+    runs inside the model's FP8/FP4 context and, except with delayed scaling, enters each layer's
+    own context inside it, so a layer whose config selects another recipe can run differently
+    once graphed. Such a block stays eager, as with per-layer graphs. The first/last-layer BF16
+    settings are not compared: inside the model's context they cannot turn FP8/FP4 off for an MTP
+    layer, and TE graphs enable FP8/FP4 for every MTP layer.
+
+    Args:
+        mtp_block (HybridStack): The mtp_model_layer of a Hybrid MTP block.
+        config (TransformerConfig): The model config that TE graphs are captured with.
+
+    Returns:
+        list: The names of the differing settings, sorted. Empty without FP8/FP4 training, in
+        which neither the eager block nor the graphs quantize.
+    """
+    if not (config.fp8 or config.fp4):
+        return []
+    return sorted(
+        {
+            name
+            for layer_config in mtp_block.layer_config_list
+            for name in _QUANTIZATION_RECIPE_FIELDS
+            if getattr(layer_config, name) != getattr(config, name)
+        }
+    )
+
+
+def _te_graph_callables(
+    layers, config: TransformerConfig, pair_hybrid_layers: bool, eager_layers=()
+) -> tuple:
+    """Return the TE graphed callables of consecutive layers and how many of them are pairs.
+
+    With pair_hybrid_layers, each mixer is captured with the layer after it where
+    _te_cuda_graph_pair_supported allows it. Every other graphable layer keeps its own callable;
+    as with per-layer graphs, a layer whose own config selects another cuda_graph_impl is not
+    graphable and stays eager. The eager_layers are neither graphed nor paired.
+    """
+    callables, num_pairs, index = [], 0, 0
+    while index < len(layers):
+        layer = layers[index]
+        partner = layers[index + 1] if pair_hybrid_layers and index + 1 < len(layers) else None
+        if partner in eager_layers:
+            partner = None
+        if partner is not None and _te_cuda_graph_pair_supported(layer, partner, config):
+            callables.append(_TECudaGraphLayerPair(layer, partner))
+            num_pairs += 1
+            index += 2
+            continue
+        if _te_cuda_graph_layer_is_graphable(layer, config) and layer not in eager_layers:
+            callables.append(layer)
+        index += 1
+    return callables, num_pairs
+
+
+def _is_mtp_te_graph_layer(layer, chunk_with_decoder) -> bool:
+    """Whether a layer is the model layer of an MTP block, or a layer of a Hybrid MTP block."""
+    for mtp_layer in getattr(getattr(chunk_with_decoder, "mtp", None), "layers", ()):
+        mtp_model_layer = mtp_layer.mtp_model_layer
+        if layer is mtp_model_layer or any(
+            layer is inner_layer for inner_layer in getattr(mtp_model_layer, "layers", ())
+        ):
             return True
     return False
 
@@ -2247,10 +2773,10 @@ class TECudaGraphHelper:
     def __init__(
         self, model, config, seq_length, micro_batch_size, optimizers=[], pg_collection=None
     ):
-        assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
         assert (
             config.cuda_graph_impl == "transformer_engine"
         ), "Option cuda_graph_impl=transformer_engine not enabled."
+        assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
         assert (
             "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
             or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
@@ -2258,9 +2784,16 @@ class TECudaGraphHelper:
             "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
             "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
+        if getattr(config, "sequence_packing_scheduler", None) is not None:
+            assert micro_batch_size == 1, "Scheduler THD graphs require micro_batch_size=1."
         self.model = model
         self.config = config
-        self.seq_length = seq_length
+        self.seq_length = (
+            config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
+            if getattr(config, "sequence_packing_scheduler", None) is not None
+            and config.pad_packed_seq_alignment is not None
+            else seq_length
+        )
         self.micro_batch_size = micro_batch_size
         self.optimizers = optimizers
         self.pg_collection = pg_collection
@@ -2294,11 +2827,27 @@ class TECudaGraphHelper:
         self.callables_per_chunk_is_mtp = []
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
+        pair_hybrid_layers = _pair_hybrid_layers_enabled(self.config)
+        # Per-layer graphs leave Hybrid MTP blocks eager: such a block is a HybridStack, which is
+        # not graphable as a whole. With pairing, its layers are graphed like decoder layers.
+        graph_hybrid_mtp = (
+            pair_hybrid_layers
+            and bool(self.config.mtp_num_layers)
+            and _hybrid_mtp_graphs_supported(self.config)
+        )
+        num_pairs, num_hybrid_mtp_callables = 0, 0
+        # The settings that keep MoE layers of Hybrid MTP blocks eager, for one warning.
+        mtp_moe_blocking_features = set()
+        # The FP8/FP4 settings that keep Hybrid MTP blocks eager, for one warning.
+        mtp_recipe_differences = set()
         for chunk_number, model_chunk in enumerate(self.model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
                     model_chunk, 'decoder', allow_none=False, return_model_obj=True
                 )
+                # unwrap the language model for vlm models, such as qwen3-vl.
+                if hasattr(chunk_with_decoder, 'language_model'):
+                    chunk_with_decoder = chunk_with_decoder.language_model
             except RuntimeError:
                 num_graphable_layers = 0
                 log_on_each_pipeline_stage(
@@ -2310,25 +2859,64 @@ class TECudaGraphHelper:
                     f'No valid layer in model chunk {chunk_number}.',
                 )
             else:
-                num_decoder_layers = len(chunk_with_decoder.decoder.layers)
-                if hasattr(chunk_with_decoder, 'mtp'):
-                    num_mtp_layers = len(chunk_with_decoder.mtp.layers)
-                else:
-                    num_mtp_layers = 0
                 num_graphable_layers = 0
-                callables, callables_is_mtp = [], []
-                for layer_number in range(num_decoder_layers):
-                    layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(False)
-                for layer_number in range(num_mtp_layers):
-                    layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(True)
+                decoder_layers = chunk_with_decoder.decoder.layers
+                mtp_layers = (
+                    chunk_with_decoder.mtp.layers if hasattr(chunk_with_decoder, 'mtp') else []
+                )
+                num_decoder_layers, num_mtp_layers = len(decoder_layers), len(mtp_layers)
+                hybrid_mtp_blocks = [
+                    mtp_layer.mtp_model_layer
+                    for mtp_layer in mtp_layers
+                    if getattr(mtp_layer, "is_hybrid_mtp", False)
+                ]
+                for layers in (decoder_layers, *(block.layers for block in hybrid_mtp_blocks)):
+                    for layer in layers:
+                        # Drop pair links left by an earlier helper, so that layers graphed
+                        # again with a different setting never replay a stale pair.
+                        if getattr(layer, "_te_cuda_graph_pair_link", None) is not None:
+                            layer._te_cuda_graph_pair_link = None
+                callables, chunk_pairs = _te_graph_callables(
+                    decoder_layers, self.config, pair_hybrid_layers
+                )
+                callables_is_mtp = [False] * len(callables)
+                for mtp_layer in mtp_layers:
+                    if _te_cuda_graph_layer_is_graphable(mtp_layer.mtp_model_layer, self.config):
+                        mtp_callables = [mtp_layer.mtp_model_layer]
+                    elif graph_hybrid_mtp and getattr(mtp_layer, "is_hybrid_mtp", False):
+                        recipe_differences = _hybrid_mtp_recipe_differences(
+                            mtp_layer.mtp_model_layer, self.config
+                        )
+                        if recipe_differences:
+                            mtp_recipe_differences.update(recipe_differences)
+                            continue
+                        mtp_block_layers = mtp_layer.mtp_model_layer.layers
+                        # An MoE layer is captured with its own config, which a
+                        # hybrid_layer_config_list can set apart from the model config.
+                        eager_moe_layers = []
+                        for layer in mtp_block_layers:
+                            blocking_features = (
+                                _hybrid_mtp_moe_blocking_features(layer.config)
+                                if getattr(layer, "is_moe_layer", False)
+                                else []
+                            )
+                            if blocking_features:
+                                eager_moe_layers.append(layer)
+                                mtp_moe_blocking_features.update(blocking_features)
+                        mtp_callables, mtp_pairs = _te_graph_callables(
+                            mtp_block_layers,
+                            self.config,
+                            pair_hybrid_layers,
+                            eager_layers=eager_moe_layers,
+                        )
+                        chunk_pairs += mtp_pairs
+                        num_hybrid_mtp_callables += len(mtp_callables)
+                    else:
+                        continue
+                    callables += mtp_callables
+                    callables_is_mtp += [True] * len(mtp_callables)
+                num_pairs += chunk_pairs
+                num_graphable_layers = len(callables)
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,
@@ -2352,6 +2940,40 @@ class TECudaGraphHelper:
                     self.callables_per_chunk.append([])
                     self.callables_per_chunk_is_mtp.append([])
 
+        # Logged per pipeline stage: only the stage that holds the MTP blocks has their layers.
+        if mtp_moe_blocking_features:
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=self.tp_group,
+                dp_cp_group=self.dp_cp_group,
+                level=logging.WARNING,
+                msg='MoE layers of Hybrid MTP blocks are not CUDA-graphed with '
+                f'{", ".join(sorted(mtp_moe_blocking_features))}; they run eagerly.',
+            )
+        if mtp_recipe_differences:
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=self.tp_group,
+                dp_cp_group=self.dp_cp_group,
+                level=logging.WARNING,
+                msg='Hybrid MTP layers are not CUDA-graphed because their layer configs differ '
+                f'from the model in {", ".join(sorted(mtp_recipe_differences))}, and TE graphs '
+                "would capture them with the model's FP8/FP4 recipe; they run eagerly.",
+            )
+        # _te_cuda_graph_pair_supported never pairs such a layer, so it is graphed on its own.
+        if pair_hybrid_layers and any(
+            getattr(c, "is_moe_layer", False) and c._cuda_graph_megakernel() is not None
+            for c in self.flattened_callables
+        ):
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=self.tp_group,
+                dp_cp_group=self.dp_cp_group,
+                level=logging.WARNING,
+                msg='cuda_graph_pair_hybrid_layers does not pair MoE layers whose CUDA graph '
+                'contains the MoE megakernel (moe_megakernel_backend); they keep their own CUDA '
+                'graphs.',
+            )
         log_on_each_pipeline_stage(
             logger=logger,
             tp_group=self.tp_group,
@@ -2360,6 +2982,16 @@ class TECudaGraphHelper:
             msg=f'Rank {torch.distributed.get_rank()}: '
             f'{len(self.flattened_callables)} graphable layers.',
         )
+        if pair_hybrid_layers:
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=self.tp_group,
+                dp_cp_group=self.dp_cp_group,
+                level=logging.INFO,
+                msg=f'Rank {torch.distributed.get_rank()}: {num_pairs} Hybrid mixer and '
+                'feed-forward layer pairs are graphed as one callable each, and '
+                f'{num_hybrid_mtp_callables} graphed callables belong to Hybrid MTP blocks.',
+            )
 
     def capture_finished(self):
         """
@@ -2407,8 +3039,8 @@ class TECudaGraphHelper:
 
         Args:
             order (List[int]): The forward/backward execution order from
-                convert_schedule_table_to_order(). Positive integers represent forward passes
-                (1-indexed chunk ID), negative integers represent backward passes.
+                convert_te_cuda_graph_schedule_table_to_order(). Positive integers represent
+                forward passes (1-indexed chunk ID), negative integers represent backward passes.
             chunk_id_list (List[Tuple[int, int]]): The list of chunk IDs and layer IDs in the
                 order. This is useful only when overlap_moe_expert_parallel_comm is enabled,
                 the order maps each layers' idx to their original chunk id.
@@ -2449,27 +3081,41 @@ class TECudaGraphHelper:
             """
             Get the static inputs for a layer.
             """
-            assert layer in chunk_of_the_layer.decoder.layers or any(
-                layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+            graphed_callable = layer
+            if isinstance(layer, _TECudaGraphLayerPair):
+                # A pair's inputs are its mixer's plus the partner's extras, so check the chunk
+                # and add the rotary input for the mixer.
+                layer = layer.mixer
+            assert layer in chunk_of_the_layer.decoder.layers or _is_mtp_te_graph_layer(
+                layer, chunk_of_the_layer
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
-                if (
-                    transformer_module.position_embedding_type == 'rope'
-                    and not self.config.multi_latent_attention
-                ):
+                uses_mla = self.config.multi_latent_attention
+                if getattr(transformer_module, "hybrid_layer_config_list", None) is not None:
+                    # Config types select the layer implementation; copied flags may differ.
+                    config_type = type(layer.config)
+                    if config_type is AttentionLayerConfig:
+                        uses_mla = False
+                    elif config_type in (MLALayerConfig, DSALayerConfig, CSALayerConfig):
+                        uses_mla = True
+                if transformer_module.position_embedding_type == 'rope' and not uses_mla:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None
                     )
                     if rotary_seq_len not in rotary_pos_emb_cache:
                         rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                            rotary_seq_len
+                            rotary_seq_len,
+                            packed_seq=getattr(self.config, "sequence_packing_scheduler", None)
+                            is not None,
                         )
                     return rotary_pos_emb_cache[rotary_seq_len]
                 else:
                     return None
 
-            static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
+            static_inputs = graphed_callable.get_layer_static_inputs(
+                self.seq_length, self.micro_batch_size
+            )
 
             from megatron.core.transformer.identity_op import IdentityOp
             from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -2488,7 +3134,9 @@ class TECudaGraphHelper:
                 # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
                 hidden_states = static_inputs.pop("hidden_states")
                 _sample_args = (hidden_states,)
-                if contains_self_attn:
+                # A layer may provide its own rotary input (e.g. batch-dependent mRoPE in VLMs that
+                # report "rope" for the language model); keep it instead of a static embedding.
+                if contains_self_attn and "rotary_pos_emb" not in static_inputs:
                     rotary_pos_emb = get_rotary_pos_emb(chunk_of_the_layer, hidden_states)
                     if rotary_pos_emb is not None:
                         static_inputs["rotary_pos_emb"] = rotary_pos_emb
@@ -2661,6 +3309,10 @@ class TECudaGraphHelper:
             ), "If PP is not enabled, there should be only one model chunk."
             self.num_microbatches = 1
         else:
+            # Keep the source-batch bound when dp_balanced produces fewer packs.
+            # With a fixed source batch and MBS=1, each aligned packed schedule is
+            # a subsequence of this capture order, preserving the existing input
+            # buffer lifetimes without wrapping around the captured graph list.
             self.num_microbatches = get_num_microbatches()
 
         _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
@@ -2675,7 +3327,7 @@ class TECudaGraphHelper:
             self.num_model_chunks,
             self.config.microbatch_group_size_per_vp_stage,
         )
-        order = convert_schedule_table_to_order(
+        order = convert_te_cuda_graph_schedule_table_to_order(
             num_warmup_microbatches, self.num_model_chunks, schedule_table
         )
         log_on_each_pipeline_stage(
@@ -2693,7 +3345,7 @@ class TECudaGraphHelper:
                 and not self.config.moe_shared_expert_overlap
             )
             capture_wgrad_graph = self.config.delay_wgrad_compute and wgrad_in_graph_scope
-            order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
+            order, chunk_id_list = get_te_cuda_graph_overlap_moe_expert_parallel_comm_order(
                 order, self.num_layers_per_chunk, capture_wgrad_graph
             )
             self.num_layers_per_chunk = [1] * sum(self.num_layers_per_chunk)
@@ -2869,6 +3521,8 @@ class TECudaGraphHelper:
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
+        from transformer_engine.pytorch.graph import make_graphed_callables
+
         start_time = self._start_capturing()
 
         if not self.flattened_callables:
@@ -2884,16 +3538,22 @@ class TECudaGraphHelper:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
-            with rng_context:
+            with rng_context, capture_constants(self), _keep_class_calls(self.flattened_callables):
                 graphs = make_graphed_callables(
                     tuple(self.flattened_callables), sample_args, **kwargs
                 )
+
+            # The returned callables can outlive this helper. Share the capture's
+            # constants with those actual graph owners instead of retaining them here.
+            constants = _CudagraphGlobalRecord.capture_constants.pop(self)
+            for graph in graphs:
+                _CudagraphGlobalRecord.capture_constants[graph] = constants
 
             # Push the captured graphs to the corresponding TransformerBlock.
             num_layers_accumulated = 0
             for layers in self.callables_per_chunk:
                 for layer_number, layer in enumerate(layers):
-                    layer.cuda_graphs = []
+                    layer.te_cuda_graphs = []
                     for batch_number in range(self.num_microbatches):
                         if self.config.overlap_moe_expert_parallel_comm:
                             graph_idx = (
@@ -2905,7 +3565,7 @@ class TECudaGraphHelper:
                                 + batch_number * len(layers)
                                 + layer_number
                             )
-                        layer.cuda_graphs.append(graphs[graph_idx])
+                        layer.te_cuda_graphs.append(graphs[graph_idx])
                 num_layers_accumulated += len(layers)
 
             self._graphs_created = True
@@ -2928,18 +3588,22 @@ class TECudaGraphHelper:
         """
         assert self._graphs_created, "No CUDA Graphs were created to delete."
 
+        torch.cuda.synchronize()
+
         graph_resettable = is_te_min_version("2.10.0")
         graphs_reset, graphs_not_reset = 0, 0
         for layers in self.callables_per_chunk:
             for layer in layers:
-                for graph in layer.cuda_graphs:
+                for graph in layer.te_cuda_graphs:
                     if graph_resettable:
                         graph.reset()
+                        release_capture_constants(graph)
                         graphs_reset += 1
                     else:
                         graphs_not_reset += 1
-                layer.cuda_graphs = []
-                layer.cuda_graph_manual_hooks = []
+                layer.te_cuda_graphs = []
+                layer.te_cuda_graph_manual_hooks = []
+                layer._after_te_cuda_graphs_deleted()
 
         log_on_each_pipeline_stage(
             logger=logger,
@@ -2953,7 +3617,9 @@ class TECudaGraphHelper:
         self._graphs_created = False
 
 
-def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, schedule_table):
+def convert_te_cuda_graph_schedule_table_to_order(
+    num_warmup_microbatches, num_model_chunks, schedule_table
+):
     """Convert a tunable schedule lookup table to the te.make_graphed_callables() accepted
     order format. For example, the tunable schedule table for PP2 N3M5 with VP2 is as below:
     virtual_microbatch_id | 0 1 2 3 4 5 6 7 8 9
@@ -2979,7 +3645,9 @@ def convert_schedule_table_to_order(num_warmup_microbatches, num_model_chunks, s
     return order
 
 
-def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capture_wgrad_graph):
+def get_te_cuda_graph_overlap_moe_expert_parallel_comm_order(
+    order, num_layers_per_chunk, capture_wgrad_graph
+):
     """
     This functions gets the order for overlap_moe_expert_parallel_comm schedule for the original
     chunk-wise order list. Each chunk is transformered to chunks with only 1 layer so that
@@ -3084,60 +3752,11 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
 
 
 # ---------------------------------------------------------------------------
-# set_current_microbatch: sets per-layer microbatch index for TE graph replay
-# ---------------------------------------------------------------------------
-
-
-def set_current_microbatch(model, microbatch_id):
-    """Set the current microbatch on all layers that use TE CUDA graph replay.
-
-    current_microbatch is read by _te_cuda_graph_replay to select the
-    correct graph index.  This helper is called from the pipeline-parallel
-    schedule before each forward step.
-    """
-    decoder_exists = True
-    model_with_decoder = None
-    try:
-        model_with_decoder = get_attr_wrapped_model(
-            model, "decoder", allow_none=False, return_model_obj=True
-        )
-    except RuntimeError:
-        decoder_exists = False
-    if decoder_exists and model_with_decoder is not None:
-        for layer in model_with_decoder.decoder.layers:
-            layer.current_microbatch = microbatch_id
-        if hasattr(model_with_decoder, 'mtp'):
-            for layer in model_with_decoder.mtp.layers:
-                assert hasattr(
-                    layer, 'mtp_model_layer'
-                ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
-                layer.mtp_model_layer.current_microbatch = microbatch_id
-
-    # Also set current_microbatch on vision encoder layers so that
-    # _te_cuda_graph_replay selects the correct graph index. Without this,
-    # vision layers always use graph 0 (since current_microbatch defaults to 0),
-    # causing all microbatch forwards to overwrite the same static buffers.
-    # When backward runs for earlier microbatches, the buffers contain stale
-    # data from later forwards, producing NaN gradients.
-    try:
-        model_with_vision = get_attr_wrapped_model(
-            model, "vision_model", allow_none=True, return_model_obj=True
-        )
-    except RuntimeError:
-        model_with_vision = None
-    if model_with_vision is not None and hasattr(model_with_vision, 'vision_model'):
-        vision_model = model_with_vision.vision_model
-        if hasattr(vision_model, 'decoder') and hasattr(vision_model.decoder, 'layers'):
-            for layer in vision_model.decoder.layers:
-                layer.current_microbatch = microbatch_id
-
-
-# ---------------------------------------------------------------------------
 # Vision encoder CUDA graph helpers
 # ---------------------------------------------------------------------------
 
 
-def _wrap_graph_for_vision(graph_fn):
+def _wrap_te_cuda_graph_for_vision(graph_fn):
     """Wrap a graphed callable to filter out None outputs.
 
     During make_graphed_callables warmup, vision encoder layers go through their
@@ -3159,7 +3778,7 @@ def _wrap_graph_for_vision(graph_fn):
     return wrapped
 
 
-def get_vision_cuda_graph_seq_length(vision_config, default_seq_length: int = 4096) -> int:
+def get_vision_te_cuda_graph_seq_length(vision_config, default_seq_length: int = 4096) -> int:
     """Calculate the sequence length for vision encoder CUDA graphs.
 
     For vision encoders, the sequence length depends on:
@@ -3260,7 +3879,7 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
                 self.vision_model.decoder, 'layers'
             ):
                 for layer in self.vision_model.decoder.layers:
-                    if _layer_is_graphable(layer, self.config):
+                    if _te_cuda_graph_layer_is_graphable(layer, self.config):
                         vision_layers.append(layer)
 
         if vision_layers:
@@ -3305,13 +3924,15 @@ class VisionTECudaGraphHelper(TECudaGraphHelper):
     def _finish_capturing(self, start_time):
         """
         Before calling super()._finish_capturing, wrap the captured graphs with
-        _wrap_graph_for_vision to filter None from (output, None) tuples so that
+        _wrap_te_cuda_graph_for_vision to filter None from (output, None) tuples so that
         _te_cuda_graph_replay's len == 1 assertion passes.
         """
         # Wrap the captured graphs before finishing
         for layer in self.flattened_callables:
-            if hasattr(layer, 'cuda_graphs'):
-                layer.cuda_graphs = [_wrap_graph_for_vision(g) for g in layer.cuda_graphs]
+            if hasattr(layer, 'te_cuda_graphs'):
+                layer.te_cuda_graphs = [
+                    _wrap_te_cuda_graph_for_vision(g) for g in layer.te_cuda_graphs
+                ]
 
         super()._finish_capturing(start_time)
 

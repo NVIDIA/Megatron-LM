@@ -15,8 +15,8 @@ from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.clip_vit_model import CLIPViTModel
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.resharding.execution import _prepare_refit_dtypes
 from megatron.core.resharding.refit import (
-    _harmonize_buffer_dtypes,
     clear_all_caches,
     prepare_swap_model_weights,
     swap_model_weights,
@@ -333,7 +333,7 @@ def test_buffer_dtype_conflicts_fail_on_every_rank():
             ]
         error = None
         try:
-            _harmonize_buffer_dtypes(plan, source, target)
+            _prepare_refit_dtypes(plan, source, target)
         except ValueError as exc:
             error = str(exc)
         errors = [None] * dist.get_world_size()
@@ -342,7 +342,6 @@ def test_buffer_dtype_conflicts_fail_on_every_rank():
             message and "Source shards disagree on buffer dtype" in message for message in errors
         ), errors
         assert len(set(errors)) == 1
-        assert plan.buffer_dtypes is None
         if target is not None:
             assert target.target_state.dtype == torch.bfloat16
     finally:

@@ -11,7 +11,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.pipeline_parallel.utils import set_streams
+from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe import fused_a2a
 from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
@@ -28,7 +28,7 @@ from tests.unit_tests.a2a_overlap.utils import (
 from tests.unit_tests.test_utilities import Utils
 
 
-def build_model(config, use_padding_mask=False, use_mtp_input_mask=False):
+def build_model(config, use_padding_mask=False, use_mtp_input_mask=False, post_process=True):
     seq_len = 32
     max_seq_len = 300
     # ids = random.sample([i for i in range(max_seq_len)], seq_len)
@@ -64,7 +64,11 @@ def build_model(config, use_padding_mask=False, use_mtp_input_mask=False):
 
     # build layer spec
     transformer_layer_spec = get_gpt_decoder_block_spec(config=config, use_transformer_engine=True)
-    mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec.layer_specs[-1], True)
+    mtp_block_spec = (
+        get_gpt_mtp_block_spec(config, transformer_layer_spec.layer_specs[-1], True)
+        if post_process
+        else None
+    )
 
     # build model
     gpt_model = GPTModel(
@@ -73,11 +77,43 @@ def build_model(config, use_padding_mask=False, use_mtp_input_mask=False):
         mtp_block_spec=mtp_block_spec,
         vocab_size=128,
         pre_process=True,
-        post_process=True,
+        post_process=post_process,
         max_sequence_length=max_seq_len,
     )
     f_schedule_plan = gpt_model.build_schedule_plan(**data)
     return gpt_model, f_schedule_plan, data
+
+
+def _make_b_grad(f_output, late_pp_recv_streams, late_pp_recv_events=None, sleep_cycles=20_000_000):
+    """Return ``(b_grad, pre_backward)`` for one backward chunk of the 1F1B pattern.
+
+    Without ``late_pp_recv_streams`` the gradient is ready and there is no hook. Otherwise
+    the ones-gradient is produced like a late pipeline receive: on a side stream behind a
+    sleep, ready only once ``pre_backward`` has made the current stream wait for it. Any
+    schedule op that reads the gradient without being ordered after that hook reads
+    uninitialized memory. If ``late_pp_recv_events`` is a list, a timing event recorded when
+    the gradient becomes ready is appended to it.
+    """
+    if late_pp_recv_streams is None:
+        return torch.ones_like(f_output), None
+
+    recv_stream = torch.cuda.Stream()
+    b_grad = torch.empty_like(f_output)
+    recv_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(recv_stream):
+        torch.cuda._sleep(sleep_cycles)
+        b_grad.fill_(1.0)
+    b_grad.record_stream(recv_stream)
+    recv_done = torch.cuda.Event(enable_timing=late_pp_recv_events is not None)
+    recv_done.record(recv_stream)
+    if late_pp_recv_events is not None:
+        late_pp_recv_events.append(recv_done)
+
+    def pre_backward(vp_stage=None):
+        late_pp_recv_streams.append(torch.cuda.current_stream())
+        torch.cuda.current_stream().wait_event(recv_done)
+
+    return b_grad, pre_backward
 
 
 def run_two_chunk_parity(
@@ -88,6 +124,10 @@ def run_two_chunk_parity(
     use_mtp_input_mask=False,
     on_plans_built=None,
     on_forward_done=None,
+    late_pp_recv_streams=None,
+    late_pp_recv_events=None,
+    late_pp_recv_sleep_cycles=20_000_000,
+    post_process=True,
 ):
     """Assert the a2a overlap schedule and the reference forward give the same grads.
 
@@ -98,6 +138,13 @@ def run_two_chunk_parity(
     ``on_forward_done`` runs on chunk 0's plan right after its forward-only pass, once per
     microbatch. With ``microbatches > 1`` both paths accumulate grads over that many
     identical microbatches and the plans are rebuilt each round, as in a real 1F1B step.
+
+    With ``late_pp_recv_streams`` (a list), each backward gradient is delivered the way a
+    pipeline receive delivers it: written on a side stream after a delay, with a
+    ``pre_backward`` hook that makes the current stream wait for it. The stream each hook
+    ran on is appended to the list, and with ``late_pp_recv_events`` (a list) a timing event
+    recorded when each gradient becomes ready. ``post_process=False`` builds stages without
+    the output layer, like every pipeline stage but the last.
     """
     assert len(layers) == 2, "the 1F1B pattern below is written for exactly two chunks"
 
@@ -113,7 +160,10 @@ def run_two_chunk_parity(
             config = get_test_config(num_layers=layer_num, extra_kwargs=extra_kwargs)
             # build model
             gpt_model, schedule_plan, data = build_model(
-                config, use_padding_mask=use_padding_mask, use_mtp_input_mask=use_mtp_input_mask
+                config,
+                use_padding_mask=use_padding_mask,
+                use_mtp_input_mask=use_mtp_input_mask,
+                post_process=post_process,
             )
             gpt_model.cuda()
             gpt_models.append(gpt_model)
@@ -153,13 +203,19 @@ def run_two_chunk_parity(
                 on_forward_done(schedule_plans[0])
             capture_0["outputs"].append(f_input_0)
             # overlap
+            b_grad_0, pre_backward_0 = _make_b_grad(
+                f_input_0, late_pp_recv_streams, late_pp_recv_events, late_pp_recv_sleep_cycles
+            )
             f_input_1 = TransformerModelChunkSchedulePlan.run(
-                schedule_plans[1], schedule_plans[0], b_grad=torch.ones_like(f_input_0)
+                schedule_plans[1], schedule_plans[0], b_grad=b_grad_0, pre_backward=pre_backward_0
             )
             capture_1["outputs"].append(f_input_1)
             # last backward
+            b_grad_1, pre_backward_1 = _make_b_grad(
+                f_input_1, late_pp_recv_streams, late_pp_recv_events, late_pp_recv_sleep_cycles
+            )
             TransformerModelChunkSchedulePlan.run(
-                None, schedule_plans[1], b_grad=torch.ones_like(f_input_1)
+                None, schedule_plans[1], b_grad=b_grad_1, pre_backward=pre_backward_1
             )
         for i in range(len(gpt_models)):
             for name, param in gpt_models[i].named_parameters():
@@ -512,7 +568,7 @@ class TestA2AOverlap:
         torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("mtp_layers", [0, 1])
+    @pytest.mark.parametrize("mtp_layers", [0, 1, 2])
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [1, 1]])
@@ -533,6 +589,89 @@ class TestA2AOverlap:
             extra_kwargs["mtp_num_layers"] = mtp_layers
             extra_kwargs["mtp_loss_scaling_factor"] = 1.1
         run_two_chunk_parity(layers, extra_kwargs)
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("mtp_layers", [0, 1])
+    @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [1, 1]])
+    def test_1f1b_schedule_model_chunk_late_pp_recv(self, mtp_layers, layers):
+        """A late backward pipeline receive is waited for before the gradient is read.
+
+        The wait is issued on the comm stream only; the backward chunk must still be ordered
+        after it on both streams.
+        """
+        extra_kwargs = {
+            "moe_token_dispatcher_type": "alltoall",
+            "overlap_moe_expert_parallel_comm": True,
+        }
+        if mtp_layers > 0:
+            extra_kwargs["mtp_num_layers"] = mtp_layers
+            extra_kwargs["mtp_loss_scaling_factor"] = 1.1
+        streams = []
+        run_two_chunk_parity(layers, extra_kwargs, late_pp_recv_streams=streams)
+        assert len(streams) == 2, "pre_backward should run once per backward chunk"
+        assert all(stream == get_comm_stream() for stream in streams)
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    def test_1f1b_schedule_late_pp_recv_overlap_intermediate_stage(self):
+        """On a stage without the output layer, the paired forward pre-dispatch computation
+        runs while a late backward pipeline receive is in flight.
+
+        Each chunk has one MoE layer, so the backward chunk starts with combine backward and
+        nothing on the compute stream waits for the gradient before the paired forward
+        pre-dispatch computation. Gradients must stay bitwise identical to the reference.
+        """
+        extra_kwargs = {
+            "moe_token_dispatcher_type": "alltoall",
+            "overlap_moe_expert_parallel_comm": True,
+        }
+        fwd_done = []
+
+        def time_paired_forward(schedule_plans):
+            # Chunk 1's forward is the one paired with chunk 0's backward.
+            node = schedule_plans[1].get_layer(0).pre_dispatch_computation
+            forward = node.forward
+
+            def timed_forward(*args, **kwargs):
+                out = forward(*args, **kwargs)
+                event = torch.cuda.Event(enable_timing=True)
+                event.record(get_comp_stream())
+                fwd_done.append(event)
+                return out
+
+            node.forward = timed_forward
+
+        streams, recv_done = [], []
+        run_two_chunk_parity(
+            [1, 1],
+            extra_kwargs,
+            on_plans_built=time_paired_forward,
+            late_pp_recv_streams=streams,
+            late_pp_recv_events=recv_done,
+            # ~50 ms at typical clocks: much longer than one small layer's forward.
+            late_pp_recv_sleep_cycles=100_000_000,
+            post_process=False,
+        )
+        torch.cuda.synchronize()
+        assert len(fwd_done) == 1 and len(recv_done) == 2
+        # Negative: the paired forward pre-dispatch finished before the gradient arrived.
+        fwd_after_recv_ms = recv_done[0].elapsed_time(fwd_done[0])
+        assert fwd_after_recv_ms < 0, fwd_after_recv_ms
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
+    def test_1f1b_schedule_model_chunk_multi_mtp_multi_microbatch(
+        self, dispatcher_type, flex_backend
+    ):
+        """Two MTP depths over four microbatches.
+
+        Each non-last depth hands a detached copy of its output to the last depth's
+        torch.cat and adds the loss-side gradient back in its own backward. Rebuilding the
+        plans every round must not carry those copies, or their gradients, into the next
+        microbatch.
+        """
+        extra_kwargs = {"mtp_num_layers": 2, "mtp_loss_scaling_factor": 1.1}
+        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
+        run_two_chunk_parity([2, 1], extra_kwargs, microbatches=4)
 
     def _run_full_recompute_parity(
         self,
@@ -581,7 +720,9 @@ class TestA2AOverlap:
                 assert segment.input_tensor is not None, "segment input was not retained"
                 for layer in segment.layers:
                     for node in layer._iter_recomputed_nodes():
-                        assert node.output is None, f"{node.name} kept its forward output"
+                        assert (
+                            node._output_edges is None
+                        ), f"{node.name} kept its forward graph edge"
                         assert node.inputs is None, f"{node.name} kept its forward inputs"
             # What survives the gap is the segment input alone, not the graph that built it.
             assert_segment_inputs_are_graph_free(plan)

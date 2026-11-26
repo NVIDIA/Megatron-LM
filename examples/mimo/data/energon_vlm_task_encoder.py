@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, Union, Iterable, Tuple, Optional, Protocol
 import heapq
+from megatron.training.global_vars import get_run_config
 import torch
 import torch.nn.utils.rnn as rnn_utils
 
@@ -501,7 +502,8 @@ class VLMTaskEncoder(
 
 def llava_vlm_dataloader_provider(train_val_test_num_samples, max_seq_length: Optional[int] = None, is_video_input: bool = False):
     args = get_args()
-    tokenizer_model_id = args.tokenizer_model
+    cfg = get_run_config()
+    tokenizer_model_id = cfg.tokenizer.tokenizer_model
     processor = AutoProcessor.from_pretrained(tokenizer_model_id)
     if is_video_input:
         model_type = ModelType.VIDEO_LLAVA_VLM

@@ -512,10 +512,15 @@ class MegatronFSDP(torch.nn.Module):
         prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
         wait_bucket_ready=True,
         bwd=False,
+        recompute=False,
     ):
         """
         All-gather parameters across the data parallel group and wait for
         the all-gather operation to complete.
+
+        `prefetch`, `prefetch_order`, `bwd` and `recompute` are passed through to
+        `AllGatherPipeline.all_gather_params`, which documents them. If
+        `wait_bucket_ready`, block until the buckets of `params` are gathered.
         """
         if all_sharding_strategies_in(self.ddp_config, ["no_shard"]):
             return
@@ -539,6 +544,7 @@ class MegatronFSDP(torch.nn.Module):
                 and (self.microbatch_count == 0 or self.model_auto_sync)
             ),
             bwd=bwd,
+            recompute=recompute,
         )
         if wait_bucket_ready:
             for param in params:
@@ -861,6 +867,7 @@ class MegatronFSDP(torch.nn.Module):
                 params=param_list,
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
+                recompute=input_training_state == TrainingState.PRE_BACKWARD,
             )
             return None
 
@@ -1368,18 +1375,16 @@ class MegatronFSDP(torch.nn.Module):
                 )
         else:
             self.synchronize_param_gather()
-            for bucket_id in range(self.all_gather_pipeline.num_buckets):
+            # Leave sharded weights to the forward pre-hooks, which gather them one FSDP unit at a
+            # time and over DP-Outer when needed, as they do after finish_grad_sync().
+            bucket_ids = [
+                bucket_id
+                for bucket_id, group in enumerate(self.param_and_grad_buffer.parameter_groups)
+                if group.model_weight_buffer is not None and not group.has_sharded_model_weights()
+            ]
+            for bucket_id in bucket_ids:
                 self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
-                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
-                if group.model_weight_buffer is None:
-                    continue
-
-                if group.model_weight_buffer.is_data_distributed:
-                    # If model weight is sharded, we wait for the all-gather to complete and
-                    # then release the bucket immediately to save memory usage.
-                    self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
-
-            for bucket_id in range(self.all_gather_pipeline.num_buckets):
+            for bucket_id in bucket_ids:
                 self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
 
     def start_grad_sync(self, *unused):

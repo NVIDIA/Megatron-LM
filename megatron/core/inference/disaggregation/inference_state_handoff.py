@@ -74,14 +74,11 @@ class InferenceStateHandoffMixin:
 
     requires_recurrent_state_dummy_slot = True
 
-    def _complete_request(
-        self, request_entry: RequestEntry, finished_request: DynamicInferenceRequest | None = None
-    ) -> DynamicInferenceRequest:
+    def _finalize_request(self, request_entry: RequestEntry) -> DynamicInferenceRequest:
         """Attach merged RL history before the completion is consumed or sent."""
-        request = super()._complete_request(request_entry, finished_request)
+        request = super()._finalize_request(request_entry)
         if request.disaggregated_params:
             # The merged record includes evictions from all prefill checkpoints.
-            # No await intervenes before the completion future's consumers resume.
             request.disaggregated_params["kv_meta"]["request_metadata"] = asdict(
                 HandoffRequestMetadata.from_request(request)
             )
@@ -293,11 +290,17 @@ class InferenceStateHandoffMixin:
         """
         if role not in ("prefill", "decode"):
             raise ValueError(f"KV transfer role must be 'prefill' or 'decode', got {role!r}")
+        if self.context.cache_dsa_indexer_keys:
+            raise ValueError(
+                "Disaggregated KV transfer does not support DSA models yet; "
+                "handoffs do not transfer the prompt's indexer keys"
+            )
         if self.context.is_hybrid_model:
             if role == "decode" and self.context.mamba_slot_allocator is not None:
                 raise RuntimeError(
-                    "A hybrid decode handoff writes directly into live SSM state; "
-                    "do not configure prefix_caching_mamba_gb on the decode engine"
+                    "A hybrid decode handoff writes directly into live SSM state, but "
+                    "this context allocated a Mamba prefix cache; build it with "
+                    "InferenceConfig.disaggregation_role='decode'"
                 )
         if self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST:
             raise ValueError(
@@ -315,6 +318,7 @@ class InferenceStateHandoffMixin:
             # a missing graph; existing captured graphs remain usable.
             self.cuda_graph_all_prefills = False
         self._kv_transfer_role = role
+        self.context.kv_transfer_enabled = True
         self._require_handoff_claim = require_handoff_claim
         backend_cls = construct_kv_transfer_backend_class(self.context.config.kv_transport_backend)
 
@@ -400,12 +404,20 @@ class InferenceStateHandoffMixin:
                     f"SSM state shape implies {nheads_global} global heads, "
                     f"but model config specifies {configured_nheads}"
                 )
+            # Mamba2 stores recurrent state as [heads, headdim, d_state]; Gated DeltaProduct
+            # stores [heads, d_state, headdim] and packs H value and key conv bands.
+            num_householder = int(getattr(self.context, "gdp_num_householder", 0) or 0)
+            if num_householder > 0:
+                d_state, headdim = int(ssm_shape[-2]), int(ssm_shape[-1])
+            else:
+                headdim, d_state = int(ssm_shape[-2]), int(ssm_shape[-1])
             ssm_dims = SSMStateDims(
                 nheads=nheads_global,
-                headdim=int(ssm_shape[-2]),
-                d_state=int(ssm_shape[-1]),
+                headdim=headdim,
+                d_state=d_state,
                 ngroups=int(model_config.mamba_num_groups),
                 d_conv=int(conv_shape[-1]),
+                num_householder=max(1, num_householder),
             )
             ssm_layout = SSMShardLayout(
                 global_rank=rank,
@@ -986,6 +998,7 @@ class InferenceStateHandoffMixin:
         allocated_blocks = [int(block) for block in allocated_blocks_tensor.tolist()]
         imported_blocks = allocated_blocks[:num_blocks_to_import]
         continuation_blocks = allocated_blocks[num_blocks_to_import:]
+        self.context._initialize_mha_value_pages(continuation_blocks)
         local_blocks = cached_blocks + imported_blocks
         owned_blocks_tensor = torch.tensor(
             local_blocks + continuation_blocks, dtype=torch.int32, device="cpu"
@@ -1097,10 +1110,9 @@ class InferenceStateHandoffMixin:
         Side: decode engine; pull and push transport paths.
         """
 
-        allocator = self.context.kv_block_allocator
         cached_blocks = []
         for block_hash in hashes[:num_blocks]:
-            block_id = allocator.kv_hash_to_block_id.get(block_hash)
+            block_id = self.context.prefix_cache_registry.kv_hash_to_block_id.get(block_hash)
             if block_id is None:
                 break
             cached_blocks.append(int(block_id))
@@ -1116,7 +1128,9 @@ class InferenceStateHandoffMixin:
         potential_matched_count = 0
         if cached_blocks:
             block_tensor = torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
-            potential_matched_count = int((allocator.block_ref_counts[block_tensor] == 0).sum())
+            potential_matched_count = int(
+                (allocator.pc_state.block_ref_counts[block_tensor] == 0).sum()
+            )
         # Model-parallel ranks process the same request and allocator operations
         # in lockstep, so capacity must remain mirrored without a per-request collective.
         return allocator.is_memory_available(
@@ -1309,6 +1323,11 @@ class InferenceStateHandoffMixin:
                 if first_token in self._terminating_token_ids(request) or stop_word_hit:
                     # Preserve the cause even when the matched string was stripped.
                     request.finish_reason = "stop"
+                if self.context.num_speculative_tokens > 0 and request.generated_tokens:
+                    # The prefill engine's step emitted this token; record it as a collocated
+                    # engine would, after stop-word trimming, so acceptance_step_lengths sums
+                    # to the generated length.
+                    request.acceptance_step_lengths.append(1)
 
             request.num_cached_tokens = len(pending.prompt)
             finished = request.finish_reason == "stop" or (
@@ -1360,12 +1379,9 @@ class InferenceStateHandoffMixin:
         self._set_finish_reason(request)
         request.generated_length = len(request.generated_tokens)
         request.status = Status.COMPLETED
-        request.add_event_finish()
-        self.finished_request_count += 1
-        finished_request = self._complete_request(request_entry)
+        self._complete_request(request_entry, reply_now=True)
 
         if self.use_coordinator and self.is_mp_coordinator:
-            self._send_requests_to_coordinator([finished_request])
             self._partial_emit_lengths.pop(request_id, None)
 
     def _release_pending_kv_import(self, pending: PendingKvImport) -> None:

@@ -14,6 +14,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+from megatron.core.ops.norm.torch_norm import L2Norm
 from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -21,7 +22,6 @@ from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module, import_module
-from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules

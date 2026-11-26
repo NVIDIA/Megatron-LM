@@ -4,11 +4,13 @@
 
 Covers every compiled function under ``megatron/core/fusions/`` that is not a Triton or CUDA
 kernel, plus the compiled activations and helpers scattered through ``megatron/core``
-(``activations.py``, ``transformer/utils.py``, ``transformer/torch_norm.py``,
+(``activations.py``, ``transformer/utils.py``, ``ops/norm/torch_norm.py``,
 ``transformer/attention.py``). Inductor picks reduction tilings per shape; the row
 reductions in the weighted backward passes (``torch.sum(weights_grad, dim=-1)``) are the
 only non-elementwise math, so shapes are sized to make those reductions wide.
 """
+
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -16,6 +18,7 @@ import torch.nn.functional as F
 
 import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import activations, parallel_state
+from megatron.core.fusions import fused_swiglu_triton
 from megatron.core.fusions.fused_bias_dropout import (
     bias_dropout_add_fused_inference,
     bias_dropout_add_fused_train,
@@ -23,15 +26,17 @@ from megatron.core.fusions.fused_bias_dropout import (
 from megatron.core.fusions.fused_bias_geglu import bias_geglu_impl, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
-from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
-from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.ops.loss.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+from megatron.core.ops.norm.torch_norm import L2Norm, WrappedTorchNorm
 from megatron.core.transformer.attention import Attention
-from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.utils import erf_gelu, gelu_impl
 from tests.unit_tests.determinism.kernels.harness import (
     CONTENTION_TOKENS,
+    assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    bytes_equal,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -40,6 +45,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 TOKENS = CONTENTION_TOKENS
 FFN = 8192
+# MoE expert width: short rows take the multi-row Triton SwiGLU kernels.
+FFN_SHORT = 768
 DTYPE = torch.bfloat16
 
 
@@ -78,6 +85,19 @@ GATED_CASES = {
         ),
         (_act((TOKENS, 2 * FFN)), None, _weights(TOKENS)),
     ),
+    "swiglu_no_bias_short_rows": lambda: (bias_swiglu_impl, (_act((TOKENS, 2 * FFN_SHORT)), None)),
+    "clamped_swiglu_short_rows": lambda: (
+        lambda x: bias_swiglu_impl(x, None, clamp_value=7.0),
+        (_act((TOKENS, 2 * FFN_SHORT)),),
+    ),
+    "weighted_swiglu_short_rows": lambda: (
+        weighted_bias_swiglu_impl,
+        (_act((TOKENS, 2 * FFN_SHORT)), None, _weights(TOKENS)),
+    ),
+    "weighted_clamped_swiglu_short_rows": lambda: (
+        lambda x, b, w: weighted_bias_swiglu_impl(x, b, w, clamp_value=7.0),
+        (_act((TOKENS, 2 * FFN_SHORT)), None, _weights(TOKENS)),
+    ),
     "bias_geglu": lambda: (bias_geglu_impl, (_act((TOKENS, 2 * FFN)), _act((2 * FFN,)))),
     "geglu_no_bias": lambda: (bias_geglu_impl, (_act((TOKENS, 2 * FFN)), None)),
     "weighted_quick_geglu": lambda: (
@@ -112,6 +132,19 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     assert_replays_bit_exact(fn, inputs, replays=3, what=case)
 
 
+@pytest.mark.parametrize(
+    "n_cols,multi_row",
+    [(FFN_SHORT, True), (fused_swiglu_triton.MR_DISPATCH_MAX_COLS, True), (FFN, False)],
+)
+def test_triton_swiglu_dispatch_by_row_length(n_cols, multi_row):
+    """The SwiGLU cases above cover both Triton kernel layouts; short rows use the multi-row ones."""
+    fwd, bwd = fused_swiglu_triton._kernels(n_cols)
+    if multi_row:
+        assert (fwd, bwd) == (fused_swiglu_triton.swiglu_fwd_mr, fused_swiglu_triton.swiglu_bwd_mr)
+    else:
+        assert (fwd, bwd) == (fused_swiglu_triton.swiglu_fwd, fused_swiglu_triton.swiglu_bwd)
+
+
 @pytest.mark.skipif(
     te_ext._te_mark_grouped_tensor is None,
     reason="Transformer Engine does not provide mark_grouped_tensor",
@@ -120,8 +153,20 @@ def test_mlp_activation_fusions_replay_bit_exactly(case):
     "name,activation",
     [("swiglu", weighted_bias_swiglu_impl), ("quick_geglu", weighted_bias_quick_geglu_impl)],
 )
-def test_paged_stash_marked_activation_fusions_replay_bit_exactly(name, activation):
-    """Marker propagation through activation views must preserve bit-exact numerics."""
+@pytest.mark.parametrize(
+    "bf16_override",
+    [False, pytest.param(True, marks=pytest.mark.launch_on_gb200)],
+    ids=["bf16", "bf16_override_under_mxfp8"],
+)
+def test_paged_stash_marked_activation_fusions_replay_bit_exactly(name, activation, bf16_override):
+    """Marked activations retain bit-exact outputs and gradients under BF16 overrides."""
+    if bf16_override:
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+
+        available, reason = te_ext.FP8GlobalStateManager.is_mxfp8_available()
+        if not available:
+            pytest.skip(reason)
+
     seeded()
     x = _act((TOKENS, 2 * FFN))
     weights = _weights(TOKENS)
@@ -130,7 +175,32 @@ def test_paged_stash_marked_activation_fusions_replay_bit_exactly(name, activati
         te_ext.mark_grouped_tensor(x)
         return activation(x, None, weights)
 
-    assert_replays_bit_exact(fn, (x, weights), replays=3, what=f"marked_{name}")
+    reference = assert_replays_bit_exact(fn, (x, weights), replays=3, what=f"marked_{name}")
+    if not bf16_override:
+        return
+
+    qparams = te_ext.TEQuantizationParams(
+        training_recipe=te_ext.TEQuantizationRecipe(), evaluation_recipe=None
+    )
+    initial_fp8_enabled = te_ext.FP8GlobalStateManager.is_fp8_enabled()
+
+    def with_bf16_override(x, weights):
+        with te_ext.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
+            assert te_ext.FP8GlobalStateManager.is_fp8_enabled()
+            with te_ext._get_fp8_autocast_for_quant_params(qparams, training=True):
+                assert not te_ext.FP8GlobalStateManager.is_fp8_enabled()
+                output = fn(x, weights)
+            assert te_ext.FP8GlobalStateManager.is_fp8_enabled()
+        assert te_ext.FP8GlobalStateManager.is_fp8_enabled() == initial_fp8_enabled
+        return output
+
+    overridden = assert_replays_bit_exact(
+        with_bf16_override, (x, weights), replays=3, what=f"marked_{name}[BF16 override]"
+    )
+    for actual, expected in zip(overridden, reference):
+        assert actual.keys() == expected.keys()
+        for key in expected:
+            assert bytes_equal(actual[key], expected[key]), f"BF16 override changed {name}: {key}"
 
 
 @pytest.mark.parametrize("weighted", [False, True])
@@ -182,6 +252,16 @@ def test_compiled_activations_replay_bit_exactly(case):
     assert_replays_bit_exact(ACTIVATION_CASES[case], (x,), replays=3, what=case)
 
 
+@pytest.mark.parametrize("tokens", [5, 13])
+def test_unfused_fast_gelu_replays_bit_exactly(tokens):
+    """Variable-length projector activation preserves output and gradient bits on replay."""
+    seeded()
+    x = _act((tokens, 96))
+    assert_replays_bit_exact(
+        activations.unfused_fast_gelu, (x,), replays=3, what="unfused_fast_gelu"
+    )
+
+
 def test_attention_output_gate_replays_bit_exactly():
     """``Attention._apply_output_gate`` is a compiled method; ``self`` is unused."""
     seeded()
@@ -201,6 +281,25 @@ def test_l2norm_replays_bit_exactly():
     norm = L2Norm(hidden_size=128).cuda()
     x = _act((4096, 2, 32, 128))
     assert_replays_bit_exact(norm, (x,), replays=3, what="L2Norm")
+
+
+@pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
+def test_wrapped_torch_norm_gamma_replays(normalization):
+    """Replay outputs and gamma gradients after the constructor marks RMSNorm weights."""
+    seeded()
+    config = SimpleNamespace(
+        normalization=normalization,
+        layernorm_zero_centered_gamma=False,
+        persist_layer_norm=False,
+        sequence_parallel=False,
+        memory_efficient_layer_norm=False,
+    )
+    norm = WrappedTorchNorm(config=config, hidden_size=2048).cuda().to(dtype=DTYPE)
+    assert getattr(norm.weight, "is_rmsnorm_weight", False) == (normalization == "RMSNorm")
+    x = _act((4096, 2, 2048))
+    assert_module_replays_bit_exact(
+        norm, (x,), replays=3, contention=True, what=f"WrappedTorchNorm[{normalization}]"
+    )
 
 
 # --- bias + dropout + residual --------------------------------------------------------------

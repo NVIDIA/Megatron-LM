@@ -336,7 +336,9 @@ class TestMtpDecodeBookkeeping:
         assert context._using_cuda_graph_this_step is True
         assert context.padded_active_token_count == 4
         mha = context.graph_attn_metadata["mha_metadata"]
-        assert mha.state_data["max_seqlen_k"] == mha.max_seqlen == MAX_SEQUENCE_LENGTH
+        # The fixed bound also covers the speculative lookahead past the sequence limit.
+        bound = MAX_SEQUENCE_LENGTH + context.num_speculative_tokens
+        assert mha.state_data["max_seqlen_k"] == mha.max_seqlen == bound
         assert mha.state_data["max_seqlen_q"] == 1
         # The metadata is sized by the PADDED count so the graph's launch bounds stay stable.
         assert mha.state_data["query_lengths"].shape[0] == 4
@@ -390,7 +392,8 @@ class TestMtpDecodeBookkeeping:
         context._mtp_setup_decode_step()
         bound_at_high_position = mha.state_data["max_seqlen_k"]
 
-        assert bound_at_low_position == bound_at_high_position == MAX_SEQUENCE_LENGTH
+        bound = MAX_SEQUENCE_LENGTH + context.num_speculative_tokens
+        assert bound_at_low_position == bound_at_high_position == bound
         # The real per-request lengths still come from the GPU cu_kv tensors.
         assert int(context.gpu_view.mha_kv_seq_lengths[0].item()) == 21
 
@@ -966,9 +969,10 @@ class TestMtpChunkBoundaryCarry:
     def test_take_raises_on_a_position_mismatch(self):
         """A carry-holding continuation chunk takes no prefix skip, so its seam lands here.
 
-        `_compute_prefix_match` gives up that chunk's ENTIRE match to guarantee it. A mismatch
-        therefore means the back-off stopped holding, not that the carry is merely stale, and
-        declining would leave a committed position unwritten.
+        `_compute_prefix_match` guarantees it: the chunk takes no prefix skip, and may inherit
+        only matched blocks contiguous with its inherited run (a match after a gap is declined).
+        A mismatch therefore means the back-off stopped holding, not that the carry is merely
+        stale, and declining would leave a committed position unwritten.
         """
         meta = self._meta()
         meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=3)
@@ -1280,10 +1284,13 @@ class TestMtpSpareBlockLifecycle:
         with pytest.raises(RuntimeError, match="cannot pause requests"):
             context.prepare_requests()
         torch.testing.assert_close(context.request_kv_length_offsets, before)
+        context.memory_buffer[1, :, held[0]].fill_(float("nan"))
         context.kv_block_allocator.release_memory_blocks(held[:1])
         assert context.can_prepare_requests()
         context.prepare_requests()
         assert context.request_kv_block_counts[0] == 2
+        assert context.request_to_kv_block_ids[0, 1] == held[0]
+        assert torch.count_nonzero(context.memory_buffer[1, :, held[0]]) == 0
         self._assert_main_token_mapping(context)
         context.kv_block_allocator.release_memory_blocks(held[1:])
 

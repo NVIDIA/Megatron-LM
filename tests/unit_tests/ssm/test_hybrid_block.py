@@ -547,7 +547,7 @@ def test_dsv4_layers_forward_build_context_and_wrap_once(monkeypatch, qk_layerno
     assert [layer for _, layer in wrapped_layers] == built_layers
     assert list(block.layers) == built_layers
 
-    with pytest.raises(ValueError, match="C/H/W layers require.*csa_layer"):
+    with pytest.raises(ValueError, match="Tried to build a `csa"):
         HybridStack(
             transformer_config,
             HybridStackSubmodules(),
@@ -762,7 +762,9 @@ class TestHybridBlock:
                 vocab_size=128,
                 max_sequence_length=8,
                 hybrid_layer_pattern=f"{Symbols.MAMBA}/{Symbols.MAMBA}",
-                pg_collection=self.get_pg_collection(),
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=["tp", "pp", "cp", "dp_cp"]
+                ),
             )
 
     def get_hybrid_block(self, layer_pattern, *, stack_spec=hybrid_stack_spec, **config_kwargs):
@@ -1435,7 +1437,7 @@ class TestHybridBlock:
             module=HybridStack,
             submodules=HybridStackSubmodules(gdn_layer=hybrid_stack_spec.submodules.gdn_layer),
         )
-        with pytest.raises(ValueError, match="gdn2_layer"):
+        with pytest.raises(ValueError, match="Tried to build a `gdn2_layer`"):
             self.get_gdn2_hybrid_block(Symbols.GDN, stack_spec=stack_spec)
 
     def test_dsa_layer_types(self):

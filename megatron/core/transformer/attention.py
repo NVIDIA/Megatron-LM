@@ -19,23 +19,18 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
+from megatron.core.ops.norm.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
-from megatron.core.parallel_state import (
-    get_data_parallel_group,
-    get_data_parallel_rank,
-    get_data_parallel_world_size,
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
-from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, copy_signature, not_none
 from megatron.core.utils import (
@@ -335,14 +330,33 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         self.kv_projection_size = self.config.kv_channels * self.config.num_query_groups
 
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+            warn_global_process_group_fallback(type(self).__name__)
+            # hcp feeds TEDotProductAttention's a2a+p2p path. The data-parallel groups are only
+            # read by SelfAttention.run_realtime_tests, which runs with test_mode and qk_layernorm,
+            # so they are resolved only then: their accessors assert before
+            # initialize_model_parallel(), and a module built earlier must not need them.
+            needs_dp = (
+                self.attention_type == "self" and self.config.test_mode and self.config.qk_layernorm
+            )
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'hcp'] + (['dp', 'dp_gtp_remat'] if needs_dp else [])
+            )
         else:
-            assert hasattr(
-                pg_collection, 'tp'
-            ), "Attention pg_collection must have tp process group"
-            assert hasattr(
-                pg_collection, 'cp'
-            ), "Attention pg_collection must have cp process group"
+            groups = vars(pg_collection)
+            for group_name in ('tp', 'cp'):
+                if group_name not in groups:
+                    raise ValueError(
+                        f"Attention pg_collection must have {group_name} process group"
+                    )
+            # A group that is present but None is unusable too. cp may be None only while context
+            # parallelism is off for this module.
+            if groups['tp'] is None:
+                raise ValueError("Attention pg_collection must have a non-None tp process group")
+            if groups['cp'] is None and self.config.context_parallel_size > 1:
+                raise ValueError(
+                    "Attention pg_collection must have a non-None cp process group when "
+                    "context_parallel_size > 1"
+                )
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
 
@@ -387,7 +401,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             attention_type=self.attention_type,
             cp_comm_type=cp_comm_type,
             softmax_scale=self.config.softmax_scale,
-            pg_collection=self.pg_collection,
+            # tp is None only for the deprecated fallback before initialize_model_parallel(); an
+            # explicit collection without tp is rejected above. Core attention then resolves its
+            # own fallback, which lets Transformer Engine defer its groups, instead of rejecting
+            # this collection as an explicit one without tp.
+            pg_collection=self.pg_collection if self.tp_group is not None else None,
         )
 
         self.checkpoint_core_attention = (
@@ -1151,6 +1169,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     causal=True,
                     window_size=window_size,
                     num_splits=0 if not self.batch_invariant_mode else 1,
+                    return_lse=need_lse,
                     **softcap_kwargs,
                 )
             elif use_fa3:
@@ -1298,6 +1317,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         causal=True,
                         window_size=window_size,
                         num_splits=0 if not self.batch_invariant_mode else 1,
+                        return_lse=need_lse,
                         **softcap_kwargs,
                     )
                     if need_lse:
@@ -1335,9 +1355,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         ), "Batch invariant mode is not supported for flash attention 2"
                         kvcache_ret = flash_attn_with_kvcache(**flash_attn_args)
                     if need_lse:
-                        # FA2/FA3 *_with_kvcache return (out, softmax_lse) when
-                        # return_softmax_lse=True.
-                        output_total, softmax_lse = kvcache_ret
+                        # FA3 may append kernel metadata after (out, softmax_lse),
+                        # while FA2 returns exactly those two values.
+                        output_total, softmax_lse, *_ = kvcache_ret
                         # output_total: (B, S, H, D); softmax_lse: (B, H, S)
                         output_total = self._apply_sink_softmax_correction_bshd(
                             output_total, softmax_lse, softmax_offset
@@ -1442,6 +1462,17 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         )
         if no_rope:
             rotary_pos_emb = None
+
+        if (
+            self.config.attention_cp_layout == "contiguous"
+            and runtime_cp_group is not None
+            and runtime_cp_group.size() > 1
+            and any(
+                value is not None
+                for value in (rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, rotary_pos_cos_sin)
+            )
+        ):
+            raise ValueError("Contiguous attention CP does not yet support rotary embeddings.")
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -1667,6 +1698,26 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # core attention computation
         # ==================================
 
+        if (
+            self.offload_core_attention
+            and self.training
+            and self.config.activation_offload_fraction > 0
+        ):
+            # Offload may gather small views into contiguous tensors, while fused
+            # attention backward retains the packed layout selected in forward.
+            # Check the actual inputs after Q/K normalization and rotary embedding.
+            qkv = (query, key, value)
+            storages = [tensor.untyped_storage().data_ptr() for tensor in qkv]
+            if any(
+                not tensor.is_contiguous() and storages.count(storage) > 1
+                for tensor, storage in zip(qkv, storages)
+            ):
+                raise ValueError(
+                    "core_attn offloading does not support packed Q/K/V views sharing storage. "
+                    "Use unpacked attention inputs or remove core_attn from offload_modules "
+                    "(and attn_proj, which requires core_attn)."
+                )
+
         nvtx_range_push(suffix="core_attention")
         core_attention_extra_kwargs = self._get_core_attention_extra_kwargs(
             hidden_states=hidden_states,
@@ -1817,6 +1868,29 @@ class SelfAttention(Attention):
     and returns output of the same size.
     """
 
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward QKV/output projections and causal attention, including FMA x2."""
+        hidden = config.hidden_size
+        heads = config.num_attention_heads
+        projection_size = config.kv_channels * heads
+        flops = (
+            4
+            * total_real_tokens_in_batch
+            * projection_size
+            * (hidden + hidden * config.num_query_groups / heads)
+            + 2 * seqlen_squared_sum_in_batch * projection_size
+        )
+        if config.attention_output_gate:
+            flops += 2 * total_real_tokens_in_batch * hidden * projection_size
+        return flops
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -1845,6 +1919,18 @@ class SelfAttention(Attention):
             is_mtp_layer=is_mtp_layer,
             name=name,
         )
+
+        # run_realtime_tests, which test_mode runs on every forward when qk_layernorm is on, is the
+        # only reader of the DP group. Check for it here rather than on the first forward.
+        if (
+            self.config.test_mode
+            and self.config.qk_layernorm
+            and self._realtime_test_dp_group() is None
+        ):
+            raise ValueError(
+                "SelfAttention with test_mode and qk_layernorm requires a dp process group; "
+                "pass one via pg_collection.dp_gtp_remat or pg_collection.dp"
+            )
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
         if self.config.attention_output_gate:
@@ -1910,6 +1996,17 @@ class SelfAttention(Attention):
             else None
         )
 
+    def _realtime_test_dp_group(self) -> torch.distributed.ProcessGroup | None:
+        """Return the data-parallel group that run_realtime_tests compares over.
+
+        dp_gtp_remat holds every data-parallel replica of the Q/K layernorm parameters, GTP-remat
+        peers included, which is the group the global accessors resolved by default. A collection
+        built for a custom grid may set only dp.
+        """
+        groups = vars(self.pg_collection)
+        dp_group = groups.get('dp_gtp_remat')
+        return dp_group if dp_group is not None else groups.get('dp')
+
     def run_realtime_tests(self):
         """Performs a consistency check.
 
@@ -1927,7 +2024,9 @@ class SelfAttention(Attention):
 
         # check that all tensor parallel and data parallel ranks have the same
         # Q & K layernorm parameters.
-        rank = get_data_parallel_rank()
+        # __init__ has already checked that the DP group is there.
+        dp_group = self._realtime_test_dp_group()
+        rank = get_pg_rank(dp_group)
         inputs = torch.stack(
             [
                 self.q_layernorm.weight.data,
@@ -1936,9 +2035,9 @@ class SelfAttention(Attention):
                 self.k_layernorm.bias.data,
             ]
         )
-        dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
+        dp_list = [torch.empty_like(inputs) for _ in range(get_pg_size(dp_group))]
         dp_list[rank] = inputs
-        torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
+        torch.distributed.all_gather(dp_list, inputs, group=dp_group)
 
         def _compare(srcs, tgts, names, parallelism):
             assert len(srcs) == len(tgts) == len(names)
@@ -1962,10 +2061,10 @@ class SelfAttention(Attention):
                 "DP",
             )
 
-        rank = get_tensor_model_parallel_rank()
-        tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
+        rank = get_pg_rank(self.tp_group)
+        tp_list = [torch.empty_like(inputs) for _ in range(get_pg_size(self.tp_group))]
         tp_list[rank] = inputs
-        torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
+        torch.distributed.all_gather(tp_list, inputs, group=self.tp_group)
 
         for i, tp in enumerate(tp_list):
             q_w, q_b, k_w, k_b = torch.unbind(tp)
@@ -2102,9 +2201,7 @@ class SelfAttention(Attention):
             # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
             gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
             if self.config.num_query_groups < self.world_size:
-                idx = get_tensor_model_parallel_rank() % (
-                    self.world_size // self.config.num_query_groups
-                )
+                idx = get_pg_rank(self.tp_group) % (self.world_size // self.config.num_query_groups)
                 size = self.num_attention_heads_per_partition // (
                     self.world_size // self.config.num_query_groups
                 )
