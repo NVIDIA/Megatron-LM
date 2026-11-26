@@ -49,6 +49,33 @@ except ImportError:
     _NO_NVFP4_REASON = "Transformer Engine NVFP4 support is unavailable"
 
 
+def _process_groups():
+    """Return the process groups currently registered with torch.distributed."""
+    if not torch.distributed.is_initialized():
+        return set()
+    return set(torch.distributed.distributed_c10d._world.pg_map)
+
+
+def _destroy_process_groups_created_since(groups_before):
+    """Destroy the process groups created after groups_before was taken.
+
+    parallel_state.destroy_model_parallel() only drops its references to the NCCL groups (see
+    #6897), so each model-parallel lifetime in a shared pytest process leaves its communicators
+    behind. On GB200 the GPU memory they keep (outside the PyTorch allocator) eventually makes a
+    later collective fail with "Invalid access of peer GPU memory over nvlink". Only this test's
+    groups are destroyed: earlier groups may still be referenced by global state, such as
+    Transformer Engine's FP8 amax reduction buffers. Every rank destroys the groups in the same
+    order. Remove once #7029 lands.
+    """
+    if not torch.distributed.is_initialized():
+        return
+    default_group = torch.distributed.distributed_c10d._get_default_group()
+    torch.cuda.synchronize()
+    for group in list(torch.distributed.distributed_c10d._world.pg_map):
+        if group is not default_group and group not in groups_before:
+            torch.distributed.destroy_process_group(group)
+
+
 _SEED = 1234
 _BLACKWELL_AVAILABLE = torch.cuda.is_available() and get_device_arch_version() >= 10
 try:
@@ -115,10 +142,12 @@ class TestMoESingleGroupedWeightNumerics:
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
         os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = "1"
         os.environ["NVTE_CUTEDSL_FUSED_GROUPED_MLP"] = "1"
+        self._process_groups_before = _process_groups()
 
     def teardown_method(self, method):
         try:
             self._cleanup()
+            _destroy_process_groups_created_since(self._process_groups_before)
         finally:
             if self._old_single_param_env is None:
                 os.environ.pop("NVTE_GROUPED_LINEAR_SINGLE_PARAM", None)
