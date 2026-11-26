@@ -22,7 +22,7 @@ from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.te_recipe import (
-    get_quantization_alignment,
+    get_dense_gemm_alignment,
     get_quantization_disabled_context,
 )
 from megatron.core.quantization.utils import is_quantization_enabled
@@ -303,12 +303,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
         self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
-        if is_quantization_enabled(self.config) and not _kda_fp8_disabled(self.config):
-            quantization_alignment = get_quantization_alignment(self.config)
-            assert self.in_proj_dim % quantization_alignment == 0, (
+        # Dense GEMM requirement of in_proj itself, not the recipe's grouped-padding alignment.
+        dense_alignment = get_dense_gemm_alignment(self.config)
+        if dense_alignment is not None and not _kda_fp8_disabled(self.config):
+            assert self.in_proj_dim % dense_alignment == 0, (
                 "For quantized execution, the innermost dimension of the GDN layer "
-                "input projection output tensor must be a multiple of "
-                f"{quantization_alignment}."
+                f"input projection output tensor must be a multiple of {dense_alignment}."
             )
         self.in_proj = _build_with_kda_fp8_disabled(
             self.config,

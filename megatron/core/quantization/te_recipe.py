@@ -69,6 +69,28 @@ def get_quantization_alignment(config: TransformerConfig) -> int:
     return 0
 
 
+def get_dense_gemm_alignment(config: TransformerConfig) -> int | None:
+    """Return the feature-dimension alignment a quantized dense GEMM needs, if known up front.
+
+    Unlike :func:`get_quantization_alignment`, which pads tokens for grouped operations, this
+    is the requirement on a dense projection's own dimensions: 16 for FP8 tensor/delayed/block
+    scaling, and 32 for MXFP8 and NVFP4 (16-byte aligned FP4/scale layouts).
+
+    Returns ``None`` for custom recipes: the factory selects each projection's format (or keeps
+    it in high precision) only when it runs, so no fixed value is correct at construction time.
+    Transformer Engine validates every GEMM against the quantizer actually selected.
+    """
+    if is_custom_recipe_selected(config):
+        return None
+    if config.fp8:
+        from megatron.core.fp8_utils import get_fp8_align_size
+
+        return get_fp8_align_size(config.fp8_recipe)
+    if config.fp4:
+        return 32
+    return None
+
+
 def _te_validates_save_original_input() -> bool:
     """Feature-detect Transformer Engine's per-quantizer validation of ``save_original_input``."""
     if not HAVE_TE:

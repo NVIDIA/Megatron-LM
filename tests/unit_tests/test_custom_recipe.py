@@ -1078,3 +1078,137 @@ def test_multimodal_projector_runs_under_custom_recipe():
         assert torch.isfinite(hidden_states.grad).all()
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    ("config_kwargs", "expected"),
+    [
+        pytest.param({}, None, id="bf16"),
+        pytest.param({"fp8": "e4m3", "fp8_recipe": "tensorwise"}, 16, id="fp8-tensorwise"),
+        pytest.param({"fp8": "e4m3", "fp8_recipe": "mxfp8"}, 32, id="mxfp8"),
+        pytest.param({"fp4": "e2m1", "fp4_recipe": "nvfp4"}, 32, id="nvfp4"),
+        *[pytest.param(p.values[0], None, id=f"custom-{p.id}") for p in CUSTOM_RECIPE_SPELLINGS],
+    ],
+)
+def test_dense_gemm_alignment_is_format_specific_and_deferred_for_custom_recipes(
+    config_kwargs, expected
+):
+    """Dense projections use their GEMM requirement, never the grouped-padding fallback.
+
+    A custom recipe picks each projection's format only when its factory runs, so there is no
+    construction-time requirement; Transformer Engine validates each GEMM at runtime.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        warnings.simplefilter("ignore", DeprecationWarning)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, **config_kwargs
+        )
+    assert te_recipe.get_dense_gemm_alignment(config) == expected
+
+
+def _first_layer_in_proj(model, pattern):
+    layer = model.decoder.layers[0]
+    return layer.mixer.in_proj if pattern == "M" else layer.self_attention.in_proj
+
+
+def _in_proj_width(model, pattern):
+    layer = model.decoder.layers[0]
+    if pattern == "M":
+        mixer = layer.mixer
+        return 2 * mixer.d_inner + 2 * mixer.ngroups * mixer.d_state + mixer.nheads
+    return layer.self_attention.in_proj_dim
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("pattern", ["M", "G"], ids=["mamba", "gdn"])
+def test_custom_recipe_does_not_apply_grouped_padding_to_dense_projections(pattern):
+    """TE's CustomRecipe.quantization_alignment (default 128) is for grouped-operation padding.
+
+    Applying it to the dense Mamba/GDN input projection rejected valid widths such as
+    Mamba's 6176 (hidden 1024 with default Mamba dims), even when the factory keeps those
+    projections in BF16 and only quantizes routed experts.
+    """
+    if pattern == "M":
+        from megatron.core.ssm.mamba_mixer import HAVE_MAMBA_SSM
+
+        if not HAVE_MAMBA_SSM:
+            pytest.skip("mamba-ssm is not installed")
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        extra = {"hidden_size": 1024} if pattern == "M" else {}
+        config = _hybrid_naming_config(num_layers=1, custom_recipe=TEST_FACTORY_PATH, **extra)
+        model = _build_hybrid(config, pattern)
+        width = _in_proj_width(model, pattern)
+        assert width % 128 != 0, "the fixture must not be aligned to the grouped fallback"
+        assert _first_layer_in_proj(model, pattern) is not None
+        if pattern == "M":
+            assert width == 6176
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fp8_still_rejects_dense_projection_widths_its_gemm_cannot_run():
+    """Built-in formats keep their dense GEMM check: FP8 needs multiples of 16."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = _hybrid_naming_config(num_layers=1, fp8="e4m3", fp8_recipe="tensorwise")
+        with pytest.raises(AssertionError, match="must be a multiple of 16"):
+            # GDN in_proj width here is 2 * 128 + 2 * 128 + 2 * 4 = 520.
+            _build_hybrid(config, "G")
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("config_kwargs", CUSTOM_RECIPE_SPELLINGS)
+def test_custom_recipe_rejects_local_transformer_impl(config_kwargs):
+    """Local layers never enter TE autocast, so the factory would be silently ignored."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        warnings.simplefilter("ignore", DeprecationWarning)
+        with pytest.raises(ValueError, match="transformer_impl='transformer_engine'"):
+            TransformerConfig(
+                num_layers=1,
+                hidden_size=128,
+                num_attention_heads=4,
+                transformer_impl="local",
+                **config_kwargs,
+            )
+    # Without a custom recipe, local layers remain a valid choice.
+    TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, transformer_impl="local"
+    )
+
+
+def _mok_config(**kwargs):
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=8,
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        gradient_accumulation_fusion=True,
+        add_bias_linear=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        moe_shared_expert_intermediate_size=128,
+        gated_linear_unit=True,
+        activation_func=torch.nn.functional.silu,
+        moe_megakernel_backend="mok",
+        **kwargs,
+    )
+
+
+def test_custom_recipe_rejects_mok_megakernel_backend():
+    """MOK's BF16 path accepted --custom-recipe, but its experts bypass the TE linears."""
+    # The same MOK configuration is valid without a custom recipe, so the rejection below
+    # comes from the custom recipe and not from an unrelated MOK requirement.
+    _mok_config()
+    with pytest.raises(ValueError, match="MOK does not support custom recipes"):
+        _mok_config(custom_recipe=TEST_FACTORY_PATH)

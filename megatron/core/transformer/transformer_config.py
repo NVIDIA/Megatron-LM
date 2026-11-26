@@ -2423,6 +2423,13 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Custom recipes do not yet support inference-optimized transformer layers."
                 )
+            if self.transformer_impl == "local":
+                # Local linears never run under Transformer Engine's autocast, so the recipe's
+                # quantizer factory would be silently ignored.
+                raise ValueError(
+                    "Custom recipes require transformer_impl='transformer_engine'; local "
+                    "layers would silently ignore the quantizer factory."
+                )
             if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
                 raise ValueError("Custom recipes do not yet support CUDA graphs in Megatron Core.")
 
@@ -3046,6 +3053,13 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("MOK requires glu_linear_offset=0.0")
             if self.activation_func_tanh_clamp_scale is not None:
                 raise ValueError("MOK does not support activation_func_tanh_clamp_scale")
+            if self.custom_recipe is not None:
+                # MOK's BF16 path accepts custom_recipe (fp8/fp4 stay unset), but the megakernel
+                # bypasses the TE expert linears, so routed experts would ignore the factory.
+                raise ValueError(
+                    "MOK does not support custom recipes: its routed experts bypass the "
+                    "Transformer Engine linears that apply the quantizer factory."
+                )
             mok_bf16 = (
                 self.bf16
                 and not self.fp16

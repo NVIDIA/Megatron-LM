@@ -24,8 +24,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.quantization.te_recipe import get_quantization_alignment
-from megatron.core.quantization.utils import is_quantization_enabled
+from megatron.core.quantization.te_recipe import get_dense_gemm_alignment
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_carry_states
@@ -305,14 +304,14 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             assert self.d_inner % self.headdim == 0, "d_inner must be evenly divisible by headdim"
             self.nheads = self.d_inner // self.headdim
 
-        if is_quantization_enabled(self.config):
-            quantization_alignment = get_quantization_alignment(self.config)
+        # Dense GEMM requirement of in_proj itself, not the recipe's grouped-padding alignment.
+        dense_alignment = get_dense_gemm_alignment(self.config)
+        if dense_alignment is not None:
             assert (
                 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
-            ) % quantization_alignment == 0, (
+            ) % dense_alignment == 0, (
                 "For quantized execution, the innermost dimension of the Mamba layer "
-                "input projection output tensor must be a multiple of "
-                f"{quantization_alignment}."
+                f"input projection output tensor must be a multiple of {dense_alignment}."
             )
 
         tp_size = self.pg_collection.tp.size()
