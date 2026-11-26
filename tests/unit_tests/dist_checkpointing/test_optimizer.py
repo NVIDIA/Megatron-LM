@@ -1945,6 +1945,43 @@ class TestOptimizerResharding:
 
 @pytest.mark.launch_on_gb200
 class TestCheckpointParameterIdentity:
+    @pytest.mark.parametrize("swiglu", [False, True])
+    def test_grouped_optimizer_state_preserves_expert_shards(self, swiglu):
+        """Whole-parent momentum saves with the same keys and offsets as discrete experts."""
+        parent = torch.nn.Parameter(torch.arange(48, dtype=torch.float32).view(3, 4, 4))
+        entries = {}
+        for index, member in enumerate(parent.unbind(0)):
+            member._checkpoint_grouped_parent_id = id(parent)
+            member._checkpoint_grouped_member_index = index
+            entry = ShardedTensor.from_rank_offsets(
+                'experts.weight', member, (0, index, 3), prepend_axis_num=1
+            )
+            if swiglu:
+                entry = apply_swiglu_sharded_factory(entry, ((0, index, 3),))
+            entries[str(index)] = entry
+        other = torch.nn.Parameter(torch.ones(4))
+        entries['norm'] = ShardedTensor.from_rank_offsets('norm', other)
+        mapping = get_param_id_to_sharded_param_map(entries, [other, parent])
+        momentum = (parent.detach() + 7).square()
+        grouped = make_sharded_optimizer_tensor(mapping[1], momentum, 'optimizer.momentum')
+        built = grouped.build()
+        loaded = []
+        for index in range(3):
+            expected = make_sharded_optimizer_tensor(
+                entries[str(index)], momentum[index], 'optimizer.momentum'
+            )
+            expected_parts = expected.build() if swiglu else [expected]
+            actual_parts = built[index] if swiglu else [built[index]]
+            for actual, reference in zip(actual_parts, expected_parts, strict=True):
+                assert actual.key == reference.key
+                assert actual.global_offset == reference.global_offset
+                assert actual.global_shape == reference.global_shape
+                assert actual.dtype == torch.float32
+                torch.testing.assert_close(actual.data, reference.data, rtol=0, atol=0)
+            values = [part.data.clone() for part in actual_parts]
+            loaded.append(values if swiglu else values[0])
+        torch.testing.assert_close(grouped.merge_fn(loaded), momentum, rtol=0, atol=0)
+
     @pytest.mark.parametrize("factory", [False, True])
     def test_optimizer_maps_original_parameter_and_keeps_moment_dtype(self, factory):
         param = torch.nn.Parameter(torch.ones(2, 4))

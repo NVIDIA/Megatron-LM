@@ -20,12 +20,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from packaging.version import Version
 
 import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP, mark_grouped_tensor
-from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.fp8_utils import (
+    copy_tensor_to_quantized_param,
+    get_fp8_context,
+    get_grouped_quantized_members,
+    is_mxfp8tensor,
+    prepare_grouped_mxfp8_weight_,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -280,6 +287,68 @@ class TestTEWrappers:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize(
+        "version,supported",
+        [
+            (None, False),
+            ("2.18.0", False),
+            ("2.19.0.dev0", False),
+            ("2.19.0", True),
+            ("2.20.2+44f31bbe", True),
+        ],
+    )
+    def test_group_quantize_version_gate_and_replay(self, monkeypatch, version, supported):
+        """Reject old APIs before preparation; replay supported in-place publication."""
+        if not _IS_BLACKWELL:
+            pytest.skip("MXFP8 primary weights require Blackwell")
+        te_ext.check_te_group_quantize_support()
+        from transformer_engine.pytorch.constants import DType
+        from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+        seeded()
+        source = torch.randn(2, 128, 128, device="cuda", dtype=torch.bfloat16)
+        weight = GroupedTensor.make_grouped_tensor_with_shapes(
+            num_tensors=2,
+            shapes=[(128, 128)] * 2,
+            quantizer=MXFP8Quantizer(DType.kFloat8E4M3, rowwise=True, columnwise=True),
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        monkeypatch.setattr(te_ext, "HAVE_TE", version is not None)
+        monkeypatch.setattr(te_ext, "get_te_version", lambda: Version(version))
+        if not supported:
+            expected = "not installed" if version is None else version
+            with pytest.raises(RuntimeError, match="requires Transformer Engine >= 2.19.0") as exc:
+                prepare_grouped_mxfp8_weight_(weight)
+            assert f"found {expected}" in str(exc.value)
+            assert not getattr(weight, "_mcore_grouped_mxfp8_weight_prepared", False)
+            with pytest.raises(RuntimeError, match="requires Transformer Engine >= 2.19.0"):
+                te_ext.te_group_quantize_(source.flatten(0, 1), weight)
+            return
+
+        prepare_grouped_mxfp8_weight_(weight)
+        assert not weight._with_gemm_swizzled_scales
+        assert not weight.quantizer.optimize_for_gemm
+        fields = ("rowwise_data", "columnwise_data", "scale_inv", "columnwise_scale_inv")
+        pointers = tuple(getattr(weight, field).data_ptr() for field in fields)
+
+        def publish(source):
+            outputs = []
+            for multiplier in (0.5, -3.0):
+                copy_tensor_to_quantized_param(weight, source * multiplier)
+                assert not weight._with_gemm_swizzled_scales
+                assert not weight.quantizer.optimize_for_gemm
+                assert tuple(getattr(weight, field).data_ptr() for field in fields) == pointers
+                outputs.extend(getattr(weight, field).clone() for field in fields)
+            return tuple(outputs)
+
+        assert_replays_bit_exact(
+            publish, (source,), backward=False, contention=True, what="TE in-place group_quantize"
+        )
+
     def test_mark_grouped_tensor_is_numerically_transparent(self):
         """The paged-stash marker must not change activation values or gradients."""
         if te_ext._te_mark_grouped_tensor is None:
@@ -294,6 +363,112 @@ class TestTEWrappers:
             return x.square()
 
         assert_replays_bit_exact(fn, (x,), replays=3, what="mark_grouped_tensor")
+
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "mxfp8"])
+    def test_grouped_optimizer_checkpoint_metadata_preserves_values(self, quantized, monkeypatch):
+        """Prepared grouped publication must preserve expert-ordered checkpoint views."""
+        from megatron.core.dist_checkpointing.optimizer import (
+            get_param_id_to_sharded_param_map,
+            make_sharded_optimizer_tensor,
+        )
+        from megatron.core.optimizer.layer_wise_optimizer import is_managed_by_layer_wise_optimizer
+
+        if (
+            "single_grouped_weight"
+            not in inspect.signature(te_ext.te.pytorch.GroupedLinear.__init__).parameters
+        ):
+            pytest.skip("requires TE single grouped weights")
+        if quantized and not _IS_BLACKWELL:
+            pytest.skip("MXFP8 primary weights require Blackwell")
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        config = _config(
+            num_moe_experts=3,
+            moe_grouped_gemm=True,
+            moe_use_grouped_tensor=True,
+            moe_single_grouped_weight=True,
+            moe_single_grouped_bias=True,
+            add_bias_linear=True,
+            fp8="e4m3" if quantized else None,
+            fp8_recipe=Fp8Recipe.mxfp8,
+            fp8_param=quantized,
+        )
+        with get_fp8_context(config, 0, is_init=True):
+            module = TEColumnParallelGroupedLinear(
+                3,
+                128,
+                256,
+                config=config,
+                init_method=init_method_normal(0.02),
+                bias=True,
+                skip_bias_add=False,
+                is_expert=True,
+                pg_collection=pg,
+            )
+        parameters = dict(module.named_parameters())
+        assert set(parameters) == {"weight", "bias"}
+        assert tuple(module.weight.shape) == (3, 256, 128)
+        assert tuple(module.bias.shape) == (3, 256)
+        assert module.weight.is_grouped_expert_weight
+        assert not module.bias.use_muon
+        assert {
+            name
+            for name, parameter in parameters.items()
+            if is_managed_by_layer_wise_optimizer(parameter)
+        } == {"weight"}
+        states = {
+            name: torch.arange(parent.numel(), device="cuda", dtype=torch.float32).view(
+                parent.shape
+            )
+            for name, parent in parameters.items()
+        }
+
+        def serialize_and_merge(states):
+            published = None
+            if quantized:
+                assert module.weight._mcore_grouped_mxfp8_weight_prepared
+                assert not module.weight._with_gemm_swizzled_scales
+                copy_tensor_to_quantized_param(module.weight, states["weight"].to(torch.bfloat16))
+                assert not module.weight._with_gemm_swizzled_scales
+                fields = ("rowwise_data", "columnwise_data", "scale_inv", "columnwise_scale_inv")
+                published = tuple(getattr(module.weight, field).clone() for field in fields)
+                for member in get_grouped_quantized_members(module.weight):
+                    assert not member._with_gemm_swizzled_scales
+            model_state = module.sharded_state_dict(
+                prefix="experts.", metadata={"dp_cp_group": pg.dp_cp}
+            )
+            for name, parent in parameters.items():
+                for expert in range(3):
+                    member = model_state[f"experts.{name}{expert}"].data
+                    assert tuple(member.shape) == tuple(parent.shape[1:])
+                    assert member._checkpoint_grouped_parent_id == id(parent)
+                    assert member._checkpoint_grouped_member_index == expert
+                    if name == "bias" or not quantized:
+                        assert bytes_equal(member, parent.rowwise_data.view(parent.shape)[expert])
+            mapping = get_param_id_to_sharded_param_map(model_state, parameters.values())
+            assert set(mapping) == {0, 1}
+            results = {}
+            for index, name in enumerate(parameters):
+                factory = make_sharded_optimizer_tensor(
+                    mapping[index], states[name], "optimizer.momentum_buffer"
+                )
+                values = [shard.data for shard in factory.build()]
+                merged = factory.merge_fn(values)
+                torch.testing.assert_close(merged, states[name], rtol=0, atol=0)
+                results[name] = values, merged
+            if published is not None:
+                results["published_weight"] = published
+            return results
+
+        assert_replays_bit_exact(
+            serialize_and_merge,
+            (states,),
+            replays=3,
+            backward=False,
+            what="grouped optimizer checkpoint metadata",
+        )
 
     def test_te_column_parallel_linear_replays(self):
         seeded()

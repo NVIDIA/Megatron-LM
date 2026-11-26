@@ -47,8 +47,14 @@ from ..dist_checkpointing.optimizer import (
 )
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..fp8_utils import (
-    is_blockwise_float8tensor,
+    copy_tensors_to_quantized_params,
+    get_high_precision_storage_view,
+    is_float8tensor,
+    is_grouped_mxfp8tensor,
+    is_grouped_tensor,
+    is_grouped_tensor_with_quantized_storage,
     is_mxfp8tensor,
+    prepare_grouped_mxfp8_weight_,
     requantize_whole_params_from_high_precision,
 )
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
@@ -311,6 +317,8 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
     if hasattr(source, "is_word_embedding_parameter"):
         destination.is_word_embedding_parameter = source.is_word_embedding_parameter
+    if hasattr(source, 'is_grouped_expert_weight'):
+        destination.is_grouped_expert_weight = source.is_grouped_expert_weight
 
 
 class MegatronOptimizer(ABC):
@@ -1280,7 +1288,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             self.fp32_from_fp32_groups = []
 
             # For all the groups in the original optimizer:
-            for param_group in self.optimizer.param_groups:
+            for group_index, param_group in enumerate(self.optimizer.param_groups):
                 float16_params_this_group = []
                 fp32_params_this_group = []
                 fp32_from_float16_params_this_group = []
@@ -1290,12 +1298,17 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
 
                         # float16 params:
                         if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                            if is_grouped_mxfp8tensor(param):
+                                # Also support standalone TE parameters without a DDP or
+                                # MCore module initialization boundary. Preparation is idempotent.
+                                prepare_grouped_mxfp8_weight_(
+                                    param, param_name=f"optimizer group {group_index} parameter {i}"
+                                )
                             float16_params_this_group.append(param)
                             # Native quantized parameters may retain their pre-quantization
                             # BF16/FP16 initializer on CPU. Build the FP32 master from that value
                             # so primary-weight and non-primary-weight runs start identically.
-                            # Falling back to the model parameter is correct for ordinary
-                            # BF16/FP16 parameters and older quantized-tensor implementations.
+                            # Without a saved initializer, use the model parameter's values.
                             get_high_precision_init_val = getattr(
                                 param, 'get_high_precision_init_val', None
                             )
@@ -1386,7 +1399,17 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         main_data = []
         for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
-                model_data.append(model_param.data)
+                if is_grouped_mxfp8tensor(model_param):
+                    # Keep the live wrapper: its cached member views
+                    # and layout metadata must follow an in-place grouped update.
+                    model_data.append(model_param)
+                else:
+                    model_data.append(
+                        get_high_precision_storage_view(model_param)
+                        if is_grouped_tensor(model_param)
+                        and not is_grouped_tensor_with_quantized_storage(model_param)
+                        else model_param.data
+                    )
                 main_data.append(main_param.data)
         return model_data, main_data
 
@@ -1416,9 +1439,26 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
             return
         # Only needed for the float16 params.
         model_data, main_data = self._get_model_and_main_params_data_float16()
-        _multi_tensor_copy_this_to_that(
-            this=main_data, that=model_data, overflow_buf=self._dummy_overflow_buf
-        )
+        ordinary_model_data, ordinary_main_data, quantized_params, bf16_values = [], [], [], []
+        for model_param, main_param in zip(model_data, main_data):
+            if is_grouped_mxfp8tensor(model_param) or (
+                is_mxfp8tensor(model_param) and model_param.ndim == 2
+            ):
+                # Keep grouped and discrete MXFP8 updates consistent with BF16
+                # all-gather publication, including replicated optimizers without AG.
+                quantized_params.append(model_param)
+                bf16_values.append(main_param.detach().to(torch.bfloat16))
+            else:
+                ordinary_model_data.append(model_param)
+                ordinary_main_data.append(main_param)
+        if ordinary_model_data:
+            _multi_tensor_copy_this_to_that(
+                this=ordinary_main_data,
+                that=ordinary_model_data,
+                overflow_buf=self._dummy_overflow_buf,
+            )
+        if quantized_params:
+            copy_tensors_to_quantized_params(quantized_params, bf16_values)
 
     def _copy_main_params_to_model_params_via_bf16(self):
         """Master-to-model copy of a LayerWise child on the compact layout.
@@ -1431,12 +1471,14 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         model_data, main_data, quantized_params, values = [], [], [], []
         for model_group, main_group in zip(self.float16_groups, self.fp32_from_float16_groups):
             for model_param, main_param in zip(model_group, main_group):
-                if is_mxfp8tensor(model_param) or is_blockwise_float8tensor(model_param):
+                if is_float8tensor(model_param) or is_grouped_tensor_with_quantized_storage(
+                    model_param
+                ):
                     if not getattr(model_param, 'requantized_by_layer_wise_gather', False):
                         quantized_params.append(model_param)
                         values.append(main_param.detach().to(torch.bfloat16))
                     continue
-                model_data.append(model_param.data)
+                model_data.append(get_high_precision_storage_view(model_param))
                 main_data.append(main_param.data)
         if model_data:
             _multi_tensor_copy_this_to_that(

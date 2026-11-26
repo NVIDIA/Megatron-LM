@@ -719,11 +719,18 @@ class OptimizerConfig:
     ) -> None:
         """Check model-dependent constraints at the native or legacy model boundary."""
         will_be_layer_wise = self.uses_layer_wise_distributed_optimizer()
-        assert not (will_be_layer_wise and moe_single_grouped_weight), (
-            "The LayerWise distributed optimizer does not support --moe-single-grouped-weight: "
-            "Muon semantics for a single grouped [E, N, K] expert weight are not defined. "
-            "Disable --moe-single-grouped-weight or use Adam/DistributedOptimizer."
-        )
+        if moe_single_grouped_weight:
+            optimizer_name, _ = resolve_layer_wise_distributed_optimizer(
+                self.optimizer,
+                self.use_distributed_optimizer,
+                self.use_layer_wise_distributed_optimizer,
+            )
+            if (will_be_layer_wise and optimizer_name != "muon") or (
+                optimizer_name == "adaptive_muon"
+            ):
+                raise ValueError("Single grouped expert weights support ordinary Muon or Adam/SGD.")
+            if optimizer_name == "muon" and self.muon_tp_mode == "layer_sharded":
+                raise ValueError("Single grouped expert weights do not support LayerShardedMuon.")
 
         if self.overlap_param_gather_with_optimizer_step:
             assert virtual_pipeline_model_parallel_size is not None, (

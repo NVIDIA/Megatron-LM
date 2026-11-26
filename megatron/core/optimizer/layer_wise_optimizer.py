@@ -25,7 +25,13 @@ from megatron.core.full_cuda_graph import FullIterationGradCopy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_model_config, get_pg_rank, get_pg_size, log_single_rank
 
-from ..fp8_utils import is_blockwise_float8tensor, is_mxfp8tensor
+from ..fp8_utils import (
+    get_high_precision_storage_view,
+    is_blockwise_float8tensor,
+    is_grouped_mxfp8tensor,
+    is_grouped_tensor,
+    is_mxfp8tensor,
+)
 from .clip_grads import count_zeros_fp32, get_grad_norm_fp32
 from .optimizer import (
     ChainedOptimizer,
@@ -50,15 +56,16 @@ logger = logging.getLogger(__name__)
 def is_managed_by_layer_wise_optimizer(param: torch.nn.Parameter) -> bool:
     """Whether a parameter is managed by :class:`LayerWiseDistributedOptimizer`.
 
-    Returns True for the 2D matrix-like weight parameters that Muon orthogonalizes
-    via Newton-Schulz, and False for parameters routed to Muon's scalar fallback:
+    Returns True for matrices and explicitly marked grouped expert matrices that Muon
+    orthogonalizes via Newton-Schulz, and False for parameters routed to its scalar fallback:
     explicit ``use_muon=False`` exclusions, embeddings, and non-matrix parameters.
 
     This DDP-buffer ownership rule must match Muon's parameter-group routing.
     """
     if not getattr(param, 'use_muon', True):
         return False
-    if not param.dim() == 2:
+    is_grouped_matrix = getattr(param, 'is_grouped_expert_weight', False) and param.dim() == 3
+    if param.dim() != 2 and not is_grouped_matrix:
         return False
     if getattr(param, 'is_embedding_or_output_parameter', False):
         return False
@@ -362,6 +369,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             GTP-sharded params reconstruct the full post-AllGather shape first
             (GTP always shards along dim 0).
             """
+            if getattr(param, 'is_grouped_expert_weight', False) and param.dim() == 3:
+                experts, m, n = param.shape
+                return experts * m * n * min(m, n)
             if param.dim() != 2:
                 return param.data.nelement()
             m, n = param.data.shape
@@ -678,6 +688,15 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         self.pg_collection = pg_collection
         self.grad_stats_parallel_group = getattr(pg_collection, 'intra_dist_opt', None)
+        if not config.bf16 and any(
+            getattr(param, 'is_grouped_expert_weight', False)
+            for optimizer in optimizers
+            for group in optimizer.param_groups
+            for param in group['params']
+        ):
+            raise ValueError(
+                "Single grouped expert weights in LayerWise require bf16=True and FP32 masters."
+            )
 
         # DDP owns the parameter-gather schedule. Heterogeneous modules can carry different
         # overlap policies, so use the wrapped chunks' DDP config just like DistributedOptimizer.
@@ -732,10 +751,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             self._check_padded_param_gather_storage(optimizers, self.ddp_config)
             self.shard_params(optimizers, full_param_layouts)
         else:
+            # Validate all replicas before sharding, including params in DP=1 domains
+            # whose local master-to-model copy does not go through a gather.
+            self._check_whole_param_gather_storage(optimizers, config)
             # Compact buffers carry no optimizer shards, so whole-parameter owners are chosen
             # here, breaking equal-numel ties by a rank-independent identity.
             self.shard_params(optimizers, param_sort_keys=self._build_param_sort_keys(model_chunks))
-            self._check_whole_param_gather_storage(optimizers, config)
+            for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
+                for param in (p for owned in params_list or [] for p in owned):
+                    if _param_uses_quantized_storage(param):
+                        # The gather publishes this param on every rank; its owner skips
+                        # the redundant local master-to-model quantization.
+                        param.requantized_by_layer_wise_gather = True
 
         # Fall back to OptimizerConfig only for direct construction without model chunks.
         sync_config = self.ddp_config if self.ddp_config is not None else config
@@ -970,48 +997,49 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for param in group['params']:
                     if not _param_uses_quantized_storage(param):
                         continue
-                    if is_mxfp8tensor(param) and reuse_grad_buf:
+                    if (is_mxfp8tensor(param) or is_grouped_mxfp8tensor(param)) and reuse_grad_buf:
                         continue
-                    hint = (
-                        "Use --layer-wise-param-layout compact, which gathers "
-                        "BF16 values and requantizes them on every rank."
-                        if is_mxfp8tensor(param) or is_blockwise_float8tensor(param)
-                        else "Use the mxfp8 or blockwise recipe, or disable --fp8-param-gather."
-                    )
                     raise ValueError(
                         "The padded layout all-gathers quantized params as raw "
                         "bytes and keeps their scales consistent only for MXFP8 staged through "
                         "the grad buffer (reuse_grad_buf_for_mxfp8_param_ag); got "
-                        f"{type(param.data).__name__}. {hint}"
+                        f"{type(param.data).__name__}. Use MXFP8 with "
+                        "reuse_grad_buf_for_mxfp8_param_ag, use the compact layout with "
+                        "MXFP8 or plain blockwise FP8, or disable --fp8-param-gather."
                     )
 
     def _check_whole_param_gather_storage(self, optimizers, config) -> None:
-        """Reject quantized params that the whole-parameter gather cannot publish, and mark
-        the ones it publishes.
+        """Validate compact-layout storage before assigning whole-parameter owners.
 
         The compact layout gathers quantized params as BF16 staged from the owners' FP32
-        masters and requantizes them on every rank, which supports plain MXFP8 and blockwise
-        FP8 storage only.
+        masters and requantizes them on every rank, supporting MXFP8 (including grouped)
+        and plain blockwise FP8 storage. DP=1 parameters use the same BF16 publication
+        locally, so validate them even though no gather will publish them.
         """
-        for params_list in (self.dp_cp_params_list, self.expt_dp_params_list):
-            for param in (p for owned in params_list or [] for p in owned):
-                if not _param_uses_quantized_storage(param):
-                    continue
-                if not (is_mxfp8tensor(param) or is_blockwise_float8tensor(param)):
-                    raise ValueError(
-                        "Whole-parameter LayerWise gathers move quantized params as BF16 and "
-                        "support only plain MXFP8 and blockwise FP8 params; got "
-                        f"{type(param.data).__name__}. Use one of those recipes or disable "
-                        "--fp8-param-gather."
-                    )
-                if not config.bf16:
-                    raise ValueError(
-                        f"Quantized params on the {self.param_layout} LayerWise layout need the "
-                        "bf16 FP32 master copies (OptimizerConfig.bf16=True)."
-                    )
-                # Temporary ownership marker: the compact gather requantizes this parameter
-                # on every rank, so the child optimizer skips its local quantization.
-                param.requantized_by_layer_wise_gather = True
+        for optimizer in optimizers:
+            for group in optimizer.param_groups:
+                for param in group["params"]:
+                    if not _param_uses_quantized_storage(param):
+                        if is_grouped_tensor(param):
+                            # Some TE builds move the wrapper with .cuda() but leave
+                            # grouped data on CPU. Check every replica before sharding.
+                            get_high_precision_storage_view(param)
+                        continue
+                    if not (
+                        is_mxfp8tensor(param)
+                        or is_grouped_mxfp8tensor(param)
+                        or is_blockwise_float8tensor(param)
+                    ):
+                        raise ValueError(
+                            "Compact LayerWise BF16 publication supports MXFP8 and plain "
+                            f"blockwise FP8 params; got {type(param.data).__name__}. "
+                            "Use one of those recipes or disable --fp8-param-gather."
+                        )
+                    if not config.bf16:
+                        raise ValueError(
+                            f"Quantized params on the {self.param_layout} LayerWise layout need "
+                            "the bf16 FP32 master copies (OptimizerConfig.bf16=True)."
+                        )
 
     def shard_params(self, optimizers, full_param_layouts=None, param_sort_keys=None):
         """Shard params across ranks according to the computed param layout.

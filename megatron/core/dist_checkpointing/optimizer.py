@@ -60,7 +60,9 @@ def get_param_id_to_sharded_param_map(
     """
     model_sharded_state_dict, _ = extract_sharded_tensors_and_factories(model_sharded_state_dict)
     id_to_sharded_param_map = {}
-    param_to_id_map = get_optim_param_to_id_map(optim_params_iter)
+    optim_params = list(optim_params_iter)
+    param_to_id_map = get_optim_param_to_id_map(optim_params)
+    grouped_members = {}
     # If using PyTorch FSDP2 the values in model_sharded_state_dict would
     # have been converted to local tensors during initialization.
     # See the make_(tp)_sharded_tensor_for_checkpoint functions.
@@ -70,6 +72,21 @@ def get_param_id_to_sharded_param_map(
             id_to_sharded_param_map[param_to_id_map[param_id]] = ten
         else:
             logger.debug('%s is not tracked by the optimizer', ten)
+        parent_id = getattr(ten.data, '_checkpoint_grouped_parent_id', None)
+        if parent_id in param_to_id_map:
+            member_index = ten.data._checkpoint_grouped_member_index
+            grouped_members.setdefault(parent_id, {})[member_index] = ten
+
+    for parent in optim_params:
+        members = grouped_members.get(id(parent))
+        if members is not None:
+            if sorted(members) != list(range(parent.shape[0])):
+                raise ValueError('Grouped optimizer checkpoint requires every expert member.')
+            id_to_sharded_param_map[param_to_id_map[id(parent)]] = (
+                _make_grouped_optimizer_checkpoint_factory(
+                    parent, [members[index] for index in range(parent.shape[0])]
+                )
+            )
 
     if not id_to_sharded_param_map:
         log_single_rank(
@@ -80,6 +97,54 @@ def get_param_id_to_sharded_param_map(
             " Make sure to call state_dict with `keep_vars=True`.",
         )
     return id_to_sharded_param_map
+
+
+def _make_grouped_optimizer_checkpoint_factory(parent, members):
+    """Map a whole grouped optimizer state to the model's existing expert checkpoint shards.
+
+    Member factories (for example SwiGLU) retain their build/merge transformations. Only
+    serialization splits the parent; optimizer state and DP ownership remain whole-parameter.
+    """
+    factory_key = members[0].key
+
+    @torch.no_grad()
+    def build(key, data, replica_id, flattened_range):
+        if flattened_range is not None:
+            raise ValueError('Grouped optimizer checkpoint expects a whole parameter.')
+        if tuple(data.shape) != tuple(parent.shape):
+            raise ValueError('Grouped optimizer state must have the parent parameter shape.')
+        # make_sharded_optimizer_tensor prefixes the factory key for each state (master,
+        # momentum, ...). Apply that same prefix to every original expert key.
+        if not key.endswith(factory_key):
+            raise ValueError(f'Unexpected grouped optimizer checkpoint key: {key}')
+        prefix = key[: -len(factory_key)]
+        result = []
+        for index, member in enumerate(members):
+            value = data[index]
+            if isinstance(member, ShardedTensorFactory):
+                result.append(member.build_fn(prefix + member.key, value, replica_id, None))
+            else:
+                shard = replace(
+                    member,
+                    key=prefix + member.key,
+                    data=value,
+                    dtype=value.dtype,
+                    replica_id=replica_id,
+                )
+                shard.validate_metadata_integrity()
+                result.append(shard)
+        return result
+
+    @torch.no_grad()
+    def merge(values):
+        return torch.stack(
+            [
+                member.merge_fn(value) if isinstance(member, ShardedTensorFactory) else value
+                for member, value in zip(members, values, strict=True)
+            ]
+        )
+
+    return ShardedTensorFactory(factory_key, parent, build, merge, members[0].replica_id)
 
 
 def make_sharded_optimizer_tensor(

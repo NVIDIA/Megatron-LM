@@ -9,6 +9,7 @@ from typing import Optional
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
+from ..fp8_utils import is_grouped_mxfp8tensor, prepare_grouped_mxfp8_weight_
 from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
@@ -213,6 +214,8 @@ class DistributedDataParallel(_BaseDataParallel):
         self.params_with_grad = []
         all_params = []
         for name, param in self.module.named_parameters():
+            if is_grouped_mxfp8tensor(param):
+                prepare_grouped_mxfp8_weight_(param, param_name=name)
             if not param.requires_grad:
                 continue
 

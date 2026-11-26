@@ -5,7 +5,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-from ..fp8_utils import requantize_whole_params_from_high_precision
+from ..fp8_utils import get_high_precision_storage_view, requantize_whole_params_from_high_precision
 
 
 def all_gather_v(
@@ -57,7 +57,7 @@ def _layerwise_gather_sources(
     from the owner's FP32 master; the copy-back requantizes them on every rank.
     """
     if not quantized:
-        return params
+        return [get_high_precision_storage_view(param) for param in params]
     for param in params:
         assert getattr(param, 'main_param', None) is not None, (
             "LayerWise quantized param gather needs the owner's FP32 main_param to stage the "
@@ -89,9 +89,10 @@ def _copy_back_layerwise_gather(
             quantized_params.extend(params)
             quantized_values.extend(_unflatten_dense_tensors(gather_list[rank], templates))
         elif rank != local_rank:
-            values = _unflatten_dense_tensors(gather_list[rank], params)
-            for model_param, value in zip(params, values):
-                model_param.data.copy_(value)
+            destinations = [get_high_precision_storage_view(param) for param in params]
+            values = _unflatten_dense_tensors(gather_list[rank], destinations)
+            for destination, value in zip(destinations, values):
+                destination.copy_(value)
     if quantized_params:
         requantize_whole_params_from_high_precision(quantized_params, quantized_values)
 

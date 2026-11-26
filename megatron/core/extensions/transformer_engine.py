@@ -76,9 +76,12 @@ from megatron.core.utils import (
 
 # Token alignment required by TE's grouped-tensor and fused grouped-MLP kernels.
 TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT = 256
+# TE #3224 added group_quantize(output=...), first released in v2.19.
+_TE_INPLACE_GROUP_QUANTIZE_MIN_VERSION = PkgVersion("2.19.0")
 
 try:
     import transformer_engine as te
+    import transformer_engine_torch as tex
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_autocast, fp8_model_init
 
     try:
@@ -131,6 +134,29 @@ def mark_grouped_tensor(*tensors: torch.Tensor | None) -> None:
             "Paged stashing requires Transformer Engine's mark_grouped_tensor utility."
         )
     _te_mark_grouped_tensor(*tensors_to_mark)
+
+
+def check_te_group_quantize_support() -> None:
+    """Require the released TE API for quantizing into existing grouped storage."""
+    version = get_te_version() if HAVE_TE else None
+    if version is None or version < _TE_INPLACE_GROUP_QUANTIZE_MIN_VERSION:
+        raise RuntimeError(
+            "In-place grouped quantization requires Transformer Engine >= "
+            f"{_TE_INPLACE_GROUP_QUANTIZE_MIN_VERSION} with group_quantize(..., output=...); "
+            f"found {version if version is not None else 'not installed'}. "
+            "Upgrade Transformer Engine to use grouped MXFP8 parameter updates."
+        )
+
+
+def te_group_quantize_(src: torch.Tensor, dst: torch.Tensor) -> None:
+    """Quantize a complete [E*N, K] source into existing uniform [E, N, K] storage.
+
+    The destination supplies its quantizer (TE requires object identity), payloads,
+    scales and scale layout. This does not allocate replacement output storage or
+    change quantizer usage. Callers must prepare the destination before capture.
+    """
+    check_te_group_quantize_support()
+    tex.group_quantize(src, dst.quantizer, dst.num_tensors, None, output=dst)
 
 
 def is_grouped_tensor_marked(tensor: Any) -> bool:
@@ -2999,6 +3025,24 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             )
 
             with init_quant_context, init_gtp_remat_context as output_size:
+                if (
+                    extra_kwargs.get("single_grouped_weight", False)
+                    and FP8GlobalStateManager.with_fp8_parameters()
+                    and FP8GlobalStateManager.get_fp8_recipe().mxfp8()
+                ):
+                    from megatron.core.fp8_utils import validate_grouped_mxfp8_weight_shape
+
+                    check_te_group_quantize_support()
+                    local_output_size = (
+                        divide(output_size, tp_size) if parallel_mode == "column" else output_size
+                    )
+                    local_input_size = (
+                        divide(input_size, tp_size) if parallel_mode == "row" else input_size
+                    )
+                    validate_grouped_mxfp8_weight_shape(
+                        (num_gemms + num_virtual_experts, local_output_size, local_input_size),
+                        param_name=f"{name or type(self).__name__}.weight",
+                    )
                 super().__init__(
                     num_gemms=num_gemms + num_virtual_experts,
                     in_features=input_size,
@@ -3018,6 +3062,21 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 )
 
             _set_expert_parameter_attributes(self, original_parallel_mode, use_expert_pgs)
+            if getattr(self, "single_grouped_weight", False):
+                # Registration/storage is grouped; Muon still treats each expert as a matrix.
+                self.weight.is_grouped_expert_weight = True
+                from megatron.core.fp8_utils import (
+                    is_grouped_mxfp8tensor,
+                    prepare_grouped_mxfp8_weight_,
+                )
+
+                if is_grouped_mxfp8tensor(self.weight):
+                    prepare_grouped_mxfp8_weight_(
+                        self.weight, param_name=f"{name or type(self).__name__}.weight"
+                    )
+            if getattr(self, "single_grouped_bias", False) and self.use_bias:
+                # Stacking expert vectors must not make them Muon matrices.
+                self.bias.use_muon = False
 
             self._register_load_state_dict_pre_hook(
                 type(self)._normalize_grouped_parameter_keys, with_module=True
@@ -3322,7 +3381,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                         full_state_dict[param_name], param_name
                     )
                 grouped_splits = grouped_split_cache[param_name]
-                return grouped_splits[gemm_idx]
+                member = grouped_splits[gemm_idx]
+                # Optimizer state belongs to the registered parent even though model
+                # checkpoints retain the per-expert tensor representation.
+                member._checkpoint_grouped_parent_id = id(full_state_dict[param_name])
+                member._checkpoint_grouped_member_index = gemm_idx
+                return member
 
             num_global_experts = get_pg_size(self._pg_collection.ep) * checkpoint_gemms
             local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * checkpoint_gemms

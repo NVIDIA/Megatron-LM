@@ -24,6 +24,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     get_supported_coefficient_types,
     validate_coefficient_type,
 )
+from megatron.core.optimizer.layer_wise_optimizer import is_managed_by_layer_wise_optimizer
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -1085,6 +1086,102 @@ def test_muon_optimizer_multiple_steps():
         assert not torch.equal(
             weights_history[i], weights_history[i + 1]
         ), f"Weight should change at step {i}"
+
+
+@pytest.mark.parametrize(
+    "shape,fp32_matmul_prec", [((1, 64, 32), "highest"), ((3, 32, 64), "medium")]
+)
+@pytest.mark.parametrize("nesterov", [False, True])
+def test_muon_grouped_weight_matches_discrete_steps(shape, fp32_matmul_prec, nesterov):
+    """A grouped master has exactly the trajectory of independent expert matrices."""
+    generator = torch.Generator(device="cuda").manual_seed(2026)
+    initial = torch.randn(shape, device="cuda", generator=generator)
+    grouped = nn.Parameter(initial.clone())
+    grouped.is_grouped_expert_weight = True
+    discrete = [nn.Parameter(member.clone()) for member in initial]
+    kwargs = dict(
+        lr=0.01,
+        momentum=0.95,
+        nesterov=nesterov,
+        weight_decay=0.01,
+        num_ns_steps=5,
+        pg_collection=None,
+        fp32_matmul_prec=fp32_matmul_prec,
+    )
+    grouped_optimizer = TensorParallelMuon([grouped], **kwargs)
+    discrete_optimizer = TensorParallelMuon(discrete, **kwargs)
+
+    for step in range(4):
+        gradient = torch.randn(shape, device="cuda", generator=generator)
+        # Different expert scales and a zero-gradient member expose accidental
+        # normalization across the expert dimension or a flattened NS matrix.
+        gradient *= torch.arange(1, shape[0] + 1, device="cuda").view(-1, 1, 1)
+        if step == 0 and shape[0] > 1:
+            gradient[0].zero_()
+        grouped.grad = gradient.clone()
+        for param, member_grad in zip(discrete, gradient):
+            param.grad = member_grad.clone()
+        grouped_optimizer.step()
+        discrete_optimizer.step()
+
+        torch.testing.assert_close(grouped, torch.stack(discrete), rtol=0, atol=0)
+        momentum = grouped_optimizer.state[grouped]["momentum_buffer"]
+        assert momentum.shape == grouped.shape
+        torch.testing.assert_close(
+            momentum,
+            torch.stack([discrete_optimizer.state[p]["momentum_buffer"] for p in discrete]),
+            rtol=0,
+            atol=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "shape,attributes,expected_muon",
+    [
+        ((3, 32, 64), {"is_grouped_expert_weight": True}, True),
+        ((3, 32, 64), {}, False),
+        ((3, 32, 64), {"is_grouped_expert_weight": True, "use_muon": False}, False),
+        ((32, 64), {}, True),
+        ((32, 64), {"is_embedding_or_output_parameter": True}, False),
+        ((32,), {}, False),
+    ],
+)
+def test_muon_grouped_weight_routing(shape, attributes, expected_muon):
+    """DDP ownership and the actual optimizer route must agree on grouped weights."""
+    param = nn.Parameter(torch.empty(shape))
+    for name, value in attributes.items():
+        setattr(param, name, value)
+    assert is_managed_by_layer_wise_optimizer(param) is expected_muon
+    assert eo_mod._is_muon_excluded(param) is not expected_muon
+
+
+@pytest.mark.parametrize("shape", [(32, 64), (0, 32, 64)])
+def test_muon_grouped_weight_rejects_invalid_shape(shape):
+    param = nn.Parameter(torch.empty(shape))
+    param.is_grouped_expert_weight = True
+    with pytest.raises(ValueError, match="nonempty shape"):
+        TensorParallelMuon([param])
+
+
+@pytest.mark.parametrize("optimizer_cls", [TensorParallelAdaptiveMuon, LayerShardedMuon])
+def test_muon_grouped_weight_rejects_other_algorithms(optimizer_cls):
+    param = nn.Parameter(torch.empty(2, 32, 64))
+    param.is_grouped_expert_weight = True
+    kwargs = {"gtp_remat_group": None} if optimizer_cls is LayerShardedMuon else {}
+    with pytest.raises(ValueError, match="ordinary TensorParallelMuon"):
+        optimizer_cls([param], **kwargs)
+
+
+@pytest.mark.parametrize("group_name", ["tp", "expt_tp", "gtp_remat", "expt_gtp_remat"])
+def test_muon_grouped_weight_rejects_tensor_parallelism(monkeypatch, group_name):
+    param = nn.Parameter(torch.empty(2, 32, 64))
+    param.is_grouped_expert_weight = True
+    groups = ProcessGroupCollection()
+    unsupported_group = object()
+    setattr(groups, group_name, unsupported_group)
+    monkeypatch.setattr(eo_mod, "get_pg_size", lambda group: 2 if group is unsupported_group else 1)
+    with pytest.raises(ValueError, match="TP=ETP=GTP=EGTP=1"):
+        TensorParallelMuon([param], pg_collection=groups)
 
 
 def test_muon_optimizer_qkv_split():

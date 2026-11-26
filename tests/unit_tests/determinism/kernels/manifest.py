@@ -686,6 +686,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_optimizer_kernels.py",
+            K + "test_grouped_param_publication.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
             "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
         ),
@@ -714,6 +715,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             C + "test_gpt_model.py",
+            K + "test_grouped_param_publication.py",
             "tests/unit_tests/distributed/test_param_storage_copyback.py",
             "tests/unit_tests/distributed/test_gradient_scaling.py",
             "tests/unit_tests/rl/test_rl_utils.py",
@@ -970,7 +972,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/fp4_utils.py",
             "megatron/core/distributed/fsdp/src/megatron_fsdp/mixed_precision.py",
         ),
-        tests=(C + "test_fp8_determinism.py", K + "test_optimizer_kernels.py"),
+        tests=(
+            C + "test_fp8_determinism.py",
+            K + "test_optimizer_kernels.py",
+            K + "test_grouped_param_publication.py",
+            K + "test_te_wrappers.py",
+        ),
         kind="dispatch",
         notes="TE cast_master_weights_to_fp8 / cast_to_fp8 (covered at model level by "
         "test_fp8_determinism.py), NVFP4 quantize_master_weights (needs TE>=2.7 + Blackwell, "
@@ -978,6 +985,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "(kernel replayed in test_optimizer_kernels.py). The whole-param BF16 -> MXFP8 / "
         "blockwise requantization of LayerWise gathers is replayed in test_optimizer_kernels.py "
         "(blockwise on Hopper, MXFP8 on Blackwell).",
+    ),
+    KernelEntry(
+        name="grouped_mxfp8_parameter_publication",
+        sources=(
+            "megatron/core/fp8_utils.py",
+            "megatron/core/optimizer/optimizer.py",
+            "megatron/core/distributed/param_gather.py",
+            "megatron/core/distributed/param_and_grad_buffer.py",
+        ),
+        tests=(K + "test_grouped_param_publication.py", K + "test_te_wrappers.py"),
+        kind="dispatch",
+        notes="Grouped whole-parameter publication casts BF16 master values with one native "
+        "TE group_quantize dispatch into fixed MXFP8 storage with unswizzled scales. "
+        "Local and gathered publication share this cast. Replay covers master initialization "
+        "from saved initializers or model values, two local optimizer steps, FP32 masters "
+        "and both parent-backed data/scale layouts "
+        "byte for byte under side-stream contention; collective ordering is covered by the "
+        "separate DDP gather tests. The version-gated TE in-place wrapper is replayed "
+        "through publication in test_te_wrappers.py.",
     ),
     KernelEntry(
         name="inference_mxfp8_quantization",
@@ -1071,6 +1097,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="dispatch",
         exempt_reason="TE make_graphed_callables captures and replays kernels that are registered on "
         "their own; the capture order is fixed by the callable list and adds no numerics.",
+    ),
+    KernelEntry(
+        name="grouped_muon_newton_schulz_dispatch",
+        sources=("megatron/core/optimizer/emerging_optimizers.py",),
+        tests=(
+            "tests/unit_tests/determinism/kernels/test_grouped_muon.py",
+            "tests/unit_tests/test_emerging_optimizers.py",
+        ),
+        kind="dispatch",
+        notes="TensorParallelMuon dispatches each grouped expert matrix to the existing 2-D "
+        "emerging-optimizers Newton-Schulz path. Replay tests compare weights and momentum "
+        "byte for byte under side-stream contention; fixed-gradient tests compare multiple "
+        "steps against independent 2-D expert parameters with zero tolerance.",
     ),
     KernelEntry(
         name="muon_newton_schulz_dispatch",

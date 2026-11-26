@@ -170,7 +170,11 @@ def _is_nonlinear_or_embedding(param):
 
 def _is_muon_excluded(param):
     """True for parameters that should use the scalar optimizer instead of Muon."""
-    return not getattr(param, 'use_muon', True) or _is_nonlinear_or_embedding(param)
+    # Keep the optimizer selection and pre-DDP buffer routing identical. Import lazily
+    # because LayerWise itself imports the optimizer wrappers.
+    from .layer_wise_optimizer import is_managed_by_layer_wise_optimizer
+
+    return not is_managed_by_layer_wise_optimizer(param)
 
 
 def _get_qkv_split_shapes(model_cfg, split_qkv_per_head: bool = False) -> list[int]:
@@ -267,7 +271,12 @@ def _select_tp_mode(
 
 
 class TensorParallelMuon(OrthogonalizedOptimizer):
-    """Tensor Parallel Muon optimizer."""
+    """Tensor Parallel Muon optimizer.
+
+    Explicitly marked grouped expert weights retain one [E, N, K] parameter and
+    momentum tensor, while orthogonalization and shape scaling act on each [N, K]
+    expert independently. This path currently requires TP=ETP=GTP=EGTP=1.
+    """
 
     def __init__(
         self,
@@ -367,6 +376,25 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             fp32_matmul_prec=fp32_matmul_prec,
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
+        for group in self.param_groups:
+            for param in group["params"]:
+                if getattr(param, "is_grouped_expert_weight", False):
+                    self._validate_grouped_expert_weight(param)
+
+    def _validate_grouped_expert_weight(self, param: torch.Tensor) -> None:
+        """Validate the deliberately narrow single-weight Muon execution contract."""
+        if type(self) is not TensorParallelMuon:
+            raise ValueError("Single grouped expert weights require ordinary TensorParallelMuon.")
+        if param.ndim != 3 or any(size == 0 for size in param.shape):
+            raise ValueError("A grouped expert weight must have nonempty shape [E, N, K].")
+        if getattr(param, "is_gtp_weight_remat", False):
+            raise ValueError("Muon single grouped expert weights do not support GTP.")
+        if self.pg_collection is not None:
+            for name in ("tp", "expt_tp", "gtp_remat", "expt_gtp_remat"):
+                if get_pg_size(getattr(self.pg_collection, name, None)) != 1:
+                    raise ValueError(
+                        "Muon single grouped expert weights require TP=ETP=GTP=EGTP=1."
+                    )
 
     @staticmethod
     def _all_gather_tensor(t, group, dim):
@@ -691,6 +719,16 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         Returns:
             The orthogonalized gradient tensor.
         """
+        if getattr(p, "is_grouped_expert_weight", False):
+            self._validate_grouped_expert_weight(p)
+            if grad.shape != p.shape:
+                raise ValueError("Grouped Muon momentum and parameter shapes must match.")
+            # Preserve the same 2-D NS kernels and shape scaling as separate expert weights.
+            # Momentum, weight decay and the final update remain elementwise on the parent.
+            return torch.stack(
+                [self.scaled_orthogonalize_fn(member, None, None, "duplicated") for member in grad]
+            )
+
         # TODO(deyuf): switch to group
         if self.pg_collection:
             tp_group = (

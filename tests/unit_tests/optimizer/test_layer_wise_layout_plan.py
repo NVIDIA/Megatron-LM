@@ -43,6 +43,13 @@ def _model():
     return model
 
 
+def test_single_grouped_weight_requires_master_weight_wrapper():
+    param = _param((3, 16, 8), is_grouped_expert_weight=True)
+    base = torch.optim.SGD([param], lr=0.01)
+    with pytest.raises(ValueError, match="bf16=True and FP32 masters"):
+        LayerWiseDistributedOptimizer([base], OptimizerConfig(optimizer="muon"))
+
+
 # ---------------------------------------------------------------------------
 # Layout and optimizer-intent resolution.
 # ---------------------------------------------------------------------------
@@ -156,11 +163,13 @@ def test_resolve_param_layout_matches_ddp_buffers():
     [
         ("bf16", False, None),
         ("mxfp8", True, None),
-        # The error names the compact layout for recipes it can publish ...
+        ("grouped_mxfp8", True, None),
+        # Every rejected recipe reports the supported layout and storage combinations.
         ("mxfp8", False, "compact"),
+        ("grouped_mxfp8", False, "compact"),
         ("blockwise", True, "compact"),
-        # ... and the others, which no LayerWise gather publishes, to another recipe.
-        ("tensorwise", True, "mxfp8 or blockwise recipe"),
+        ("tensorwise", True, "plain blockwise FP8"),
+        ("grouped_nvfp4", True, "plain blockwise FP8"),
     ],
 )
 def test_padded_layout_rejects_quantized_params_it_cannot_publish(kind, reuse_grad_buf, error):
@@ -171,11 +180,68 @@ def test_padded_layout_rejects_quantized_params_it_cannot_publish(kind, reuse_gr
     with (
         mock.patch(f"{module}._param_uses_quantized_storage", return_value=kind != "bf16"),
         mock.patch(f"{module}.is_mxfp8tensor", return_value=kind == "mxfp8"),
-        mock.patch(f"{module}.is_blockwise_float8tensor", return_value=kind == "blockwise"),
+        mock.patch(f"{module}.is_grouped_mxfp8tensor", return_value=kind == "grouped_mxfp8"),
         nullcontext() if error is None else pytest.raises(ValueError, match=error),
     ):
         LayerWiseDistributedOptimizer._check_padded_param_gather_storage(
             [optimizer], SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=reuse_grad_buf)
+        )
+
+
+@pytest.mark.parametrize("gathered_domain", [None, "dense", "expert"])
+def test_compact_layout_rejects_unsupported_storage_outside_gather_lists(gathered_domain):
+    # With DP=1 neither domain gathers. Mixed DP sizes can leave only the dense or
+    # expert domain ungathered; those parameters still need the same recipe validation.
+    supported = _param((8, 8))
+    unsupported = _param((8, 8))
+    unsupported_is_expert = gathered_domain == "dense"
+    optimizer = SimpleNamespace(
+        param_groups=[
+            {"params": [supported], "is_expert_parallel": not unsupported_is_expert},
+            {"params": [unsupported], "is_expert_parallel": unsupported_is_expert},
+        ]
+    )
+    lwo = SimpleNamespace(
+        param_layout="compact",
+        dp_cp_params_list=[[supported]] if gathered_domain == "dense" else None,
+        expt_dp_params_list=[[supported]] if gathered_domain == "expert" else None,
+    )
+    module = "megatron.core.optimizer.layer_wise_optimizer"
+    with (
+        mock.patch(f"{module}._param_uses_quantized_storage", return_value=True),
+        mock.patch(f"{module}.is_mxfp8tensor", side_effect=lambda param: param is supported),
+        mock.patch(f"{module}.is_grouped_mxfp8tensor", return_value=False),
+        mock.patch(f"{module}.is_blockwise_float8tensor", return_value=False),
+        pytest.raises(ValueError, match="supports MXFP8 and plain blockwise FP8"),
+    ):
+        LayerWiseDistributedOptimizer._check_whole_param_gather_storage(
+            lwo, [optimizer], SimpleNamespace(bf16=True)
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "bf16", "error"),
+    [
+        ("mxfp8", True, None),
+        ("grouped_mxfp8", True, None),
+        ("blockwise", True, None),
+        ("mxfp8", False, "bf16 FP32 master copies"),
+    ],
+)
+def test_compact_layout_supported_quantized_storage_requires_bf16(kind, bf16, error):
+    # No gather is needed for DP=1, but local publication still stages BF16 from the master.
+    optimizer = SimpleNamespace(param_groups=[{"params": [_param((8, 8))]}])
+    lwo = SimpleNamespace(param_layout="compact", dp_cp_params_list=None, expt_dp_params_list=None)
+    module = "megatron.core.optimizer.layer_wise_optimizer"
+    with (
+        mock.patch(f"{module}._param_uses_quantized_storage", return_value=True),
+        mock.patch(f"{module}.is_mxfp8tensor", return_value=kind == "mxfp8"),
+        mock.patch(f"{module}.is_grouped_mxfp8tensor", return_value=kind == "grouped_mxfp8"),
+        mock.patch(f"{module}.is_blockwise_float8tensor", return_value=kind == "blockwise"),
+        nullcontext() if error is None else pytest.raises(ValueError, match=error),
+    ):
+        LayerWiseDistributedOptimizer._check_whole_param_gather_storage(
+            lwo, [optimizer], SimpleNamespace(bf16=bf16)
         )
 
 
