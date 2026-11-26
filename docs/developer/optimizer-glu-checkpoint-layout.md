@@ -4,7 +4,8 @@ Native `torch_dist` checkpoints store GLU FC1 rows in canonical gate/up order.
 The Core factory converts the runtime row layout on save and restores the target
 runtime layout on load. The factory retains the original parameter identity, so
 model-space optimizer factories apply the same conversion to FP32 masters and
-Adam moments. Routed TEGroupedMLP, fused shared experts and the grouped dense MLP
+Adam moments, including ordinary non-distributed optimizers. BF16/FP16 grouped
+parameters retain their model dtype while optimizer shards retain their own FP32 dtype. Routed TEGroupedMLP, fused shared experts and the grouped dense MLP
 declare their runtime layout at the factory call site.
 
 The existing content metadata records these semantic fields:
@@ -60,7 +61,11 @@ memory at production scale. Custom GLU modules must declare their layout through
 
 
 Core `save` collects GLU factory declarations across ranks and writes the model
-layout marker even when called directly, as AutoBridge does. Core `load` checks
+layout marker even when called directly, as AutoBridge does. Automatically generated
+metadata stays out of the returned model/optimizer state dictionary, so strict
+module loading and chained-optimizer loading retain their original keys. It is
+available through `load_content_metadata`; explicitly supplied content metadata
+retains its existing return behavior. Core `load` checks
 the marker before factory expansion or tensor loading. The factory stores the
 registered parameter, including single grouped expert weights; expert splitting
 happens inside its build function so optimizer identity lookup sees that same

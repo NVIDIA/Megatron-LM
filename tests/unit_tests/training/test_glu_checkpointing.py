@@ -437,18 +437,30 @@ def test_native_factory_results_are_not_converted_again():
     torch.testing.assert_close(runtime, snapshot, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize('model_space', [False, True])
-def test_native_save_metadata_declares_optimizer_layout(run_config, model_space):
+@pytest.mark.parametrize(
+    "distributed,fully_reshardable,model_space",
+    [(True, False, False), (True, True, True), (False, False, True)],
+)
+def test_native_save_metadata_declares_optimizer_layout(
+    run_config, distributed, fully_reshardable, model_space
+):
     from megatron.training.checkpointing import _build_sharded_state_dict_metadata
 
-    run_config.optimizer.use_distributed_optimizer = True
-    run_config.checkpoint.dist_ckpt_optim_fully_reshardable = model_space
+    run_config.optimizer.use_distributed_optimizer = distributed
+    run_config.checkpoint.dist_ckpt_optim_fully_reshardable = fully_reshardable
     run_config.model.transformer.gated_linear_unit = True
     run_config.model.transformer.moe_mlp_glu_interleave_size = 2
-    metadata = _build_sharded_state_dict_metadata(dp_cp_group=object(), ckpt_format='torch_dist')
+    built = torch.nn.Module()
+    built.config = run_config.model.transformer
+    built.num_local_experts = 1
+    # The built implementation has a different layout from the recipe config.
+    built._checkpoint_glu_interleave_size = lambda: 4
+    metadata = _build_sharded_state_dict_metadata(
+        dp_cp_group=object(), ckpt_format='torch_dist', model=[built]
+    )
     assert metadata['glu_checkpoint_layout'] == 'contiguous'
     assert metadata['glu_optimizer_layout'] == ('contiguous' if model_space else 'runtime')
-    assert metadata['glu_runtime_layout']['routed'] == 2
+    assert metadata['glu_runtime_layout']['routed'] == 4
 
 
 @pytest.mark.parametrize(

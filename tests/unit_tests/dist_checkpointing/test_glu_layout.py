@@ -8,6 +8,7 @@ from functools import partial
 
 import pytest
 import torch
+from torch.utils._pytree import tree_map
 
 from megatron.core import dist_checkpointing, parallel_state
 from megatron.core.dist_checkpointing.glu import (
@@ -134,8 +135,9 @@ def distributed():
 
 @pytest.mark.parametrize('single_weight', [False, True])
 def test_real_grouped_mlp_factories_use_the_configured_layout(
-    distributed, single_weight, tmp_path_dist_ckpt
+    distributed, single_weight, tmp_path_dist_ckpt, monkeypatch
 ):
+    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
     model_parallel_cuda_manual_seed(123)
     config = TransformerConfig(
         num_layers=1,
@@ -158,7 +160,11 @@ def test_real_grouped_mlp_factories_use_the_configured_layout(
     submodules = get_submodules(
         get_gpt_layer_with_transformer_engine_submodules(2, moe_grouped_gemm=True).mlp
     )
-    layer = MoELayer(config, submodules)
+    layer = MoELayer(config, submodules).bfloat16()
+    for linear in (layer.experts.linear_fc1, layer.experts.linear_fc2):
+        assert linear.single_grouped_weight == single_weight
+        if single_weight:
+            assert "weight" in dict(linear.named_parameters(recurse=False))
     for module, size in ((layer.experts, 2), (layer.shared_experts, 4)):
         state = module.sharded_state_dict(
             metadata={'dp_cp_group': parallel_state.get_data_parallel_group()}
@@ -177,15 +183,27 @@ def test_real_grouped_mlp_factories_use_the_configured_layout(
         ]
         assert factories
         for factory in factories:
-            canonical = torch.arange(
-                factory.data.numel(), device=factory.data.device, dtype=factory.data.dtype
-            ).reshape_as(factory.data)
+            grouped = factory.data.ndim == 3
+            views = list(factory.data.unbind(0)) if grouped else [factory.data]
+            canonical = []
+            for expert, view in enumerate(views):
+                # Keep small BF16-exact row values, distinct within each expert.
+                rows = torch.arange(view.shape[0], device=view.device) % 32 + expert * 32
+                value = rows[:, None].expand_as(view).to(view.dtype)
+                canonical.append(value)
+            runtime = [_runtime(value, size) for value in canonical]
             with torch.no_grad():
-                factory.data.copy_(_runtime(canonical, size))
-            parts = factory.build()
-            torch.testing.assert_close(
-                torch.cat([part.data for part in parts]), canonical, rtol=0, atol=0
-            )
+                factory.data.copy_(torch.stack(runtime) if grouped else runtime[0])
+            built = factory.build()
+            expert_parts = built if grouped else [built]
+            for parts, expected in zip(expert_parts, canonical, strict=True):
+                torch.testing.assert_close(
+                    torch.cat([part.data for part in parts]),
+                    expected,
+                    rtol=0,
+                    atol=0,
+                    msg=lambda m: f"{factory.key} shape={factory.data.shape} size={size} grouped={grouped} {m}",
+                )
 
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
@@ -207,11 +225,30 @@ def test_real_grouped_mlp_factories_use_the_configured_layout(
         **glu_checkpoint_metadata([layer], optimizer_uses_model_layout=True),
     }
     model_state = layer.sharded_state_dict()
+
+    def snapshot():
+        return tree_map(
+            lambda value: value.detach().clone() if isinstance(value, torch.Tensor) else value,
+            {"model": layer.state_dict(), "optimizer": optimizer.state_dict()},
+        )
+
+    expected = snapshot()
     optimizer_state = optimizer.sharded_state_dict(model_state, metadata=metadata)
     with TempNamedDir(tmp_path_dist_ckpt / 'real-grouped-adam') as path:
         dist_checkpointing.save(
             {'model': model_state, 'optimizer': optimizer_state}, path, content_metadata=metadata
         )
+        with torch.no_grad():
+            for parameter in layer.parameters():
+                parameter.zero_()
+            for part in getattr(optimizer, "chained_optimizers", [optimizer]):
+                for group in part.param_groups:
+                    for parameter in group["params"]:
+                        parameter.zero_()
+                for state in part.optimizer.state.values():
+                    for value in state.values():
+                        if isinstance(value, torch.Tensor):
+                            value.zero_()
         loaded = dist_checkpointing.load(
             {
                 'model': layer.sharded_state_dict(),
@@ -223,6 +260,7 @@ def test_real_grouped_mlp_factories_use_the_configured_layout(
         )
         layer.load_state_dict(loaded['model'])
         optimizer.load_state_dict(loaded['optimizer'])
+        torch.testing.assert_close(snapshot(), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -275,6 +313,8 @@ class InterleavedOptimizerModel(SwigluFactoryModel):
     def __init__(self, size):
         super().__init__()
         self.size = size
+        self.config.gated_linear_unit = True
+        self.config.moe_mlp_glu_interleave_size = size
         canonical = (
             torch.arange(self.linear.weight.numel(), dtype=torch.float32).reshape_as(
                 self.linear.weight
@@ -301,9 +341,9 @@ def _initialize_interleaved(*, size, **kwargs):
     return InterleavedOptimizerModel(size)
 
 
-@pytest.mark.parametrize('memory_efficient', [False, True])
-def test_distributed_adam_resume_preserves_three_updates(
-    tmp_path_dist_ckpt, distributed, memory_efficient
+@pytest.mark.parametrize("dist_opt,memory_efficient", [(True, False), (True, True), (False, False)])
+def test_adam_resume_preserves_three_updates(
+    tmp_path_dist_ckpt, distributed, dist_opt, memory_efficient
 ):
     metadata = {
         'distrib_optim_sharding_type': 'fully_reshardable',
@@ -313,7 +353,11 @@ def test_distributed_adam_resume_preserves_three_updates(
 
     def initialize(size):
         models, optimizer = setup_model_and_optimizer(
-            seed=5, tp=1, pp=1, initialize_fn=partial(_initialize_interleaved, size=size)
+            seed=5,
+            tp=1,
+            pp=1,
+            dist_opt=dist_opt,
+            initialize_fn=partial(_initialize_interleaved, size=size),
         )
         for group in optimizer.param_groups:
             group['lr'] = 0.003
@@ -332,6 +376,12 @@ def test_distributed_adam_resume_preserves_three_updates(
         assert optimizer.step()[0]
 
     model_a, optimizer_a = initialize(2)
+    if not dist_opt:
+        from megatron.training.checkpointing import _build_sharded_state_dict_metadata
+
+        metadata = _build_sharded_state_dict_metadata(model=[model_a])
+        metadata.pop("dp_cp_group")
+        assert metadata["glu_optimizer_layout"] == "contiguous"
     for step in range(2):
         update(model_a, optimizer_a, step)
     with TempNamedDir(tmp_path_dist_ckpt / 'glu-adam-resume') as path:
@@ -357,6 +407,37 @@ def test_distributed_adam_resume_preserves_three_updates(
         )
         model_b.load_state_dict(loaded['model'])
         optimizer_b.load_state_dict(loaded['optimizer'])
+
+        def assert_optimizer_state(rtol=0):
+            if dist_opt:
+                states = [
+                    optimizer.get_parameter_state_dp_zero(
+                        use_gloo_comm=False, return_on_all_ranks=True
+                    )
+                    for optimizer in (optimizer_a, optimizer_b)
+                ]
+                buffers = [next(iter(state[0].values())) for state in states]
+            else:
+                buffers = []
+                for optimizer in (optimizer_a, optimizer_b):
+                    master = optimizer.fp32_from_float16_groups[0][0]
+                    buffers.append({"param": master, **optimizer.optimizer.state[master]})
+            for name in ('param', 'exp_avg', 'exp_avg_sq'):
+                torch.testing.assert_close(
+                    permute_glu_rows(buffers[0][name].reshape(64, 5), 2, interleave=False),
+                    permute_glu_rows(buffers[1][name].reshape(64, 5), 4, interleave=False),
+                    rtol=rtol,
+                    atol=0,
+                )
+
+        # Loading itself must be bit-exact, before any optimizer arithmetic runs.
+        assert_optimizer_state()
+        torch.testing.assert_close(
+            permute_glu_rows(model_a.linear.weight, 2, interleave=False),
+            permute_glu_rows(model_b.linear.weight, 4, interleave=False),
+            rtol=0,
+            atol=0,
+        )
         for step in range(2, 5):
             update(model_a, optimizer_a, step)
             update(model_b, optimizer_b, step)
@@ -366,18 +447,9 @@ def test_distributed_adam_resume_preserves_three_updates(
                 rtol=0,
                 atol=0,
             )
-            states = [
-                optimizer.get_parameter_state_dp_zero(use_gloo_comm=False, return_on_all_ranks=True)
-                for optimizer in (optimizer_a, optimizer_b)
-            ]
-            buffers = [next(iter(state[0].values())) for state in states]
-            for name in ('param', 'exp_avg', 'exp_avg_sq'):
-                torch.testing.assert_close(
-                    permute_glu_rows(buffers[0][name].reshape(64, 5), 2, interleave=False),
-                    permute_glu_rows(buffers[1][name].reshape(64, 5), 4, interleave=False),
-                    rtol=0,
-                    atol=0,
-                )
+            # Reordered ordinary FusedAdam tensors can select different vector lanes
+            # and differ by one FP32 ulp after arithmetic. Restore above remains exact.
+            assert_optimizer_state(rtol=0 if dist_opt else 1e-6)
 
 
 def test_legacy_conversion_uses_built_modules_not_vision_fc1_names():
@@ -419,8 +491,9 @@ def test_runtime_layout_follows_built_dense_mlp():
         )
 
 
+@pytest.mark.parametrize("explicit_metadata", [False, True])
 def test_direct_core_writer_marks_glu_and_rejects_ambiguous_old_rows(
-    tmp_path_dist_ckpt, distributed
+    tmp_path_dist_ckpt, distributed, explicit_metadata
 ):
     canonical = torch.arange(24, device='cuda').reshape(8, 3).float()
     runtime = _runtime(canonical, 1)
@@ -433,13 +506,19 @@ def test_direct_core_writer_marks_glu_and_rejects_ambiguous_old_rows(
         )
 
     with TempNamedDir(tmp_path_dist_ckpt / 'direct-glu') as path:
-        dist_checkpointing.save({'fc1': factory(1)}, path)
+        requested = {'fc1': factory(1)}
+        dist_checkpointing.save(
+            requested, path, content_metadata={"application": 7} if explicit_metadata else None
+        )
+        assert set(requested) == {'fc1'}
         assert (
             dist_checkpointing.load_content_metadata(path)['glu_checkpoint_layout'] == 'contiguous'
         )
-        torch.testing.assert_close(
-            dist_checkpointing.load({'fc1': factory(1)}, path)['fc1'], runtime
-        )
+        loaded = dist_checkpointing.load({'fc1': factory(1)}, path)
+        assert set(loaded) == ({'fc1', 'content_metadata'} if explicit_metadata else {'fc1'})
+        if explicit_metadata:
+            assert loaded['content_metadata']['application'] == 7
+        torch.testing.assert_close(loaded['fc1'], runtime)
     with TempNamedDir(tmp_path_dist_ckpt / 'old-direct-glu') as path:
         # Reproduce the old Core writer: split runtime rows without canonicalization.
         old = factory(None)
@@ -492,6 +571,40 @@ def test_single_grouped_parameter_is_used_by_optimizer_factories(
         loaded = dist_checkpointing.load({'weight': factory, 'moment': moment}, path)
         torch.testing.assert_close(loaded['weight'], param)
         torch.testing.assert_close(loaded['moment'], param + 100)
+
+
+@pytest.mark.parametrize("flattened", [False, True])
+def test_grouped_fc2_restores_fp32_optimizer_tensors(distributed, tmp_path_dist_ckpt, flattened):
+    from megatron.core.dist_checkpointing.optimizer import make_sharded_optimizer_tensor
+    from megatron.core.transformer.moe.experts import _grouped_checkpoint_factory
+
+    values = torch.arange(24, device="cuda", dtype=torch.float32).reshape(2, 4, 3)
+    parameter = torch.nn.Parameter(
+        values.bfloat16().reshape(8, 3) if flattened else values.bfloat16()
+    )
+
+    def split(tensor, _):
+        return list(tensor.reshape(2, 4, 3).unbind(0))
+
+    templates = [
+        ShardedTensor.from_rank_offsets(
+            "experts.fc2", view, (0, expert, 2), prepend_axis_num=1, replica_id=Utils.rank
+        )
+        for expert, view in enumerate(split(parameter, "weight"))
+    ]
+    factory = _grouped_checkpoint_factory(parameter, templates, split, "weight")
+    expected = {"model": parameter.detach().clone()}
+    state = {"model": factory}
+    for index, name in enumerate(("master", "exp_avg", "exp_avg_sq")):
+        expected[name] = parameter.detach().float() + index + 0.125
+        state[name] = make_sharded_optimizer_tensor(factory, expected[name].clone(), prefix=name)
+        assert state[name].data.dtype == torch.float32
+        assert all(shard.dtype == torch.float32 for shard in state[name].build())
+    with TempNamedDir(tmp_path_dist_ckpt / "grouped-fc2") as path:
+        dist_checkpointing.save(dict(state), path)
+        loaded = dist_checkpointing.load(dict(state), path)
+        for name, value in expected.items():
+            torch.testing.assert_close(loaded[name], value, rtol=0, atol=0)
 
 
 def test_dtensor_conversion_preserves_local_sharding(distributed):

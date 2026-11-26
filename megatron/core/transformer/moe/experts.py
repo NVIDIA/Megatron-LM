@@ -173,7 +173,9 @@ def _grouped_checkpoint_factory(parameter, templates, split_tensor, param_name):
         for template, part in zip(templates, parts):
             assert template.key.startswith(old_prefix)
             renamed = new_prefix + template.key[len(old_prefix) :]
-            shard = replace(template, key=renamed, data=part, replica_id=replica_id)
+            # Optimizer factories substitute FP32 masters/moments for model tensors.
+            kwargs = {} if isinstance(template, ShardedTensorFactory) else {"dtype": part.dtype}
+            shard = replace(template, key=renamed, data=part, replica_id=replica_id, **kwargs)
             result.append(shard.build() if isinstance(shard, ShardedTensorFactory) else shard)
         return result
 

@@ -687,6 +687,7 @@ def _build_sharded_state_dict_metadata(
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     *,
     ckpt_format: Optional[str] = None,
+    model=None,
 ) -> dict:
     """Builds metadata used for sharded_state_dict versioning.
 
@@ -701,6 +702,7 @@ def _build_sharded_state_dict_metadata(
     Args:
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
         ckpt_format: The format of the operation (default: the run's checkpoint section's)
+        model: Built modules whose actual GLU layout should be recorded, when available.
     """
     cfg = get_run_config()
     checkpoint = cfg.checkpoint
@@ -733,15 +735,17 @@ def _build_sharded_state_dict_metadata(
 
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
-    metadata.update(
-        glu_checkpoint_metadata(
-            cfg.model,
-            optimizer_uses_model_layout=(
-                not has_distributed_optimizer
-                or metadata.get('distrib_optim_sharding_type') == 'fully_reshardable'
-            ),
+    layout_config = cfg.model if model is None else model
+    if layout_config is not None:
+        metadata.update(
+            glu_checkpoint_metadata(
+                layout_config,
+                optimizer_uses_model_layout=(
+                    not has_distributed_optimizer
+                    or metadata.get('distrib_optim_sharding_type') == 'fully_reshardable'
+                ),
+            )
         )
-    )
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
     if dp_cp_group is None:
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -1013,11 +1017,8 @@ def save_checkpoint(
     ):
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(
-                dp_cp_group=dp_cp_group, ckpt_format=save_format
+                dp_cp_group=dp_cp_group, ckpt_format=save_format, model=model
             )
-            sharded_sd_metadata.update(glu_checkpoint_metadata(
-                model, optimizer_uses_model_layout=sharded_sd_metadata.get('distrib_optim_sharding_type') == 'fully_reshardable'
-            ))
             if hasattr(cfg, "optimizer") and cfg.optimizer.use_distributed_optimizer:
                 print_rank_0(
                     f'Storing distributed optimizer sharded state of type'

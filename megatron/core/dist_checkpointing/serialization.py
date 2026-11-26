@@ -188,6 +188,10 @@ def load(
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
         sharded_state_dict
     )
+    if metadata.get('glu_implicit_metadata') and _CONTENT_METADATA_KEY not in sharded_state_dict:
+        # Core-generated layout information must not become an unexpected model parameter.
+        # It remains available through load_content_metadata(checkpoint_dir).
+        common_state_dict.pop(_CONTENT_METADATA_KEY)
     merge(common_state_dict, nonpersistent_state_dict)
 
     # At this point we are only dealing with ShardedBase objects
@@ -482,7 +486,13 @@ def save(
                 raise ValueError(f'Inconsistent GLU factory layout for {key}')
             glu_layouts[key] = layout
     if glu_layouts:
-        content_metadata = dict(content_metadata or {})
+        if content_metadata is None:
+            content_metadata = sharded_state_dict.get(_CONTENT_METADATA_KEY)
+        content_metadata = (
+            {'glu_implicit_metadata': True} if content_metadata is None else dict(content_metadata)
+        )
+        # Do not add automatic metadata to the caller's model-state mapping in place.
+        sharded_state_dict = sharded_state_dict.copy()
         content_metadata['glu_checkpoint_layout'] = 'contiguous'
         content_metadata['glu_tensor_layouts'] = glu_layouts
         content_metadata.setdefault(
