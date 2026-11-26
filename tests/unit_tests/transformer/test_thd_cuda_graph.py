@@ -2547,7 +2547,7 @@ def _get_available_port(preferred):
     raise RuntimeError("Could not find an available localhost port")
 
 
-def _run_pretrain(model_args, cuda_graph_args, master_port):
+def _run_pretrain(model_args, cuda_graph_args, master_port, extra_env=None, timeout=900):
     """Subprocess-launch `torchrun pretrain_gpt.py` once and capture stdout."""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(_REPO_ROOT) + ":" + env.get("PYTHONPATH", "")
@@ -2574,6 +2574,8 @@ def _run_pretrain(model_args, cuda_graph_args, master_port):
     # least one of fused/flash attention to build the model.
     env.pop("NVTE_FLASH_ATTN", None)
     env.pop("NVTE_FUSED_ATTN", None)
+    if extra_env:
+        env.update(extra_env)
 
     cmd = (
         [
@@ -2593,7 +2595,7 @@ def _run_pretrain(model_args, cuda_graph_args, master_port):
     )
 
     result = subprocess.run(
-        cmd, cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=900
+        cmd, cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=timeout
     )
     return result
 

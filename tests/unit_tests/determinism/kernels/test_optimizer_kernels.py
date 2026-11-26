@@ -77,6 +77,46 @@ def test_grouped_muon_replays(layer_sharded):
     )
 
 
+def test_mla_per_head_muon_replays():
+    """MLA up-projection splits per head, batched per pattern position, replay bit for bit."""
+    pytest.importorskip("emerging_optimizers")
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
+
+    seeded()
+    split_shapes = [48, 16] * 8  # (qk_head_dim, qk_pos_emb_head_dim) per head
+    weight = torch.randn(sum(split_shapes), 256, device="cuda")
+    gradient = torch.randn_like(weight)
+
+    def run(initial, grad):
+        parameter = torch.nn.Parameter(initial.clone())
+        parameter.is_qkv = True
+        parameter.qkv_split_shapes = split_shapes
+        optimizer = TensorParallelMuon(
+            [parameter],
+            lr=0.01,
+            momentum=0.95,
+            split_qkv=True,
+            split_qkv_per_head=True,
+            is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
+            qkv_split_shapes=split_shapes,
+            fp32_matmul_prec="highest",
+            pg_collection=None,
+        )
+        for _ in range(2):
+            parameter.grad = grad.clone()
+            optimizer.step()
+        return parameter.detach(), optimizer.state[parameter]["momentum_buffer"]
+
+    assert_replays_bit_exact(
+        run,
+        (weight, gradient),
+        replays=3,
+        backward=False,
+        contention=True,
+        what="MLA per-head Muon",
+    )
+
+
 class TestGradNormAndClip:
     def setup_method(self, method):
         Utils.initialize_model_parallel()

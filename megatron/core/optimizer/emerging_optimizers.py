@@ -164,6 +164,21 @@ def _is_muon_excluded(param):
     return not getattr(param, 'use_muon', True) or _is_nonlinear_or_embedding(param)
 
 
+def _repeating_split_pattern(split_shapes) -> tuple[int, ...] | None:
+    """The shortest pattern that ``split_shapes`` repeats at least twice, or None.
+
+    Per-head QKV splits list one pattern per head (or per query group), so slices at the same
+    pattern position share a shape and can be orthogonalized in one batched call.
+    """
+    count = len(split_shapes)
+    for period in range(1, count // 2 + 1):
+        if count % period == 0 and list(split_shapes) == list(split_shapes[:period]) * (
+            count // period
+        ):
+            return tuple(split_shapes[:period])
+    return None
+
+
 def _get_qkv_split_shapes(model_cfg, split_qkv_per_head: bool = False) -> list[int]:
     """Compute fused QKV split shapes from logical attention layout metadata."""
     if hasattr(model_cfg, 'projection_split_shapes'):
@@ -786,6 +801,19 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 # A 3D input selects Emerging-Optimizers' batched Newton-Schulz path.
                 head_rows = split_shapes[0]
                 return orthogonalize_fn(grad.view(len(split_shapes), head_rows, -1)).view_as(grad)
+            pattern = _repeating_split_pattern(split_shapes)
+            if pattern is not None:
+                # MLA up-projections repeat one slice pattern per head, e.g. (qk_head_dim,
+                # qk_pos_emb_head_dim) or (qk_head_dim, v_head_dim). Batch the slices at each
+                # pattern position into one 3D Newton-Schulz call instead of one call per slice.
+                grouped = grad.view(len(split_shapes) // len(pattern), sum(pattern), -1)
+                return torch.cat(
+                    [
+                        orthogonalize_fn(part.contiguous())
+                        for part in torch.split(grouped, list(pattern), dim=1)
+                    ],
+                    dim=1,
+                ).view_as(grad)
             return torch.cat(
                 [orthogonalize_fn(head) for head in torch.split(grad, split_shapes, dim=0)], dim=0
             )

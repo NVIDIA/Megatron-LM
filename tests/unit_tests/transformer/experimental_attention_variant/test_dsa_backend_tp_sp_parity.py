@@ -344,6 +344,7 @@ def _record_backend_calls(backend: str, monkeypatch: pytest.MonkeyPatch):
         original_full = dsa_cudnn_kernels.run_fused_dsa_attention
         original_topk_only = dsa_cudnn_kernels.run_fused_qk_topk
         original_topk = dsa_cudnn_kernels.run_fused_qk_topk_with_loss
+        original_loss_from_topk = dsa_cudnn_kernels.run_sparse_indexer_loss_from_topk
         original_attention = dsa_cudnn_kernels.run_fused_absorbed_sparse_attention
 
         def wrapped_run_fused_dsa_attention(*args, **kwargs):
@@ -364,6 +365,14 @@ def _record_backend_calls(backend: str, monkeypatch: pytest.MonkeyPatch):
                 called["indexer_loss"] += 1
             return result
 
+        def wrapped_run_sparse_indexer_loss_from_topk(*args, **kwargs):
+            # The split path's loss also runs here, after the sparse attention, when it
+            # reads the attention's LSE.
+            result = original_loss_from_topk(*args, **kwargs)
+            if result is not None:
+                called["indexer_loss"] += 1
+            return result
+
         def wrapped_run_fused_absorbed_sparse_attention(*args, **kwargs):
             result = original_attention(*args, **kwargs)
             if result is not None:
@@ -376,6 +385,11 @@ def _record_backend_calls(backend: str, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(dsa_cudnn_kernels, "run_fused_qk_topk", wrapped_run_fused_qk_topk)
         monkeypatch.setattr(
             dsa_cudnn_kernels, "run_fused_qk_topk_with_loss", wrapped_run_fused_qk_topk_with_loss
+        )
+        monkeypatch.setattr(
+            dsa_cudnn_kernels,
+            "run_sparse_indexer_loss_from_topk",
+            wrapped_run_sparse_indexer_loss_from_topk,
         )
         monkeypatch.setattr(
             dsa_cudnn_kernels,

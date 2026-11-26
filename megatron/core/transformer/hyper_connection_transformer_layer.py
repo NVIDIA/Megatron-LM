@@ -286,18 +286,21 @@ class HyperConnectionTransformerLayer(
         """
         return False
 
-    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+    def get_layer_static_inputs(self, seq_length, micro_batch_size, *, for_pipeline_prewarm=False):
         """Use hidden-size graph inputs for the attention-only mHC split.
 
         The mixin produces n-stream hidden_states of shape [s, b, n*C]. The split's captured
         callable begins at the attention consumer, after the eager mHC producer has reduced
         the n streams to one hidden-size tensor, so it keeps the base layer's static inputs.
+        Pipeline prewarm runs the whole layer, whose forward starts from n streams.
         """
-        if self._uses_mhc_recompute_attn_cuda_graph_split():
+        if not for_pipeline_prewarm and self._uses_mhc_recompute_attn_cuda_graph_split():
             return super(
                 TECudaGraphHyperConnectionTransformerLayerMixin, self
             ).get_layer_static_inputs(seq_length, micro_batch_size)
-        return super().get_layer_static_inputs(seq_length, micro_batch_size)
+        return super().get_layer_static_inputs(
+            seq_length, micro_batch_size, for_pipeline_prewarm=for_pipeline_prewarm
+        )
 
     def create_mcore_cudagraph_manager(self, config):
         """Create only CUDA graph managers compatible with this mHC layer."""

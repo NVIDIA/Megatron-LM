@@ -42,7 +42,10 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
-from megatron.core.datasets.data_schedule import wrap_data_iterator
+from megatron.core.datasets.data_schedule import (
+    prepare_thd_static_batch_for_full_iteration_cuda_graph,
+    wrap_data_iterator,
+)
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -105,6 +108,7 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.parallel_prewarm import prewarm_pipeline_model_parallel
 from megatron.core.pipeline_parallel.utils import (
     get_pp_last_rank,
     is_pp_first_stage,
@@ -1039,10 +1043,12 @@ def _dsa_indexer_flops(
     Multiply ``token_linear`` by the real token count and ``core`` by
     ``sum_i(L_i ** 2)``.
 
-    With KPool (``dsa_indexer_kpool > 1``) the indexer is forward only and
-    scores complete key pools plus a per-token gate; that case delegates to the
-    shared counter in ``megatron.training.logging.dsa_flops``, which needs the
-    batch statistics ``total_tokens`` and ``seqlen_squared_sum``.
+    With KPool (``dsa_indexer_kpool > 1``) the indexer scores complete key pools
+    plus a per-token gate: forward only when frozen, and with the backward of
+    the sparse pool-level loss when trained (KPool rejects the dense loss);
+    that case delegates to the shared counter in
+    ``megatron.training.logging.dsa_flops``, which needs the batch statistics
+    ``total_tokens`` and ``seqlen_squared_sum``.
     """
     if dsa_indexer_kpool > 1:
         return _dsa_kpool_indexer_flops(
@@ -1111,24 +1117,26 @@ def _num_dsa_indexer_layers(
     *,
     mtp_num_layers=0,
     mtp_use_repeated_layer=False,
+    mtp_shares_sparse_attention_index=False,
 ):
     """Count DSA indexer executions on the standard-model path.
 
     Cross-layer top-k sharing is tied to the physical layer number, so repeated
-    MTP either executes its one indexer ``D`` times or reuses top-k ``D`` times.
+    MTP normally executes its one indexer ``D`` times. When repeated MTP shares
+    its sparse-attention index, only depth 0 executes the indexer.
     """
 
     def computes_index(layer_number):
         return not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
 
-    return sum(
-        computes_index(layer_number)
-        for layer_number in _standard_layer_numbers_for_execution(
-            num_decoder_layers,
-            mtp_num_layers=mtp_num_layers,
-            mtp_use_repeated_layer=mtp_use_repeated_layer,
-        )
+    layer_numbers = _standard_layer_numbers_for_execution(
+        num_decoder_layers,
+        mtp_num_layers=mtp_num_layers,
+        mtp_use_repeated_layer=mtp_use_repeated_layer,
     )
+    if mtp_use_repeated_layer and mtp_num_layers > 0 and mtp_shares_sparse_attention_index:
+        layer_numbers = layer_numbers[: num_decoder_layers + 1]
+    return sum(computes_index(layer_number) for layer_number in layer_numbers)
 
 
 def _vision_flops_stats_tensor(reference: torch.Tensor | None = None) -> torch.Tensor:
@@ -2210,9 +2218,9 @@ def num_floating_point_operations(
                 dsa_indexer_kpool=dsa_indexer_kpool,
             )
             # The indexer carries its own forward/backward factor (forward only
-            # unless its KL loss is on; KPool requires the loss off, so it is
-            # forward only there), so it is added after the global factor 3
-            # below rather than inside it.
+            # unless its KL loss is on; with KPool only the sparse KL is
+            # allowed), so it is added after the global factor 3 below rather
+            # than inside it.
             dsa_indexer_flops_total = (
                 indexer_token_linear * total_tokens + indexer_core * seqlen_squared_sum
             )
@@ -2356,6 +2364,11 @@ def num_floating_point_operations(
         else:
             mtp_num_layers = 0
             num_layers = transformer_cfg.num_layers
+
+        mtp_use_repeated_layer = getattr(transformer_cfg, "mtp_use_repeated_layer", False)
+        mtp_shared_components = frozenset(
+            getattr(transformer_cfg, "mtp_repeated_layer_shared_components", None) or ()
+        )
 
         moe_ffn_hidden_size = (
             transformer_cfg.moe_ffn_hidden_size
@@ -2504,6 +2517,7 @@ def num_floating_point_operations(
         dsv4_hybrid_extra_core_term = 0
         dsa_extra_term = 0
         dsa_extra_core_term = 0
+        dsa_repeated_mtp_saved_term = 0
         if is_linear_attention_variant(transformer_cfg.experimental_attention_variant):
             # The attention pattern describes only the main decoder layers.
             if isinstance(transformer_cfg.linear_attention_freq, int):
@@ -2687,7 +2701,10 @@ def num_floating_point_operations(
                     transformer_cfg.dsa_indexer_skip_topk_offset,
                     transformer_cfg.dsa_indexer_topk_freq,
                     mtp_num_layers=mtp_num_layers,
-                    mtp_use_repeated_layer=getattr(transformer_cfg, "mtp_use_repeated_layer", False),
+                    mtp_use_repeated_layer=mtp_use_repeated_layer,
+                    mtp_shares_sparse_attention_index=(
+                        "sparse_attention_index" in mtp_shared_components
+                    ),
                 ),
                 dsa_indexer_loss_enabled=(transformer_cfg.dsa_indexer_loss_coeff or 0.0) > 0,
                 dsa_indexer_use_sparse_loss=getattr(transformer_cfg, "dsa_indexer_use_sparse_loss", False),
@@ -2697,6 +2714,22 @@ def num_floating_point_operations(
                 dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
                 dsa_indexer_kpool=dsa_indexer_kpool,
             )
+            if mtp_use_repeated_layer and "latent_kv" in mtp_shared_components:
+                # Later depths reuse the normalized, post-RoPE latent KV from depth 0.
+                # They still execute the absorbed K/V up-projection work on their query
+                # and attention output. Runtime also skips key RoPE and communication,
+                # which this FLOPs model does not count; only the KV down projection and
+                # norm disappear from the modeled standard MLA token-linear term.
+                dsa_repeated_mtp_saved_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * max(mtp_num_layers - 1, 0)
+                    * (
+                        transformer_cfg.hidden_size
+                        * (transformer_cfg.kv_lora_rank + transformer_cfg.qk_pos_emb_head_dim)
+                        + transformer_cfg.kv_lora_rank
+                    )
+                )
         else:
             num_linear_attention_layers = 0
             linear_self_attn_term = 0
@@ -2709,6 +2742,7 @@ def num_floating_point_operations(
             + standard_self_attn_term * num_standard_attention_layers
             + dsv4_hybrid_extra_term
             + dsa_extra_term
+            - dsa_repeated_mtp_saved_term
         )
         # Core attention (L^2) FLOPs. Standard attention has a uniform per-layer
         # coefficient; DSv4 sparse attention varies by layer type and is pre-summed.
@@ -3879,6 +3913,13 @@ def pretrain(
     one_logger and one_logger.log_metrics(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
+
+    if cfg_container.model.transformer.cuda_graph_impl == "full_iteration":
+        # Captured graphs (including graph-captured NCCL P2P for PP) must be
+        # destroyed before communicator/process teardown, otherwise interpreter
+        # shutdown can hang until the NCCL watchdog aborts the process.
+        torch.cuda.synchronize()
+        FullCudaGraphWrapper.reset_cuda_graph()
 
     if (
         cfg_container.model.transformer.gtp_remat_nccl_ub
@@ -5824,6 +5865,13 @@ def training_log(
                 dsa_transformer_cfg.dsa_indexer_topk_freq,
                 mtp_num_layers=dsa_transformer_cfg.mtp_num_layers,
                 mtp_use_repeated_layer=dsa_transformer_cfg.mtp_use_repeated_layer,
+                mtp_shares_sparse_attention_index=(
+                    "sparse_attention_index"
+                    in (
+                        getattr(dsa_transformer_cfg, "mtp_repeated_layer_shared_components", None)
+                        or ()
+                    )
+                ),
             )
         if dsa_transformer_cfg.csa_compress_ratios is not None and is_hybrid_model(cfg.model):
             tracked_layers, num_indexer_layers = _get_indexer_logging_layer_counts(cfg.model)
@@ -6619,6 +6667,27 @@ def is_batch_size_transition(
     return has_step_batch_size_schedule and get_current_global_batch_size() != global_batch_size
 
 
+def _resolve_thd_static_batch_pg_collection(pg_collection, model_pg_collection=None):
+    """Resolve the language-model process groups used by THD batch preparation.
+
+    Since DCP V2 the packed-batch path requires a process-group collection. Prefer the
+    schedule's carrier; otherwise use the model chunk's groups, which the eager get_batch
+    receives from forward_step, and finally the MPU groups that get_batch falls back to.
+    """
+    if pg_collection is None:
+        pg_collection = model_pg_collection
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        raise ValueError(
+            "THD full-iteration batch preparation does not support "
+            "MultiModuleProcessGroupCollection."
+        )
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "pp", "cp", "tp_cp", "dynamic_cp", "dynamic_tp_cp"]
+        )
+    return pg_collection
+
+
 def train(
     forward_step_func,
     model,
@@ -6658,6 +6727,15 @@ def train(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
+    if config.pipeline_model_parallel_prewarm and (
+        cfg.ddp.use_megatron_fsdp or isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig)
+    ):
+        raise ValueError(
+            "pipeline_model_parallel_prewarm does not support Megatron-FSDP or Torch-FSDP2 "
+            "because it bypasses the FSDP module hooks. Disable pipeline_model_parallel_prewarm "
+            "when using FSDP."
+        )
+
     timers = get_timers()
     train_state = get_train_state()
 
@@ -6848,10 +6926,27 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
     if cfg.model.transformer.cuda_graph_impl == "full_iteration":
+        thd_batch_preparation_fn = None
+        if args.sequence_packing_scheduler is not None:
+            # THD full-iteration graphs require every packed microbatch to be
+            # canonicalized to graph-static shapes outside the captured region
+            # (this path issues TP broadcasts), and a fixed num_microbatches
+            # per step (enforced via the wrapper's capture signature).
+            thd_pg_collection = _resolve_thd_static_batch_pg_collection(
+                pg_collection, model_pg_collection
+            )
+            thd_batch_preparation_fn = functools.partial(
+                prepare_thd_static_batch_for_full_iteration_cuda_graph,
+                config=config,
+                vpp_size=config.virtual_pipeline_model_parallel_size,
+                pg_collection=thd_pg_collection,
+            )
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=cfg.model.transformer.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
+            batch_preparation_fn=thd_batch_preparation_fn,
+            require_global_static_metadata_consensus=config.cuda_graph_static_dynamic_cp,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if cfg.model.transformer.moe_expert_rank_capacity_factor is not None:
@@ -6947,6 +7042,16 @@ def train(
             ), "Parameter hashes not matching across DP replicas"
             torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
+
+    if config.pipeline_model_parallel_prewarm:
+        prewarm_pipeline_model_parallel(
+            model=model,
+            config=config,
+            seq_length=args.seq_length,
+            micro_batch_size=cfg.train.micro_batch_size,
+            optimizers=[optimizer],
+            pg_collection=model_pg_collection,
+        )
 
     # Initialize CUDA Graphs helper.
     if cfg.model.transformer.cuda_graph_impl == "transformer_engine":
@@ -7693,7 +7798,14 @@ def evaluate(
     # average a 1/gtp_remat subsample of the eval batch (768 sequences read, 12 averaged at
     # dp=6/gtp_remat=64) while consumed_valid_samples still books the full eval_batch_size.
     eval_dp_cp_group = getattr(eval_pgc, 'dp_cp_gtp_remat', None) or eval_pgc.dp_cp
-    if cfg.model.transformer.cuda_graph_impl == "full_iteration":
+    if (
+        cfg.model.transformer.cuda_graph_impl == "full_iteration"
+        and args.sequence_packing_scheduler is None
+    ):
+        # THD sequence packing keeps validation eager: a dedicated fixed-shape
+        # validation graph is not implemented yet, and the packed validation
+        # schedule may use a different num_microbatches than the captured
+        # training graph.
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=cfg.model.transformer.cuda_graph_warmup_steps,
