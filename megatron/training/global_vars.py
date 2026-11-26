@@ -253,6 +253,18 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         signal.signal(signal.SIGTERM, _graceful_shutdown)
 
 
+def _reset_checkpoint_manager():
+    """Drop the cached checkpoint manager.
+
+    The manager is cached per run; a second run reusing the same CheckpointConfig object (for
+    example an in-process restart) must not get back a manager, and its backend, that the first run
+    already shut down. Shared by every teardown path.
+    """
+    from megatron.training.checkpoint_manager import set_checkpoint_manager
+
+    set_checkpoint_manager(None)
+
+
 def unset_global_variables():
     """Unset global vars.
 
@@ -289,11 +301,7 @@ def unset_global_variables():
 
     unset_num_microbatches_calculator()
 
-    # The checkpoint manager is cached per run; a second run reusing the same CheckpointConfig
-    # object must not get back a manager the first run already shut down.
-    from megatron.training.checkpoint_manager import set_checkpoint_manager
-
-    set_checkpoint_manager(None)
+    _reset_checkpoint_manager()
 
 
 def set_args(args):
@@ -762,3 +770,5 @@ def destroy_global_vars():
 
     global _GLOBAL_TELEMETRY_HANDLE
     _GLOBAL_TELEMETRY_HANDLE = None
+
+    _reset_checkpoint_manager()

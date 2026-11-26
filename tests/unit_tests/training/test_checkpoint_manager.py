@@ -324,14 +324,15 @@ class TestGetCheckpointManager:
         assert isinstance(default_manager, cm.DefaultCheckpointManager)
         assert isinstance(custom_manager, _GoodManager)
 
-    def test_manager_is_rebuilt_after_teardown_even_with_the_same_config_object(self):
-        from megatron.training.global_vars import unset_global_variables
+    @pytest.mark.parametrize("teardown", ["unset_global_variables", "destroy_global_vars"])
+    def test_manager_is_rebuilt_after_teardown_even_with_the_same_config_object(self, teardown):
+        from megatron.training import global_vars
 
         config = _config()
 
         with self._run_config(config):
             first = cm.get_checkpoint_manager()
-            unset_global_variables()
+            getattr(global_vars, teardown)()
             second = cm.get_checkpoint_manager()
 
         assert first is not second
