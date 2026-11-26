@@ -63,5 +63,6 @@ def prepare_packed_seq_params(
         capacity=capacity,
         graphs_enabled=cuda_graph_captures_attention(config),
         graph_dynamic_packs=dynamic_packs,
+        auto_config=config if config.dsa_cp_balance_indexer == "auto" else None,
     )
     return packed_seq_params

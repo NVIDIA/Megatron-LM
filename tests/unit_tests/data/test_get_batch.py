@@ -314,6 +314,7 @@ def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monk
             capacity=4096,
             graphs_enabled=True,
             graph_dynamic_packs=True,
+            auto_config=None,
         )
     else:
         prebuild.assert_not_called()
@@ -388,13 +389,15 @@ def test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeyp
             capacity=4096,
             graphs_enabled=True,
             graph_dynamic_packs=True,
+            auto_config=None,
         )
     else:
         prebuild.assert_not_called()
 
 
 @pytest.mark.parametrize("frontend", ["gpt", "hybrid"])
-def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, frontend):
+@pytest.mark.parametrize("balance_mode", [True, "auto"])
+def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, frontend, balance_mode):
     """An MLP-only graph must not pin the eager indexer's pack composition."""
     module = pretrain_gpt if frontend == "gpt" else pretrain_hybrid
     args = SimpleNamespace(
@@ -412,7 +415,7 @@ def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, front
         mtp_num_layers=0,
         virtual_pipeline_model_parallel_size=None,
         linear_cp_layout="contiguous",
-        dsa_cp_balance_indexer=True,
+        dsa_cp_balance_indexer=balance_mode,
         dsa_cp_balance_indexer_graph_dynamic_packs=False,
         pad_packed_seq_alignment="max",
         cuda_graph_impl="transformer_engine",
@@ -491,6 +494,7 @@ def test_scheduler_prebuild_marks_attention_eager_graph_scope(monkeypatch, front
         capacity=None,
         graphs_enabled=False,
         graph_dynamic_packs=False,
+        auto_config=config if balance_mode == "auto" else None,
     )
 
 
@@ -565,6 +569,7 @@ def test_hybrid_thd_forward_prebuilds_batch_metadata_once(monkeypatch):
         "capacity": None,
         "graphs_enabled": True,
         "graph_dynamic_packs": False,
+        "auto_config": None,
     }
 
 

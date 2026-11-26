@@ -3549,17 +3549,14 @@ class CompressedSparseAttention(MegatronModule):
                         cp_balanced_indexer,
                     )
 
-                    # Per-pack routing: a pack the zigzag builders cannot represent
-                    # (raw-cu middle stages and non-scheduler frontends can produce
-                    # one regardless of the configured capacity alignment) takes the
-                    # original contiguous reference path for this microbatch. The
-                    # verdict comes from prebuild's cache (no probe),
-                    # the module registry under capture (raises without an eager
-                    # warmup), or one cached D2H probe for frontends that never
-                    # prebuild.
-                    use_balance = cp_balanced_indexer.pack_eligible_for_zigzag(
-                        packed_seq_params, cu_seqlens, cp_group, cp_size, l_local
-                    )
+                    if self.config.dsa_cp_balance_indexer == "auto":
+                        use_balance = cp_balanced_indexer.auto_use_zigzag(
+                            packed_seq_params, cp_group, l_local, self.config
+                        )
+                    else:
+                        use_balance = cp_balanced_indexer.pack_eligible_for_zigzag(
+                            packed_seq_params, cu_seqlens, cp_group, cp_size, l_local
+                        )
                 # Layout precondition (contiguous) is enforced module-wide above:
                 # CompressedSparseAttention raises for any CP run whose
                 # PackedSeqParams.cp_partition_mode is not "contiguous".
@@ -3772,8 +3769,8 @@ class CompressedSparseAttention(MegatronModule):
                         )
                     )
                 else:
-                    # Inside a balanced run (flag on, this pack merely ineligible)
-                    # other fused calls have already been issued, so an above-limit
+                    # In a balanced run, a pack can take the contiguous path after
+                    # other fused calls have been issued, so an above-limit
                     # fused call here is the verified-corrupt pattern: take the
                     # unfused path (ordinary layout, exact). With the flag off this
                     # is the pre-existing path and keeps its behavior (the shared

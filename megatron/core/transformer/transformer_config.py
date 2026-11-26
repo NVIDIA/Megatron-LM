@@ -603,7 +603,10 @@ class TransformerConfig(ModelParallelConfig):
     backend. The final index scores remain FP32 independently of this option. This option does
     not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
 
-    dsa_cp_balance_indexer: bool = False
+    dsa_cp_balance_indexer: bool | Literal["auto"] = field(
+        default=False,
+        metadata={"argparse_meta": {"type": str, "nargs": "?", "const": True, "choices": ["auto"]}},
+    )
     """Enable the load-balanced context-parallel DSA indexer path. The contiguous CP split makes the
     causal indexer's per-query cost grow with rank, so later CP ranks become stragglers. When True,
     each rank instead scores a balanced low-position + high-position chunk pair (two launches of the
@@ -620,8 +623,9 @@ class TransformerConfig(ModelParallelConfig):
     balanced two-half-call path therefore fails closed above per-rank capacities of
     2 * 32768 rows, balanced-run reference fallbacks above 32768 rows take the unfused
     implementation, and pre-existing paths keep their behavior with a once-per-process
-    correctness warning. Whether balancing is worthwhile for a workload is decided once,
-    at recipe level, by this flag.
+    correctness warning. With ``"auto"``, data preparation chooses between the two legal
+    layouts per packed microbatch by comparing critical-rank scoring work with routing cost.
+    Auto requires attention to execute outside CUDA graph capture.
     Selection Q inherits the effective per-layer precision. Only delayed-scaling selection
     uses a stateless nonquantized projection; its canonical local projection still records once
     in eval/no-grad checkpoint forwards so amax and recompute metadata remain consistent.
@@ -648,7 +652,7 @@ class TransformerConfig(ModelParallelConfig):
         replay always agree on whether fixed-capacity dynamic route metadata is required.
         """
         return bool(
-            self.dsa_cp_balance_indexer
+            self.dsa_cp_balance_indexer is True
             and self.cuda_graph_impl == "transformer_engine"
             and cuda_graph_captures_attention(self)
             and self.sequence_packing_scheduler == "dp_balanced"
@@ -3019,6 +3023,11 @@ class TransformerConfig(ModelParallelConfig):
                         "cp_partition_mode='contiguous'."
                     )
 
+        if (
+            not isinstance(self.dsa_cp_balance_indexer, bool)
+            and self.dsa_cp_balance_indexer != "auto"
+        ):
+            raise ValueError("dsa_cp_balance_indexer must be False, True, or 'auto'.")
         if self.dsa_cp_balance_indexer and self.experimental_attention_variant != "dsv4_hybrid":
             # The flag is consumed only by the CSA indexer; on any other model the
             # data-step prebuild would burn per-microbatch host syncs for nothing.
@@ -5842,6 +5851,11 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
         graph_captures_attention = cuda_graph_captures_attention(self)
+        if self.dsa_cp_balance_indexer == "auto" and graph_captures_attention:
+            raise ValueError(
+                "dsa_cp_balance_indexer='auto' requires attention outside CUDA graph capture: "
+                "different microbatches can issue different collectives."
+            )
 
         if self.dsa_cp_balance_indexer_graph_dynamic_packs:
             if self.dynamic_context_parallel or self.context_parallel_size <= 1:
