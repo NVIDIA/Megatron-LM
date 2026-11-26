@@ -165,7 +165,7 @@ def test_mcore_angular_muown(distributed_setup, pg_collection) -> None:
         muon_scale_mode="shape_scaling",
         muon_use_muown=True,
         muown_use_angular=True,
-        muown_angular_horizon_iters=4,
+        muown_angular_warmup_iters=4,
     )
     torch.manual_seed(1234)
     model = FullyShardedDataParallel(
@@ -187,7 +187,7 @@ def test_mcore_angular_muown(distributed_setup, pg_collection) -> None:
     assert set(angular_muown.get_parameters()) == {
         param for param in model.module.decoder.parameters() if param.ndim == 2
     }
-    assert angular_muown.optimizer.angular_horizon_steps == 4
+    assert angular_muown.optimizer.angular_warmup_steps == 4
 
     inputs = torch.randint(0, 8, (3, 2, 4), device=distributed_setup.device)
     assert torch.isfinite(_train(model, optimizer, inputs)).all()

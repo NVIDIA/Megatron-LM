@@ -355,31 +355,15 @@ class OptimizerConfig:
     angular multiplier kappa_t. Requires muon_use_muown and muon_scale_mode='shape_scaling'.
     Defaults to False."""
 
-    muown_angular_decay_scale: float = 8.9
-    """Dimensionless scale C of kappa_t = (1 + C * u**r) ** (-p / r), where u is the progress
-    after the angular warmup normalized by muown_angular_horizon_iters. Defaults to 8.9."""
+    muown_angular_decay_scale: float = 0.001
+    """Scale c of the angular multiplier kappa_t = (1 + c * max(0, t - t_w)) ** (-p).
+    Defaults to 0.001."""
 
     muown_angular_decay_degree: float = 1.0
-    """Decay degree p of kappa_t. Zero disables the decay after warmup. Defaults to 1.0."""
-
-    muown_angular_plateau_degree: float = 1.0
-    """Plateau degree r >= 1 of kappa_t. r > 1 flattens the start of the decay.
-    Defaults to 1.0."""
+    """Decay degree p of kappa_t. Zero disables the decay. Defaults to 1.0."""
 
     muown_angular_warmup_iters: int = 0
-    """Iterations that keep kappa_t = 1. Defaults to 0."""
-
-    muown_angular_horizon_iters: int = 0
-    """Iterations T that normalize the progress of kappa_t, usually the number of training
-    iterations. Zero disables the decay. Defaults to 0."""
-
-    muown_norm_eps: float = 1e-12
-    """Floor for the absolute row scale and for the row-normalization denominator.
-    Defaults to 1e-12."""
-
-    muown_weight_decay_mult: float = 1.0
-    """Multiplier of weight_decay for the decoupled decay of MuOwn row scales. The row directions
-    are never decayed. Zero disables the decay. Defaults to 1.0."""
+    """Iterations t_w before the angular decay starts. Defaults to 0."""
 
     # Lion.
     lion_beta1: float = 0.95
@@ -566,15 +550,6 @@ class OptimizerConfig:
                     "AngularMuOwn requires muon_scale_mode='shape_scaling', got "
                     f"{self.muon_scale_mode!r}."
                 )
-            if self.muown_angular_plateau_degree < 1:
-                raise ValueError("muown_angular_plateau_degree must be >= 1.")
-            if self.muown_angular_decay_scale < 0 or self.muown_angular_decay_degree < 0:
-                raise ValueError(
-                    "muown_angular_decay_scale and muown_angular_decay_degree must be "
-                    "non-negative."
-                )
-            if self.muown_norm_eps <= 0:
-                raise ValueError("muown_norm_eps must be positive.")
 
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.

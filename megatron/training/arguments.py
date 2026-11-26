@@ -2711,24 +2711,13 @@ def _add_regularization_args(parser):
                        help='Use AngularMuOwn: unit row directions with an angular step '
                        'multiplier. Requires --muon-use-muown and '
                        '--muon-scale-mode shape_scaling.')
-    group.add_argument('--muown-angular-decay-scale', type=float, default=8.9,
-                       help='Dimensionless scale C of the angular multiplier '
-                       'kappa_t = (1 + C * u**r) ** (-p / r).')
+    group.add_argument('--muown-angular-decay-scale', type=float, default=0.001,
+                       help='Scale c of the angular multiplier '
+                       'kappa_t = (1 + c * max(0, t - t_w)) ** (-p).')
     group.add_argument('--muown-angular-decay-degree', type=float, default=1.0,
                        help='Decay degree p of the angular multiplier. 0 disables the decay.')
-    group.add_argument('--muown-angular-plateau-degree', type=float, default=1.0,
-                       help='Plateau degree r >= 1 of the angular multiplier.')
     group.add_argument('--muown-angular-warmup-iters', type=int, default=0,
-                       help='Iterations that keep the angular multiplier at 1.')
-    group.add_argument('--muown-angular-horizon-iters', type=int, default=0,
-                       help='Iterations that normalize the progress of the angular multiplier, '
-                       'usually --train-iters. 0 disables the decay.')
-    group.add_argument('--muown-norm-eps', type=float, default=1e-12,
-                       help='Floor for the absolute row scale and the row-normalization '
-                       'denominator.')
-    group.add_argument('--muown-weight-decay-mult', type=float, default=1.0,
-                       help='Multiplier of --weight-decay for the MuOwn row scales. '
-                       'The row directions are never decayed.')
+                       help='Iterations t_w before the angular decay starts.')
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')
