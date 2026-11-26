@@ -39,6 +39,7 @@ from megatron.core.transformer.moe.moe_utils import pad_routing_map
 from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     bytes_equal,
+    perf_scaled,
     seeded,
 )
 
@@ -393,16 +394,17 @@ def _pinned_block_h(block_h):
 @pytest.mark.parametrize("variant", ["out_of_place", "inplace"])
 @pytest.mark.parametrize("heads", [32, 12])
 @pytest.mark.parametrize("remove_interleaving", [False, True])
-def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads, remove_interleaving):
+@perf_scaled
+def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads, remove_interleaving, perf_scale):
     seeded()
     nope_dim, emb_dim = 128, 64
     dtype = torch.bfloat16
     if layout == "sbhd":
-        seqlen, batch = 2048, 2
+        seqlen, batch = 2048 * perf_scale, 2
         cu_seqlens = None
         t = torch.randn(seqlen, batch, heads, nope_dim + emb_dim, device="cuda", dtype=dtype)
     else:
-        bounds = [0, 1000, 1500, 2048, 4096]
+        bounds = [b * perf_scale for b in (0, 1000, 1500, 2048, 4096)]
         seqlen = max(b - a for a, b in zip(bounds, bounds[1:]))
         cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device="cuda")
         t = torch.randn(bounds[-1], heads, nope_dim + emb_dim, device="cuda", dtype=dtype)
@@ -436,17 +438,18 @@ def test_fused_mla_rope_q_replays_fwd_bwd(layout, variant, heads, remove_interle
 @pytest.mark.skipif(fused_mla_rope_kv_split is None, reason="fused MLA RoPE unavailable")
 @pytest.mark.parametrize("layout", ["sbhd", "thd"])
 @pytest.mark.parametrize("heads", [32, 12])
-def test_fused_mla_rope_kv_split_replays_fwd_bwd(layout, heads):
+@perf_scaled
+def test_fused_mla_rope_kv_split_replays_fwd_bwd(layout, heads, perf_scale):
     seeded()
     k_dim, v_dim, emb_dim = 128, 128, 64
     dtype = torch.bfloat16
     if layout == "sbhd":
-        seqlen, batch = 2048, 2
+        seqlen, batch = 2048 * perf_scale, 2
         cu_seqlens = None
         kv = torch.randn(seqlen, batch, heads, k_dim + v_dim, device="cuda", dtype=dtype)
         k_pos_emb = torch.randn(seqlen, batch, 1, emb_dim, device="cuda", dtype=dtype)
     else:
-        bounds = [0, 1000, 1500, 2048, 4096]
+        bounds = [b * perf_scale for b in (0, 1000, 1500, 2048, 4096)]
         seqlen = max(b - a for a, b in zip(bounds, bounds[1:]))
         cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device="cuda")
         kv = torch.randn(bounds[-1], heads, k_dim + v_dim, device="cuda", dtype=dtype)

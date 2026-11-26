@@ -10,9 +10,10 @@ OUT_ARG="${1:?usage: $0 OUTDIR -- CMD...}"; shift
 mkdir -p "$OUT_ARG"
 OUT=$(realpath "$OUT_ARG")
 
-for MODE in det nondet; do
+# DETERMINISM_PERF_ORDER="nondet det" reverses the order, to check that it does not bias the result.
+for MODE in ${DETERMINISM_PERF_ORDER:-det nondet}; do
   DETERMINISM_PERF_MODE=$MODE \
-    nsys profile -t cuda,nvtx -f true \
+    nsys profile -t cuda,nvtx -f true ${NSYS_PROFILE_ARGS:-} \
       --capture-range=cudaProfilerApi --capture-range-end=stop \
       -o "$OUT/nsys-$MODE" "$@"
   nsys stats --force-export=true --report nvtx_sum --format csv "$OUT/nsys-$MODE.nsys-rep" > "$OUT/nsys-$MODE.csv"

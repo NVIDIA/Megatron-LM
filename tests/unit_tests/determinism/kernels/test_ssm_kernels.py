@@ -35,6 +35,7 @@ from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     deterministic_algorithms,
+    perf_scaled,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -970,12 +971,13 @@ def test_torch_chunk_gated_delta_rule_cuda_graph(
             torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
 
-def test_torch_chunk_gated_delta_rule_replays_fwd_bwd():
+@perf_scaled
+def test_torch_chunk_gated_delta_rule_replays_fwd_bwd(perf_scale):
     """The path ``--deterministic-mode`` selects for GDN (FLA is not deterministic)."""
     from megatron.core.ssm.gated_delta_net.gdn import torch_chunk_gated_delta_rule
 
     seeded()
-    B, T, H, K = 2, 2048, 16, 128
+    B, T, H, K = 2, 2048 * perf_scale, 16, 128
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     v = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -1043,10 +1045,11 @@ def test_kda_fp8_opt_out_scope_is_replay_safe():
 @pytest.mark.xfail(
     strict=False, reason="FLA chunk_gated_delta_rule is documented non-deterministic; recorded"
 )
-def test_fla_chunk_gated_delta_rule_replays_fwd_bwd():
+@perf_scaled
+def test_fla_chunk_gated_delta_rule_replays_fwd_bwd(perf_scale):
     fla_ops = pytest.importorskip("fla.ops.gated_delta_rule")
     seeded()
-    B, T, H, K = 2, 2048, 16, 128
+    B, T, H, K = 2, 2048 * perf_scale, 16, 128
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     v = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)

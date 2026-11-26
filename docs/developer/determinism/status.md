@@ -43,9 +43,9 @@ environment values.
   (`tests/performance_tests/shell_test_utils/determinism/`): Runs a small
   recipe in deterministic and default mode under Nsight Systems, reports a
   per-range leaderboard, and fails when the deterministic step time exceeds the
-  documented threshold. `kernel_bench.py` in the same directory times each cuDNN
-  Frontend kernel (flash attention and linear attention), forward and backward,
-  in deterministic and default mode. It is a manual report, not a gate.
+  documented threshold. `kernel_breakdown.sh` in the same directory runs the
+  kernel determinism tests the same way and reports one row per test, forward
+  and backward. It is a manual report, not a gate.
 - **End-to-end verification**: Compares full-precision training metrics across
   two independent runs (refer to the glossary's "Verification" note). The
   functional tests do the same against checked-in golden values: every
