@@ -427,6 +427,9 @@ class TestPagedStashingGroupedTensor:
     """Paged stashing with device-initiated GroupedLinear and no TE operation fuser."""
 
     def teardown_method(self, method):
+        # The HybridEP buffer is a process global created on first use; leaving this class's
+        # 4-rank buffer behind makes the next hybridep test in the session dispatch into it.
+        reset_hybrid_ep_buffer()
         Utils.destroy_model_parallel()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
