@@ -361,10 +361,13 @@ def test_adam_resume_preserves_three_updates(
         )
         for group in optimizer.param_groups:
             group['lr'] = 0.003
-        if hasattr(optimizer, 'chained_optimizers'):
-            assert len(optimizer.chained_optimizers) == 1
-            optimizer = optimizer.chained_optimizers[0]
         return models[0], optimizer
+
+    def inner(optimizer):
+        # Training and checkpoint operations use the public optimizer. Inspect its
+        # sole child only to compare the unsharded master weights and Adam moments.
+        (child,) = optimizer.chained_optimizers
+        return child
 
     def update(model, optimizer, step):
         optimizer.zero_grad()
@@ -411,7 +414,7 @@ def test_adam_resume_preserves_three_updates(
         def assert_optimizer_state(rtol=0):
             if dist_opt:
                 states = [
-                    optimizer.get_parameter_state_dp_zero(
+                    inner(optimizer).get_parameter_state_dp_zero(
                         use_gloo_comm=False, return_on_all_ranks=True
                     )
                     for optimizer in (optimizer_a, optimizer_b)
@@ -419,13 +422,18 @@ def test_adam_resume_preserves_three_updates(
                 buffers = [next(iter(state[0].values())) for state in states]
             else:
                 buffers = []
-                for optimizer in (optimizer_a, optimizer_b):
+                for wrapper in (optimizer_a, optimizer_b):
+                    optimizer = inner(wrapper)
                     master = optimizer.fp32_from_float16_groups[0][0]
                     buffers.append({"param": master, **optimizer.optimizer.state[master]})
             for name in ('param', 'exp_avg', 'exp_avg_sq'):
                 torch.testing.assert_close(
-                    permute_glu_rows(buffers[0][name].reshape(64, 5), 2, interleave=False),
-                    permute_glu_rows(buffers[1][name].reshape(64, 5), 4, interleave=False),
+                    permute_glu_rows(
+                        buffers[0][name].reshape_as(model_a.linear.weight), 2, interleave=False
+                    ),
+                    permute_glu_rows(
+                        buffers[1][name].reshape_as(model_b.linear.weight), 4, interleave=False
+                    ),
                     rtol=rtol,
                     atol=0,
                 )
@@ -466,6 +474,12 @@ def test_legacy_conversion_uses_built_modules_not_vision_fc1_names():
     torch.testing.assert_close(
         restored['language.linear_fc1.weight'], state['language.linear_fc1.weight']
     )
+
+
+def test_model_without_glu_layout_skips_dtensor_preprocessing():
+    model = torch.nn.Linear(4, 4)
+    state = {"weight": model.weight}
+    assert convert_glu_model_state(state, model, interleave=False) is state
 
 
 def test_runtime_layout_follows_built_dense_mlp():

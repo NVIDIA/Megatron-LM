@@ -245,17 +245,21 @@ def convert_glu_model_state(state_dict, model, *, interleave):
         return name
 
     sizes = {normalized(key): size for key, size in glu_parameter_layouts(model).items()}
-    if any(hasattr(value, 'placements') for value in state_dict.values()):
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-            preprocess_state_dict_for_uneven_dtensor,
-        )
-
-        state_dict = preprocess_state_dict_for_uneven_dtensor(dict(state_dict))
+    if not sizes:
+        return state_dict
     result = dict(state_dict)
     for key in sorted(state_dict):
         size = sizes.get(normalized(key))
         if size is not None:
             tensor = state_dict[key]
+            if hasattr(tensor, 'placements') and not hasattr(
+                tensor._local_tensor, '__create_chunk_list__'
+            ):
+                from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+                    update_uneven_dtensor_chunk_metadata,
+                )
+
+                update_uneven_dtensor_chunk_metadata(tensor)
             axis = tensor.ndim - (1 if key.rsplit('.', 1)[-1].startswith('bias') else 2)
             result[key] = permute_glu_rows(tensor, size, axis, interleave=interleave)
     return result

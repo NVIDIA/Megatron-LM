@@ -79,3 +79,11 @@ writer. If only model provenance is established, start a fresh optimizer.
 A blanket metadata annotation or generic row shuffle cannot establish unknown
 master/moment layouts, so this change does not provide an automatic conversion
 of ambiguous historical optimizer state.
+
+If the original Hugging Face checkpoint is available and its weights are the ones
+you want to initialize from, import it again with the updated AutoBridge writer.
+This creates a marked model checkpoint. It starts a new optimizer and cannot
+recover later training updates. For a trained checkpoint, keep the original
+reader available for full resume until model rows, master weights and both Adam
+moments can all be verified. Adding a model layout marker alone cannot establish
+the optimizer layout.
