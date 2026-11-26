@@ -250,7 +250,10 @@ class TestMasterWeightsCheckpoint:
             pytest.param(torch.bfloat16, True, id="bf16_remainder"),
         ],
     )
-    def test_resume_without_master(self, tmp_path_dist_ckpt, model_dtype, store_param_remainders):
+    @pytest.mark.parametrize("strict_load", [True, False], ids=["strict", "partial"])
+    def test_resume_without_master(
+        self, tmp_path_dist_ckpt, model_dtype, store_param_remainders, strict_load
+    ):
         models = []
         try:
             # Reproduce the old optimizer configuration, not just a new checkpoint
@@ -268,26 +271,13 @@ class TestMasterWeightsCheckpoint:
             assert all(
                 "master_param" not in state for state in legacy_state["optimizer"]["state"].values()
             )
-            checkpoint_dir = tmp_path_dist_ckpt / "iter_0000001"
-            args = SimpleNamespace(
-                swiglu=True,
-                num_experts=None,
-                use_megatron_fsdp=True,
-                non_persistent_global_ckpt_dir=None,
-                non_persistent_ckpt_type=None,
-                strict_fsdp_dtensor_load=False,
-                dist_ckpt_strictness="raise_unexpected",
-                finetune=False,
-            )
-            dcp.save(
+            args = self._checkpoint_args()
+            args.strict_fsdp_dtensor_load = strict_load
+            metadata = self._save_checkpoint(
+                tmp_path_dist_ckpt,
                 preprocess_fsdp_dtensor_state_dict(args, legacy_state, source.module),
-                checkpoint_id=checkpoint_dir,
             )
-            metadata = dcp.FileSystemReader(checkpoint_dir).read_metadata().state_dict_metadata
             assert not any("master_param" in key for key in metadata)
-            if Utils.rank == 0:
-                (tmp_path_dist_ckpt / "latest_checkpointed_iteration.txt").write_text("1")
-            torch.distributed.barrier()
 
             torch.manual_seed(5678)
             restored, restored_optimizer = self._build_model_and_optimizer(
@@ -361,6 +351,14 @@ class TestMasterWeightsCheckpoint:
                 torch.testing.assert_close(
                     restored.state_dict()[name].to_local(), expected.to_local(), rtol=0, atol=0
                 )
+            actual_state = restored_optimizer.sharded_param_state_fsdp_dtensor()
+            expected_state = reference_optimizer.sharded_param_state_fsdp_dtensor()
+            for name, slots in expected_state["state"].items():
+                for key, value in slots.items():
+                    torch.testing.assert_close(
+                        actual_state["state"][name][key], value, rtol=0, atol=0
+                    )
+            assert actual_state["param_to_group_meta"] == expected_state["param_to_group_meta"]
         finally:
             for model in models:
                 model.stop_communication()
