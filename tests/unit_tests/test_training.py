@@ -116,20 +116,28 @@ def test_entrypoint_loss_checks_read_rerun_config(
 ):
     with patch("logging.basicConfig"):
         entrypoint = importlib.import_module(module_name)
-    # Unmigrated application inputs only; there are no rerun fields in args.
-    monkeypatch.setattr(
-        entrypoint, "get_args", lambda: SimpleNamespace(logits_load_dir=None, loss_alpha=1)
-    )
-    if hasattr(entrypoint, "has_nvidia_modelopt"):
-        monkeypatch.setattr(entrypoint, "has_nvidia_modelopt", False)
+    if module_name in ("pretrain_gpt", "pretrain_hybrid"):
+        # GPT and Hybrid inject a configured callback; the shared module owns its checks.
+        from megatron.training import losses as loss_owner
+    else:
+        loss_owner = entrypoint
+        # Unmigrated application inputs only; there are no rerun fields in args.
+        monkeypatch.setattr(
+            entrypoint, "get_args", lambda: SimpleNamespace(logits_load_dir=None, loss_alpha=1)
+        )
+        if hasattr(entrypoint, "has_nvidia_modelopt"):
+            monkeypatch.setattr(entrypoint, "has_nvidia_modelopt", False)
     machine = Mock()
-    monkeypatch.setattr(entrypoint, "get_rerun_state_machine", lambda: machine)
+    monkeypatch.setattr(loss_owner, "get_rerun_state_machine", lambda: machine)
     run_config.rerun_state_machine.check_for_nan_in_loss = nan_check
     run_config.rerun_state_machine.check_for_spiky_loss = spiky_check
     if loss_factor is not None:
         run_config.rerun_state_machine.spiky_loss_factor = loss_factor
     values = torch.ones(2, device="cuda")
-    if module_name == "train_rl":
+    if module_name in ("pretrain_gpt", "pretrain_hybrid"):
+        result = entrypoint.build_loss_func(run_config)(values, values)
+        expected_nan_checks = 2
+    elif module_name == "train_rl":
         result = entrypoint.loss_func(values, values, values, values, values, values, 1, values)
         expected_nan_checks = 1
     else:
