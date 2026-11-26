@@ -30,6 +30,7 @@ from megatron.training import checkpointing
 from megatron.training.checkpointing import (
     CheckpointType,
     _build_sharded_state_dict_metadata,
+    _check_layer_wise_param_layout,
     _load_base_checkpoint,
     _maybe_setup_gpt_to_hybrid_load,
     _read_checkpoint_run_config,
@@ -1711,11 +1712,13 @@ def _describe_metadata_run(
     ckpt_format='torch_dist',
     dist_ckpt_optim_fully_reshardable=False,
     distrib_optim_fully_reshardable_mem_efficient=False,
+    use_layer_wise_param_layout=True,
 ):
     """The metadata builder reads the optimizer flags from the optimizer section and the
     checkpoint settings from the checkpoint section."""
     run_config.optimizer.use_distributed_optimizer = use_distributed_optimizer
     run_config.optimizer.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
+    run_config.optimizer.use_layer_wise_param_layout = use_layer_wise_param_layout
     run_config.checkpoint = CheckpointConfig(
         ckpt_format=ckpt_format,
         dist_ckpt_optim_fully_reshardable=dist_ckpt_optim_fully_reshardable,
@@ -1794,6 +1797,72 @@ class TestBuildShardedStateDictMetadata:
         _describe_metadata_run(run_config)
         metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert 'distrib_optim_sharding_type' not in metadata
+
+    @pytest.mark.parametrize(
+        'use_layer_wise_param_layout, layout', [(True, 'shard_aligned'), (False, 'compact')]
+    )
+    def test_layer_wise_records_param_layout(self, run_config, use_layer_wise_param_layout, layout):
+        _describe_metadata_run(
+            run_config,
+            use_layer_wise_distributed_optimizer=True,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
+        )
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
+        assert metadata['layer_wise_param_layout'] == layout
+
+    @pytest.mark.parametrize('use_distributed_optimizer', [False, True])
+    def test_param_layout_only_for_layer_wise(self, run_config, use_distributed_optimizer):
+        # The layout does not apply to Adam's DistributedOptimizer, so it is not recorded.
+        _describe_metadata_run(run_config, use_distributed_optimizer=use_distributed_optimizer)
+        metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
+        assert 'layer_wise_param_layout' not in metadata
+
+
+class TestCheckLayerWiseParamLayout:
+    """Resuming LayerWise optimizer state requires the layout it was saved with."""
+
+    @staticmethod
+    def _optimizer(use_layer_wise_param_layout, use_layer_wise_distributed_optimizer=True):
+        return SimpleNamespace(
+            use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
+        )
+
+    @pytest.mark.parametrize(
+        'saved_layout, use_layer_wise_param_layout, fix',
+        [
+            ('compact', True, 'pass --no-use-layer-wise-param-layout'),
+            ('shard_aligned', False, 'drop --no-use-layer-wise-param-layout'),
+        ],
+    )
+    def test_mismatch_names_the_fix(self, saved_layout, use_layer_wise_param_layout, fix):
+        with pytest.raises(RuntimeError, match=f'saved with the {saved_layout} LayerWise') as error:
+            _check_layer_wise_param_layout(
+                {'layer_wise_param_layout': saved_layout},
+                self._optimizer(use_layer_wise_param_layout),
+            )
+        assert fix in str(error.value)
+        assert '--no-load-optim' in str(error.value)
+
+    @pytest.mark.parametrize(
+        'saved_layout, use_layer_wise_param_layout', [('compact', False), ('shard_aligned', True)]
+    )
+    def test_matching_layout(self, saved_layout, use_layer_wise_param_layout):
+        _check_layer_wise_param_layout(
+            {'layer_wise_param_layout': saved_layout}, self._optimizer(use_layer_wise_param_layout)
+        )
+
+    @pytest.mark.parametrize(
+        'metadata', [None, {}, {'distrib_optim_sharding_type': 'dp_reshardable'}]
+    )
+    def test_checkpoints_without_recorded_layout_are_not_checked(self, metadata):
+        _check_layer_wise_param_layout(metadata, self._optimizer(True))
+
+    def test_runs_without_layer_wise_optimizer_are_not_checked(self):
+        _check_layer_wise_param_layout(
+            {'layer_wise_param_layout': 'compact'},
+            self._optimizer(True, use_layer_wise_distributed_optimizer=False),
+        )
 
 
 def test_save_follows_the_section_not_the_namespace(
