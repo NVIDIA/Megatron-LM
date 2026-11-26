@@ -193,8 +193,7 @@ fi
 
 # Extract training params
 PARAMS=("${PARAMS[@]}" "${TRAINING_PARAMS_ARRAY[@]}")
-# Keep functional validation on FA2 while using the unpatched NGC 26.09 stack, unless the
-# test case selects its own FlashAttention version.
+# Keep functional validation on FA2 unless the test case selects its own FlashAttention version.
 if [[ " ${TRAINING_PARAMS_ARRAY[*]} " != *" --flash-attention-version "* ]]; then
     export NVTE_FLASH_ATTN_V4=0
     if [[ "$IS_NEMO_TEST" != "true" ]]; then
