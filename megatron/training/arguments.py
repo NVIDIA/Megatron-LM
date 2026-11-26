@@ -2704,6 +2704,20 @@ def _add_regularization_args(parser):
                        choices=['adam', 'lion'],
                        help='Optimizer for scalar parameters (embeddings, biases, norms) '
                        'when using muon. Defaults to adam.')
+    group.add_argument('--muon-use-muown', action='store_true',
+                       help='Replace Muon on the Muon matrices with MuOwn. Only the AngularMuOwn '
+                       'variant (--muown-use-angular) with Megatron-FSDP v2 is implemented.')
+    group.add_argument('--muown-use-angular', action='store_true',
+                       help='Use AngularMuOwn: unit row directions with an angular step '
+                       'multiplier. Requires --muon-use-muown and '
+                       '--muon-scale-mode shape_scaling.')
+    group.add_argument('--muown-angular-decay-scale', type=float, default=0.001,
+                       help='Scale c of the angular multiplier '
+                       'kappa_t = (1 + c * max(0, t - t_w)) ** (-p).')
+    group.add_argument('--muown-angular-decay-degree', type=float, default=1.0,
+                       help='Decay degree p of the angular multiplier. 0 disables the decay.')
+    group.add_argument('--muown-angular-warmup-iters', type=int, default=0,
+                       help='Iterations t_w before the angular decay starts.')
     group.add_argument('--lion-beta1', type=float, default=0.95,
                        help='First beta coefficient for Lion optimizer '
                        '(used in sign update). Default: 0.95.')

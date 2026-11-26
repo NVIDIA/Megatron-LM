@@ -344,6 +344,27 @@ class OptimizerConfig:
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""
 
+    # MuOwn.
+    muon_use_muown: bool = False
+    """Replace Muon on the Muon matrices with MuOwn, which updates row scales with Adam and row
+    directions with Muon. Only the AngularMuOwn variant (muown_use_angular) on Megatron-FSDP v2
+    is implemented. Defaults to False."""
+
+    muown_use_angular: bool = False
+    """Use AngularMuOwn: keep the row directions at unit norm and scale their Muon step by the
+    angular multiplier kappa_t. Requires muon_use_muown and muon_scale_mode='shape_scaling'.
+    Defaults to False."""
+
+    muown_angular_decay_scale: float = 0.001
+    """Scale c of the angular multiplier kappa_t = (1 + c * max(0, t - t_w)) ** (-p).
+    Defaults to 0.001."""
+
+    muown_angular_decay_degree: float = 1.0
+    """Decay degree p of kappa_t. Zero disables the decay. Defaults to 1.0."""
+
+    muown_angular_warmup_iters: int = 0
+    """Iterations t_w before the angular decay starts. Defaults to 0."""
+
     # Lion.
     lion_beta1: float = 0.95
     """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""
@@ -512,6 +533,23 @@ class OptimizerConfig:
             self.optimizer not in ('sgd', 'adam')
             and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
         )
+
+        if self.muown_use_angular and not self.muon_use_muown:
+            raise ValueError("muown_use_angular requires muon_use_muown.")
+        if self.muon_use_muown:
+            if self.optimizer != 'muon':
+                raise ValueError(
+                    f"muon_use_muown requires optimizer='muon', got {self.optimizer!r}."
+                )
+            if not self.muown_use_angular:
+                raise NotImplementedError(
+                    "Only the AngularMuOwn variant of MuOwn is implemented; set muown_use_angular."
+                )
+            if self.muon_scale_mode != 'shape_scaling':
+                raise ValueError(
+                    "AngularMuOwn requires muon_scale_mode='shape_scaling', got "
+                    f"{self.muon_scale_mode!r}."
+                )
 
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.
