@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch import Tensor
 
+from megatron.core.inference.config import PrefixCachingEvictionPolicy
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.transformer.enums import InferenceCudaGraphScope
@@ -152,8 +153,14 @@ class MTPContextMixin:
         req: DynamicInferenceRequest,
         matched_block_ids: List[int],
         already_allocated_blocks: int,
-    ) -> Tuple[List[int], int]:
-        """Return the inheritable prefix and the number of blocks declined for MTP."""
+    ) -> Tuple[List[int], int, Optional[int]]:
+        """Return the inheritable prefix and what was declined for MTP.
+
+        Returns:
+            (Tuple): the inheritable matched block ids; how many matched blocks were declined;
+            and the first declined block's id when a per-block successor check declined it
+            against a successor this request has, else None.
+        """
         # MTP draft KV: give up matched blocks we cannot inherit correctly. A block's FINAL draft
         # slot consumes one token past the block, so it is not determined by the block's hash and
         # the block is ref-counted, meaning it cannot be corrected in place. Keep a block only
@@ -161,17 +168,24 @@ class MTPContextMixin:
         # truncate at the first disagreement, since everything after it is unreachable anyway.
         # This covers both the last matched block (whose successor is past the match, so the
         # producer's choice rarely agrees) and a branch point mid-chain, where an earlier block
-        # was registered by a request that continued differently. A continuation chunk still
-        # holding a boundary carry gives up the WHOLE match instead: the carry is only consumable
-        # at `finished - 1`, and any skip (block granular) moves past it, orphaning that entry
-        # permanently. A request with a private suffix also declines later matches: it cannot
-        # inherit descendants without owning their canonical ancestors. Trim the list rather
-        # than the skip so the two stay consistent.
+        # was registered by a request that continued differently.
+        #
+        # A continuation chunk still holding a boundary carry takes no prefix SKIP (see
+        # `_compute_prefix_match`): the carry is only consumable at `finished - 1`, and any skip
+        # (block granular) would move past it. It may still INHERIT its matched blocks when they
+        # extend the request's leading run of inherited blocks, since that run is exactly what
+        # the draft commit pass keeps its writes out of. A match after a gap gives up the WHOLE
+        # match, because the commit pass would write into those shared blocks.
+        #
+        # A request with a private suffix also declines later matches: it cannot inherit
+        # descendants without owning their canonical ancestors. Trim the list rather than the
+        # skip so the two stay consistent.
         backed_off_blocks = 0
+        declined_block_id = None
         if self.enable_mtp_kv_cache and matched_block_ids:
-            if (
-                self.mtp_metadata.chunk_boundary_req_id == req.request_id
-                or req.mtp_private_suffix_start is not None
+            holds_carry = self.mtp_metadata.chunk_boundary_req_id == req.request_id
+            if req.mtp_private_suffix_start is not None or (
+                holds_carry and req.num_matched_prefix_blocks < already_allocated_blocks
             ):
                 backed_off_blocks = len(matched_block_ids)
                 matched_block_ids = []
@@ -196,10 +210,44 @@ class MTPContextMixin:
                     # against, so equality there is not agreement -- neither is inheritable.
                     if producer_next < 0 or producer_next != our_next:
                         keep = k
+                        if our_next >= 0:
+                            declined_block_id = block_id
                         break
                 backed_off_blocks = len(matched_block_ids) - keep
                 matched_block_ids = matched_block_ids[:keep]
-        return matched_block_ids, backed_off_blocks
+        return matched_block_ids, backed_off_blocks, declined_block_id
+
+    def _mtp_try_replace_declined_block(self, match) -> bool:
+        """Take over a declined cached block whose draft slot this request can supersede.
+
+        A request that declines a block recomputes it privately. Its copy cannot be registered
+        while the producer's copy holds the hash, so without this it would keep its whole
+        suffix private -- and every later turn of the same session, which extends this prompt,
+        would decline the same block again and re-prefill everything after it. When the
+        declined block is a cached leaf nobody holds (the usual case: the previous turn's last
+        complete prompt block), evict it instead, so this request registers its own copy, whose
+        final draft slot pairs with the token later turns continue with.
+
+        Returns:
+            (bool): True if the declined block was evicted and this request may register its
+            recomputed copy and the rest of its prompt.
+        """
+        block_id = match.mtp_declined_block_id
+        alloc = self.kv_block_allocator
+        if (
+            block_id is None
+            or match.backed_off_blocks != 1
+            or self.prefix_caching_eviction_policy != PrefixCachingEvictionPolicy.LRU
+            or int(alloc.pc_state.block_ref_counts[block_id]) != 0
+            or int(alloc.pc_state.block_child_count[block_id]) != 0
+            or int(alloc.pc_state.block_hashes[block_id]) == -1
+        ):
+            return False
+        victims = torch.tensor([block_id], dtype=torch.int32)
+        hashes = alloc.pc_state.deregister_blocks(victims)
+        alloc._push_to_pool(victims)
+        alloc._notify_deregistered(victims, hashes)
+        return True
 
     @property
     def _decode_kv_lookahead_tokens(self) -> int:
@@ -393,29 +441,13 @@ class MTPContextMixin:
         n = mtp.active_request_count
         padded = mtp.padded_count
 
-        positions = mtp.active_offsets  # [n] int, MTP write position P_r for this depth
+        # Token write maps (one token per active request at its MTP write position P_r, padded
+        # rows sent to the dummy block) and MHA read metadata (query_length=1 per request,
+        # kv_length = P_r + 1, write-then-attend), in one sync-free launch.
+        kv_len = mtp.write_draft_step_metadata(self.gpu_view)
 
-        # Token write maps (one token per active request), padded rows sent to the dummy block.
-        mtp.write_token_maps(
-            gpu_view=self.gpu_view,
-            rows=mtp.row_ids[:n],
-            positions=positions,
-            block_table=mtp.active_block_table,
-            padded_token_count=padded,
-        )
-
-        # MHA read metadata: query_length=1 per request, kv_length = P_r + 1 (write-then-attend).
-        query_lengths, kv_len = mtp.stage_decode_lengths()
-        mtp.write_mha_metadata(
-            gpu_view=self.gpu_view,
-            query_lengths=query_lengths,
-            kv_lengths=kv_len,
-            block_table=mtp.active_block_table,
-            padded_request_count=padded,
-        )
-
-        # The staged buffers above are read only by these writes; the graph reads `gpu_view`
-        # alone, whose addresses are fixed, so replaying against them is graph-safe.
+        # Outside the eager max below, the graph reads `gpu_view` alone, whose addresses are
+        # fixed, so replaying against them is graph-safe.
         if mtp.graphed:
             # Graphed: route to the graph metadata and use the FIXED capture-time sequence-length
             # bound (baked into the flash-attn kernel launch at capture) rather than a per-step

@@ -22,6 +22,7 @@ from megatron.training.argument_utils import (
     TypeInferenceError,
     _default_config_from_args,
     core_transformer_config_from_args,
+    gpt_data_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
@@ -83,6 +84,37 @@ def _minimal_training_args(monkeypatch):
     return args
 
 
+def test_sft_context_parallel_checks_pack_width_not_truncation_limit(monkeypatch):
+    monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    args = _minimal_training_args(monkeypatch)
+    args.freeze_base_model_for_mtp = False
+    args.sft = True
+    args.seq_length = 33
+    args.max_seq_length_per_sample = 64
+    args.context_parallel_size = 2
+    args.world_size = 2
+    args.bf16 = True
+    args.create_attention_mask_in_dataloader = False
+    validate_args(args)
+    cfg = pretrain_cfg_container_from_args(args, data_cfg=gpt_data_config_from_args(args))
+    cfg.validate()
+    assert cfg.data.dataset.sequence_length == 33
+    assert cfg.model.transformer.max_seq_length_per_sample == 64
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_megatron_fsdp_user_buffer_registration_matches_version(monkeypatch, version):
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    args = _minimal_training_args(monkeypatch)
+    args.use_megatron_fsdp = True
+    args.megatron_fsdp_version = version
+    args.nccl_ub = True
+    args.ckpt_format = "fsdp_dtensor"
+    args = validate_args(args)
+    assert args.fsdp_manual_registration is (version == 1)
+    assert not args.fsdp_double_buffer
+
+
 def test_moe_norm_flag_reaches_transformer_config():
     """The generated LatentMoE norm flag should populate the model config."""
     parser = ArgumentParser()
@@ -105,13 +137,28 @@ def test_moe_norm_flag_reaches_transformer_config():
 def test_gtp_userbuffer_flags_preserve_cli_contract(name):
     parser = ArgumentParser()
     add_megatron_arguments(parser)
-    assert getattr(parser.parse_args([]), name) is False
-    assert getattr(parser.parse_args(["--" + name.replace("_", "-")]), name) is True
+    flag = "--" + name.replace("_", "-")
+    assert getattr(parser.parse_args([]), name) is None
+    # A bare flag parses to []; validate_args expands it to both collectives.
+    assert getattr(parser.parse_args([flag]), name) == []
+    assert getattr(parser.parse_args([flag, "rs"]), name) == ["rs"]
+    with pytest.raises(SystemExit):
+        parser.parse_args([flag, "foo"])
+
+
+def test_moe_backend_arguments():
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    assert args.moe_token_dispatcher_type == "alltoall"
+    assert args.moe_grouped_gemm is True
+    assert parser.parse_args(["--moe-grouped-gemm"]).moe_grouped_gemm is True
+    assert parser.parse_args(["--no-moe-grouped-gemm"]).moe_grouped_gemm is False
 
 
 def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
     """--no-megatron-fsdp-padded-shards should disable padded shards in the DDP config."""
-    from megatron.training.training import get_megatron_ddp_config
+    from megatron.training.argument_utils import get_megatron_ddp_config
 
     parser = ArgumentParser()
     add_megatron_arguments(parser)
@@ -191,7 +238,10 @@ def test_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, expected
         ({"use_megatron_fsdp": True, "megatron_fsdp_version": 2}, False),
     ],
 )
-def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, expected):
+@pytest.mark.parametrize("execution_bound", [None, 128])
+def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(
+    fsdp_kwargs, expected, execution_bound
+):
     """The YAML path reads the FSDP flags from the outer namespace before rebinding."""
     language_model = Namespace(
         **vars(TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4))
@@ -199,6 +249,7 @@ def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, exp
     language_model.params_dtype = torch.float32
     language_model.activation_func = "gelu"
     language_model.embedding_init_method = "xavier_uniform"
+    language_model.max_seq_length_per_sample = execution_bound
 
     # ``core_transformer_config_from_yaml`` merges the ``language_model`` and
     # ``model_parallel`` sections, and this fixture already carries every
@@ -211,6 +262,7 @@ def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, exp
     config = core_transformer_config_from_yaml(args)
 
     assert config.deallocate_pipeline_outputs is expected
+    assert config.max_seq_length_per_sample == execution_bound
 
 
 def test_wide_residual_cli_builds_typed_config():
@@ -1425,7 +1477,9 @@ def mock_ddp_config():
 @pytest.fixture
 def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
     """Patch the two helper functions called by pretrain_cfg_container_from_args."""
-    with patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config):
+    with patch(
+        "megatron.training.argument_utils.get_megatron_ddp_config", return_value=mock_ddp_config
+    ):
         yield
 
 
@@ -1436,7 +1490,7 @@ class TestPretrainContainerFromArgsStructure:
         result = pretrain_cfg_container_from_args(_make_args())
         assert isinstance(result, PretrainConfigContainer)
 
-    @patch("megatron.training.training.get_megatron_ddp_config")
+    @patch("megatron.training.argument_utils.get_megatron_ddp_config")
     def test_ddp_config_comes_from_helper(self, mock_ddp):
         """Test that ddp config comes from get_megatron_ddp_config."""
         mock_ddp_instance = MagicMock(spec=DistributedDataParallelConfig)
@@ -1456,6 +1510,24 @@ class TestPretrainContainerFromArgsStructure:
         assert cfg.ddp.use_megatron_fsdp is enabled
         assert cfg.dist.fake_process_group is enabled
         assert not hasattr(cfg.dist, "use_megatron_fsdp")
+
+    @pytest.mark.parametrize(
+        "flags, delayed",
+        [
+            ([], False),
+            (["--delay-wgrad-compute"], True),
+            (["--overlap-dispatch-backward-with-experts-wgrad"], True),
+        ],
+    )
+    def test_ddp_hooks_follow_delayed_expert_wgrad(self, flags, delayed):
+        """Both flags delay TE's expert wgrad to backward_dw(), where DDP's hooks must fire."""
+        from megatron.training.argument_utils import get_megatron_ddp_config
+
+        parser = ArgumentParser()
+        add_megatron_arguments(parser)
+        args = parser.parse_args(flags)
+
+        assert get_megatron_ddp_config(args, use_torch_fsdp2=False).delay_wgrad_compute is delayed
 
 
 @pytest.mark.parametrize("native_model", [False, True])
@@ -1503,6 +1575,30 @@ def test_legacy_checkpoint_gloo_requirement_uses_effective_optimizer(monkeypatch
     args.ckpt_format = "torch"
     args.use_layer_wise_param_layout = False
     with pytest.raises(AssertionError) if optimizer in ("adam", "sgd") else nullcontext():
+        validate_args(args)
+
+
+@pytest.mark.parametrize("use_layer_wise_param_layout", [False, True])
+@pytest.mark.parametrize("optimizer", ["adam", "muon", "dist_muon"])
+def test_mem_efficient_reshardable_checkpoint_gloo_requirement(
+    monkeypatch, optimizer, use_layer_wise_param_layout
+):
+    """Every optimizer that builds a DistributedOptimizer needs Gloo for the mem-efficient
+    fully reshardable format, including the one the layer-wise path builds for Muon."""
+    args = _minimal_training_args(monkeypatch)
+    args.optimizer = optimizer
+    args.use_distributed_optimizer = True
+    args.use_gloo_process_groups = False
+    args.ckpt_format = "torch_dist"
+    args.dist_ckpt_optim_fully_reshardable = True
+    args.distrib_optim_fully_reshardable_mem_efficient = True
+    args.use_layer_wise_param_layout = use_layer_wise_param_layout
+    builds_distributed_optimizer = optimizer == "adam" or use_layer_wise_param_layout
+    with (
+        pytest.raises(AssertionError, match="fully-reshardable-mem-efficient")
+        if builds_distributed_optimizer
+        else nullcontext()
+    ):
         validate_args(args)
 
 

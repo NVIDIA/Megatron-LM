@@ -206,8 +206,8 @@ def _train(model, optimizer, opt_param_scheduler, forward_step,
                                               grad_norm, params_norm, num_zeros_in_grad)
 
             # Autoresume
-            if args.adlr_autoresume and \
-               (train_state.iteration % args.adlr_autoresume_interval == 0):
+            if cfg.fault_tolerance.adlr_autoresume and \
+               (train_state.iteration % cfg.fault_tolerance.adlr_autoresume_interval == 0):
                 check_adlr_autoresume_termination(train_state.iteration, model,
                                                   optimizer, opt_param_scheduler)
 

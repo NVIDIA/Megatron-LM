@@ -41,6 +41,54 @@ def _dev_scalar(value, dtype=torch.int32):
 
 
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+def test_expert_weight_build_protects_source_storage(precision, monkeypatch):
+    """Record source allocations before the builder can rebind their storage."""
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+    from megatron.core.inference.utils import InferenceMode
+    from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+    weight = torch.ones(32, 32, device="cuda", dtype=torch.bfloat16)
+    if precision == "mxfp8":
+        weight = MXFP8Tensor.from_bf16(weight, backend="triton")
+    sources = (weight.data, weight.scale) if precision == "mxfp8" else (weight,)
+    recorded = []
+    record_stream = torch.Tensor.record_stream
+
+    def record(tensor, stream):
+        recorded.append((tensor.data_ptr(), stream))
+        record_stream(tensor, stream)
+
+    monkeypatch.setattr(torch.Tensor, "record_stream", record)
+    side = torch.cuda.Stream()
+
+    def build():
+        assert recorded == [(tensor.data_ptr(), side) for tensor in sources]
+
+    experts = SimpleNamespace(
+        _concatenated_weights_built=False,
+        _EXPERT_WEIGHT_GROUPS=(("linear_fc1", "_fc1_weight"),),
+        num_local_experts=1,
+        linear_fc1=SimpleNamespace(weight0=weight),
+        _unwrap_mxfp8_weight=InferenceGroupedMLP._unwrap_mxfp8_weight,
+        _build_flashinfer_clamp_limit=lambda device: None,
+        _build_concatenated_mxfp8_weights=build,
+        _build_concatenated_weights=build,
+        _nvfp4_recipe=None,
+    )
+    monkeypatch.setattr(
+        InferenceGroupedMLP, "_expert_weights_use_mxfp8", lambda _: precision == "mxfp8"
+    )
+    with pytest.raises(RuntimeError, match="requires InferenceMode"):
+        InferenceGroupedMLP.build_inference_weights(experts)
+    side.wait_stream(torch.cuda.current_stream())
+    with InferenceMode.active(), torch.cuda.stream(side):
+        InferenceGroupedMLP.build_inference_weights(experts)
+        InferenceGroupedMLP.build_inference_weights(experts)
+    torch.cuda.current_stream().wait_stream(side)
+    assert len(recorded) == len(sources)
+
+
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
 @pytest.mark.parametrize("ep_rank", [0, 1])
 def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
     """Replay the MCore adapter, including graph capture and local-EP expert offsets.
@@ -91,6 +139,7 @@ def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
     clamp_scale = 0.5
     module = SimpleNamespace(
         _uses_mxfp8_weights=precision == "mxfp8",
+        _nvfp4_weights=None,
         _fc1_weight=execution_weights[0],
         _fc2_weight=execution_weights[1],
         _flashinfer_activation_type=ActivationType.ClampedRelu2,
@@ -140,9 +189,15 @@ def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
     assert error_l2 <= relative_l2
     assert_replays_bit_exact(run, (x,), backward=False, what=f"clamped_relu2_{precision}")
 
+    # Exercise the shortcut stream fork/join inside the existing graph replay test.
+    side = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = run(x)
+        main = torch.cuda.current_stream()
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            captured = run(x)
+        main.wait_stream(side)
 
     def replay():
         graph.replay()
@@ -796,6 +851,45 @@ def test_vllm_fused_moe_and_moe_sum_replay():
         fn, (hidden_states, probs), replays=4, backward=False, what="vllm_fused_moe"
     )
 
+    # Decode-sized steps at Nemotron 3.5 Lightning expert shapes: the multi-CTA
+    # indirection-table builder with 2 (8 tokens) and 24 (128 tokens) working
+    # CTAs, an 8-token hint for 256 valid tokens and, on GB300, the measured
+    # launch configs.
+    decode_hidden, decode_ffn, decode_topk = 2688, 1856, 6
+    decode_routing = torch.rand(256, 128, device="cuda").topk(decode_topk, dim=1).indices
+    decode_hidden_states = torch.randn(256, decode_hidden, device="cuda", dtype=torch.bfloat16)
+    decode_probs = torch.rand(256, decode_topk, device="cuda")
+    decode_fc1 = torch.randn(experts, decode_ffn, decode_hidden, device="cuda").bfloat16() * 0.02
+    decode_fc2 = torch.randn(experts, decode_hidden, decode_ffn, device="cuda").bfloat16() * 0.02
+    # Overestimated prefill hints on either side of the multi-CTA builder's pair
+    # limit: both use 128-row tiles and the multi-kernel builder, with the same
+    # valid prefix and reusable buffers.
+    for decode_tokens, hint in ((8, 8), (128, 128), (256, 8), (256, 1025), (256, 2049)):
+        decode_valid = _dev_scalar(decode_tokens)
+
+        def decode_fn(h, p, decode_valid=decode_valid, decode_tokens=decode_tokens, hint=hint):
+            out = vllm_fused_moe(
+                h,
+                p,
+                decode_fc1,
+                decode_fc2,
+                ActivationType.SQUARED_RELU,
+                experts,
+                0,
+                decode_valid,
+                decode_routing,
+                num_tokens_hint=hint,
+            )
+            return out[:decode_tokens]
+
+        assert_replays_bit_exact(
+            decode_fn,
+            (decode_hidden_states, decode_probs),
+            replays=4,
+            backward=False,
+            what=f"vllm_fused_moe (decode, {decode_tokens} tokens, hint {hint})",
+        )
+
     inp = torch.randn(max_tokens * topk, 2688, device="cuda", dtype=torch.bfloat16)
 
     # The top-k sum both ways: weighted (apply_weights=True) and the unweighted sum that
@@ -1221,3 +1315,235 @@ def test_flashinfer_nvfp4_moe_is_batch_invariant(gated):
             f"FlashInfer NVFP4 MoE output changed at batch {name}; max abs diff: "
             f"{(output_alone.float() - output.float()).abs().max().item()}"
         )
+
+
+def _ep_invariant_case(num_tokens=4096, valid=3000, hidden=512, num_local=24, topk=6):
+    """Fixed routing over 24 local experts (8 leaves of 3), some slots routed elsewhere,
+    tokens past ``valid`` dead; expert-grouped rows with their inverse map."""
+    seeded()
+    start = 24
+    routing = torch.stack([torch.randperm(96, device="cuda")[:topk] for _ in range(num_tokens)]).to(
+        torch.int64
+    )
+    inverse_map = torch.full((num_tokens, num_local), -1, device="cuda", dtype=torch.int32)
+    lid = routing[:valid] - start
+    local = (lid >= 0) & (lid < num_local)
+    tok = torch.arange(valid, device="cuda")[:, None].expand_as(lid)[local]
+    n_rows = int(local.sum())
+    inverse_map[tok, lid[local]] = torch.randperm(n_rows, device="cuda").int()
+    rows = torch.randn(n_rows + 64, hidden, device="cuda", dtype=torch.bfloat16)
+    return rows, inverse_map, routing, start, num_local, _dev_scalar(valid), valid
+
+
+def test_ep_invariant_dense_map_replays():
+    """moe_ep_invariant_combine on the torch backend (dense inverse map, 8 leaves of 3
+    experts): live rows replay bit-exactly and rows past the valid prefix stay untouched."""
+    from megatron.core.inference.moe import batch_invariant
+
+    rows, inverse_map, _, _, _, valid_t, valid = _ep_invariant_case()
+
+    def fn(rows):
+        out = torch.full((inverse_map.shape[0], rows.shape[1]), 7.0, device="cuda")
+        return batch_invariant.unpermute_tokens_in_expert_order(
+            rows, inverse_map, valid_t, out, ep_invariant_leaves=8
+        )
+
+    ref, _ = assert_replays_bit_exact(
+        fn, (rows,), backward=False, contention=True, what="EP-invariant dense-map combine"
+    )
+    assert torch.all(next(iter(ref.values()))[valid:] == 7.0)
+
+
+def test_ep_invariant_topk_replays():
+    """moe_ep_invariant_combine on the top-k layout (vLLM, and mcore at expert TP > 1):
+    the slot reorder and the subtree replay bit-exactly; rows past the prefix stay untouched."""
+    from megatron.core.inference.moe.fused_moe import _rows_in_topk_order
+    from megatron.core.transformer.moe import ep_invariant_combine as eic
+
+    rows, inverse_map, routing, start, num_local, valid_t, valid = _ep_invariant_case()
+
+    def fn(rows):
+        slot_rows = _rows_in_topk_order(rows, inverse_map, routing, start, num_local)
+        out = torch.full((routing.shape[0], rows.shape[1]), 7.0, device="cuda")
+        eic.tree_combine_topk_forward(slot_rows, routing, start, num_local, 8, valid_t, out)
+        return slot_rows, out
+
+    ref, _ = assert_replays_bit_exact(
+        fn, (rows,), backward=False, contention=True, what="EP-invariant top-k combine"
+    )
+    assert torch.all(list(ref.values())[1][valid:] == 7.0)
+
+
+@pytest.mark.parametrize(
+    "topk,hidden", [(6, 2688), (22, 1024), (22, 2048), (22, 4096), (22, 8192), (3, 129)]
+)
+@pytest.mark.parametrize("apply_weights", [False, True])
+def test_vllm_tiled_sum_matches_original_bits(topk, hidden, apply_weights):
+    """Keep the original slot arithmetic across layouts, sparse routes and graph replays."""
+    from megatron.core.inference.moe.vllm_fused_moe import _get_num_sms, _moe_sum, _moe_sum_kernel
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        set_batch_invariant_mode,
+    )
+
+    seeded()
+    capacity = 33
+    inp = torch.randn(capacity * topk, hidden, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(capacity, topk, device="cuda")
+    routing = torch.randint(-1, 130, (capacity, topk), device="cuda")
+    routing[0] = -1
+    routing[1] = 64
+    inp[0::7] = float("nan")  # Includes undefined non-local slots.
+    inp[1::11] = -0.0
+    valid = _dev_scalar(capacity)
+    expected = torch.full((capacity, hidden), -123.0, device="cuda")
+    actual = torch.full_like(expected, -123.0)
+    block_k = min(1 << (hidden - 1).bit_length(), 1024)
+    sms = _get_num_sms(inp.device)
+
+    def original():
+        _moe_sum_kernel[(sms,)](
+            inp,
+            expected,
+            weights,
+            valid,
+            routing,
+            64,
+            64,
+            hidden,
+            topk=topk,
+            BLOCK_M=sms,
+            BLOCK_K=block_k,
+            NUM_K_BLOCKS=(hidden + block_k - 1) // block_k,
+            APPLY_WEIGHTS=apply_weights,
+            ACC_FP64=False,
+        )
+
+    def candidate():
+        return _moe_sum(
+            inp,
+            weights,
+            capacity,
+            topk,
+            hidden,
+            valid,
+            routing,
+            64,
+            64,
+            out=actual,
+            apply_weights=apply_weights,
+        )
+
+    with set_batch_invariant_mode(False):
+        original()
+        candidate()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            candidate()
+        for tokens in (0, 1, 7, 16, 31, capacity):
+            valid.fill_(tokens)
+            weights.neg_()
+            inp[2::13].neg_()
+            expected.fill_(-123.0)
+            actual.fill_(-123.0)
+            original()
+            graph.replay()
+            assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
+        assert_replays_bit_exact(
+            lambda x: candidate(),
+            (inp,),
+            replays=3,
+            backward=False,
+            what=f"ordinary tiled MoE sum topk={topk} hidden={hidden}",
+        )
+
+
+# --- DSA-over-GQA inference ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "query_lengths,kv_lengths,num_decode",
+    [
+        ([1, 1, 1, 1], [700, 4096, 33, 1], 4),
+        ([300, 45], [300, 900], 0),
+        ([1, 1, 300], [2600, 9, 900], 2),
+    ],
+    ids=["decode", "prefill", "mixed"],
+)
+def test_dsa_gqa_deterministic_rows_replay(query_lengths, kv_lengths, num_decode, monkeypatch):
+    """Deterministic DSA inference selects every row's keys, decode rows included, with
+    FlashInfer's deterministic ragged top-k over Triton scores instead of GVR2 top-k.
+
+    The indexer keys take four distinct values, so most scores tie at the top-k cutoff. Eager
+    calls and CUDA-graph replays at the static context bound, with the score buffer split into
+    windows, must be bit-exact.
+    """
+    from megatron.core.inference.contexts.attention_context.dsa_metadata import DSAMetadata
+    from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference
+    from megatron.core.tuning import policy as tuning_policy
+
+    monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
+    seeded()
+    heads, groups, head_dim, index_dim, topk = 16, 2, 128, 128, 512
+    page_size, bound = 256, 4096
+    # About 100 score rows per window at the graph bound, so prefill windows split requests.
+    monkeypatch.setattr(dsa_gqa_inference, "SCORE_BUFFER_BYTES", 100 * bound * 4)
+    requests, tokens = len(query_lengths) + 1, sum(query_lengths) + 3
+    max_pages = bound // page_size
+    num_pages = requests * max_pages
+    table = torch.randperm(num_pages, device="cuda").view(requests, max_pages).to(torch.int32)
+    keys = torch.randn(num_pages, page_size, groups, head_dim, device="cuda", dtype=torch.bfloat16)
+    values = torch.randn_like(keys)
+    distinct = torch.randn(4, index_dim, device="cuda", dtype=torch.bfloat16)
+    index_keys = distinct[torch.randint(0, 4, (num_pages, page_size), device="cuda")]
+    query = torch.randn(tokens, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    index_query = torch.randn(tokens, 1, 1, index_dim, device="cuda", dtype=torch.bfloat16)
+
+    metadata = DSAMetadata(max_requests=requests, max_tokens=tokens)
+    metadata.update(
+        query_lengths,
+        kv_lengths,
+        num_decode_requests=num_decode,
+        padded_tokens=tokens,
+        padded_requests=requests,
+        decode_only=num_decode == len(query_lengths),
+    )
+    metadata.transfer(table, non_blocking=False)
+    graphed = [False]
+    context = SimpleNamespace(
+        num_speculative_tokens=0,
+        dsa_metadata=metadata,
+        max_sequence_length=bound,
+        using_cuda_graph_this_step=lambda: graphed[0],
+    )
+
+    def attend():
+        return dsa_gqa_inference.dynamic_sparse_attention(
+            query=query,
+            key_cache=keys,
+            value_cache=values,
+            index_query=index_query,
+            index_key_cache=index_keys,
+            inference_context=context,
+            index_topk=topk,
+            softmax_scale=head_dim**-0.5,
+        )
+
+    assert_replays_bit_exact(attend, (), backward=False, contention=True, what="DSA rows eager")
+
+    graphed[0] = True
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        attend()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = attend()
+
+    def replay():
+        graph.replay()
+        return captured
+
+    assert_replays_bit_exact(replay, (), backward=False, what="DSA rows graph")
+    # Native decode's FlashInfer scratch is never allocated.
+    assert metadata.topk_workspace is None

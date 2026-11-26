@@ -12,21 +12,22 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 import datasets
 import torch
 import transformers
+from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.parallel_state import get_context_parallel_group
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
-from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+from megatron.post_training.model_config import (
+    distillation_config_from_args,
+    modelopt_model_config_from_args,
+)
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, pretrain
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.utils import print_rank_0
-from megatron.training.global_vars import set_run_config
-from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
-from model_provider import model_provider
-from megatron.core.parallel_state import get_context_parallel_group
-
 
 REMOVE_THINK_CHAT_TEMPLATE = (
     "{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}"
@@ -430,12 +431,27 @@ class SFTDataset(torch.utils.data.Dataset):
         return processed_data
 
 
-def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
+def _is_offline_model() -> bool:
+    """Whether the run's model is built for offline speculative-decoding training.
+
+    ``--export-offline-model`` is recorded in the model config's transformations when the
+    CLI is translated (``original_num_layers``), so the callbacks follow the run config.
+    """
+    transformations = get_run_config().model.transformations
+    return transformations is not None and transformations.original_num_layers is not None
+
+
+def train_valid_test_sft_datasets_provider(
+    train_val_test_num_samples, offline_data_dir=None, *, sequence_length
+):
     """Build the train test and validation datasets.
 
     Args:
         train_val_test_num_samples : A list containing the number of samples
             in train test and validation.
+        offline_data_dir: Directory with the base model's features
+            (``--offline-distillation-data``), used when the model is built for offline
+            speculative-decoding training.
     """
     print_rank_0("> building train, validation, and test SFT datasets ...")
     args = get_args()
@@ -446,10 +462,12 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
     if args.micro_batch_size > 1:
         raise ValueError("SFTDataloader only supports micro_batch_size=1.")
 
-    if args.export_offline_model:
-        train_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "train"), train_val_test_num_samples[0])
-        valid_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "valid"), train_val_test_num_samples[1])
-        test_ds = OfflineDataset(os.path.join(args.offline_distillation_data, "test"), train_val_test_num_samples[2])
+    if _is_offline_model():
+        if offline_data_dir is None:
+            raise ValueError("Offline speculative-decoding training requires --offline-distillation-data.")
+        train_ds = OfflineDataset(os.path.join(offline_data_dir, "train"), train_val_test_num_samples[0])
+        valid_ds = OfflineDataset(os.path.join(offline_data_dir, "valid"), train_val_test_num_samples[1])
+        test_ds = OfflineDataset(os.path.join(offline_data_dir, "test"), train_val_test_num_samples[2])
 
         print_rank_0("> finished creating offline SFT datasets ...")
     else:
@@ -458,7 +476,7 @@ def train_valid_test_sft_datasets_provider(train_val_test_num_samples):
             "hf_dataset_split": args.finetune_data_split,
             "hf_dataset_data_files": args.finetune_data_files,
             "tokenizer": hf_tokenizer,
-            "seq_length": args.seq_length,
+            "seq_length": sequence_length,
             # Optional kwargs
             "num_shards": mpu.get_expert_data_parallel_world_size(),
             "shard_index": mpu.get_expert_data_parallel_rank(),
@@ -478,18 +496,20 @@ def get_batch(data_iterator):
 
     For OfflineDataset, the aux_hidden_states and final hidden_states from the
     base model are loaded for offline speculative model training."""
+    cfg = get_run_config()
     # TODO: this is pretty hacky, find a better way
     if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
         return None, None, None, None, None
 
     args = get_args()
+    offline = _is_offline_model()
 
     # Broadcast data since only TP rank-0 has the data_iterator.
     if data_iterator is not None:
         data = next(data_iterator)
     else:
         data = None
-    if not args.export_offline_model:
+    if not offline:
         keys = ["input_ids", "loss_mask"]
         datatype = torch.int64
         data_b = tensor_parallel.broadcast_data(keys, data, datatype)
@@ -509,7 +529,7 @@ def get_batch(data_iterator):
     sample_loss_mask = data_b.get("loss_mask")
     batch = build_lm_batch(
         data_b["input_ids"],
-        args.seq_length,
+        cfg.model.transformer.max_seq_length_per_sample,
         sample_loss_mask=sample_loss_mask,
         eos_token_id=get_eos_token_id(),
         reset_position_ids=args.reset_position_ids,
@@ -518,9 +538,10 @@ def get_batch(data_iterator):
         cp_group=get_context_parallel_group(),
     )
 
-    if args.export_offline_model:
-        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[: args.seq_length]
-        batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[: args.seq_length]
+    if offline:
+        sequence_length = cfg.model.transformer.max_seq_length_per_sample
+        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[:sequence_length]
+        batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[:sequence_length]
 
     return batch
 
@@ -528,7 +549,7 @@ def get_batch(data_iterator):
 def non_loss_data_func(model: GPTModel):
     """Callback to compute the acceptance length."""
     args = get_args()
-    if not args.export_offline_model and args.context_parallel_size == 1:
+    if not _is_offline_model() and args.context_parallel_size == 1:
         try:
             report_draft_acceptance_length(model)
         except Exception as e:
@@ -544,8 +565,7 @@ def forward_step(data_iterator, model: GPTModel):
         model: The GPT Model
     """
     timers = get_timers()
-
-    args = get_args()
+    offline = _is_offline_model()
 
     # Get the batch.
     timers("batch-generator", log_level=2).start()
@@ -555,12 +575,12 @@ def forward_step(data_iterator, model: GPTModel):
     loss_mask = batch["loss_mask"]
     attention_mask = batch["attention_mask"]
     position_ids = batch["position_ids"]
-    if args.export_offline_model:
+    if offline:
         aux_hidden_states = batch["aux_hidden_states"]
         hidden_states = batch["hidden_states"]
     timers("batch-generator").stop()
 
-    if args.export_offline_model:
+    if offline:
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels, aux_hidden_states=aux_hidden_states, hidden_states=hidden_states,)
     else:
         output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
@@ -576,13 +596,22 @@ if __name__ == "__main__":
         extra_args_provider=add_finetune_args,
         args_defaults={"tokenizer_type": "HuggingFaceTokenizer"},
     )
-    full_config = pretrain_cfg_container_from_args(args)
+    model_cfg = modelopt_model_config_from_args(args, vocab_size_from_tokenizer=True)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    full_config.distillation = distillation_config_from_args(args, model_cfg)
+    if full_config.model.transformer.max_seq_length_per_sample != args.seq_length:
+        raise ValueError(
+            "ModelOpt's fixed-width dataset requires max_seq_length_per_sample == seq_length"
+        )
     set_run_config(full_config)
     pretrain(
         full_config,
-        train_valid_test_sft_datasets_provider,
+        partial(
+            train_valid_test_sft_datasets_provider,
+            offline_data_dir=args.offline_distillation_data,
+            sequence_length=args.seq_length,
+        ),
         ModelType.encoder_or_decoder,
         forward_step,
-        partial(model_provider, modelopt_gpt_hybrid_builder),
         non_loss_data_func=non_loss_data_func,
     )
