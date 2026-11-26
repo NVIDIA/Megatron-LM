@@ -147,3 +147,72 @@ def test_existing_scheduler_entry_point_remains_available(monkeypatch, run_confi
     scheduler = training.get_optimizer_param_scheduler(optimizer)
     scheduler.step(increment=2)
     assert optimizer.param_groups[0]["lr"] == 0.005
+
+
+def test_resume_legacy_decoupled_groups_with_equal_lr(tmp_path_dist_ckpt):
+    """Restore Adam moments written with the pre-recipe standard group policy."""
+    from megatron.core import dist_checkpointing
+    from megatron.core.optimizer import get_standard_config_overrides
+    from tests.unit_tests.dist_checkpointing import TempNamedDir
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        groups = ProcessGroupCollection.use_mpu_process_groups()
+        config = OptimizerConfig(
+            lr=0.01, min_lr=0.001, decoupled_lr=0.01, bf16=True, use_distributed_optimizer=True
+        )
+        metadata = {"distrib_optim_sharding_type": "dp_reshardable"}
+
+        def build(legacy):
+            raw = SetupModel()
+            raw.embedding = torch.nn.Parameter(torch.ones_like(raw.weight))
+            raw.embedding.is_embedding_or_output_parameter = True
+            ddp = DistributedDataParallel(
+                raw.config,
+                DistributedDataParallelConfig(use_distributed_optimizer=True),
+                raw,
+                pg_collection=groups,
+            )
+            policy = (
+                get_standard_config_overrides(config)
+                if legacy
+                else build_optimizer_config_overrides(config, [ddp])
+            )
+            opt, _ = setup_optimizer(
+                config, _scheduler_config(), [ddp], config_overrides=policy, pg_collection=groups
+            )
+            return raw, opt
+
+        def update(raw, opt, sign):
+            for group in opt.param_groups:
+                group["lr"] = config.lr
+            for i, param in enumerate(raw.parameters(), 1):
+                param.main_grad.fill_(sign * 0.1 * i)
+            assert opt.step()[0]
+
+        original, old = build(True)
+        update(original, old, 1)
+        with TempNamedDir(tmp_path_dist_ckpt / "legacy-group-policy") as path:
+            state = original.sharded_state_dict()
+            dist_checkpointing.save(
+                {"model": state, "optimizer": old.sharded_state_dict(state, metadata=metadata)},
+                path,
+            )
+            resumed, new = build(False)
+            assert len(old.param_groups) == len(new.param_groups) + 1
+            state = resumed.sharded_state_dict()
+            restored = dist_checkpointing.load(
+                {
+                    "model": state,
+                    "optimizer": new.sharded_state_dict(state, metadata=metadata, is_loading=True),
+                },
+                path,
+            )
+            resumed.load_state_dict(restored["model"])
+            new.load_state_dict(restored["optimizer"])
+            update(original, old, -1)
+            update(resumed, new, -1)
+            for a, b in zip(original.parameters(), resumed.parameters()):
+                torch.testing.assert_close(a, b, rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()
