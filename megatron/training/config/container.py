@@ -36,6 +36,7 @@ from megatron.training.config.dataset_config import (
 )
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
+from megatron.training.config.offline_distillation_config import OfflineDistillationConfig
 from megatron.training.config.resilience_config import (
     FaultToleranceConfig,
     RerunStateMachineConfig,
@@ -68,6 +69,13 @@ from megatron.training.models.distillation import DistillationConfig, validate_d
 
 T = TypeVar("T", bound="ConfigContainerBase")
 logger = logging.getLogger(__name__)
+
+_FROZEN_OPTIMIZER_FLAGS = (
+    "use_distributed_optimizer",
+    "overlap_param_gather",
+    "overlap_param_gather_with_optimizer_step",
+)
+
 
 @dataclass(kw_only=True)
 class ConfigContainerBase:
@@ -309,6 +317,9 @@ class PretrainConfigContainer(ConfigContainerBase):
     distillation: DistillationConfig | None = None
     """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
 
+    offline_distillation: OfflineDistillationConfig | None = None
+    """Offline logits KD: exactly one of teacher_save or student_load. None disables it."""
+
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""
         launch_world_size = safe_get_world_size()
@@ -465,8 +476,14 @@ class PretrainConfigContainer(ConfigContainerBase):
         if getattr(self.model, "transformer", None) is None:
             raise ValueError("Training requires model.transformer to be configured")
         optimizer = self._optimizer_with_model_precision()
-        # Validate effective precision without modifying either config or finalizing early.
-        ConfigContainerBase.validate(replace(self, optimizer=optimizer))
+        if self.train.freeze_all_layers:
+            # Resolve aliases on the private copy first: Muon derives its layer-wise path
+            # from use_distributed_optimizer, which the frozen policy then disables.
+            optimizer.finalize_optimizer_config()
+            optimizer = replace(optimizer, **dict.fromkeys(_FROZEN_OPTIMIZER_FLAGS, False))
+        # Every optimizer check sees the policy that will run; the live config stays unchanged.
+        effective = replace(self, optimizer=optimizer)
+        ConfigContainerBase.validate(effective)
         # Config-only topology checks also run when validating a recipe off-cluster.
         # Launch world-size checks remain in the runtime parallel-size helpers.
         transformer = self.model.transformer
@@ -499,12 +516,15 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("GTP sequence sharding uses Megatron DDP, not FSDP")
             if self.dist.use_tp_pp_dp_mapping:
                 raise ValueError("GTP sequence sharding does not support TP-PP-DP mapping")
-        self._validate_checkpoint()
+        effective._validate_checkpoint()
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
         self._validate_distillation()
+        self._validate_offline_distillation()
+        if self.train.freeze_all_layers and transformer.freeze_base_model_for_mtp:
+            raise ValueError("freeze_all_layers cannot be combined with freeze_base_model_for_mtp.")
         global_batch_size, _, _ = self._resolve_batch_sizes()
-        self._validate_ddp_config()
+        effective._validate_ddp_config()
         self._validate_rl_config(global_batch_size)
         optimizer.validate_run(
             ddp_config=self.ddp,
@@ -534,6 +554,26 @@ class PretrainConfigContainer(ConfigContainerBase):
             validate_distillation_student(self.distillation, self.model)
         if self.train.manual_gc:
             raise ValueError("ModelOpt distillation is incompatible with manual_gc.")
+
+    def _validate_offline_distillation(self) -> None:
+        """Check offline KD against the training, checkpoint, distillation and data sections."""
+        offline_kd_cfg = self.offline_distillation
+        if offline_kd_cfg is None:
+            return
+        if (
+            self.train.rampup_batch_size is not None
+            or self.train.step_batch_size_schedule is not None
+        ):
+            raise ValueError("Offline distillation requires a fixed global batch size.")
+        if offline_kd_cfg.teacher_save is not None:
+            if not self.checkpoint.async_save or not self.checkpoint.use_persistent_ckpt_worker:
+                raise ValueError(
+                    "teacher_save requires checkpoint.async_save and use_persistent_ckpt_worker."
+                )
+        elif self.distillation is not None:
+            raise ValueError("student_load cannot be combined with online ModelOpt distillation.")
+        if self.data.dataset is None:
+            raise ValueError("Offline distillation requires cfg.data.dataset for cache identity.")
 
     def _validate_checkpoint(self) -> None:
         """Check the checkpoint format and optimizer policy against the sections that own the
@@ -970,6 +1010,15 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "falling back to unquantized parameter gathering."
                 )
                 self.ddp.fp4_param_gather = False
+        if self.train.freeze_all_layers:
+            enabled = [name for name in _FROZEN_OPTIMIZER_FLAGS if getattr(self.optimizer, name)]
+            if enabled:
+                logger.warning(
+                    "train.freeze_all_layers: disabling incompatible optimizer settings %s.",
+                    enabled,
+                )
+            for name in enabled:
+                setattr(self.optimizer, name, False)
         self.ddp.overlap_param_gather = self.optimizer.overlap_param_gather
         self.ddp.reuse_grad_buf_for_mxfp8_param_ag = (
             self.optimizer.reuse_grad_buf_for_mxfp8_param_ag
