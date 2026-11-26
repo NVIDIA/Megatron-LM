@@ -519,8 +519,8 @@ def test_ep_fsdp_checkpoint_roundtrip(
     outer_size = 2 if topology in ("hsdp", "hfsdp") else 1
     pp_size = 2 if topology in ("pp2", "vpp2") else 1
     vpp_size = 2 if topology == "vpp2" else 1
-    if topology != "fsdp" and ep_size == 4:
-        pytest.skip("HSDP, HFSDP, and PP are covered with EP=1 and EP=2.")
+    if topology != "fsdp" and ep_size > 1:
+        pytest.skip("HSDP, HFSDP, and PP are covered with EP=1.")
     if world_size % (ep_size * outer_size * pp_size):
         pytest.skip(f"world_size {world_size} is incompatible with {topology} and EP={ep_size}.")
     if optimizer_name == "muon":

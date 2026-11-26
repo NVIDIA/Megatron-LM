@@ -61,7 +61,6 @@ from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     get_unexpected_model_keys,
     handle_mla_down_proj_in_state_dict,
     handle_mtp_in_state_dict,
-    handle_pipeline_layers_in_state_dict,
     match_mla_fused_down_proj_key,
     rename_mtp_inner_layer_keys,
     validate_fsdp_dtensor_model_load,
@@ -1404,31 +1403,20 @@ def _wrapped_chunk(layer_number):
     return chunk
 
 
-class TestPipelineLayerNames:
-
-    def test_wrapper_prefix_kept_and_layer_globalized(self):
-        state_dict = {"module.decoder.layers.0.inner_layer.weight": 0, "module.embedding.weight": 1}
-        assert handle_pipeline_layers_in_state_dict(_wrapped_chunk(5), state_dict) == {
-            "module.decoder.layers.4.inner_layer.weight": 0,
-            "module.embedding.weight": 1,
-        }
-
-    def test_first_stage_keys_unchanged(self):
-        state_dict = {"module.decoder.layers.0.inner_layer.weight": 0}
-        assert handle_pipeline_layers_in_state_dict(_wrapped_chunk(1), state_dict) == state_dict
-
-
 def test_loader_returns_virtual_chunk_sections(run_config, tmp_path):
-    """The fsdp_dtensor loader hands each virtual chunk its own section under local names."""
+    """The fsdp_dtensor loader names chunks' layers globally and hands each its section back."""
     torch.manual_seed(0)
-    chunks = [_wrapped_chunk(3), _wrapped_chunk(7)]  # Local layer 0 is global layer 2 and 6.
+    chunks = [_wrapped_chunk(1), _wrapped_chunk(7)]  # Local layer 0 is global layer 0 and 6.
     saved = [copy.deepcopy(chunk.state_dict()) for chunk in chunks]
     state = {f"model{i}": chunk.state_dict() for i, chunk in enumerate(chunks)}
     state = preprocess_fsdp_dtensor_state_dict(run_config.model.transformer, state, chunks)
+    # The first stage keeps its keys; the later chunk takes global indices, wrapper prefix kept.
+    assert list(state["model0"]) == list(saved[0])
+    assert list(state["model1"]) == [k.replace("layers.0.", "layers.6.") for k in saved[1]]
     dcp.save(state, checkpoint_id=tmp_path / "iter_0000001")
     (tmp_path / "latest_checkpointed_iteration.txt").write_text("1")
 
-    chunks = [_wrapped_chunk(3), _wrapped_chunk(7)]
+    chunks = [_wrapped_chunk(1), _wrapped_chunk(7)]
     state = {f"model{i}": chunk.state_dict() for i, chunk in enumerate(chunks)}
     state, *_ = _load_base_checkpoint(
         tmp_path,
