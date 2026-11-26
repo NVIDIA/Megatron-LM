@@ -9,6 +9,7 @@ from typing import Literal, Optional
 import torch
 
 from megatron.core import dist_checkpointing
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -480,15 +481,14 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
     return parser
 
 
-def get_inference_config(
-    model: MegatronModule, setup_cfg: InferenceSetupConfig, *, is_logging_rank: bool
-):
+def get_inference_config(model: MegatronModule, setup_cfg: InferenceSetupConfig):
     """Build the runtime `InferenceConfig`."""
+    # The metrics writer exists on the logging rank only: the last rank, as in training.
     metrics_writer = None
     if (
         setup_cfg.inference_logging_step_interval > 0
         and setup_cfg.inference_wandb_logging
-        and is_logging_rank
+        and safe_get_rank() == safe_get_world_size() - 1
     ):
         metrics_writer = get_wandb_writer()
         if metrics_writer is None:
@@ -505,9 +505,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     """Returns an `InferenceConfig` constructed from the model and command line arguments."""
     from megatron.training.argument_utils import inference_cfg_from_args
 
-    return get_inference_config(
-        model, inference_cfg_from_args(args), is_logging_rank=args.rank == (args.world_size - 1)
-    )
+    return get_inference_config(model, inference_cfg_from_args(args))
 
 
 def get_dynamic_inference_engine(
@@ -536,9 +534,7 @@ def get_dynamic_inference_engine(
     if setup_cfg is None:
         inference_config = get_inference_config_from_model_and_args(model, args)
     else:
-        inference_config = get_inference_config(
-            model, setup_cfg, is_logging_rank=args.rank == (args.world_size - 1)
-        )
+        inference_config = get_inference_config(model, setup_cfg)
     if disaggregation_role is not None:
         inference_config.disaggregation_role = disaggregation_role
     return build_dynamic_inference_engine(

@@ -1210,6 +1210,10 @@ class RootConfigContainer(ConfigContainerBase):
 
     def validate(self) -> None:
         """Validate every member and check the rules between them."""
+        if self.training is None and self.inference is None:
+            raise ValueError("A root container needs a training or an inference container.")
+        if self.algorithm is not None and self.training is None:
+            raise ValueError("Algorithm sections apply to a training container.")
         self._validate_rl()
         super().validate()
         # After the members: the distillation section's own validation resolves the teacher.
@@ -1219,14 +1223,10 @@ class RootConfigContainer(ConfigContainerBase):
     def _finalize(self) -> None:
         """Apply the derivations between the members, then finalize the members."""
         self._finalize_rl()
-        # The run config last: an RL run finalizes its rollout deployment before training.
-        run_config = self.run_config
-        for config_field in dataclass_fields(self):
-            member = getattr(self, config_field.name)
-            if isinstance(member, ConfigContainerBase) and member is not run_config:
+        # Training last: an RL run finalizes its rollout deployment before training.
+        for member in (self.inference, self.algorithm, self.training):
+            if member is not None:
                 member.finalize()
-        if run_config is not None:
-            run_config.finalize()
 
     def _validate_rl(self, global_batch_size: int | None = None) -> None:
         """Check the RL section against the training container and the rollout deployment,
@@ -1235,6 +1235,8 @@ class RootConfigContainer(ConfigContainerBase):
         if rl is None:
             return
         training, inference = self.training, self.inference
+        if inference is None:
+            raise ValueError("An RL run needs an inference container for its rollout engine.")
         if global_batch_size is None:
             global_batch_size = training.train.global_batch_size
         # The offload `_finalize_rl` will request, checked like the offload the DDP section
@@ -1331,29 +1333,20 @@ class RootConfigContainer(ConfigContainerBase):
             f"got {type(run_config).__qualname__}"
         )
 
-    @classmethod
-    def run_config_member(cls, members: Mapping[str, Any]) -> str | None:
-        """The name of the member a process runs on (`training`, else `inference`), given a root
-        container's members or its saved document."""
-        return next(
-            (name for name in ("training", "inference") if members.get(name) is not None), None
-        )
-
     @property
     def run_config(self) -> PretrainConfigContainer | InferenceConfigContainer | None:
-        """The container the process runs on."""
-        member = self.run_config_member(vars(self))
-        return None if member is None else getattr(self, member)
+        """The container the process runs on: `training`, else `inference`."""
+        return self.training if self.training is not None else self.inference
 
     def to_dict(self, **section_overrides: Mapping[str, Any]) -> dict[str, Any]:
         """The document holds only the members the run has. Section overrides (a checkpoint save's
         own directory and format) reach the member that is the run config."""
         document = {key: value for key, value in super().to_dict().items() if value is not None}
         if section_overrides:
-            owner = self.run_config_member(vars(self))
-            if owner is None:
+            if self.run_config is None:
                 raise ValueError(
                     "RootConfigContainer has no run config member to apply overrides to"
                 )
-            document[owner] = getattr(self, owner).to_dict(**section_overrides)
+            owner = "training" if self.training is not None else "inference"
+            document[owner] = self.run_config.to_dict(**section_overrides)
         return document

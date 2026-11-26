@@ -1,14 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import inspect
 import os
-from contextlib import nullcontext
 from functools import partial
 
 import torch
 
-from gpt_builders import gpt_builder
-from hybrid_builders import hybrid_builder
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -40,59 +36,16 @@ from megatron.training.argument_utils import (
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
-from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.config import AlgorithmConfigContainer, RLConfig, RootConfigContainer
 from megatron.training.global_vars import get_run_config
 from megatron.training.utils import is_hybrid_model
-from model_provider import model_provider
 
 stimer = StragglerDetector()
 
 import logging
 
 logging.basicConfig(level=logging.INFO, force=True)
-
-def _gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
-    # TODO(Peter): This is a hack to get around the fact that we are activation recomputation for training but not
-    # for inference with cuda graphs. Without out this the post checks in the transformer config will assert error.
-    if config is None:
-        recompute_granularity_from_args = None
-        if args.recompute_granularity is not None:
-            recompute_granularity_from_args = args.recompute_granularity
-            args.recompute_granularity = None
-
-        config = core_transformer_config_from_args(args)
-
-        if recompute_granularity_from_args is not None:
-            config.recompute_granularity = recompute_granularity_from_args
-
-    build_model_context = nullcontext
-    build_model_context_args = {}
-    if args.fp8_param_gather:
-        try:
-            from transformer_engine.pytorch import fp8_model_init
-
-            build_model_context = fp8_model_init
-            build_model_context_args["enabled"] = True
-
-            # Check if fp8_model_init supports preserve_high_precision_init_val
-            if "preserve_high_precision_init_val" in inspect.signature(fp8_model_init).parameters:
-                build_model_context_args["preserve_high_precision_init_val"] = True
-        except:  # noqa E722
-            raise RuntimeError(
-                "--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found."
-            )
-
-    with build_model_context(**build_model_context_args):
-        return gpt_builder(
-            args,
-            pre_process,
-            post_process,
-            vp_stage=vp_stage,
-            config=config,
-            pg_collection=pg_collection,
-        )
-
 
 # define spiky loss as a variation of 20% or more
 SPIKY_LOSS_PERC = 0.2
@@ -402,28 +355,6 @@ if __name__ == "__main__":
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
-    def _model_builder(
-        args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
-    ):
-        if is_hybrid_model(args):
-            return hybrid_builder(
-                args,
-                pre_process,
-                post_process,
-                vp_stage,
-                config=config,
-                pg_collection=pg_collection,
-            )
-        else:
-            return _gpt_builder(
-                args,
-                pre_process,
-                post_process,
-                vp_stage,
-                config=config,
-                pg_collection=pg_collection,
-            )
-
     def _add_rl_entry_args(parser):
         """RL entry point: the inference server flags plus the RL section."""
         return add_rl_args(add_inference_args(parser))
@@ -455,13 +386,8 @@ if __name__ == "__main__":
     rl_cfg = root.algorithm.rl
     inference_container = root.inference
     assert rl_cfg.perform_rl_step, "train_rl.py requires --perform-rl-step."
-    rl_model_provider = partial(model_provider, _model_builder)
 
-    rl_setup = RLSetupCallback(
-        inference_container,
-        model_provider=rl_model_provider,
-        model_type=ModelType.encoder_or_decoder,
-    )
+    rl_setup = RLSetupCallback(inference_container, model_type=ModelType.encoder_or_decoder)
 
     def next_train_iterator(iteration, current_iterator):
         return next_rollout_iterator(

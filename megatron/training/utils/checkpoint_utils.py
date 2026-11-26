@@ -278,8 +278,8 @@ def run_config_sections(run_config: Optional[dict[str, Any]]) -> Optional[dict[s
         "." + RootConfigContainer.__qualname__
     ):
         # A root container: the sections of the member the saving process ran on.
-        member = RootConfigContainer.run_config_member(run_config)
-        return None if member is None else run_config[member]
+        training = run_config.get("training")
+        return training if training is not None else run_config.get("inference")
     return run_config
 
 

@@ -2,7 +2,7 @@
 
 import copy
 from argparse import Namespace
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import torch
 
@@ -28,7 +28,6 @@ from megatron.training.checkpointing import load_checkpoint
 from megatron.training.config import InferenceConfigContainer
 from megatron.training.config.container import rollout_model_is_separate
 from megatron.training.global_vars import get_args, get_run_config, get_train_state
-from megatron.training.training import get_model
 from megatron.training.utils import print_rank_0
 
 try:
@@ -43,7 +42,6 @@ def build_rollout_inference_model(
     inference_container: InferenceConfigContainer,
     args: Namespace,
     config: TransformerConfig,
-    model_provider: Callable[..., torch.nn.Module],
     model_type: ModelType,
 ) -> Optional[list[torch.nn.Module]]:
     """Build the rollout engine's separately parallelized model, if the deployment needs one."""
@@ -86,12 +84,14 @@ def build_rollout_inference_model(
         setattr(inference_config, name, getattr(deployment, name))
 
     with inference_model_alloc_context():
-        inference_model = get_model(
-            model_provider,
-            model_type,
-            wrap_with_ddp=False,
+        model_config = copy.deepcopy(inference_container.model)
+        model_config.transformer = inference_config
+        inference_model = model_config.get_builder_cls()(model_config).build_distributed_models(
             pg_collection=inference_pg_collection,
-            config=inference_config,
+            wrap_with_ddp=False,
+            model_type=model_type,
+            # No DDP or FSDP wrapper places this model: it always goes to this rank's GPU.
+            device=torch.device("cuda", torch.cuda.current_device()),
         )
     inference_model[0].eval()
     return inference_model
@@ -169,11 +169,9 @@ class RLSetupCallback(Callback):
         self,
         inference_container: InferenceConfigContainer,
         *,
-        model_provider: Callable[..., torch.nn.Module],
         model_type: ModelType,
     ) -> None:
         self._inference_container = inference_container
-        self._model_provider = model_provider
         self._model_type = model_type
         self.model: Optional[list] = None
         self.optimizer: Any = None
@@ -189,7 +187,6 @@ class RLSetupCallback(Callback):
             self._inference_container,
             args,
             get_model_config(self.model[0]),
-            self._model_provider,
             self._model_type,
         )
         if not cfg.validation.skip_train:

@@ -691,6 +691,27 @@ def test_weight_offload_needs_a_separate_rollout_model(offload):
         _rl_run(pretrain, inference=deployment, **rl).validate()
 
 
+@pytest.mark.parametrize(
+    "members, match",
+    [
+        ((), "needs a training or an inference container"),
+        (("inference", "algorithm"), "apply to a training container"),
+        (("training", "algorithm"), "needs an inference container"),
+    ],
+)
+def test_root_container_rejects_a_run_missing_a_member(members, match):
+    """An empty root, algorithm sections without `training`, and an RL section without its
+    rollout deployment each fail validation by name."""
+    available = dict(
+        training=_pretrain_container(),
+        inference=_inference_container(),
+        algorithm=AlgorithmConfigContainer(rl=RLConfig(perform_rl_step=True, **GRPO_4x3)),
+    )
+    root = RootConfigContainer(**{name: available[name] for name in members})
+    with pytest.raises(ValueError, match=match):
+        root.validate()
+
+
 def test_rl_run_config_is_a_singleton(monkeypatch):
     from megatron.training import global_vars
 
