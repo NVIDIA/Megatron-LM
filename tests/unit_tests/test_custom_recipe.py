@@ -196,6 +196,110 @@ def test_per_module_custom_recipe_rejects_quantized_parameter_storage():
         )
 
 
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_per_module_custom_recipe_cannot_inherit_quantized_parameter_storage():
+    """Inheriting the model-init context must not smuggle in quantized storage.
+
+    fp8_param/fp4_param are rejected for per-module custom recipes, but inheriting under a
+    quantized-storage model would allocate the weight in that format anyway. Only the storage
+    actually inherited matters, so BF16 regions inside such a model keep working.
+    """
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+
+    inherit_custom = te_extension.TEQuantizationRecipe.parse_from_config(
+        {
+            "fp8_quantization_recipe": Fp8Recipe.custom,
+            "custom_recipe_factory": TEST_FACTORY_PATH,
+            "inherit_model_init_context": True,
+        }
+    )
+    inherit_builtin = te_extension.TEQuantizationRecipe.parse_from_config(
+        {"fp8_quantization_recipe": Fp8Recipe.mxfp8, "inherit_model_init_context": True}
+    )
+    resolve = te_extension._get_fp8_model_init_for_quant_recipe
+
+    # BF16 storage inherited: nothing to reject.
+    assert isinstance(resolve(inherit_custom), nullcontext)
+    with te_extension.te.pytorch.quantized_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+        with pytest.raises(ValueError, match="inherit_model_init_context"):
+            resolve(inherit_custom)
+        # Built-in per-module recipes may still inherit quantized storage.
+        assert isinstance(resolve(inherit_builtin), nullcontext)
+        # A BF16 region nested in a quantized-storage model (e.g. first/last BF16 layers).
+        with te_extension.te.pytorch.quantized_model_init(enabled=False):
+            assert isinstance(resolve(inherit_custom), nullcontext)
+
+
+def _inherit_custom_fc2_recipe():
+    from megatron.core.quantization.quant_config import RecipeConfig
+
+    return RecipeConfig.from_config_dict(
+        {
+            "configs": {
+                "custom_inherit": {
+                    "transformer_engine_config_type": "TEQuantizationParams",
+                    "training_recipe": {
+                        "fp8_quantization_recipe": "custom",
+                        "custom_recipe_factory": TEST_FACTORY_PATH,
+                        "inherit_model_init_context": True,
+                    },
+                }
+            },
+            "matchers": {
+                "custom_inherit": {
+                    "type": "glob",
+                    "enabled": True,
+                    "pattern": "*linear_fc2",
+                    "config": "custom_inherit",
+                }
+            },
+        }
+    )
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("storage_kwargs", "rejected"),
+    [
+        pytest.param({"fp8_param": True}, True, id="mxfp8-param-storage"),
+        pytest.param({}, False, id="bf16-storage"),
+        pytest.param(
+            {"fp8_param": True, "first_last_layers_bf16": True, "num_layers_at_start_in_bf16": 1},
+            False,
+            id="mxfp8-param-storage-in-bf16-first-layer",
+        ),
+    ],
+)
+def test_global_mxfp8_storage_rejects_inheriting_per_module_custom_recipe(storage_kwargs, rejected):
+    """The per-module custom-recipe storage check covers inherited global MXFP8 storage."""
+    _skip_unless_fp8_available()
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            params_dtype=torch.bfloat16,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            quant_recipe=_inherit_custom_fc2_recipe(),
+            **storage_kwargs,
+        )
+        build = lambda: TransformerBlock(
+            config, get_gpt_layer_with_transformer_engine_spec(), name="decoder"
+        )
+        if rejected:
+            with pytest.raises(ValueError, match="inherit_model_init_context"):
+                build()
+        else:
+            build()
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(not te_recipe.HAVE_TE, reason="Transformer Engine is not installed")
 def test_get_quantization_context_uses_format_neutral_te_api():
     config = TransformerConfig(
@@ -436,58 +540,58 @@ def test_custom_recipe_dense_forward_backward_receives_semantic_role_names(facto
 
 @pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize(
-    "factory_path", [TEST_FACTORY_PATH, DELAYED_FACTORY_PATH], ids=["current", "delayed-state-loss"]
-)
-def test_custom_recipe_grouped_moe_checkpoint_extra_state_is_stateless(factory_path):
+def _grouped_moe_config(factory_path):
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        ffn_hidden_size=256,
+        num_attention_heads=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        params_dtype=torch.bfloat16,
+        add_bias_linear=False,
+        custom_recipe=factory_path,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=256,
+        moe_grouped_gemm=True,
+        moe_router_topk=2,
+        moe_token_dispatcher_type="alltoall",
+        moe_router_padding_for_quantization=True,
+    )
+
+
+def _grouped_moe_block(config):
+    return TransformerBlock(
+        config,
+        get_gpt_layer_with_transformer_engine_spec(num_experts=2, moe_grouped_gemm=True),
+        name="decoder",
+    )
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_custom_recipe_grouped_moe_checkpoint_extra_state_is_stateless():
     """Grouped experts must checkpoint without unpickling the CustomRecipe factory.
 
     TE stores the CustomRecipe object, including its quantizer factory, in the TE extra
     state, exactly as it does for the built-in recipes. MCore's own ``SafeUnpickler`` cannot
     decode an arbitrary factory, so the per-GEMM split used by distributed checkpointing
-    stores an empty extra state. This is lossless for current scaling; delayed scaling
-    must warn that its amax history is being dropped.
+    stores an empty extra state, which is lossless for a stateless factory.
     """
     _skip_unless_fp8_available()
 
     Utils.initialize_model_parallel(1, 1)
     try:
         model_parallel_cuda_manual_seed(123)
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=128,
-            ffn_hidden_size=256,
-            num_attention_heads=4,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-            params_dtype=torch.bfloat16,
-            add_bias_linear=False,
-            custom_recipe=factory_path,
-            num_moe_experts=2,
-            moe_ffn_hidden_size=256,
-            moe_grouped_gemm=True,
-            moe_router_topk=2,
-            moe_token_dispatcher_type="alltoall",
-            moe_router_padding_for_quantization=True,
-        )
-        block = TransformerBlock(
-            config,
-            get_gpt_layer_with_transformer_engine_spec(num_experts=2, moe_grouped_gemm=True),
-            name="decoder",
-        )
+        config = _grouped_moe_config(TEST_FACTORY_PATH)
+        block = _grouped_moe_block(config)
         hidden_states = torch.randn(
             16, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
         output = block(hidden_states=hidden_states, attention_mask=None)
         output.float().square().mean().backward()
 
-        # Only a stateful factory loses amax history in the per-expert split.
-        te_extension._warn_custom_recipe_extra_state_dropped.cache_clear()
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            sharded_state_dict = block.sharded_state_dict()
-        state_loss_warnings = [w for w in caught if "delayed-scaling state" in str(w.message)]
-        assert len(state_loss_warnings) == (1 if factory_path == DELAYED_FACTORY_PATH else 0)
+        sharded_state_dict = block.sharded_state_dict()
         grouped_extra_states = {
             key: value
             for key, value in sharded_state_dict.items()
@@ -505,6 +609,59 @@ def test_custom_recipe_grouped_moe_checkpoint_extra_state_is_stateless(factory_p
         for gemm_idx in range(1, grouped_linear.num_gemms):
             grouped_state_dict[f"_extra_state{gemm_idx}"] = torch.empty(0, dtype=torch.uint8)
         grouped_linear.load_state_dict(grouped_state_dict)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_custom_recipe_grouped_moe_rejects_delayed_scaling_state_on_first_step():
+    """Delayed-scaling state cannot be checkpointed per expert, so fail before training on.
+
+    Failing at the first checkpoint would waste the compute spent until then.
+    """
+    _skip_unless_fp8_available()
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        block = _grouped_moe_block(_grouped_moe_config(DELAYED_FACTORY_PATH))
+        hidden_states = torch.randn(
+            16, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=r"delayed-scaling quantizers for grouped linear "
+            r"'decoder\.layers\.0\.mlp\.experts\.linear_fc1'",
+        ):
+            block(hidden_states=hidden_states, attention_mask=None)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_custom_recipe_grouped_moe_checkpoint_save_rejects_delayed_scaling_state(monkeypatch):
+    """The per-expert checkpoint split must never drop delayed-scaling state silently.
+
+    Covers state that the forward check could not observe yet, e.g. delayed scaling returned
+    only for backward roles and saved before the next forward.
+    """
+    _skip_unless_fp8_available()
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        block = _grouped_moe_block(_grouped_moe_config(TEST_FACTORY_PATH))
+        hidden_states = torch.randn(
+            16, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        block(hidden_states=hidden_states, attention_mask=None).float().sum().backward()
+        monkeypatch.setattr(
+            te_extension, "_te_custom_recipe_has_delayed_state", lambda fp8_meta: True
+        )
+        with pytest.raises(RuntimeError, match="cannot be saved in per-expert checkpoints"):
+            block.sharded_state_dict()
     finally:
         Utils.destroy_model_parallel()
 

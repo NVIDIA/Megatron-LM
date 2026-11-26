@@ -382,21 +382,46 @@ def _te_custom_recipe_has_delayed_state(fp8_meta) -> bool:
         return False
 
 
-@functools.lru_cache(maxsize=None)
-def _warn_custom_recipe_extra_state_dropped() -> None:
-    """Warn once per process that custom delayed-scaling state is not checkpointed."""
-    warnings.warn(
-        "The custom recipe's quantizer factory produced delayed-scaling state for a grouped "
-        "linear, but Megatron cannot serialize it per GEMM and is dropping it from the "
-        "checkpoint. Resuming from this checkpoint will restart the amax history rather than "
-        "continue it. Use a stateless quantizer factory for grouped/MoE layers to avoid this.",
-        UserWarning,
-        stacklevel=2,
+def _raise_if_custom_recipe_delayed_state(fp8_meta, module_name: Optional[str]) -> None:
+    """Reject delayed-scaling state from a custom recipe on a grouped linear.
+
+    Grouped linears are checkpointed per GEMM, and that split cannot carry a custom recipe's
+    delayed-scaling amax history and scales. Saving would silently restart them on resume, so
+    fail as soon as the factory has produced such state, before any checkpoint is written.
+    """
+    if not _is_te_custom_recipe(fp8_meta.get("recipe")):
+        return
+    if not _te_custom_recipe_has_delayed_state(fp8_meta):
+        return
+    where = f" '{module_name}'" if module_name else ""
+    raise RuntimeError(
+        f"The custom recipe's quantizer factory returned delayed-scaling quantizers for grouped "
+        f"linear{where}. Their amax history and scales cannot be saved in per-expert "
+        "checkpoints, so resuming would silently restart them. Return stateless quantizers "
+        "(current scaling, MXFP8, block scaling or NVFP4) for grouped/MoE layers."
+    )
+
+
+def _is_per_module_custom_recipe(qrecipe: TEQuantizationRecipe) -> bool:
+    return (
+        qrecipe.fp8_quantization_recipe == Fp8Recipe.custom
+        or qrecipe.fp4_quantization_recipe == Fp4Recipe.custom
     )
 
 
 def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
     if qrecipe.inherit_model_init_context:
+        if _is_per_module_custom_recipe(qrecipe) and FP8GlobalStateManager.with_fp8_parameters():
+            # parse_from_config() rejects fp8_param/fp4_param for per-module custom recipes,
+            # but inheriting would allocate the weight with the enclosing quantized storage
+            # and its quantizer anyway. Check the storage actually inherited here, so BF16
+            # regions (e.g. first/last BF16 layers) inside a quantized-storage model still work.
+            raise ValueError(
+                "Per-module custom recipes do not yet support quantized parameter storage, "
+                "but this module sets inherit_model_init_context while the enclosing model "
+                "stores parameters in a quantized format (e.g. --fp8-param). Remove "
+                "inherit_model_init_context for this module or disable quantized storage."
+            )
         # Preserve both the enclosing recipe and whether storage is enabled. In
         # particular, this lets the global first/last-layer BF16 policy remain in
         # control while a per-module recipe changes execution precision.
@@ -3318,6 +3343,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             with quant_context:
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
             self.is_first_microbatch = False
+            # Fail on the first step rather than at the first checkpoint. Backward-only delayed
+            # state appears after the first backward and is caught on the next forward.
+            _raise_if_custom_recipe_delayed_state(self.fp8_meta, self.quant_module_name)
 
             # TE only returns a tuple when return_bias is True, otherwise
             # it returns a single Tensor, we always want to return two
@@ -3367,11 +3395,11 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 #
                 # An empty payload is the correct, lossless result for a stateless factory
                 # (mxfp8, current scaling, block scaling, nvfp4), which is what TE itself
-                # stores for the equivalent built-in recipes. A factory that produces
-                # delayed-scaling quantizers does have state, and it is dropped here --
-                # warn rather than lose amax history silently.
-                if _te_custom_recipe_has_delayed_state(self.fp8_meta):
-                    _warn_custom_recipe_extra_state_dropped()
+                # stores for the equivalent built-in recipes. Delayed-scaling state cannot be
+                # represented here; forward() already rejects it, and this guards the save.
+                _raise_if_custom_recipe_delayed_state(
+                    self.fp8_meta, getattr(self, "quant_module_name", None)
+                )
                 return [torch.empty(0, dtype=torch.uint8)] * self.num_gemms
 
             state = self._decode_extra_state(state)

@@ -270,6 +270,21 @@ def test_custom_recipe_matches_native(
                         continue
                     parameter.add_(expected[2][name], alpha=-0.01)
                     candidate_parameters[name].add_(actual[2][name], alpha=-0.01)
+            if step == 0:
+                # Start a new optimizer step as the training schedule does. Otherwise both
+                # sides reuse their step-0 quantized weights and step one compares stale caches.
+                for block in (reference, candidate):
+                    block.set_is_first_microbatch()
+                # The update must reach the next forward: rerunning step 0's inputs must not
+                # reproduce step 0's output.
+                _set_all_rng_states(*copy.deepcopy(rng))
+                with torch.no_grad():
+                    probe = candidate(hidden_states=inputs, attention_mask=None)
+                assert not torch.equal(probe, actual[0]), "weight update did not reach forward"
+                # The probe consumed the flag and recorded routing; restore both for step one.
+                candidate.set_is_first_microbatch()
+                for counts in token_counts.values():
+                    counts.clear()
         # Ensure the custom path actually called the factory at the MCore locations.
         mlp = "mlp" if path == "dense" else "mlp.experts"
         assert (f"decoder.layers.0.{mlp}.linear_fc1", "weight") in _FACTORY_ROLES
