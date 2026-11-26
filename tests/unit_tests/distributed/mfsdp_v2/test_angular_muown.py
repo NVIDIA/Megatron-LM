@@ -27,10 +27,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.angular_muown
 )
 from tests.unit_tests.distributed.mfsdp_v2.test_muon import TinyModel, _train
 
-# The angular decay starts after the first step, so kappa_t < 1 for the rest of the run.
-KWARGS = dict(
-    lr=0.05, momentum=0.9, weight_decay=0.1, angular_warmup_steps=1, angular_horizon_steps=4
-)
+# The angular decay starts after the second step, so kappa_t < 1 for the rest of the run.
+KWARGS = dict(lr=0.05, momentum=0.9, angular_warmup_steps=1, angular_decay_scale=0.5)
 
 
 class ReferenceAngularMuOwn(Muon):
@@ -39,19 +37,18 @@ class ReferenceAngularMuOwn(Muon):
     It reuses EO Muon's orthogonalize(), with FsdpAngularMuOwn's default hyperparameters.
     """
 
-    def __init__(self, params, *, angular_warmup_steps, angular_horizon_steps, **kwargs) -> None:
+    def __init__(self, params, *, angular_warmup_steps, angular_decay_scale, **kwargs) -> None:
         super().__init__(params, scale_mode="shape_scaling", **kwargs)
         self.warmup_steps = angular_warmup_steps
-        self.horizon_steps = angular_horizon_steps
-        self.t = 0
+        self.decay_scale = angular_decay_scale
+        self.angular_step = 0
 
     @torch.no_grad()
     def step(self, closure=None):
-        self.t += 1
-        t, (beta1, beta2), eps = self.t, (0.9, 0.95), 1e-8
-        # kappa_t = (1 + C u)^(-1) with C = 8.9 and u = (t - t_w) / T, and 1 during warmup.
-        u = max(t - self.warmup_steps, 0) / self.horizon_steps
-        kappa = 1 / (1 + 8.9 * u)
+        (beta1, beta2), eps = (0.9, 0.95), 1e-8
+        # kappa_t = (1 + c * max(0, t - t_w))^(-1), with t counted from zero.
+        kappa = 1 / (1 + self.decay_scale * max(0, self.angular_step - self.warmup_steps))
+        self.angular_step += 1
         for group in self.param_groups:
             lr, beta = group["lr"], group["momentum"]
             for p in group["params"]:
@@ -61,7 +58,9 @@ class ReferenceAngularMuOwn(Muon):
                     state["g"] = p.norm(dim=1, keepdim=True)
                     state["m"] = torch.zeros_like(state["g"])
                     state["v"] = torch.zeros_like(state["g"])
-                g, M, m, v = state["g"], state["M"], state["m"], state["v"]
+                    state["t"] = 0
+                state["t"] += 1
+                g, M, m, v, t = state["g"], state["M"], state["m"], state["v"], state["t"]
                 G, U = p.grad.float(), p / g
                 # Split the gradient into the row-scale part d and the direction part dU.
                 d = (G * U).sum(dim=1, keepdim=True)
@@ -76,7 +75,8 @@ class ReferenceAngularMuOwn(Muon):
                 m.mul_(beta1).add_((1 - beta1) * d)
                 v.mul_(beta2).add_((1 - beta2) * d * d)
                 adam = (m / (1 - beta1**t)) / ((v / (1 - beta2**t)).sqrt() + eps)
-                g.mul_(1 - lr * group["weight_decay"]).sub_(lr * adam)
+                g.sub_(lr * adam)
+                g.copy_(torch.copysign(g.abs().clamp_min(1e-7), g))
                 p.copy_(g * U_plus / U_plus.norm(dim=1, keepdim=True))
 
 

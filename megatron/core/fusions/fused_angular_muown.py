@@ -44,15 +44,15 @@ def _momentum_inputs_kernel(
     beta,
     beta1,
     beta2,
-    norm_eps,
+    eps,
     NESTEROV: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     base = row * n_cols
     g = tl.load(row_scale_ptr + row)
-    # copysign(max(|g|, norm_eps), g), with g = -0 taken as +0.
-    scale = tl.where(g < 0, -1.0, 1.0) * tl.maximum(tl.abs(g), norm_eps)
+    # copysign(max(|g|, eps), g), with g = -0 taken as +0.
+    scale = tl.where(g < 0, -1.0, 1.0) * tl.maximum(tl.abs(g), eps)
 
     # U = W / g.  d = <G, U>: the radial gradient, which is dL/dg.
     acc = tl.zeros([BLOCK], dtype=tl.float32)
@@ -100,20 +100,19 @@ def _apply_update_kernel(
     n_cols,
     direction_lr,
     lr,
-    decay,
     bias_correction1,
     bias_correction2,
     adam_eps,
-    norm_eps,
+    eps,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     base = row * n_cols
     g = tl.load(row_scale_ptr + row)
-    # copysign(max(|g|, norm_eps), g), with g = -0 taken as +0.
-    scale = tl.where(g < 0, -1.0, 1.0) * tl.maximum(tl.abs(g), norm_eps)
+    # copysign(max(|g|, eps), g), with g = -0 taken as +0.
+    scale = tl.where(g < 0, -1.0, 1.0) * tl.maximum(tl.abs(g), eps)
 
-    # U+ = W / g - lr * kappa_t * O;  rho = ||U+||,  rho_den = max(rho, norm_eps).
+    # U+ = W / g - lr * kappa_t * O;  ||U+|| floored at eps.
     acc = tl.zeros([BLOCK], dtype=tl.float32)
     for start in range(0, n_cols, BLOCK):
         cols = start + tl.arange(0, BLOCK)
@@ -122,31 +121,27 @@ def _apply_update_kernel(
         update = tl.load(update_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
         direction = w / scale - direction_lr * update
         acc += direction * direction
-    row_norm = tl.sqrt(tl.sum(acc, axis=0))
-    denominator = tl.maximum(row_norm, norm_eps)
+    row_norm = tl.maximum(tl.sqrt(tl.sum(acc, axis=0)), eps)
 
-    # Adam on g with decoupled decay:
-    #   g <- (1 - lr * lambda') * g - lr * m_hat / (sqrt(v_hat) + eps),
-    #   m_hat = m_g / (1 - beta1^t),  v_hat = v_g / (1 - beta2^t).
+    # Adam on g:  g <- g - lr * m_hat / (sqrt(v_hat) + eps),
+    #   m_hat = m_g / (1 - beta1^t),  v_hat = v_g / (1 - beta2^t), then |g| floored at eps.
     exp_avg = tl.load(exp_avg_ptr + row)
     exp_avg_sq = tl.load(exp_avg_sq_ptr + row)
-    new_g = decay * g - lr * (exp_avg / bias_correction1) / (
+    new_g = g - lr * (exp_avg / bias_correction1) / (
         tl.sqrt(exp_avg_sq / bias_correction2) + adam_eps
     )
+    new_g = tl.where(new_g < 0, -1.0, 1.0) * tl.maximum(tl.abs(new_g), eps)
+    tl.store(row_scale_ptr + row, new_g)
 
-    # W = g * U+ / rho_den, with the U+ that the old g recovers and |g| floored as above, so a row
-    # whose g lands on zero keeps its direction.
-    new_scale = tl.where(new_g < 0, -1.0, 1.0) * tl.maximum(tl.abs(new_g), norm_eps)
+    # W = g * U+ / ||U+||, with the U+ that the old g recovers.
     for start in range(0, n_cols, BLOCK):
         cols = start + tl.arange(0, BLOCK)
         mask = cols < n_cols
         w = tl.load(weight_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
         update = tl.load(update_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
         direction = w / scale - direction_lr * update
-        w = direction * (new_scale / denominator)
+        w = direction * (new_g / row_norm)
         tl.store(weight_ptr + base + cols, w.to(weight_ptr.dtype.element_ty), mask=mask)
-    # g <- g * rho / rho_den: a no-op unless the clamp fired, where it keeps |g| = ||W||.
-    tl.store(row_scale_ptr + row, new_g * (row_norm / denominator))
 
 
 def fused_angular_muown_momentum_inputs(
@@ -160,7 +155,7 @@ def fused_angular_muown_momentum_inputs(
     *,
     beta: float,
     betas: tuple[float, float],
-    norm_eps: float,
+    eps: float,
     nesterov: bool,
 ) -> None:
     """Split the gradient by rows, update the moments, and write the Newton-Schulz input.
@@ -182,7 +177,7 @@ def fused_angular_muown_momentum_inputs(
         beta,
         betas[0],
         betas[1],
-        norm_eps,
+        eps,
         NESTEROV=nesterov,
         BLOCK=block,
         num_warps=8 if block >= 2048 else 4,
@@ -198,15 +193,13 @@ def fused_angular_muown_apply_update(
     *,
     direction_lr: float,
     lr: float,
-    decay: float,
     bias_corrections: tuple[float, float],
     adam_eps: float,
-    norm_eps: float,
+    eps: float,
 ) -> None:
     """Rotate and retract the rows, take the Adam step on their scales, and rewrite the weights.
 
-    ``direction_lr`` is ``lr * kappa_t`` and ``decay`` is ``1 - lr * lambda'``. Updates
-    ``weight`` and ``row_scale`` in place.
+    ``direction_lr`` is ``lr * kappa_t``. Updates ``weight`` and ``row_scale`` in place.
     """
     n_rows, n_cols = weight.shape
     block = min(triton.next_power_of_2(n_cols), 4096)
@@ -219,11 +212,10 @@ def fused_angular_muown_apply_update(
         n_cols,
         direction_lr,
         lr,
-        decay,
         bias_corrections[0],
         bias_corrections[1],
         adam_eps,
-        norm_eps,
+        eps,
         BLOCK=block,
         num_warps=8 if block >= 2048 else 4,
     )
