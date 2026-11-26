@@ -80,8 +80,9 @@ class ReferenceAngularMuOwn(Muon):
                 p.copy_(g * U_plus / U_plus.norm(dim=1, keepdim=True))
 
 
+@pytest.mark.parametrize("use_fused_kernels", [False, True], ids=["torch", "fused"])
 @pytest.mark.parametrize("nesterov", [False, True], ids=["momentum", "nesterov"])
-def test_angular_muown_matches_reference(distributed_setup, nesterov):
+def test_angular_muown_matches_reference(distributed_setup, nesterov, use_fused_kernels):
     """FSDP and unsharded AngularMuOwn should produce the same loss curves."""
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
@@ -102,7 +103,12 @@ def test_angular_muown_matches_reference(distributed_setup, nesterov):
     other_names = ["block2.3.weight", "block2.3.bias"]
     muon_names = [name for name in params if name not in other_names]
 
-    optimizer = FsdpAngularMuOwn([params[n] for n in muon_names], nesterov=nesterov, **KWARGS)
+    optimizer = FsdpAngularMuOwn(
+        [params[n] for n in muon_names],
+        nesterov=nesterov,
+        use_fused_kernels=use_fused_kernels,
+        **KWARGS,
+    )
     fully_shard_optimizer(optimizer, precision_aware=True)
     other_optimizer = torch.optim.SGD([params[n] for n in other_names], lr=0.01, foreach=False)
     fully_shard_optimizer(other_optimizer)

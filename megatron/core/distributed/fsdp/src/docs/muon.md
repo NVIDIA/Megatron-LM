@@ -163,6 +163,8 @@ Optimizers' Newton–Schulz for the orthogonalization.
 
 The row states (`row_scale` and its two Adam moments) are `(m, 1)` DTensors
 sharded like their parameters, so they add no communication.
+With `use_fused_kernels=True`, each of the two local steps is one Triton kernel per tensor,
+with one program per row ([`fused_angular_muown.py`](../../../../fusions/fused_angular_muown.py)).
 
 ## Tradeoffs
 

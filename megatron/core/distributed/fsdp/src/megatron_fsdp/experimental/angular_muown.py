@@ -32,6 +32,15 @@ from .dbuffer import DBuffer
 from .muon import FsdpMuon, _FsdpGroupAssignment
 from .parameter_group import FsdpParameterGroup
 
+try:
+    from megatron.core.fusions.fused_angular_muown import (
+        fused_angular_muown_apply_update,
+        fused_angular_muown_momentum_inputs,
+    )
+except ImportError:
+    # Standalone Megatron-FSDP has only the torch path.
+    fused_angular_muown_apply_update = fused_angular_muown_momentum_inputs = None
+
 __all__ = ["FsdpAngularMuOwn"]
 
 # Floor of |g| and of the retraction denominator, as in the reference AngularMuown.
@@ -71,6 +80,8 @@ class FsdpAngularMuOwn(FsdpMuon):
         angular_decay_degree: Degree ``p`` of ``kappa_t``. Zero disables the decay.
         row_scale_betas: Adam betas for the row scales.
         row_scale_eps: Adam epsilon for the row scales.
+        use_fused_kernels: Run the local work before the gather and after the scatter as two
+            fused Triton kernels, one launch per tensor, instead of torch ops.
         **kwargs: Keyword arguments passed to ``FsdpMuon``. ``scale_mode`` defaults to, and must
             be, ``"shape_scaling"``, so that ``kappa_t`` means the same rotation in every layer.
     """
@@ -83,6 +94,7 @@ class FsdpAngularMuOwn(FsdpMuon):
         angular_decay_degree: float = 1.0,
         row_scale_betas: tuple[float, float] = (0.9, 0.95),
         row_scale_eps: float = 1e-8,
+        use_fused_kernels: bool = False,
         **kwargs: Any,
     ) -> None:
         scale_mode = kwargs.setdefault("scale_mode", "shape_scaling")
@@ -111,6 +123,9 @@ class FsdpAngularMuOwn(FsdpMuon):
         self.angular_decay_degree = angular_decay_degree
         self.row_scale_betas = row_scale_betas
         self.row_scale_eps = row_scale_eps
+        if use_fused_kernels and fused_angular_muown_apply_update is None:
+            raise ImportError("use_fused_kernels needs Megatron-Core's fused AngularMuOwn kernels.")
+        self.use_fused_kernels = use_fused_kernels
         for group in self.param_groups:
             group.setdefault("angular_step", 0)
 
@@ -179,12 +194,29 @@ class FsdpAngularMuOwn(FsdpMuon):
             beta: float = group["momentum"]
             # Local rows: W and G are (k, n); g and Adam's moments of g are (k, 1).
             weight: torch.Tensor = param.to_local()
-            grad: torch.Tensor = param.grad.to_local().to(momentum.dtype).reshape(momentum.shape)
+            grad: torch.Tensor = param.grad.to_local().reshape(momentum.shape)
             row_scale: torch.Tensor = state["row_scale"].to_local()
             row_scale_exp_avg: torch.Tensor = state["row_scale_exp_avg"].to_local()
             row_scale_exp_avg_sq: torch.Tensor = state["row_scale_exp_avg_sq"].to_local()
             # This rank's rows of the Newton-Schulz input, filled in place below.
             ns_input: torch.Tensor = momentum_inputs.get_tensor_view(i).view_as(momentum)
+            if self.use_fused_kernels:
+                # The steps below as one kernel.
+                fused_angular_muown_momentum_inputs(
+                    weight,
+                    grad,
+                    momentum,
+                    ns_input,
+                    row_scale,
+                    row_scale_exp_avg,
+                    row_scale_exp_avg_sq,
+                    beta=beta,
+                    betas=self.row_scale_betas,
+                    eps=EPS,
+                    nesterov=self.nesterov,
+                )
+                continue
+            grad = grad.to(momentum.dtype)
 
             # U = W / g, with |g| floored at EPS. copysign keeps g's sign and maps +0 to +EPS.
             direction = weight / torch.copysign(row_scale.abs().clamp_min(EPS), row_scale)
@@ -249,6 +281,21 @@ class FsdpAngularMuOwn(FsdpMuon):
             row_scale: torch.Tensor = state["row_scale"].to_local()
             row_scale_exp_avg: torch.Tensor = state["row_scale_exp_avg"].to_local()
             row_scale_exp_avg_sq: torch.Tensor = state["row_scale_exp_avg_sq"].to_local()
+            if self.use_fused_kernels:
+                # The steps below as one kernel.
+                fused_angular_muown_apply_update(
+                    weight,
+                    update,
+                    row_scale,
+                    row_scale_exp_avg,
+                    row_scale_exp_avg_sq,
+                    direction_lr=lr * kappa,
+                    lr=lr,
+                    bias_corrections=(1 - beta1**step, 1 - beta2**step),
+                    adam_eps=self.row_scale_eps,
+                    eps=EPS,
+                )
+                continue
 
             # U+ = U - lr * kappa_t * O, with U = W / g recovered before g changes.
             direction = weight / torch.copysign(row_scale.abs().clamp_min(EPS), row_scale)
