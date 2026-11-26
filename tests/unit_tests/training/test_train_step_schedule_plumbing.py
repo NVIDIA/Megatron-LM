@@ -10,6 +10,7 @@ from unittest import mock
 import pytest
 
 from megatron.core.enums import ModelType
+from megatron.core.process_groups_config import MultiModuleProcessGroupCollection
 from megatron.training import training as training_mod
 from megatron.training.models import ModelConfig
 from megatron.training.state import TrainState
@@ -479,7 +480,8 @@ def test_train_step_pre_forward_sync_only_uses_layerwise_bucket_subset():
     ]
 
 
-def test_train_step_wraps_sequence_packing_after_rerun_check():
+@pytest.mark.parametrize("multi_module_schedule_carrier", [False, True])
+def test_train_step_wraps_sequence_packing_after_rerun_check(multi_module_schedule_carrier):
     """The rerun machine must see the original iterator before dynamic-CP packs it."""
     args = SimpleNamespace(
         save_params_interval=None,
@@ -505,6 +507,13 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
     # wrap_data_iterator takes pg_collection from the model (main ea99fdfce), so the
     # mock has to carry one for the plumbing assertion below.
     model_pg_collection = object()
+    # The schedule carrier can be a multi-module collection, which has no dp_cp group of
+    # its own.
+    schedule_carrier = (
+        mock.MagicMock(spec=MultiModuleProcessGroupCollection)
+        if multi_module_schedule_carrier
+        else None
+    )
     model = [
         SimpleNamespace(
             force_all_reduce=False, zero_grad_buffer=lambda: None, pg_collection=model_pg_collection
@@ -538,18 +547,97 @@ def test_train_step_wraps_sequence_packing_after_rerun_check():
             config=config,
             forward_backward_func=forward_backward,
             iteration=0,
+            pg_collection=schedule_carrier,
         )
 
     assert rerun.should_run_forward_backward.call_args_list[0].args[0] is original_iterator
     assert rerun.should_run_forward_backward.call_args_list[1].args[0] is packed_iterator
     assert rerun.should_run_forward_backward.call_args_list[2].args[0] is packed_iterator
     wrap_data_iterator.assert_called_once_with(
-        original_iterator, config, 1, pg_collection=model_pg_collection
+        original_iterator, config, 1, pg_collection=model_pg_collection, prefetch_next=False
     )
     assert forwarded_iterators == [packed_iterator, packed_iterator]
     assert captured["num_microbatches"] == 3
     assert len(result) == 13
     assert result[8:] == (3, 12.0, 34.0, None, 3)
+
+
+def _schedule_lookahead(iteration, **loader):
+    """``prefetch_next`` as one train_step passes it to wrap_data_iterator."""
+    args = SimpleNamespace(
+        save_params_interval=None,
+        save_activations_interval=None,
+        save_tokens_per_expert_interval=None,
+        save_wgrads_interval=None,
+        save_dgrads_interval=None,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
+        overlap_param_gather=False,
+        seq_length=8,
+        global_batch_size=1,
+        micro_batch_size=1,
+        decoder_seq_length=None,
+        empty_unused_memory_level=0,
+        **loader,
+    )
+    model = [
+        SimpleNamespace(
+            force_all_reduce=False, zero_grad_buffer=lambda: None, pg_collection=object()
+        )
+    ]
+    with (
+        mock.patch.object(training_mod, "get_args", return_value=args),
+        mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
+        mock.patch.object(training_mod, "get_rerun_state_machine", return_value=_Rerun()),
+        mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
+        mock.patch.object(training_mod, "has_nvidia_modelopt", False),
+        mock.patch.object(
+            training_mod, "wrap_data_iterator", return_value=(None, 1, 8.0, 64.0)
+        ) as wrap_data_iterator,
+    ):
+        training_mod.train_step(
+            forward_step_func=lambda *a, **k: None,
+            data_iterator=object(),
+            model=model,
+            optimizer=SimpleNamespace(zero_grad=lambda: None),
+            opt_param_scheduler=None,
+            config=SimpleNamespace(sequence_packing_scheduler="default_dynamic_cp"),
+            forward_backward_func=lambda **kwargs: [],
+            iteration=iteration,
+        )
+    wrap_data_iterator.assert_called_once()
+    return wrap_data_iterator.call_args.kwargs["prefetch_next"]
+
+
+@pytest.mark.parametrize(
+    "train_iters,iteration,dataloader_type,num_workers,use_varlen_dataset,expected",
+    [
+        # Another step follows and the data comes from a loader that can be read ahead.
+        (10, 8, "cyclic", 2, False, True),
+        (10, 3, "single", 0, True, True),  # The varlen dataset is read in the main process.
+        # Nothing follows the last iteration.
+        (10, 9, "single", 2, False, False),
+        # A run without an iteration count, or a step without an iteration number.
+        (None, 0, "single", 2, False, False),
+        (10, None, "single", 2, False, False),
+        # In-process loading of a dataset other than the varlen one.
+        (10, 0, "single", 0, False, False),
+        # A loader that the training loop does not own.
+        (10, 0, "external", 2, True, False),
+    ],
+)
+def test_train_step_plans_the_next_schedule_only_when_the_next_batch_can_be_read_ahead(
+    run_config, train_iters, iteration, dataloader_type, num_workers, use_varlen_dataset, expected
+):
+    run_config.train.train_iters = train_iters
+    assert (
+        _schedule_lookahead(
+            iteration,
+            dataloader_type=dataloader_type,
+            num_workers=num_workers,
+            use_varlen_dataset=use_varlen_dataset,
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize(

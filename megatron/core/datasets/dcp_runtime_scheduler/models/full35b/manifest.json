@@ -1,0 +1,41 @@
+{
+  "adaptations": [
+    "Preserve the consumed GDN-v2 feature function and the pack layout; rewrite the round geometry as round_work of geometry.py (the same integers); use package-relative imports and omit unused GDN-v1 features.",
+    "Replace the 32 per-CP FA-v1 coefficient tables by one coefficient vector per direction over the features bias, cp_enabled, extra_rounds, round_critical_work_m, valid_tokens_k and sequences_x_cp, fitted with the column-scaled non-negative least squares of the source on its 256 calibration packs.",
+    "Keep the GDN-v2 hot-pass forward head and the pass-0 backward head unchanged; replace the cold-pass forward head by the hot head plus one constant, and the per-CP per-layer cache table by its rule (cold forward pass in the first GDN layer when CP > 1); omit the pass-1 backward head, which no layer uses.",
+    "Extract density.json layer names/order only, stored as the naming rule; no density coefficients or measured tail values are packaged.",
+    "Require fixed user non-attention F/B times excluding the whole predicted attention module.",
+    "Prepend the copyright header that the repository requires to the packaged Python files; function bodies unchanged except fa_features and round_work of geometry.py."
+  ],
+  "measured_points_sha256": {
+    "fa-cp1-8-points.json": "1915d9d9db4bb963870054b7efbc389e5a860068c62a821de43eec719ce2974d",
+    "fa-cp17-24-points.json": "90119bcb997f4ea55ed8639c4f53bb7ff4049d38734d3a31402748a9ba23d8ad",
+    "fa-cp25-32-points.json": "72f63d7a779ebf7076aaab9919268c1c0a11f5da7de66813e3e1e904d339ff37",
+    "fa-cp9-16-points.json": "27423556b8532a0af67bd7ed495181519c9a260c0454cdc26cf6c5a0d182cf2b",
+    "gdn-cp1-8-points.json": "523ccfe42610df8f609e14c1cec49240950419629b6d6b556f92aa4b4207a190",
+    "gdn-cp17-24-points.json": "fb078a4d245356a3dbee491d3a172fdc9f97809ca0280aca6a8fa5145bf91154",
+    "gdn-cp25-32-points.json": "ce572f88cc9b0308ebca4e36e7f9c32c007a597f0cab08f7e55fc0d82cdc0b69",
+    "gdn-cp9-16-points.json": "96e9ec9371ed08ebebc0551cfb06d08167727d776f2625b9d0139a842fbf76c4",
+    "gdn-second-heldout-points.json": "e81fff08f621c5f7d16e8963c17e4ea311621af9703486097c57606e88cdd44a",
+    "gdn-second-training-points.json": "6d983b52d1ba6c91ddf654a15d47f86ed88a8c2577890b1d1c51e47188615cf2"
+  },
+  "packaged_sha256": {
+    "gdn_features.py": "0ae1d49e3b4ab0b118f99bb8a4d82b48a1878c3b49494a32cd62eeb7c74459b1",
+    "geometry.py": "3d22d72a54c3f4d61c45c531c4a612b89a74bef0e49c5d0e1b26f5649b4b5da7",
+    "parameters.json": "c59b3ec1df44a9dc2606f6c031c425f587f6274b0d44b80662f39cce6aa6fb24"
+  },
+  "source_candidate_sha256": "a268249ab9c342db393d1be0f321f88891a7fa0545b52e23460c0c58c3c26284",
+  "source_sha256": {
+    "attention.json": "6863c2f7cc06410b8da6f2055e67725687d8d343d347d33d6af6bbd9717af439",
+    "cache_program.json": "5607ff3713e4a3a56e91648546c25e8685b6c57e503f079f0121f30359cc896a",
+    "composition.json": "512e2be40dbe6957704b6591123a50540dbd174940eb7cbd535d446acde33882",
+    "contract.py": "9ae00280bae2d79e71d1962c8cfbb0efcf116ffcbff4e3aca6e3c4ea06ba8da7",
+    "cp_round_geometry.py": "b721f18f95e42cfbbbc0451f0df2bfb6ecf3c4929ea4c43a6d5186491453dad4",
+    "density.json": "227e777691520c33f0c1d480c20351d7dd80502133bb1d5a07e079b95603fc73",
+    "fixed_diagnostic_factory.py": "1d99fcbbcb50406d33f3f2a92ee9a212d2b0e6b7a20d9efc4787998868510115",
+    "full35b_gdn_v2_factory.py": "4bbf413b28cbef730246e5796ab302d1ce9bbee2a874d924af2751692118a8f9",
+    "gdn_v2/features.py": "13b05b06f247acc4bacb09a7719196e335b24fa5161d386b99241ec4ffc40c6b",
+    "geometry.py": "f10c2eec9429fa2b36ca57744515d8658e66734712968ea291c59e5c09259109"
+  },
+  "source_snapshot": "cost-model candidate of the full Qwen3.5-35B-A3B experiment of NVIDIA's DCP attention benchmark (unpublished); source_candidate_sha256 is the digest of its descriptor"
+}

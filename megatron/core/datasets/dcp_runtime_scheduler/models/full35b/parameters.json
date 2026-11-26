@@ -1,0 +1,87 @@
+{
+  "schema": "qwen35-full35b-module-costs/2",
+  "units": "milliseconds per whole attention module; one coefficient vector per direction for every CP size 1 to 32",
+  "full_attention": {
+    "forward": {
+      "bias": 2.534677834881723,
+      "cp_enabled": 0.49198100834373376,
+      "extra_rounds": 2.6306511042558074,
+      "round_critical_work_m": 0.004353802775472234,
+      "valid_tokens_k": 0.0009053270534665142,
+      "sequences_x_cp": 0.00308620481570092
+    },
+    "backward": {
+      "bias": 2.8047315436184785,
+      "cp_enabled": 0.0,
+      "extra_rounds": 2.775756179734416,
+      "round_critical_work_m": 0.020328149501822837,
+      "valid_tokens_k": 0.029793598626200138,
+      "sequences_x_cp": 0.00011733104019231727
+    }
+  },
+  "gdn": {
+    "feature_schema": "GDN_CP_BRANCH_ACTIVATION_V2",
+    "forward": {
+      "active_cross_rank_kernel": 0.1286824160888048,
+      "bias": 2.966317005455499,
+      "boundary_summary_chunks_per_64": 0.0570527235864669,
+      "cp_enabled": 0.1144015409115036,
+      "extra_local_sequences": 0.0,
+      "max_prefix_chain": 0.0,
+      "summary_hops": 0.05925120096431775
+    },
+    "backward": {
+      "active_cross_rank_kernel": 0.48563161965419915,
+      "bias": 5.400031000375753,
+      "boundary_summary_chunks_per_64": 0.2016596556812841,
+      "cp_enabled": 0.3890907106842454,
+      "extra_local_sequences": 0.0,
+      "max_prefix_chain": 0.003152061568819834,
+      "summary_hops": 0.06579949163137605
+    },
+    "first_layer_cold_forward_ms": 0.9098180311341421,
+    "cache": {
+      "forward_policy": "CP1_ALL_HOT_INDEX;CP_GT1_FIRST_COLD_CONTEXT_PLUS_HOT_INDEX_THEN29HOT",
+      "backward_policy": "FIXED_DIAGNOSTIC_FIRST_BACKWARD_HEAD_NO_CACHE_STATE_CLAIM",
+      "observed_cp_sizes": [1, 8, 16, 32],
+      "fullCP_observation_claimed": false
+    }
+  },
+  "layer_names": {
+    "decoder": "layer:0:module.module.decoder.layers.{index}",
+    "mtp": "layer:0:module.module.mtp.layers.0.mtp_model_layer"
+  },
+  "fit": {
+    "solver": "non-negative least squares on columns scaled by their root mean square",
+    "full_attention": "calibration packs 0 to 7 of every CP size 1 to 32 (256 packs); held-out packs 8 to 13 (192 packs)",
+    "gdn": "heads of the source fit, 512 calibration points each; cold constant from the 496 calibration cold-pass points with CP > 1; held-out points 22 to 29 (256 per head)",
+    "heldout_limits_pct": {"wape_pct": 3.0, "p90_ape_pct": 5.0, "max_ape_pct": 10.0},
+    "heldout": {
+      "full_attention_forward": {"packs": 192, "mean_ape_pct": 0.58, "p90_ape_pct": 1.23, "max_ape_pct": 2.94, "wape_pct": 0.52},
+      "full_attention_backward": {"packs": 192, "mean_ape_pct": 1.42, "p90_ape_pct": 3.21, "max_ape_pct": 8.19, "wape_pct": 1.11},
+      "gdn_forward": {"packs": 256, "mean_ape_pct": 2.17, "p90_ape_pct": 4.64, "max_ape_pct": 11.37, "wape_pct": 2.12},
+      "gdn_forward_cold_first_layer": {"packs": 248, "mean_ape_pct": 2.38, "p90_ape_pct": 4.91, "max_ape_pct": 9.99, "wape_pct": 2.31},
+      "gdn_backward": {"packs": 256, "mean_ape_pct": 1.78, "p90_ape_pct": 3.83, "max_ape_pct": 6.68, "wape_pct": 1.76}
+    }
+  },
+  "accuracy": {"full_attention_heldout_gate_pass": true, "gdn_heldout_gate_pass": false},
+  "source_execution_domain": {
+    "expected_runtime_inventory": {"FA_core_API": 11, "FA_module": 11, "GDN_module": 30, "MoE_with_EP": 41, "layer": 41},
+    "geometry_policy": {
+      "dataset_alignment": 64,
+      "declared_max_policy": "FULL_PACK_CAPACITY",
+      "ep_size": 32,
+      "local_tokens": 16384,
+      "static_endpoints": 65,
+      "tail_padding": "extend_last",
+      "world_size": 32
+    },
+    "image_sha256": "047032f79b80ad0be37db116001870bafd1ed6e5a30f0c88b8aa822e4680a7b9",
+    "stack_commits": {
+      "fla": "ade1f500fb1067cef486c69742b854769b5a743d",
+      "library": "1551ac843bcf0e595add0357729173d4afb13faf",
+      "mcore": "fea470c0a33da28a636f82b6b02dc8a6d1d84858",
+      "te": "c6188347e7de79d7261b9e0113114482998541bf"
+    }
+  }
+}
