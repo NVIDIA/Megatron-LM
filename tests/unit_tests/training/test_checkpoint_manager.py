@@ -379,9 +379,11 @@ class TestTrainerExitFinalization:
 
         manager = Mock()
         run_config = SimpleNamespace(checkpoint=SimpleNamespace(custom_manager_class=custom_class))
-        with patch.object(training, "get_checkpoint_manager", return_value=manager), patch.object(
-            training, "get_run_config", return_value=run_config
-        ), patch("megatron.training.async_utils.maybe_finalize_async_save") as native:
+        with (
+            patch.object(training, "get_checkpoint_manager", return_value=manager),
+            patch.object(training, "get_run_config", return_value=run_config),
+            patch("megatron.training.async_utils.maybe_finalize_async_save") as native,
+        ):
             training._finalize_async_saves_at_exit(terminate=terminate)
 
         manager.finalize_async_saves.assert_called_once_with(blocking=True, terminate=terminate)
