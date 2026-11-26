@@ -166,7 +166,9 @@ def _propagate_expert_allreduce_to_lsq_params(model):
             param.allreduce = allreduce
 
 
-def lsq_hook(scale_lr: float | None) -> PreWrapHook:
+def lsq_hook(
+    scale_lr: float | None, *, scale_min_lr: float | None = None, scale_wd_mult: float | None = None
+) -> PreWrapHook:
     """Prepare LSQ (scale-learning QAD) parameters for DDP and the distributed optimizer.
 
     LSQ ``_amax_*`` params lack MCore's ``allreduce`` attribute; propagate it from each weight
@@ -177,6 +179,8 @@ def lsq_hook(scale_lr: float | None) -> PreWrapHook:
         for model in models:
             _propagate_expert_allreduce_to_lsq_params(model)
             model._lsq_scale_lr = scale_lr
+            model._lsq_scale_min_lr = scale_min_lr
+            model._lsq_scale_wd_mult = scale_wd_mult
         return models
 
     return hook
@@ -292,7 +296,13 @@ def modelopt_setup_hooks(model_config, checkpoint=None) -> list[PreWrapHook]:
             hooks.append(restore_modelopt_state_hook(load_dir, checkpoint))
     if options.qad_train_target is not None:
         hooks.append(qad_freeze_hook(options.qad_train_target))
-    hooks.append(lsq_hook(options.lsq_scale_lr))
+    hooks.append(
+        lsq_hook(
+            options.lsq_scale_lr,
+            scale_min_lr=options.lsq_scale_min_lr,
+            scale_wd_mult=options.lsq_scale_wd_mult,
+        )
+    )
     if not options.default_te_spec:
         hooks.append(te_load_state_dict_hook())
     return [on_model_init_device(hook, init_meta) for hook in hooks]

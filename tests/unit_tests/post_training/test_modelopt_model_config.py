@@ -54,6 +54,8 @@ class TestDistillationConfigFromArgs:
         )
         args = make_modelopt_test_args(
             export_kd_teacher_load=str(tmp_path),
+            lsq_scale_min_lr=1e-6,
+            lsq_scale_wd_mult=0.0,
             export_kd_teacher_model_config=str(teacher_yaml),
             export_kd_teacher_ckpt_format="torch_dist",
             export_kd_cfg=str(kd_yaml),
@@ -75,6 +77,10 @@ class TestDistillationConfigFromArgs:
         assert distillation.teacher_model.transformations is not student.transformations
         assert distillation.teacher_model.transformations.qad_train_target is None
         assert distillation.teacher_model.transformations.lsq_scale_lr is None
+        assert distillation.teacher_model.transformations.lsq_scale_min_lr is None
+        assert distillation.teacher_model.transformations.lsq_scale_wd_mult is None
+        assert student.transformations.lsq_scale_min_lr == 1e-6
+        assert student.transformations.lsq_scale_wd_mult == 0.0
         assert (
             distillation.teacher_model.transformations.real_quant_cfg
             == student.transformations.real_quant_cfg
@@ -470,7 +476,7 @@ class TestModelType:
     def test_te_load_hook_registered_unless_default_te_spec(self, monkeypatch, default_te_spec):
         te_hook = Mock(return_value=lambda models: models)
         monkeypatch.setattr(model_hooks, "te_load_state_dict_hook", te_hook)
-        monkeypatch.setattr(model_hooks, "lsq_hook", lambda *_: lambda models: models)
+        monkeypatch.setattr(model_hooks, "lsq_hook", lambda *_, **__: lambda models: models)
         config = mc.modelopt_model_config_from_args(
             make_modelopt_test_args(export_default_te_spec=default_te_spec)
         )
@@ -491,7 +497,7 @@ class TestModelOptCheckpointSelection:
 
         restore = Mock(return_value=lambda models: models)
         monkeypatch.setattr(model_hooks, "restore_modelopt_state_hook", restore)
-        monkeypatch.setattr(model_hooks, "lsq_hook", lambda *_: lambda models: models)
+        monkeypatch.setattr(model_hooks, "lsq_hook", lambda *_, **__: lambda models: models)
         monkeypatch.setattr(
             checkpointing,
             "checkpoint_exists",
