@@ -22,6 +22,8 @@ The EP overlap schedule (implemented by the combined 1F1B scheduler and enabled 
 
 The adapter sets `SchedulePolicy.register_hooks=False` for EP overlap, so the ordinary FSDP module hooks and the per-parameter gradient countdown do not duplicate these operations. The persistent hooks stay registered across microbatches. Creating a schedule plan only binds callbacks to its nodes and does not register another set of module hooks; `release_state()` drops the finished plan's references.
 
+Persistent hooks run when PyTorch invokes a submodule. Schedule callbacks run when an EP-overlap node reaches its explicit completion boundary.
+
 ## Demand gathering
 
 The persistent hooks walk the module tree while tracking the nearest enclosing
@@ -36,6 +38,16 @@ Demand gathering makes weights available where the fine-grained schedule uses
 them. Parameter release and gradient completion use the explicit boundaries
 below because different schedule nodes can create separate autograd GraphTasks,
 and delayed `backward_dw()` produces gradients after autograd returns.
+
+## Binding callbacks for one microbatch
+
+When a microbatch's chunk plan is created, `register_fsdp_hooks()` calls `register_fsdp_ep_overlap_schedule_hooks()`. Registration only binds callbacks:
+
+1. Collect all FSDP units in the outer model chunk, including wrappers, into `remaining`.
+2. Visit layer plans in forward order. Remove each plan's still-unassigned units from `remaining` and capture them in `finish_layer(_module, units=units)`. The default argument fixes that plan's tuple. Bind the callback through `plan.set_fsdp_schedule_callbacks()`.
+3. Return `finish_chunk()` for the units left in `remaining`, including the root. The chunk plan stores it as `_on_backward_complete`.
+
+This assigns backward completion once per unit. If a shared unit A appears twice, forward order `A(first) -> B -> A(second)` becomes `A(second) -> B -> A(first)` in backward. The first plan's callback completes A once, after both uses. Each forward callback still reshards all units in its layer, including nested experts.
 
 ## Completion boundaries
 
@@ -58,10 +70,12 @@ sequenceDiagram
     S->>H: Parameter-bearing submodule backward
     H->>U: unshard()
     Note over S,U: pre_dispatch_computation.backward() completes<br/>and delayed backward_dw(), if enabled, completes
-    S->>U: Layer callback: reshard() then post_accumulate_grad()
+    S->>S: Layer callback: finish_layer()
+    S->>U: Captured units: reshard() then post_accumulate_grad()
     Note over U,C: Gradient reductions are submitted<br/>on context streams
 
     Note over S,U: Chunk pre_process.backward() completes
+    S->>S: Chunk callback: finish_chunk()
     S->>U: Remaining units: reshard() then post_accumulate_grad()
 
     Note over S,C: All microbatch backward work completes
@@ -73,9 +87,19 @@ forward callback to `moe_combine`, or `mlp` for a dense layer. It reshards that
 layer module and its independently sharded descendants. For an MTP plan, the
 forward callback receives `mtp_model_layer`.
 
-The layer's backward callback is attached to `pre_dispatch_computation`, which is the first forward node and the last backward node of a layer. Without delayed wgrad, the callback runs after that node's `backward()`. With delayed wgrad, it runs after `backward_dw()`. For the first layer in forward order, `backward_dw()` is deferred until after the layer loop, so the callback fires then. The callback calls `complete_fsdp_unit_backward()` on the units assigned to that layer plan: `reshard()` releases the gathered parameters, and `post_accumulate_grad()` packs the gradients and submits their reductions.
+The layer's backward callback is attached to `pre_dispatch_computation`, which is the first forward node and the last backward node of a layer:
 
-`register_fsdp_ep_overlap_schedule_hooks()` discovers FSDP units from the outer model chunk, including any wrappers, and visits layer plans in forward order. Each unit is assigned exactly once. A unit that appears in several plans goes to its first forward occurrence, which is its last use in backward. Units outside every layer plan, including the root, are held by the chunk plan and completed after `pre_process.backward()` and the chunk's stream dependency.
+```text
+pre_dispatch_computation.backward() / delayed backward_dw()
+  -> node post-backward hook
+  -> finish_layer()
+  -> complete_fsdp_unit_backward(unit) for each captured unit
+  -> unit.reshard() then unit.post_accumulate_grad()
+```
+
+Without delayed wgrad, `finish_layer()` runs after the node's `backward()`. With delayed wgrad, it runs after `backward_dw()`. For the first layer in forward order, `backward_dw()` is deferred until after the layer loop, so the callback fires then. Unit completion releases gathered parameters, packs the gradients, and submits their reductions.
+
+After `pre_process.backward()` and the chunk's stream dependency, the chunk plan invokes `_on_backward_complete`, which calls `finish_chunk()` to complete the remaining units. `release_state()` then drops the callback.
 
 For supported untied MTP models, root-owned embedding and output-head
 parameters can receive contributions from several nodes or depths. They remain
