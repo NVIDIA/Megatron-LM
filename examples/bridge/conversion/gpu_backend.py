@@ -1,5 +1,6 @@
 # Adapted from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/08035723e7a86f94fc54a7f4473bd0519f2ac941/scripts/conversion/gpu_backend.py
 # Source license: Apache-2.0.
+# Follow-up fixes from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/c209ed397fb36272c2216053058cda4e37802f2d/scripts/conversion/gpu_backend.py
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -407,6 +408,10 @@ def export_checkpoint(
         "pipeline_dtype": dtype,
         "params_dtype": dtype,
     }
+    # load_megatron_model rebuilds the model from the checkpoint's run config, so the vocabulary
+    # padding this export's tensor-parallel size needs is passed with the other overrides.
+    if getattr(model_config, "should_pad_vocab", False):
+        model_parallel_overrides["should_pad_vocab"] = True
     if isinstance(resolved_pipeline_layout, list):
         model_parallel_overrides["pipeline_model_parallel_layout"] = resolved_pipeline_layout
         # Keep the Hybrid stage boundaries paired with the restored or regenerated layout.
