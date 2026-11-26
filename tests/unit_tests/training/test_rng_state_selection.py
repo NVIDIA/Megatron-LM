@@ -120,3 +120,31 @@ def test_either_flag_makes_the_save_gather_per_rank_states(
     state = checkpointing.get_rng_state("torch", group, group, dp_cp_group=group)
     assert gather.call_count == int(gathers)
     assert len(state) == (2 if gathers else 1)
+
+
+def _stored_names(key, n):
+    return {f"rng_state.{key}.{i}.random_rng_state": None for i in range(n)}
+
+
+@pytest.mark.parametrize(
+    ("saved_entries", "local_entries"),
+    [(2, 4), (4, 1), (1, 4)],  # old DP-only list; saved-true/current-false; saved-false/current-true
+)
+def test_fsdp_template_follows_the_stored_list_length(saved_entries, local_entries):
+    local = {"(0, 0)": [{"random_rng_state": i} for i in range(local_entries)]}
+    template = checkpointing._fsdp_rng_state_load_template(
+        local, _stored_names("(0, 0)", saved_entries)
+    )
+    assert list(template) == ["(0, 0)"]
+    assert len(template["(0, 0)"]) == saved_entries
+
+
+def test_fsdp_template_is_unchanged_without_stored_rng_keys():
+    local = {"(0, 0)": _states(2)}
+    assert checkpointing._fsdp_rng_state_load_template(local, {}) is local
+
+
+def test_single_stored_entry_is_used_on_a_nonzero_dp_rank():
+    # saved with per-rank states off, resumed with them on: DP rank 1 must not index past the list.
+    states = _states(1)
+    assert checkpointing._select_rng_state(states, True, _group(1, 2), _group(1, 2)) is states[0]

@@ -3436,8 +3436,11 @@ def load_checkpoint(
                     data_iterator=None, ckpt_format=ckpt_format, force=True
                 )
             if load_rng:
-                gen_sd_rng_state = get_rng_state(
-                    load_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
+                gen_sd_rng_state = _fsdp_rng_state_load_template(
+                    get_rng_state(
+                        load_format, tp_group, pp_group, dp_cp_group=dp_cp_group, dp_group=dp_group
+                    ),
+                    state_dict_metadata,
                 )
         if (
             restore_training_state
@@ -3998,7 +4001,7 @@ def _select_rng_state(
     two lengths differ exactly when CP (or GTP) widens the group, so a list whose length is not
     the DP x CP size is the old layout and is indexed by the plain DP rank.
     """
-    if not per_dp_rank:
+    if not per_dp_rank or len(rng_state_list) == 1:
         return rng_state_list[0]
     if dp_cp_group is None:
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -4007,6 +4010,35 @@ def _select_rng_state(
     if dp_group is None:
         dp_group = mpu.get_data_parallel_group()
     return rng_state_list[get_pg_rank(dp_group)]
+
+
+def _fsdp_rng_state_load_template(
+    rng_state: dict[str, list[dict[str, Any]]], state_dict_metadata: dict[str, Any]
+) -> dict[str, list[dict[str, Any]]]:
+    """Resize the FSDP-DTensor RNG load template to the list length stored in the checkpoint.
+
+    DCP flattens the list of RNG dicts into indexed keys (``rng_state.(pp, tp).<i>.<name>``), so
+    the template must request exactly the saved entries, whatever the active save policy is.
+    The entry count comes from the DCP metadata; which entry a rank uses is decided afterwards by
+    ``_select_rng_state`` (DP x CP order, or DP order for old DP-only lists). Without stored RNG
+    keys the template is returned unchanged.
+    """
+    ((key, local_list),) = rng_state.items()
+    prefix = 'rng_state.'
+    counts: dict[str, int] = {}
+    for name in state_dict_metadata:
+        if not name.startswith(prefix):
+            continue
+        stored_key, _, rest = name[len(prefix) :].partition('.')
+        index = rest.partition('.')[0]
+        if index.isdigit():
+            counts[stored_key] = max(counts.get(stored_key, 0), int(index) + 1)
+    if not counts:
+        return rng_state
+    if key not in counts:
+        key = next(iter(counts))
+    # Entries only supply tensor shapes/dtypes; every rank's state has the same structure.
+    return {key: [local_list[0] for _ in range(counts[key])]}
 
 
 def _checkpoint_has_per_dp_rng_states(run_config: Optional[dict[str, Any]], default: bool = False) -> bool:
