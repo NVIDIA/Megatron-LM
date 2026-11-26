@@ -330,6 +330,52 @@ class TestEmbeddingAlignment:
                 atol=0,
             )
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("composition", ["mixed", "text_only", "vision_only"])
+    @pytest.mark.parametrize("noncontiguous", [False, True])
+    def test_mask_alignment_values_and_gradients(self, dtype, composition, noncontiguous):
+        """Copy whole token rows in batch-major order, including empty modalities and views."""
+        input_ids = torch.tensor([[1, 50, 2, 51, 50, 3], [51, 4, 50, 5, 51, 6]], device=self.device)
+        if composition == "text_only":
+            input_ids.fill_(1)
+        elif composition == "vision_only":
+            input_ids.fill_(50)
+        if noncontiguous:
+            input_ids = input_ids.t().contiguous().t()
+
+        masks = {
+            "vision": input_ids == 50,
+            "text": (input_ids != 50) & (input_ids != 51),
+            "audio": input_ids == 51,
+        }
+        embeddings = {}
+        expected = torch.zeros(*input_ids.shape, self.hidden_dim, device=self.device, dtype=dtype)
+        for name, mask in masks.items():
+            num_tokens = int(mask.sum().item())
+            if noncontiguous:
+                embedding = torch.randn(
+                    self.hidden_dim, num_tokens, device=self.device, dtype=dtype
+                ).t()
+            else:
+                embedding = torch.randn(
+                    num_tokens, self.hidden_dim, device=self.device, dtype=dtype
+                )
+            embeddings[name] = embedding.requires_grad_()
+            expected[mask] = embedding.detach()
+
+        output = self.model.align_embeddings_by_token_positions(
+            embeddings, input_ids, {"vision": 50, "audio": 51}
+        )
+        assert output.is_contiguous()
+        torch.testing.assert_close(output, expected.transpose(0, 1), rtol=0, atol=0)
+
+        output_gradient = torch.randn_like(output)
+        output.backward(output_gradient)
+        for name, mask in masks.items():
+            torch.testing.assert_close(
+                embeddings[name].grad, output_gradient.transpose(0, 1)[mask], rtol=0, atol=0
+            )
+
     def test_multiple_images_with_variable_length(self):
         """Test handling multiple images per sample with variable sequence lengths.
 
