@@ -62,3 +62,57 @@ boundary. Existing providers that return the complete standard/custom mapping sh
 be adapted as replacement mappings. Providers returning only additions use extend
 mode. No import-only provider-base-class migration is assumed. This branch changes
 MLM and Core only; it does not modify the Bridge repository.
+
+## Construct an optimizer and scheduler outside the training loop
+
+`megatron.training.optim.setup_optimizer` accepts explicit optimizer and scheduler
+configs, model chunks, a resolved parameter-group policy and process groups. It does
+not read the training loop's global arguments. MLM's training setup calls this helper,
+and Bridge's existing setup function delegates construction to it.
+
+Validation and finalization remain with the caller: run the framework's normal
+configuration preparation before constructing the model. This includes converting
+iteration horizons into scheduler sample counts. The helper does not finalize configs
+again, so custom `finalize()` implementations run at their existing boundary.
+
+```python
+from megatron.training.config.optimizer_config import build_optimizer_config_overrides
+from megatron.training.optim import setup_optimizer
+
+# cfg has already been validated/finalized; model and its process groups exist.
+overrides = build_optimizer_config_overrides(
+    cfg.optimizer,
+    model,
+    cfg.optimizer_config_overrides,
+    mode=cfg.optimizer_config_overrides_mode,
+)
+optimizer, scheduler = setup_optimizer(
+    cfg.optimizer,
+    cfg.scheduler,
+    model,
+    config_overrides=overrides,
+    pg_collection=pg_collection,
+    use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
+)
+```
+
+The construction helper takes an already resolved `config_overrides` mapping. It
+preserves `None` versus an empty mapping and does not normalize an existing complete
+policy again. New recipe contributions should first use `build_optimizer_config_overrides`.
+Explicit process groups are forwarded unchanged. With no groups, the standard Core
+factory retains its legacy MPU fallback. MLM training uses the model's process groups
+when no explicit collection is supplied.
+
+For custom construction, pass `optimizer_factory` with the optimizer configuration
+already bound. For example, `functools.partial(get_megatron_optimizer, config=cfg.optimizer)`
+uses the standard factory, while `cfg.optimizer.provide` preserves an existing custom
+config factory. The callable receives exactly `model_chunks`, `config_overrides`,
+`use_gloo_process_groups`, and `pg_collection` as keyword arguments. A custom factory
+receives the original single model or model list and returns a Megatron-compatible
+optimizer with parameter groups, update methods, and checkpoint state. The default
+factory normalizes a single model into a list.
+
+`build_optimizer_param_scheduler` exposes the same explicit-config scheduler builder
+for an optimizer that already exists. The old
+`megatron.training.training.get_optimizer_param_scheduler(optimizer)` entry point is
+retained as a wrapper. Scheduler state and optimizer checkpoint formats are unchanged.
