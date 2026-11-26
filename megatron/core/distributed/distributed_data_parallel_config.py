@@ -303,6 +303,15 @@ class DistributedDataParallelConfig:
     nccl_ub (symmetric memory).
     """
 
+    megatron_fsdp_partial_grad_buffers: int = 2
+    """Megatron-FSDP v2 only. Number of persistent gradient-reduction input buffers,
+    each sized for the largest parameter group outside the root module and reused
+    round-robin, so packing a group's gradients waits only for the reduction that last
+    used its buffer. 0 allocates one buffer per reduction, which makes packing wait for
+    every queued reduction. Ignored with nccl_ub or when all-gathers and reductions
+    share a stream.
+    """
+
     megatron_fsdp_max_pool_double_buffer: bool = False
     """
     Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
