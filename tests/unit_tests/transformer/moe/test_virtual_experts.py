@@ -94,6 +94,8 @@ def hybridep_kernel_cache(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def virtual_expert_environment(monkeypatch, hybridep_kernel_cache):
     """Keep the recipe's kernel/offload settings local to these tests."""
+    # The HybridEP buffer is process-global; one left by another file's test keeps its EP layout.
+    fused_a2a.reset_hybrid_ep_buffer()
     monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
     monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM", "0")
     monkeypatch.setenv("NVTE_CPU_OFFLOAD_V1", "1")
