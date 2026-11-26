@@ -220,7 +220,7 @@ class FsdpAngularMuOwn(FsdpMuon):
             beta: float = group["momentum"]
             # Local rows: W and G are (k, n); g and Adam's moments of g are (k, 1).
             weight: torch.Tensor = param.to_local()
-            grad: torch.Tensor = param.grad.to_local().to(momentum.dtype).reshape(momentum.shape)
+            grad: torch.Tensor = param.grad.to_local().reshape(momentum.shape)
             row_scale: torch.Tensor = state["row_scale"].to_local()
             row_scale_exp_avg: torch.Tensor = state["row_scale_exp_avg"].to_local()
             row_scale_exp_avg_sq: torch.Tensor = state["row_scale_exp_avg_sq"].to_local()
@@ -242,6 +242,7 @@ class FsdpAngularMuOwn(FsdpMuon):
                     nesterov=self.nesterov,
                 )
                 continue
+            grad = grad.to(momentum.dtype)
 
             # U = W / g, with |g| floored at norm_eps. copysign keeps g's sign and maps +0 to +eps.
             direction = weight / torch.copysign(row_scale.abs().clamp_min(self.norm_eps), row_scale)
