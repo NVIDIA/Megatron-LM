@@ -377,7 +377,8 @@ class OptimizerConfig:
     """Use :class:`LayerWiseDistributedOptimizer` for emerging optimizers (e.g. Muon).
     When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
     arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
-    that the standard distributed-optimizer path is not triggered."""
+    that the standard distributed-optimizer path is not triggered. With Megatron DDP, both
+    compact and shard-aligned layouts require one distributed optimizer instance."""
 
     use_layer_wise_param_layout: bool = True
     """Use shard-aligned parameter layouts with the layer-wise distributed optimizer."""
@@ -597,6 +598,18 @@ class OptimizerConfig:
                 self.overlap_param_gather
             ), 'Must use --overlap-param-gather-with-optimizer-step with --overlap-param-gather'
 
+    def validate_ddp_optimizer_instances(self, num_instances: int) -> None:
+        """Check the instance count for layer-wise optimizers using Megatron DDP."""
+        # The run config may still carry a distributed request or a legacy dist_* name.
+        layer_wise = self.use_layer_wise_distributed_optimizer or self.optimizer.startswith('dist_')
+        if self.optimizer not in ('adam', 'sgd') and self.use_distributed_optimizer:
+            layer_wise = True
+        if layer_wise and num_instances != 1:
+            raise ValueError(
+                "Layer-wise optimizers with DDP require "
+                f"num_distributed_optimizer_instances=1 (got {num_instances})."
+            )
+
     def validate_run(
         self,
         *,
@@ -605,6 +618,9 @@ class OptimizerConfig:
         ckpt_format: str | None,
     ) -> None:
         """Check settings shared with DDP and checkpointing without modifying them."""
+        if not use_torch_fsdp2 and not ddp_config.use_megatron_fsdp:
+            self.validate_ddp_optimizer_instances(ddp_config.num_distributed_optimizer_instances)
+
         if self.optimizer_cpu_offload:
             assert not ddp_config.fp8_param_gather or self.fp8_recipe == "delayed", (
                 "When `--fp8-param-gather` is enabled, the optimizer cpu offload "

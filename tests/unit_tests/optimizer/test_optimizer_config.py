@@ -1,9 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig, ParamKey, ParamPredicate
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 
 def test_layer_sharded_muon_tp_mode_requirements():
@@ -38,6 +42,50 @@ def test_factory_rejects_invalid_optimizer_config(optimizer):
     config = OptimizerConfig(optimizer=optimizer, lr=1e-3, muon_tp_mode="layer_sharded")
     with pytest.raises(ValueError, match="requires optimizer='muon'"):
         get_megatron_optimizer(config, [])
+
+
+@pytest.mark.parametrize("layout", [False, True], ids=["compact", "aligned"])
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"optimizer": "muon", "use_distributed_optimizer": True},
+        {"optimizer": "muon", "use_layer_wise_distributed_optimizer": True},
+        {"optimizer": "dist_muon"},
+        {"optimizer": "dist_adaptive_muon"},
+    ],
+)
+def test_layer_wise_ddp_rejects_multiple_instances(settings, layout):
+    """Validate explicit, implicit and legacy layer-wise requests before model setup."""
+    config = OptimizerConfig(**settings, use_layer_wise_param_layout=layout)
+    ddp = DistributedDataParallelConfig(num_distributed_optimizer_instances=2)
+    with pytest.raises(ValueError, match=r"num_distributed_optimizer_instances=1 \(got 2\)"):
+        config.validate_run(ddp_config=ddp, use_torch_fsdp2=False, ckpt_format="torch_dist")
+
+
+@pytest.mark.parametrize(
+    "optimizer, instances, mfsdp_v2", [("muon", 1, False), ("adam", 2, False), ("muon", 2, True)]
+)
+def test_ddp_instance_check_preserves_other_optimizer_modes(optimizer, instances, mfsdp_v2):
+    """Only layer-wise DDP owns this instance-count constraint."""
+    config = OptimizerConfig(optimizer=optimizer, use_distributed_optimizer=True)
+    ddp = DistributedDataParallelConfig(
+        num_distributed_optimizer_instances=instances,
+        use_megatron_fsdp=mfsdp_v2,
+        megatron_fsdp_version=2 if mfsdp_v2 else 1,
+    )
+    config.validate_run(ddp_config=ddp, use_torch_fsdp2=False, ckpt_format="torch_dist")
+
+
+def test_direct_layer_wise_factory_checks_ddp_instances():
+    """A caller supplying constructed model chunks receives the same actionable error."""
+    config = OptimizerConfig(optimizer="dist_muon")
+    chunk = SimpleNamespace(
+        ddp_config=DistributedDataParallelConfig(num_distributed_optimizer_instances=2)
+    )
+    with pytest.raises(ValueError, match=r"num_distributed_optimizer_instances=1 \(got 2\)"):
+        get_megatron_optimizer(
+            config, [chunk], config_overrides={}, pg_collection=ProcessGroupCollection()
+        )
 
 
 def test_paramkey_matches():
