@@ -226,9 +226,9 @@ class MTPMetadata:
 
         All three conditions below hold by construction. The caller derives `req_id` by matching
         `chunk_boundary_req_id` in its own request list, which settles the first two. The third
-        rests on `_compute_prefix_match` giving up a carry-holding continuation chunk's ENTIRE
-        prefix match, so the chunk starts at `finished` and its seam lands exactly where the
-        carry was recorded.
+        rests on `_compute_prefix_match` taking no prefix skip for a carry-holding continuation
+        chunk, so the chunk starts at `finished` and its seam lands exactly where the carry was
+        recorded.
 
         They RAISE rather than declining: skipping the seam would leave a committed position
         unwritten, a silent draft-acceptance regression that masks whichever invariant broke.

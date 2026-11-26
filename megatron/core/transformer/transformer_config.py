@@ -1366,6 +1366,12 @@ class TransformerConfig(ModelParallelConfig):
     minimum of 2 per-graph warmup steps regardless of this value, because the first warmup builds
     the weight-prefetch chain and the second exercises the prefetch path before capture."""
 
+    cuda_graph_pair_hybrid_layers: bool = False
+    """With cuda_graph_impl="transformer_engine", capture each Hybrid mixer layer and the MoE or
+    MLP layer that follows it as one CUDA graph instead of two, and also graph the layers of
+    Hybrid MTP blocks. Layers that cannot be paired keep their own graphs, and unsupported
+    configurations fall back with a warning; see docs/user-guide/features/cuda_graph.md."""
+
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.
     When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
