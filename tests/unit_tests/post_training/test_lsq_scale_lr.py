@@ -91,7 +91,6 @@ def test_shared_scale_policy_only_emits_differences(
         {"scale_min_lr": float("nan")},
         {"scale_wd_mult": float("inf")},
         {"scale_wd_mult": -0.5},
-        {"scale_min_lr": 2e-3},
     ],
 )
 def test_invalid_scale_policy(kwargs):
@@ -134,6 +133,30 @@ class TestLSQParamGroups:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("minimum", [1e-6, 1e-4])
+    def test_custom_minimum_is_validated_after_lsq_composition(self, minimum):
+        config = OptimizerConfig(lr=1e-3, min_lr=1e-4)
+        model = _toy_model()
+        lsq_hook(1e-5)([model])
+        custom = {ParamKey(name=("*_amax_pre", "*_amax_post")): {"min_lr": minimum}}
+        if minimum > 1e-5:
+            with pytest.raises(ValueError, match="minimum learning rate exceeds"):
+                build_optimizer_config_overrides(config, [model], custom)
+            return
+        groups = _get_param_groups(
+            [model], config, build_optimizer_config_overrides(config, [model], custom)
+        )
+        scale = model.linear.weight_quantizer._amax_pre
+        group = next(group for group in groups if any(param is scale for param in group["params"]))
+        assert (group["max_lr"], group["min_lr"]) == (1e-5, 1e-6)
+
+    def test_inherited_maximum_rejects_inverted_final_bounds(self):
+        config = OptimizerConfig(lr=1e-3, min_lr=1e-4)
+        model = _toy_model()
+        lsq_hook(None, scale_min_lr=2e-3)([model])
+        with pytest.raises(ValueError, match="minimum learning rate exceeds"):
+            build_optimizer_config_overrides(config, [model])
 
     def test_minimum_rate_and_weight_decay_reach_scale_groups(self):
         config = OptimizerConfig(lr=3e-5, min_lr=3e-6, weight_decay=0.1)

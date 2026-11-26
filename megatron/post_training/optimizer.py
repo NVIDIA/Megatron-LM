@@ -33,7 +33,7 @@ def get_lsq_config_overrides(
         scale_wd_mult: Weight-decay multiplier for the scales.
 
     Raises:
-        ValueError: If a scale setting is negative/nonfinite or the LR bounds are inverted.
+        ValueError: If a scale setting is negative/nonfinite or both explicit LR bounds are inverted.
 
     Returns:
         Scale-specific contributions, without standard weight-decay or decoupled-LR rules.
@@ -45,8 +45,10 @@ def get_lsq_config_overrides(
     ):
         if value is not None and (not math.isfinite(value) or value < 0):
             raise ValueError(f"LSQ {name} must be finite and nonnegative, got {value}.")
-    maximum = lsq_scale_lr if lsq_scale_lr is not None else base_lr
-    minimum = scale_min_lr if scale_min_lr is not None else base_min_lr
+    # Inherited bounds can still be overridden by a recipe after this contribution.
+    # Compare only explicit bounds here; validate the composed policy at setup.
+    maximum = lsq_scale_lr
+    minimum = scale_min_lr
     if maximum is not None and minimum is not None and minimum > maximum:
         raise ValueError("LSQ minimum learning rate must not exceed its maximum learning rate.")
     override = ParamGroupOverride()

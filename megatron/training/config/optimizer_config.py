@@ -95,9 +95,16 @@ def build_optimizer_config_overrides(
     for chunk in model_chunks:
         for name, param in chunk.named_parameters():
             if param.requires_grad:
-                combine_param_group_overrides(
+                effective = combine_param_group_overrides(
                     [value for selector, value in combined.items() if selector.matches(param, name)]
                 )
+                maximum = effective.get("max_lr", optimizer_config.lr)
+                minimum = effective.get("min_lr", optimizer_config.min_lr)
+                if maximum is not None and minimum is not None and minimum > maximum:
+                    raise ValueError(
+                        f"Optimizer minimum learning rate exceeds its maximum for {name}: "
+                        f"{minimum} > {maximum}."
+                    )
     defaults = {
         "max_lr": optimizer_config.lr,
         "min_lr": optimizer_config.min_lr,
