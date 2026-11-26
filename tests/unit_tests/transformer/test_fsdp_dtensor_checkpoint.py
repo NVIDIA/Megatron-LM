@@ -69,6 +69,8 @@ from megatron.training.checkpointing import (
     _load_base_checkpoint,
     preprocess_fsdp_dtensor_state_dict,
 )
+from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.test_utilities import Utils
 
 
 # ============================================================================
@@ -1403,8 +1405,9 @@ def _wrapped_chunk(layer_number):
     return chunk
 
 
-def test_loader_returns_virtual_chunk_sections(run_config, tmp_path):
+def test_loader_returns_virtual_chunk_sections(run_config, tmp_path_dist_ckpt):
     """The fsdp_dtensor loader names chunks' layers globally and hands each its section back."""
+    Utils.initialize_distributed()
     torch.manual_seed(0)
     chunks = [_wrapped_chunk(1), _wrapped_chunk(7)]  # Local layer 0 is global layer 0 and 6.
     saved = [copy.deepcopy(chunk.state_dict()) for chunk in chunks]
@@ -1413,17 +1416,18 @@ def test_loader_returns_virtual_chunk_sections(run_config, tmp_path):
     # The first stage keeps its keys; the later chunk takes global indices, wrapper prefix kept.
     assert list(state["model0"]) == list(saved[0])
     assert list(state["model1"]) == [k.replace("layers.0.", "layers.6.") for k in saved[1]]
-    dcp.save(state, checkpoint_id=tmp_path / "iter_0000001")
-    (tmp_path / "latest_checkpointed_iteration.txt").write_text("1")
+    with TempNamedDir(tmp_path_dist_ckpt / "vpp_loader_sections", sync=True) as load_dir:
+        dcp.save(state, checkpoint_id=load_dir / "iter_0000001")
+        (load_dir / "latest_checkpointed_iteration.txt").write_text("1")
 
-    chunks = [_wrapped_chunk(1), _wrapped_chunk(7)]
-    state = {f"model{i}": chunk.state_dict() for i, chunk in enumerate(chunks)}
-    state, *_ = _load_base_checkpoint(
-        tmp_path,
-        SimpleNamespace(),
-        sharded_state_dict={**state, "_model": chunks},
-        use_megatron_fsdp=True,
-    )
+        chunks = [_wrapped_chunk(1), _wrapped_chunk(7)]
+        state = {f"model{i}": chunk.state_dict() for i, chunk in enumerate(chunks)}
+        state, *_ = _load_base_checkpoint(
+            load_dir,
+            SimpleNamespace(),
+            sharded_state_dict={**state, "_model": chunks},
+            use_megatron_fsdp=True,
+        )
     for i, chunk in enumerate(chunks):
         chunk.load_state_dict(state[f"model{i}"])
         torch.testing.assert_close(chunk.state_dict(), saved[i])
