@@ -62,6 +62,44 @@ def _strip_wrapper_prefixes(path):
     return '.'.join(parts)
 
 
+def _pipeline_layer_prefixes(model):
+    """Map each pipeline layer's local path prefix to its global one, for ``_checkpoint_path``."""
+    prefixes = {}
+    for name, module in model.named_modules():
+        name = _strip_wrapper_prefixes(name)
+        match = re.fullmatch(r"(.*layers)\.(\d+)", name)
+        # Wrappers such as HyperConnectionHybridLayer carry the layer_number of the layer inside.
+        if match and hasattr(module, "layer_number") and "mtp" not in name:
+            prefixes[f"{name}."] = f"{match.group(1)}.{module.layer_number - 1}."
+    return prefixes
+
+
+def _checkpoint_path(name, layer_prefixes):
+    """``name`` without wrapper prefixes and with its pipeline layer index made global.
+
+    Every pipeline stage and virtual stage numbers its layers from zero; checkpoints use the
+    global index ``layer_number - 1``, as ``TransformerBlock.sharded_state_dict`` does.
+    """
+    path = _strip_wrapper_prefixes(name)
+    for local, global_ in layer_prefixes.items():
+        if f"{path}.".startswith(local):
+            return f"{global_}{path[len(local):]}".rstrip(".")
+    return path
+
+
+def handle_pipeline_layers_in_state_dict(model, model_state_dict):
+    """Name the pipeline layers in ``model``'s state dict by their global index.
+
+    Keys keep their wrapper prefixes, so checkpoints saved without pipeline stages still load.
+    """
+    layer_prefixes = _pipeline_layer_prefixes(model)
+    return {
+        key[: len(key) - len(_strip_wrapper_prefixes(key))]
+        + _checkpoint_path(key, layer_prefixes): value
+        for key, value in model_state_dict.items()
+    }
+
+
 def _is_mfsdp_v2_param(param):
     """Whether ``param`` is managed by MFSDP v2."""
     return get_containing_parameter_group(param) is not None
@@ -245,10 +283,11 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     # layers have gated_linear_unit=False while language decoder layers
     # have gated_linear_unit=True.
     # ------------------------------------------------------------------
+    layer_prefixes = _pipeline_layer_prefixes(model)
     _layer_glu = {}
     for name, module in model.named_modules():
         if isinstance(module, TransformerLayer):
-            _layer_glu[_strip_wrapper_prefixes(name)] = getattr(
+            _layer_glu[_checkpoint_path(name, layer_prefixes)] = getattr(
                 module.config, 'gated_linear_unit', False
             )
 
@@ -356,7 +395,9 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         )
         return weight_w, weight_v
 
-    parameters = {_strip_wrapper_prefixes(name): param for name, param in model.named_parameters()}
+    parameters = {
+        _checkpoint_path(name, layer_prefixes): param for name, param in model.named_parameters()
+    }
     model_state_dict = model_state_dict.copy()
     _swiglu_split_count = 0
     _swiglu_skip_count = 0
@@ -391,7 +432,13 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             opt_state_dict = optimizer_state_dict["state"]
             new_opt_state_dict = {}
             for key in list(opt_state_dict.keys()):
-                if not is_swiglu_key(key) or not _key_in_glu_layer(key):
+                local_key = _strip_wrapper_prefixes(expert_param_local_key(key, num_experts))
+                # With virtual pipeline stages, another chunk's states are split with that chunk.
+                if (
+                    not is_swiglu_key(key)
+                    or not _key_in_glu_layer(key)
+                    or local_key not in parameters
+                ):
                     new_opt_state_dict[key] = opt_state_dict[key]
                     continue
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
@@ -399,8 +446,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                 for subkey in ("exp_avg", "exp_avg_sq", "momentum_buffer"):
                     if subkey not in opt_state_dict[key]:
                         continue
-                    local_key = expert_param_local_key(key, num_experts)
-                    dist_param = parameters[_strip_wrapper_prefixes(local_key)]
+                    dist_param = parameters[local_key]
                     weight_w, weight_v = split_swiglu_linear_fc1(
                         opt_state_dict[key][subkey],
                         dist_param,
@@ -444,6 +490,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
     # in_proj_dim attributes (set in GatedDeltaNet.__init__).
     # ------------------------------------------------------------------
     _gdn_info = {}  # normalized_path → {in_proj_sizes, conv1d_sizes}
+    layer_prefixes = _pipeline_layer_prefixes(model)
     for name, mod in model.named_modules():
         if not (hasattr(mod, 'qk_dim') and hasattr(mod, 'v_dim') and hasattr(mod, 'in_proj_dim')):
             continue
@@ -451,7 +498,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         qk = mod.qk_dim // tp
         v = mod.v_dim // tp
         nvh = mod.num_value_heads // tp
-        _gdn_info[_strip_wrapper_prefixes(name)] = {
+        _gdn_info[_checkpoint_path(name, layer_prefixes)] = {
             'in_proj_sizes': [qk, qk, v, v, nvh, nvh],
             'conv1d_sizes': [qk, qk, v],
         }
@@ -531,7 +578,9 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         return results
 
     # ---- Model state dict ------------------------------------------------
-    parameters = {_strip_wrapper_prefixes(name): param for name, param in model.named_parameters()}
+    parameters = {
+        _checkpoint_path(name, layer_prefixes): param for name, param in model.named_parameters()
+    }
     model_state_dict = model_state_dict.copy()
     _gdn_split_count = 0
     for key in list(model_state_dict.keys()):
@@ -676,11 +725,12 @@ def get_mla_fused_down_proj_splits(model):
     tensor-parallel-unsharded units. Returns an empty dict for unfused models.
     """
     splits = {}
+    layer_prefixes = _pipeline_layer_prefixes(model)
     for name, mod in model.named_modules():
         if not hasattr(mod, MLA_FUSED_DOWN_PROJ):
             continue
         config = mod.config
-        splits[_strip_wrapper_prefixes(name)] = [
+        splits[_checkpoint_path(name, layer_prefixes)] = [
             config.q_lora_rank,
             config.kv_lora_rank + config.qk_pos_emb_head_dim,
         ]
@@ -741,7 +791,10 @@ def handle_mla_down_proj_in_state_dict(model, model_state_dict, optimizer_state_
 
     rewritten = 0
 
-    parameters = {_strip_wrapper_prefixes(name): param for name, param in model.named_parameters()}
+    layer_prefixes = _pipeline_layer_prefixes(model)
+    parameters = {
+        _checkpoint_path(name, layer_prefixes): param for name, param in model.named_parameters()
+    }
     model_state_dict = model_state_dict.copy()
     for key in list(model_state_dict.keys()):
         match = match_mla_fused_down_proj_key(key, fused_splits)
@@ -1104,23 +1157,14 @@ def get_global_unique_param_name(model_chunks, param):
     for model in model_chunks:
         for name, p in model.named_parameters():
             if p is param:
-                param_name = name
+                # Keep the wrapper prefix; give the pipeline layer its global index.
+                wrapper = name[: len(name) - len(_strip_wrapper_prefixes(name))]
+                param_name = wrapper + _checkpoint_path(name, _pipeline_layer_prefixes(model))
                 break
+        if param_name is not None:
+            break
     if param_name is None:
         raise ValueError("Parameter not found in model chunks")
-
-    # Get PP unique parameter name
-    if re.search(r"layers\.(\d+)", param_name) and "mtp" not in param_name:
-        tf_layer_number = -1
-        for module in model.modules():
-            if not isinstance(module, TransformerLayer):
-                continue
-            for p in module.parameters():
-                if p is param:
-                    tf_layer_number = module.layer_number
-                    break
-        if tf_layer_number != -1:
-            param_name = re.sub(r"layers\.(\d+)", f"layers.{tf_layer_number - 1}", param_name)
 
     # Get EP unique parameter name
     num_experts = model_chunks[0].config.num_moe_experts if model_chunks else None
