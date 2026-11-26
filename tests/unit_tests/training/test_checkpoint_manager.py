@@ -348,9 +348,15 @@ class TestGetCheckpointManager:
 
 
 class TestCheckpointConfigValidation:
-    def test_custom_manager_class_must_be_fully_qualified(self):
-        with pytest.raises(AssertionError, match="fully qualified"):
+    def test_custom_manager_class_must_be_allowlisted(self):
+        with pytest.raises(AssertionError, match="allowlist"):
             CheckpointConfig(custom_manager_class="NoDotsInThisName").validate()
 
-    def test_fully_qualified_custom_manager_class_is_accepted(self):
-        CheckpointConfig(custom_manager_class="mypackage.module.Manager").validate()
+    def test_allowlisted_custom_manager_class_is_accepted(self):
+        from megatron.training.config.instantiate_utils import target_allowlist
+
+        target_allowlist.add_prefix("mypackage.")
+        try:
+            CheckpointConfig(custom_manager_class="mypackage.module.Manager").validate()
+        finally:
+            target_allowlist.remove_prefix("mypackage.")
