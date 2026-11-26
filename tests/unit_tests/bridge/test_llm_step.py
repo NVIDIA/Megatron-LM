@@ -2,6 +2,8 @@
 
 """The packaged text step preserves MLM's batch partitioning and masked loss."""
 
+import logging
+import warnings
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,13 +16,21 @@ from megatron.training.config import DataConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDatasetConfig
 from megatron.training.forward_steps import llm_step
 from megatron.training.models.hybrid import HybridModelConfig
+from tests.unit_tests.process_group_test_utils import cleanup_process_groups
 from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.mark.parametrize("tp,pp,cp", [(2, 1, 1), (1, 2, 1), (1, 1, 2)])
 @pytest.mark.parametrize("packed", [False, True])
 def test_batch_matches_existing_mlm_partitioning(run_config, tp, pp, cp, packed):
-    from pretrain_hybrid import get_batch as existing_get_batch
+    # Importing the entrypoint configures logging and warnings for the whole process.
+    pytree_logger = logging.getLogger("torch.utils._pytree")
+    original_level = pytree_logger.level
+    try:
+        with warnings.catch_warnings():
+            from pretrain_hybrid import get_batch as existing_get_batch
+    finally:
+        pytree_logger.setLevel(original_level)
 
     Utils.initialize_model_parallel(tp, pp, context_parallel_size=cp)
     try:
