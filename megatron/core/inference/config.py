@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, List, Literal, Optional, Sequence, Tuple, Unio
 
 import torch
 
+from megatron.core.enums import Fp8Recipe
+from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_attr_wrapped_model
@@ -554,7 +556,8 @@ class InferenceConfig:
     max_tokens: Optional[int] = None
     """
     Max number of tokens to use for forward passes. This is primarily limited by prefill activation
-    memory usage. (Defaults to 16384).
+    memory usage. Must be divisible by the tensor parallel size. Batch-invariant inference also
+    requires alignment to the dynamic context's token rounding size. (Defaults to 16384).
     """
 
     unified_memory_level: int = 0
@@ -570,6 +573,14 @@ class InferenceConfig:
     """
     Mode used to determine how large tensors are handled by the allocate and deallocate methods.
     See `KVCacheManagementMode` for options.
+    """
+
+    start_suspended: bool = False
+    """
+    Construct the engine in the `SUSPENDED` state instead of `RUNNING`, so it can be built
+    before its weights are in place. CUDA-graph capture waits for the first `resume()`.
+    The inference-state buffers are still allocated at construction and are then held or
+    released according to `kv_cache_management_mode`, as after a regular `suspend()`.
     """
 
     # =================================
@@ -784,6 +795,15 @@ class InferenceConfig:
     kv_transport_backend: Literal["nixl", "nccl"] = "nixl"
     """Backend for disaggregated KV and recurrent-state transfers."""
 
+    disaggregation_role: Optional[Literal["prefill", "decode"]] = None
+    """This engine's side of a prefill/decode split, or None when not disaggregated.
+
+    Must be set before the context is built: a decode context drops
+    ``prefix_caching_mamba_gb``, so one config can serve both roles. Native disaggregation
+    sets it from ``disaggregation_shards``; callers that build their own context set it
+    directly.
+    """
+
     # =================================
     # Logging config
     # =================================
@@ -896,10 +916,39 @@ class InferenceConfig:
             )
         if model_config.params_dtype != torch.bfloat16:
             raise ValueError("inference_shortcut_moe_overlap requires BF16 model parameters")
-        if model_config.fp8 or model_config.fp4:
-            raise ValueError("Shortcut MoE overlap with FP8 or FP4 requires further testing")
-        if model_config.tensor_model_parallel_size != 1 or model_config.context_parallel_size != 1:
-            raise ValueError("inference_shortcut_moe_overlap requires TP=1 and CP=1")
+        if model_config.fp4:
+            raise ValueError("Shortcut MoE overlap with FP4 requires further testing")
+        if model_config.fp8 and (
+            model_config.fp8_recipe != Fp8Recipe.mxfp8
+            or model_config.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
+        ):
+            raise ValueError(
+                "Shortcut MoE overlap with FP8 requires fp8_recipe='mxfp8' and "
+                "inference_grouped_gemm_backend='flashinfer'. Other backends are intended for "
+                "testing, not performance. Other FP8 recipes require further testing."
+            )
+        if model_config.fp8 and model_config.activation_func_tanh_clamp_scale is None:
+            raise ValueError(
+                "MXFP8 shortcut overlap requires activation_func_tanh_clamp_scale "
+                "for FlashInfer CUTLASS; the routed path is not yet validated."
+            )
+        if model_config.context_parallel_size != 1:
+            raise ValueError("inference_shortcut_moe_overlap requires CP=1")
+        # TP > 1 is safe because every TP-group collective stays on the main stream: see
+        # ShortcutMoEBlock._forward_inference_overlap. These checks keep it that way.
+        if model_config.tensor_model_parallel_size > 1 and not model_config.sequence_parallel:
+            raise ValueError("inference_shortcut_moe_overlap with TP>1 requires sequence_parallel")
+        if model_config.moe_shared_expert_overlap:
+            # Would run the shared expert's TP collectives on a third stream.
+            raise ValueError(
+                "inference_shortcut_moe_overlap requires moe_shared_expert_overlap=False"
+            )
+        if model_config.inference_fuse_tp_communication:
+            # Its fused reduce-scatter writes the residual (the pair input) in place on the
+            # main stream while the shortcut stream reads that input.
+            raise ValueError(
+                "inference_shortcut_moe_overlap requires inference_fuse_tp_communication=False"
+            )
         if model_config.inference_moe_token_dispatcher_type != "nvls":
             raise ValueError("inference_shortcut_moe_overlap requires the NVLS dispatcher")
         if model_config.inference_disable_triton_nvls_kernels:
@@ -914,6 +963,23 @@ class InferenceConfig:
                 "inference_shortcut_moe_overlap requires further testing with batch-invariant mode "
                 "or CuTeDSL GDP kernels"
             )
+
+    def resolve_pg_collection(self) -> ProcessGroupCollection:
+        """Return the configured process groups, falling back to the MPU globals.
+
+        This is the compatibility boundary for inference: engines and wrappers call it and can then
+        assume a collection, instead of each re-deriving one from global state. Resolution is lazy
+        so it happens after ``initialize_model_parallel``, not at config construction.
+
+        The fallback is returned without being stored on the config. ``pg_collection`` stays
+        ``None`` unless the caller set it, because the inference context and controller read that
+        field and treat ``None`` as "no explicit collection". Storing the global groups would
+        change which branch they take depending on which component resolved first, and would pin
+        the groups of one parallel-state initialization onto a long-lived config.
+        """
+        if self.pg_collection is not None:
+            return self.pg_collection
+        return ProcessGroupCollection.use_mpu_process_groups()
 
     def __post_init__(self, verbose: bool):
         self._verbose = verbose

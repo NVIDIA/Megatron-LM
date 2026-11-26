@@ -11,6 +11,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -389,6 +391,46 @@ def load_residual_state(
             if key.startswith(prefix + legacy):
                 state_dict[prefix + current + key[len(prefix + legacy) :]] = state_dict.pop(key)
                 break
+
+
+def has_combined_residual_keys(checkpoint_keys) -> bool:
+    """Whether a distributed checkpoint stores each residual branch as one combined module.
+
+    Such checkpoints key the read map, write map and retention of a branch under
+    residual_connection{suffix} rather than residual_read{suffix} / residual_write{suffix}.
+
+    Args:
+        checkpoint_keys: ShardedTensor keys of the checkpoint, e.g.
+            dist_checkpointing.load_tensors_metadata(checkpoint_dir).keys().
+    """
+    combined_prefixes = tuple(combined for _, combined in _RESIDUAL_STATE_PREFIXES)
+    return any(
+        key.startswith(combined) or f".{combined}" in key
+        for key in checkpoint_keys
+        for combined in combined_prefixes
+    )
+
+
+def apply_combined_residual_keys(
+    sharded_state_dict: ShardedStateDict, prefix: str, metadata: dict | None
+) -> None:
+    """Address a layer's residual tensors by their combined residual_connection{suffix} keys.
+
+    The loader sets metadata['combined_residual_keys'] for checkpoints that store each residual
+    branch as one combined module; other checkpoints keep the residual_read{suffix} /
+    residual_write{suffix} keys.
+
+    Args:
+        sharded_state_dict: The layer's sharded state dict, renamed in place.
+        prefix: The layer's state dict prefix.
+        metadata: Sharded state dict metadata from the checkpoint load, or None.
+    """
+    if not metadata or not metadata.get("combined_residual_keys"):
+        return
+    apply_prefix_mapping(
+        sharded_state_dict,
+        {f"{prefix}{split}": f"{prefix}{combined}" for split, combined in _RESIDUAL_STATE_PREFIXES},
+    )
 
 
 class StreamwiseSigmoidResidualReadout(nn.Module):
