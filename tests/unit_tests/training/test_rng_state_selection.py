@@ -134,7 +134,11 @@ def _stored_names(key, n):
 
 @pytest.mark.parametrize(
     ("saved_entries", "local_entries"),
-    [(2, 4), (4, 1), (1, 4)],  # old DP-only list; saved-true/current-false; saved-false/current-true
+    [
+        (2, 4),
+        (4, 1),
+        (1, 4),
+    ],  # old DP-only list; saved-true/current-false; saved-false/current-true
 )
 def test_fsdp_template_follows_the_stored_list_length(saved_entries, local_entries):
     local = {"(0, 0)": [{"random_rng_state": i} for i in range(local_entries)]}
