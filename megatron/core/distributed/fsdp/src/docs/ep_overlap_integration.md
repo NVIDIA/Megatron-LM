@@ -9,15 +9,9 @@
 
 # M-FSDP v2 integration with EP overlap
 
-Combined 1F1B executes a layer through fine-grained schedule nodes. Some nodes
-call submodules directly, bypassing the owning `FsdpModule.forward()` and its
-ordinary execution hooks. The integration gathers parameters at the submodule
-calls that consume them and lets the schedule choose when to release parameters
-and submit completed gradients for reduction.
+The EP overlap schedule (implemented by the combined 1F1B scheduler and enabled by `overlap_moe_expert_parallel_comm`) executes each layer as a sequence of fine-grained schedule nodes. Some of these nodes call submodules directly and therefore bypass the owning `FsdpModule.forward()` and its ordinary execution hooks. To compensate, the integration (1) gathers parameters on demand, at the submodule call that consumes them, and (2) lets the schedule decide when to release parameters and when to submit completed gradients for reduction.
 
-`FsdpModule` owns parameter materialization and gradient reduction.
-`FsdpContext` owns communication streams and execution-order state. The EP
-overlap schedule supplies the forward and backward completion boundaries.
+`FsdpModule` owns parameter materialization and gradient reduction. `FsdpContext` owns the communication streams and execution-order state. The EP overlap schedule supplies the forward and backward completion boundaries.
 
 ## Persistent hooks and per-microbatch callbacks
 
@@ -26,12 +20,7 @@ overlap schedule supplies the forward and backward completion boundaries.
 | `setup_mfsdp_v2_ep_overlap()` calls `register_fsdp_module_hooks()` after wrapping | Persistent hooks on the model | Gather an owning unit before a parameter-bearing submodule's forward or backward; release gathered parameters after evaluation forwards. |
 | `TransformerModelChunkSchedulePlan.register_fsdp_hooks()` calls `register_fsdp_ep_overlap_schedule_hooks()` | Callbacks bound to one microbatch's schedule plan | Release layer parameters after forward, complete each unit at its last scheduled backward use, and complete remaining units at the chunk boundary. |
 
-The adapter sets `SchedulePolicy.register_hooks=False` for EP overlap, so the
-ordinary FSDP module hooks and parameter-gradient countdown do not also perform
-these operations. The persistent integration hooks remain active across
-microbatches; creating a plan binds callbacks to its nodes without registering
-another set of module hooks. `release_state()` drops the completed plan's
-references.
+The adapter sets `SchedulePolicy.register_hooks=False` for EP overlap, so the ordinary FSDP module hooks and the per-parameter gradient countdown do not duplicate these operations. The persistent hooks stay registered across microbatches. Creating a schedule plan only binds callbacks to its nodes and does not register another set of module hooks; `release_state()` drops the finished plan's references.
 
 ## Demand gathering
 
@@ -40,10 +29,8 @@ The persistent hooks walk the module tree while tracking the nearest enclosing
 a parameter-bearing submodule runs forward or backward, its hook calls the
 owner's `unshard()`.
 
-Root-owned parameters also need stream preparation: their forward demand hook
-orders all-gather after the current stream, and their backward demand hook calls
-`FsdpContext.pre_backward()` before unsharding. This makes the reduction stream
-participate in an active CUDA Graph capture.
+Root-owned parameters need extra stream preparation. Their forward demand hook orders the all-gather after the current stream. Their backward demand hook calls `FsdpContext.pre_backward()` before unsharding, which makes the reduction stream wait on the current stream so that it is included when a CUDA Graph is being captured.
+
 
 Demand gathering makes weights available where the fine-grained schedule uses
 them. Parameter release and gradient completion use the explicit boundaries
@@ -87,21 +74,9 @@ forward callback to `moe_combine`, or `mlp` for a dense layer. It reshards that
 layer module and its independently sharded descendants. For an MTP plan, the
 forward callback receives `mtp_model_layer`.
 
-The layer's backward callback belongs to `pre_dispatch_computation`, the first
-forward node and last backward node. Without delayed wgrad it runs after that
-node's `backward()`. With delayed wgrad it runs after `backward_dw()`, including
-the first forward layer's wgrad deferred until after the layer loop. The
-callback invokes `complete_fsdp_unit_backward()` for the units assigned to
-that layer plan: `reshard()` releases gathered parameters and
-`post_accumulate_grad()` packs gradients and submits their reductions.
+The layer's backward callback is attached to `pre_dispatch_computation`, which is the first forward node and the last backward node of a layer. Without delayed wgrad, the callback runs after that node's `backward()`. With delayed wgrad, it runs after `backward_dw()`. For the first layer in forward order, `backward_dw()` is deferred until after the layer loop, so the callback fires then. The callback calls `complete_fsdp_unit_backward()` on the units assigned to that layer plan: `reshard()` releases the gathered parameters, and `post_accumulate_grad()` packs the gradients and submits their reductions.
 
-`register_fsdp_ep_overlap_schedule_hooks()` discovers units from the outer
-model chunk, including its wrappers. It assigns each unit once, visiting layer
-plans in forward order. A unit repeated in several plans is assigned to its
-first forward occurrence, which finishes last in backward. Units outside the
-layer plans stay in a closure owned by the chunk plan. After
-`pre_process.backward()` and the chunk's stream dependency, the chunk callback
-completes those remaining units, including the root.
+`register_fsdp_ep_overlap_schedule_hooks()` discovers FSDP units from the outer model chunk, including any wrappers, and visits layer plans in forward order. Each unit is assigned exactly once. A unit that appears in several plans goes to its first forward occurrence, which is its last use in backward. Units outside every layer plan, including the root, are held by the chunk plan and completed after `pre_process.backward()` and the chunk's stream dependency.
 
 For supported untied MTP models, root-owned embedding and output-head
 parameters can receive contributions from several nodes or depths. They remain
@@ -111,24 +86,11 @@ their assigned schedule boundary are outside this integration's contract.
 
 ## Schedule completion and gradient visibility
 
-The MCore adapter uses `autograd_completes_execution=False` because one
-schedule contains multiple autograd backward calls. After all microbatch
-backward work, `finalize_model_grads()` calls `FsdpContext.post_backward()` once
-for the shared context to finish execution-order tracking. That context-level
-operation is distinct from completing an individual unit's gradients.
+The MCore adapter sets `autograd_completes_execution=False` because one schedule contains multiple autograd backward calls. After all microbatch backward work finishes, `finalize_model_grads()` calls `FsdpContext.post_backward()` once on the shared context to complete execution-order tracking. This is separate from completing an individual unit's gradients.
 
-Unit completion submits the reductions allowed by the current gradient
-finalization mode. `SKIP_OUTER` omits outer-DP reduction during accumulation;
-the final microbatch must submit the required outer reductions. The adapter's
-`finish_grad_sync()` then delegates to the context to order the current stream
-after submitted inner- and outer-reduction work before gradients are consumed.
-It enqueues GPU stream dependencies without blocking the CPU, and does not
-launch reductions skipped earlier.
+Unit completion submits the reductions allowed by the current gradient-finalization mode. With `SKIP_OUTER`, outer-DP reduction is skipped during accumulation, so the final microbatch must submit it. The adapter's `finish_grad_sync()` then makes the current stream wait on all submitted inner and outer reductions before gradients are consumed. It only enqueues GPU stream dependencies, so it does not block the CPU, and it does not launch reductions that were skipped earlier.
 
-Evaluation uses the ordinary forward path without a combined training plan.
-The persistent forward post-hook on each `FsdpModule` calls `reshard()` when
-`module.training` is false, so evaluation releases gathered weights without
-waiting for a training-plan callback.
+Evaluation uses the ordinary forward path without a combined training plan. The persistent forward post-hook on each `FsdpModule` calls `reshard()` when `module.training` is false, so evaluation releases gathered weights without waiting for a training-plan callback.
 
 ## Implementation references
 
