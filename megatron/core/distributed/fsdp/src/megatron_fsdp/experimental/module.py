@@ -175,7 +175,9 @@ class FsdpModule:
 
         Without input gradients, PyTorch's module hook fires before internal
         backward. Defer that case to autograd completion instead.
-        Custom schedulers must call context.post_backward() after each microbatch's backward.
+        Custom schedulers that bypass the autograd completion callback must call
+        ``context.post_microbatch()`` after each microbatch's backward to release deferred
+        weights, then ``context.post_backward()`` once after the complete schedule.
         """
 
         def grad_checking_post_backward_hook(module, grad_input, _grad_output):
