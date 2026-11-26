@@ -5,6 +5,7 @@
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, fields, replace
+from fnmatch import fnmatchcase
 from typing import Literal
 
 from megatron.core.optimizer import (
@@ -80,25 +81,38 @@ class LoRAPlusOptimizerOverrides:
 
 
 def validate_lora_plus_warmup(
-    overrides: OptimizerConfigOverrides | None, optimizer_config: OptimizerConfig, initial_lr: float
+    overrides: OptimizerConfigOverrides | None,
+    optimizer_config: OptimizerConfig,
+    initial_lr: float,
+    *,
+    require_adapter_selector: bool = True,
 ) -> None:
-    """Reject unequal named A/B bounds with a shared nonzero initial warmup LR.
+    """Check composed name-based adapter bounds without depending on rank-local parameters.
 
-    Check the policy rather than local parameter presence so pipeline ranks agree.
-    This covers name-only mappings using the exact standard adapter globs.
-    More general selectors must supply their own validation.
+    MLM can receive arbitrary model policies. By default, only check when a name-only
+    selector explicitly targets adapter A or B. Bridge historically checks all named
+    policies and can opt into that behavior. Predicates cannot be evaluated from a name.
     """
     if not overrides or initial_lr == 0:
         return
-    # Only the explicit standard adapter policy establishes LoRA intent. Arbitrary
-    # globs and OR-combined predicates may describe ordinary model parameters.
-    # Their authors own validation; do not invent parameters to evaluate them.
+    named = [
+        (selector, (selector.name,) if isinstance(selector.name, str) else selector.name, value)
+        for selector, value in overrides.items()
+        if selector.name
+    ]
+    if require_adapter_selector and not any(
+        pattern.endswith(("linear_in.weight", "linear_out.weight"))
+        for selector, patterns, _ in named
+        if not (selector.attr or selector.predicate or selector.with_name_predicate)
+        for pattern in patterns
+    ):
+        return
     bounds = []
-    for pattern in ("*.linear_in.weight", "*.linear_out.weight"):
+    for name in ("adapter.linear_in.weight", "adapter.linear_out.weight"):
         matched = [
             value
-            for selector, value in overrides.items()
-            if selector in (ParamKey(name=pattern), ParamKey(name=(pattern,)))
+            for _, patterns, value in named
+            if any(fnmatchcase(name, pattern) for pattern in patterns)
         ]
         policy = combine_param_group_overrides(matched)
         bounds.append(

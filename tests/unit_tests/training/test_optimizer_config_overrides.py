@@ -362,6 +362,17 @@ def test_lora_plus_warmup_accepts_absent_policies(overrides):
     validate_lora_plus_warmup(overrides, OptimizerConfig(lr=0.001), 0.0001)
 
 
+@pytest.mark.parametrize("name", ["*linear_out.weight", ("*.linear_out.weight", "*.other")])
+def test_warmup_composes_all_matching_name_selectors(name):
+    config = OptimizerConfig(lr=0.001, min_lr=0.0001)
+    raised = {"max_lr": 0.004}
+    mapping = {ParamKey(name=name): raised}
+    with pytest.raises(ValueError, match="lr_warmup_init=0"):
+        validate_lora_plus_warmup(mapping, config, 1e-5)
+    mapping[ParamKey(name="*.weight")] = raised
+    validate_lora_plus_warmup(mapping, config, 1e-5)
+
+
 @pytest.mark.parametrize("mixed", [False, True])
 def test_warmup_does_not_infer_lora_from_general_selectors(mixed):
     selector = (

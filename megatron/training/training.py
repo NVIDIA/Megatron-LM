@@ -2637,12 +2637,12 @@ def setup_model_and_optimizer(
             cfg.optimizer_config_overrides,
             mode=cfg.optimizer_config_overrides_mode,
         )
-        validate_lora_plus_warmup(optim_cfg_overrides, optim_cfg, cfg.scheduler.lr_warmup_init)
         optim_cfg.timers = timers
 
         # Legacy callers may supply a model/optimizer config without finalized scheduler
         # horizons. As in get_optimizer_param_scheduler, use the finalized run settings.
         run_cfg = get_run_config()
+        validate_lora_plus_warmup(optim_cfg_overrides, optim_cfg, run_cfg.scheduler.lr_warmup_init)
         optimizer, opt_param_scheduler = setup_optimizer(
             run_cfg.optimizer,
             run_cfg.scheduler,
