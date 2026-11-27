@@ -205,6 +205,14 @@ class OptimizerConfig:
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights. Defaults to torch.float32."""
 
+    fp8_param_rounding: str = "nearest"
+    """How FP32 master shards round to FP8 params with --fp8-param-gather and the blockwise recipe:
+    "nearest" (Transformer Engine's default) or "fixed_threshold" (a fixed per-weight threshold, see
+    megatron.core.fp8_param_rounding)."""
+
+    fp8_param_rounding_seed: int = 0
+    """Seed for the per-weight thresholds of fixed-threshold FP8 param rounding."""
+
     use_precision_aware_optimizer: bool = False
     """If true, allows optimizer-related tensors (master_param, gradients and optimizer states)
     to be set to lower precision. Defaults to False.

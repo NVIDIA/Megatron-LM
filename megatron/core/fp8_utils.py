@@ -688,12 +688,30 @@ def modify_underlying_storage(tensor: torch.Tensor, new_raw_data: torch.Tensor):
 
 # Interface Function
 def quantize_param_shard(
-    model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params=None
+    model_params,
+    main_params,
+    start_offsets,
+    data_parallel_group,
+    fsdp_shard_model_params=None,
+    rounding: str = "nearest",
+    rounding_seed: int = 0,
 ):
-    """Cast shard fp32 main params to fp8 model params."""
-    _quantize_param_shard_impl(
-        model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params
-    )
+    """Cast shard fp32 main params to fp8 model params.
+
+    ``rounding="fixed_threshold"`` applies fixed-threshold rounding to the blockwise recipe (see
+    ``megatron.core.fp8_param_rounding``). Other recipes always round to nearest.
+    """
+    context = nullcontext()
+    if rounding == "fixed_threshold":
+        from megatron.core.fp8_param_rounding import fixed_threshold_blockwise_cast
+
+        context = fixed_threshold_blockwise_cast(rounding_seed)
+    elif rounding != "nearest":
+        raise ValueError(f"Unknown fp8 param rounding: {rounding}")
+    with context:
+        _quantize_param_shard_impl(
+            model_params, main_params, start_offsets, data_parallel_group, fsdp_shard_model_params
+        )
 
 
 # Interface Function
