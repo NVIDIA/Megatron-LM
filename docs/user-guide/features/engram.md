@@ -24,8 +24,13 @@ as [NVIDIA/Megatron-LM#7224](https://github.com/NVIDIA/Megatron-LM/pull/7224) im
 which has no short convolution.
 
 The tables dominate the memory: one table set can hold hundreds of millions of rows. They are
-always sharded by rows, in the EP layout: rows are sharded over the expert-parallel (EP) group
-and replicated over expert-data-parallel. Lookups use NCCL all-to-alls.
+always sharded by rows, and you choose the layout:
+
+- **EP layout** (the default). Rows are sharded over the expert-parallel (EP) group and
+  replicated over expert-data-parallel. Lookups use NCCL all-to-alls.
+- **DP x CP layout** (`--engram-parallel-size P`). Rows are sharded over `P` consecutive ranks
+  of each pipeline stage's data-parallel times context-parallel group, which contains the EP
+  group. Each shard is replicated over the remaining ranks. Lookups use NCCL all-to-alls.
 
 ## Quick start
 
@@ -36,6 +41,16 @@ python pretrain_hybrid.py ... \
     --expert-model-parallel-size 8 \
     --engram-vocab-sizes 129280 129280 --engram-layer-ids 2 10 \
     --engram-variant qwen --engram-eos-token-id 151643 --engram-unigram-vocab-size 151936
+```
+
+DP x CP layout with every row owned by one rank of a 128-rank data-parallel group:
+
+```bash
+python pretrain_hybrid.py ... \
+    --use-distributed-optimizer \
+    --engram-vocab-sizes 129280 129280 --engram-layer-ids 2 10 \
+    --engram-variant qwen --engram-eos-token-id 151643 --engram-unigram-vocab-size 151936 \
+    --engram-parallel-size 128
 ```
 
 ## Variants
@@ -91,6 +106,8 @@ Engram is enabled by `--engram-vocab-sizes`.
 | `--engram-embedding-lr-multiplier` | 5.0 | Multiplier on the tables' maximum and minimum learning rates |
 | `--engram-embedding-weight-decay` | 0.0 | Weight decay of the tables |
 | `--engram-freeze-embedding` | off | Keep the tables fixed; the dense part still trains |
+| `--engram-parallel-size` | – | Use the DP x CP layout with row groups of this many ranks |
+| `--engram-max-parallel-size` | – | Use the DP x CP layout with row groups of at most this many ranks (see [Choosing the number of row shards](#choosing-the-number-of-row-shards)) |
 
 Layer IDs follow `--hybrid-layer-pattern` with the pipeline separators (`|`) removed, so the
 same IDs work for any pipeline split. A selected layer must be a transformer layer (attention,
@@ -116,12 +133,103 @@ EP group. Engram issues its own all-to-alls over the EP group, separately from t
 dispatcher, so it works with any dispatcher. `--moe-expert-rank-capacity-factor` is rejected
 (see the limitations).
 
+### DP x CP layout
+
+`--engram-parallel-size P` reads each pipeline stage's data-parallel times context-parallel
+group (dp_cp) in rank order as a `[replica, shard]` mesh. Rows are sharded over `P` consecutive
+ranks and replicated over the ranks at the same position in the other shards. `P` must divide
+the size of dp_cp. With tensor and expert-tensor parallel sizes of 1, dp_cp contains every EP
+group as a contiguous block, so:
+
+- `P = size(dp_cp)` gives every row a single owner, which minimizes table memory;
+- `P = size(EP)` reproduces the EP layout's row ranges, initialization and checkpoint shards.
+
+The tables form their own parameter domain (`engram`), with their own DDP buffers and their own
+distributed optimizer over the replica group. When the replica group has one rank, it is never
+reduced, and no communicator is created for it.
+
+Requirements:
+
+- `--use-distributed-optimizer` (also with Muon, in its default layer-wise parameter layout, not
+  `--no-use-layer-wise-param-layout`) and `--num-distributed-optimizer-instances 1`;
+- tensor-parallel and expert-tensor-parallel sizes of 1, and no GTP;
+- a distributed checkpoint format;
+- no Megatron-FSDP or FSDP2, no `--overlap-param-gather-with-optimizer-step`, and no
+  `--distrib-optim-fully-reshardable-mem-efficient` together with
+  `--dist-ckpt-optim-fully-reshardable`;
+- no `--tensor-metrics`;
+- with `--fake-process-group`, a single pipeline stage.
+
+#### Choosing the number of row shards
+
+`P` is the number of row shards of every table, and every shard has `size(dp_cp) / P` replicas.
+With `T` table parameters in a pipeline stage, each rank of the stage holds about:
+
+- `T / P` parameters, and as many gradients in the gradient buffer (FP32 by default, so twice
+  the bytes of BF16 parameters);
+- the optimizer state of `T / size(dp_cp)` parameters, whatever `P` is: the tables' distributed
+  optimizer splits the state of a shard evenly over its replicas.
+
+Doubling `P` to `2P` therefore frees the parameters and gradients of `T / (2P)` table
+parameters on each rank, half of what the doubling before it freed.
+
+A shard with more than one replica (`P < size(dp_cp)`) is kept in sync densely. In every
+training step, DDP reduce-scatters the whole gradient buffer of a rank's shards over the
+replica group, and the parameter all-gather after the optimizer step fills the whole parameter
+buffer over it, whichever rows the step looked up. With one owner per row
+(`P = size(dp_cp)`), both are skipped. Frozen tables (`--engram-freeze-embedding`) have no
+gradient buffer and no optimizer state, and neither collective runs for them.
+
+A smaller `P` does not shrink the lookup: the rows a rank looks up, and the gradient rows it
+returns in backward, are set by the token positions it holds, whatever `P` is. `P` sets where
+they go: to the owners of the rows among the `P` ranks of the row group, the rank itself
+included. A smaller `P` thus gives each rank fewer peers, and keeps the lookup inside a node or
+an NVLink domain when the row group fits in one. With `P = 1`, each rank holds whole tables and
+looks rows up locally.
+
+A row group is `P` consecutive ranks of dp_cp, in increasing global rank. In the default rank
+order, the ranks of a pipeline stage are consecutive, so each row group is a run of `P`
+consecutive global ranks that starts at a multiple of `P`. If the launcher places the global
+ranks in order, `G` on each node or in each NVLink domain, every row group stays inside one
+node or domain when `P` divides `G`. With `--use-tp-pp-dp-mapping` and several pipeline stages,
+the ranks of a stage are interleaved with those of the other stages, and this rule does not
+apply.
+
+`--engram-max-parallel-size C` is given instead of `--engram-parallel-size` (passing both is
+rejected) and sets `P = min(size(dp_cp), C)` at startup; a dp_cp size above `C` must be a
+multiple of `C`. One set of arguments then serves every such job size. Up to `C` ranks in
+dp_cp, each row has one owner; from `C` ranks on, the tables keep `C` row shards and only gain
+replicas. Moving a run between two job sizes changes `P`, and so reshards the tables, unless
+both have at least `C` ranks in dp_cp; see [Checkpointing](#checkpointing) for what loads
+across a change of `--engram-parallel-size`.
+
 ## Lookup
 
 The owner of each row is computed in closed form. Requests are exchanged with
 `all_to_all_single`, the owners gather their rows, and the rows return through a differentiable
 all-to-all. Backward sends gradients back to the owners, which accumulate them. In
 deterministic mode, the owner sums repeated rows with a segmented reduction instead of atomics.
+
+## Memory
+
+The table, gradient and optimizer bytes scale with the rows each rank owns. In the DP x CP
+layout with `P = size(dp_cp)`, the parameter and gradient buffers are half of what EP 64 x
+expert-DP 2 holds. The optimizer state is the same in both layouts. With 300B table parameters
+on 128 GPUs, `P = 128` takes 13.1 GiB less per GPU: 4.4 GiB of bf16 parameters and 8.7 GiB of
+FP32 gradients.
+
+The lookup takes device memory that NCCL holds outside PyTorch's allocator,
+per GPU, measured on GB300 after two training steps:
+
+| Row group | Device memory |
+|---|---|
+| `P = 4`, one node | About 1.1 GiB |
+| `P = 8`, two NVLink domains | About 650 MiB |
+| `P = 128`, two NVLink domains | About 2.1 GiB |
+
+This memory is mostly peer-to-peer buffers that the first all-to-alls set up. It
+depends on the number of NVLink peers and on the number of channels NCCL gives each peer, which
+is smaller in larger groups. Peers in another NVLink domain use shared network pools instead.
 
 ## Known issue: cross-node all-to-all with the SPCX network plugin
 
@@ -157,12 +265,14 @@ gradient, so they get no gradient buffer and no optimizer state.
 
 Each table is saved as an irregular `ShardedTensor` whose global shape is the full table and
 whose local shard is the owned row range. Replicas are marked as such. The model weights
-therefore load under a different EP size.
+therefore load under a different EP size or `--engram-parallel-size`, and across the EP and
+DP x CP layouts.
 
 The tables' optimizer state follows the checkpoint format:
 
-- In the default format, it loads at another data- or context-parallel size with the same EP size.
-- To change the EP size, save it fully reshardable
+- In the default format, it loads at another data- or context-parallel size with the same layout
+  and the same EP size or `--engram-parallel-size`.
+- To change the layout, the EP size or `--engram-parallel-size`, save it fully reshardable
   (`--dist-ckpt-optim-fully-reshardable`). It then loads when the table optimizer sits at the same
   position in the chained optimizer of both runs. Otherwise, resume with `--no-load-optim`.
 
@@ -189,7 +299,7 @@ The tables' optimizer state follows the checkpoint format:
   `--pad-packed-seq-alignment max` and `--max-seqlen-per-dp-cp-rank` equal to the packed row
   width (`--max-seq-length-per-sample` when it is set, `--seq-length` otherwise).
   `--dataloader-inter-document-masking` with context parallelism requires `--sft`.
-- Activation recomputation replays the memory from the token IDs, on every rank of the EP group
+- Activation recomputation replays the memory from the token IDs, on every rank of a row group
   together. A model that calls the module itself can replay the fusion alone, see
   [Lookup ahead of the fusion](#lookup-ahead-of-the-fusion).
 - CUDA graphs: only Transformer Engine per-layer capture restricted to the MoE scopes
@@ -256,6 +366,8 @@ storage are not supported.
 
 The package comes from the Engram support in
 [NVIDIA/Megatron-LM#7231](https://github.com/NVIDIA/Megatron-LM/pull/7231) and
-[NVIDIA/Megatron-LM#7553](https://github.com/NVIDIA/Megatron-LM/pull/7553) by Li Tao.
-The fusion of the `deepseek_v41` variant follows the DeepSeek-V4.1 Engram module by Deyu Fu and
-Hongxiao Bai in [NVIDIA/Megatron-LM#7224](https://github.com/NVIDIA/Megatron-LM/pull/7224).
+[NVIDIA/Megatron-LM#7553](https://github.com/NVIDIA/Megatron-LM/pull/7553) by Li Tao. The
+parameter replica domains come from
+[NVIDIA/Megatron-LM#7224](https://github.com/NVIDIA/Megatron-LM/pull/7224) by Hongxiao Bai.
+The fusion of the `deepseek_v41` variant follows the DeepSeek-V4.1 Engram module of the same
+pull request, by Deyu Fu and Hongxiao Bai.

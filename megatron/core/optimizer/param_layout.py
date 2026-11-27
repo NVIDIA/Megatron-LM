@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Parameter layout dataclasses for optimizer-driven buffer layout.
 
@@ -58,12 +58,21 @@ class BufferKey:
             managed by :class:`LayerWiseDistributedOptimizer` (shard-aligned layout
             so each whole param lives in one shard). Non-LayerWise params get
             :class:`DistributedOptimizer`'s byte-level layout in a separate buffer.
+        parallel_domain: Name of an extra parameter domain whose replica group is
+            registered in ``ProcessGroupCollection.parameter_replica_groups``, or None for
+            dense and expert parameters, whose buffers keep their previous keys.
     """
 
     param_dtype: torch.dtype
     grad_dtype: torch.dtype
     is_expert_parallel: bool
     is_managed_by_layer_wise_optimizer: bool = False
+    parallel_domain: Optional[str] = None
+
+    @property
+    def domain(self) -> str:
+        """Replica domain of the buffer: the extra domain, else 'expert' or 'dense'."""
+        return self.parallel_domain or ('expert' if self.is_expert_parallel else 'dense')
 
 
 @dataclass

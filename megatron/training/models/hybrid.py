@@ -8,7 +8,11 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
-from megatron.core.models.engram import EngramConfig, apply_engram_to_hybrid_stack_spec
+from megatron.core.models.engram import (
+    EngramConfig,
+    apply_engram_to_hybrid_stack_spec,
+    initialize_engram_parallel_state,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
@@ -322,6 +326,9 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             List of model stages.
         """
         transformer_config = self._model_config.transformer
+        # Collective over every rank, so it runs here and not in build_model: it creates the
+        # sharded Engram table groups on the pg_collection that the model stages and DDP share.
+        initialize_engram_parallel_state(pg_collection, self._model_config.engram_config)
         composed_pre_wrap_hook = compose_hooks(self._model_config.pre_wrap_hooks)
         model_list = unimodal_build_distributed_models(
             self.build_model,

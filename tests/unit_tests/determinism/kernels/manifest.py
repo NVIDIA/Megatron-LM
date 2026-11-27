@@ -710,6 +710,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
+            "tests/unit_tests/distributed/test_parameter_domains.py",
             "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
             "tests/unit_tests/test_layer_wise_expert_distopt.py",
         ),
@@ -720,7 +721,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies. "
         "test_layer_wise_expert_distopt steps an expert-parallel Adam table through the "
         "distributed optimizer it gets beside the layer-wise one and checks that the table's "
-        "expert-DP replicas hold identical values afterwards.",
+        "expert-DP replicas hold identical values afterwards. "
+        "test_parameter_domains trains a table of an extra parameter domain through its own "
+        "distributed optimizer bit for bit against the same table held as a dense parameter, and "
+        "checks the params norm over domains against the dense reference.",
     ),
     KernelEntry(
         name="tensor_metric_l2",
@@ -739,13 +743,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/distributed/test_param_storage_copyback.py",
             "tests/unit_tests/distributed/test_gradient_scaling.py",
             "tests/unit_tests/rl/test_rl_utils.py",
+            "tests/unit_tests/distributed/test_parameter_domains.py",
         ),
         kind="external-lib",
         notes="NCCL reduce-scatter / all-gather; covered by the FSDP/DP cells of the model-level suite. "
         "Relocated parameter storage is checked exactly after all-gather and CUDA graph replay; "
         "the RL test checks exact classic-DDP reduce-scatter after gradient-buffer restoration. "
         "Token scaling is compared exactly with FP32 multiplication in eager and CUDA graph "
-        "replay, including changing factors and low-precision gradient buffers.",
+        "replay, including changing factors and low-precision gradient buffers. "
+        "test_parameter_domains reduces the buffers of an extra parameter domain over its "
+        "replica group exactly, by all-reduce and reduce-scatter, overlapped or not, including "
+        "single-rank replica groups, whose collectives are skipped.",
     ),
     KernelEntry(
         name="nccl_allocator",
@@ -1173,6 +1181,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/models/engram/test_engram_numerics.py",
             "tests/unit_tests/models/engram/test_ownership_and_optimizer.py",
             "tests/unit_tests/models/engram/test_distributed_lookup.py",
+            "tests/unit_tests/models/engram/test_table_sharding.py",
+            "tests/unit_tests/models/engram/test_table_sharding_optimizer.py",
         ),
         kind="torch-op",
         notes="EP-sharded Engram tables: F.embedding lookup, or under deterministic_mode a "
@@ -1183,7 +1193,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "GPU under stream contention. test_ownership_and_optimizer checks the deterministic "
         "backward's sum over repeated rows exactly on CPU, and test_distributed_lookup checks the "
         "EP2 and EP4 all-to-all lookup, its owner-side gradients and an Adam step against a "
-        "full-table FP64 reference on GPU; the multi-rank routing has no bit-exact replay yet.",
+        "full-table FP64 reference on GPU; the multi-rank routing has no bit-exact replay yet. "
+        "test_table_sharding checks the lookup and owner-side gradients with the rows sharded "
+        "over DP x CP against the EP layout and a full-table FP32 reference, bit for bit with "
+        "integer gradients, and that the source stays byte-identical to PR 8225's; "
+        "test_table_sharding_optimizer trains both layouts through DDP and the distributed "
+        "optimizer and compares them bit for bit.",
     ),
     KernelEntry(
         name="dsa_dispatch",

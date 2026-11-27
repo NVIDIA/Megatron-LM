@@ -976,11 +976,53 @@ def log_on_each_pipeline_stage(
         logger.log(level, msg, *args, **kwargs)
 
 
+def get_extra_parameter_replica_groups(
+    model: Optional[List[torch.nn.Module]] = None, pg_collection: Optional[Any] = None
+) -> Dict[str, torch.distributed.ProcessGroup]:
+    """Return the replica groups of the extra parameter domains, keyed by domain name.
+
+    Extra domains are the parameter domains other than ``dense`` and ``expert`` (for example
+    sharded Engram tables), registered in ``ProcessGroupCollection.parameter_replica_groups``.
+    The groups are read from ``pg_collection`` when it registers any, otherwise from the
+    DDP-wrapped chunks of ``model`` or from the unwrapped model's ``pg_collection``.
+
+    Args:
+        model (List[torch.nn.Module], optional): Model chunks, wrapped in DDP or not.
+        pg_collection (ProcessGroupCollection, optional): Explicit process groups.
+
+    Returns:
+        Dict[str, torch.distributed.ProcessGroup]: The replica group of each extra domain;
+        empty when no extra domain is registered.
+    """
+    from megatron.core.process_groups_config import IMPLICIT_PARAMETER_DOMAINS
+
+    def _extra_groups(source):
+        groups = getattr(source, 'parameter_replica_groups', None)
+        # Collections built without extra domains leave the field unset.
+        if not isinstance(groups, dict):
+            return {}
+        return {
+            name: group for name, group in groups.items() if name not in IMPLICIT_PARAMETER_DOMAINS
+        }
+
+    extra_groups = _extra_groups(pg_collection)
+    for model_chunk in model or []:
+        if extra_groups:
+            break
+        extra_groups = _extra_groups(model_chunk) or _extra_groups(
+            getattr(unwrap_model(model_chunk), 'pg_collection', None)
+        )
+    return extra_groups
+
+
 def check_param_hashes_across_dp_replicas(
     model: List[torch.nn.Module], cross_check: bool = False
 ) -> bool:
     """Computes hashes of all parameters in model, all-gathers hashes across DP replicas,
     and then checks for equality between the locally-computed hashes and those of other ranks.
+
+    Parameters of extra domains (see ``get_extra_parameter_replica_groups``) are compared
+    across the replica group of their domain instead; a 1-rank replica group is skipped.
 
     NOTE: This function computes SHA-1 hashes on the CPU and thus needs to move all param
     tensors from GPU to CPU first; as a result, this function is not intended to be called
@@ -995,37 +1037,64 @@ def check_param_hashes_across_dp_replicas(
         True if all param hashes match with corresponding hash on DP replica 0 or
         across all replicas if cross_check is enabled, False otherwise.
     """
+    from megatron.core.process_groups_config import (
+        IMPLICIT_PARAMETER_DOMAINS,
+        get_parameter_parallel_domain,
+    )
 
     # Compute per-parameter hashes on this rank.
     # Keep track of expert and non-expert parameters separately since they need to be
-    # all-gathered across different sets of ranks.
+    # all-gathered across different sets of ranks; the same holds for each extra domain.
+    # A 1-rank replica group holds no other copy to compare against, so its params are not
+    # hashed and its communicator is never initialized.
+    extra_replica_groups = get_extra_parameter_replica_groups(model)
+    extra_domains = sorted(
+        domain for domain, group in extra_replica_groups.items() if group.size() > 1
+    )
     non_expert_params, expert_params = [], []
     local_non_expert_param_hashes, local_expert_param_hashes = [], []
+    extra_params = {domain: [] for domain in extra_domains}
+    local_extra_param_hashes = {domain: [] for domain in extra_domains}
     for model_chunk_id, model_chunk in enumerate(model):
         for param_name, param in model_chunk.named_parameters():
+            domain = get_parameter_parallel_domain(param)
+            if domain not in IMPLICIT_PARAMETER_DOMAINS:
+                if domain not in extra_replica_groups:
+                    raise ValueError(
+                        f"No replica process group is registered for parameter domain "
+                        f"{domain!r} of {param_name} in model chunk {model_chunk_id}"
+                    )
+                if domain not in extra_params:
+                    continue
             param_hash = torch.frombuffer(
                 array.array(
                     "B", hashlib.sha1(param.data.to("cpu").float().numpy(force=True)).digest()
                 ),
                 dtype=torch.uint8,
             )
-            if getattr(param, "allreduce", True):
+            if domain == 'dense':
                 non_expert_params.append((model_chunk_id, param_name, param))
                 local_non_expert_param_hashes.append(param_hash)
-            else:
+            elif domain == 'expert':
                 expert_params.append((model_chunk_id, param_name, param))
                 local_expert_param_hashes.append(param_hash)
+            else:
+                extra_params[domain].append((model_chunk_id, param_name, param))
+                local_extra_param_hashes[domain].append(param_hash)
 
     # Use data-modulo-expert parallel group to all-gather expert param hashes, regular
-    # data-parallel group for non-expert param hashes.
+    # data-parallel group for non-expert param hashes, and the replica group of each extra
+    # domain, in the same sorted order on every rank, for its param hashes.
     all_param_hashes_match = True
     for params, local_param_hashes, all_gather_group in zip(
-        [non_expert_params, expert_params],
-        [local_non_expert_param_hashes, local_expert_param_hashes],
+        [non_expert_params, expert_params] + [extra_params[domain] for domain in extra_domains],
+        [local_non_expert_param_hashes, local_expert_param_hashes]
+        + [local_extra_param_hashes[domain] for domain in extra_domains],
         [
             parallel_state.get_data_parallel_group(with_gtp_remat=False),
             parallel_state.get_expert_data_parallel_group(with_gtp_remat=False),
-        ],
+        ]
+        + [extra_replica_groups[domain] for domain in extra_domains],
     ):
         # Collect per-parameter hashes across all ranks in group.
         assert len(params) == len(local_param_hashes)

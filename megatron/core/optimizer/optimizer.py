@@ -172,6 +172,19 @@ def get_param_group_identifier_tuple(param_group: Dict) -> tuple:
     )
 
 
+def keep_current_parallel_domain(loaded_group: Dict, current_group: Dict) -> None:
+    """Give a param group loaded from a checkpoint the parameter domain of the current run.
+
+    The domain describes this run's layout, not the saved one, and is not part of the
+    identifier: a table group matches across layouts that place it in different domains (it
+    reports ``is_expert_parallel=True`` in all of them), so the saved group's domain may be
+    stale or missing.
+    """
+    loaded_group.pop('parallel_domain', None)
+    if 'parallel_domain' in current_group:
+        loaded_group['parallel_domain'] = current_group['parallel_domain']
+
+
 _IS_DSA_INDEXER_INDEX = param_group_identifier_keys.index('is_dsa_indexer')
 
 _PRE_SPLIT_CHECKPOINT_HINT = (
@@ -234,7 +247,9 @@ def _expand_pre_split_param_groups(
                 "state back up. These parameters were not tagged with one, so the checkpoint "
                 "cannot be matched; start from fresh optimizer state."
             )
-        final_groups.append({**source, 'params': indices})
+        final_group = {**source, 'params': indices}
+        keep_current_parallel_domain(final_group, group)
+        final_groups.append(final_group)
 
     assigned = [index for group in final_groups for index in group['params']]
     if sorted(assigned) != list(range(len(assigned))):
@@ -300,6 +315,8 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
     """Copy optimizer-relevant metadata when creating param views/copies."""
     if hasattr(source, 'allreduce'):
         destination.allreduce = source.allreduce
+    if hasattr(source, 'parallel_domain'):
+        destination.parallel_domain = source.parallel_domain
     if hasattr(source, 'shared'):
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
@@ -889,10 +906,13 @@ class MegatronOptimizer(ABC):
                 raise ValueError(_missing_param_group_message(key, loaded_groups_map))
 
         final_groups = []
-        for key, params in zip(needed_groups, params_in_state_dict_order):
+        for current_group, key, params in zip(
+            current_groups, needed_groups, params_in_state_dict_order
+        ):
             # Update group's parameters to preserve state dict ordering
             group = loaded_groups_map[key]
             group['params'] = params
+            keep_current_parallel_domain(group, current_group)
             final_groups.append(group)
 
         return final_groups
@@ -2084,6 +2104,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
     def _enable_deferred_mxfp8_param_sync(self) -> List[Tuple[Any, Any]]:
         """Enable deferred DistOpt param sync and collect bucket groups to sync later."""
+        from ..distributed.param_and_grad_buffer import get_all_bucket_groups
         from .distrib_optimizer import DistributedOptimizer
         from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
 
@@ -2102,9 +2123,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
             optimizer._defer_param_sync = True
             for model_chunk in optimizer.model_chunks:
-                for bucket_group in (
-                    model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
-                ):
+                for bucket_group in get_all_bucket_groups(model_chunk):
                     if not bucket_group.buckets:
                         continue
                     if _bucket_is_managed_by_layer_wise_optimizer(

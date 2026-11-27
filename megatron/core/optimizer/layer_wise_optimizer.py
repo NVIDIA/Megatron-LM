@@ -533,6 +533,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         data_parallel_world_size: int,
         ddp_config,
         expert_data_parallel_world_size: Optional[int] = None,
+        parallel_group_sizes: Optional[Dict[str, int]] = None,
     ) -> 'FullParamLayout':
         """Compute parameter layouts for all buffer groups.
 
@@ -548,6 +549,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             ddp_config: :class:`DistributedDataParallelConfig`.
             expert_data_parallel_world_size: Expert DP group size (defaults to
                 ``data_parallel_world_size``).
+            parallel_group_sizes: Replica-group size of each extra parameter domain (see
+                ``ProcessGroupCollection.parameter_replica_groups``). Required for every extra
+                domain among the params. Their buffers get DistributedOptimizer's layout: this
+                optimizer never owns them.
 
         Returns:
             :class:`FullParamLayout` with a :class:`PerBufferParamLayout` per buffer group.
@@ -558,7 +563,21 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
+            if buffer_key.parallel_domain is not None:
+                # This optimizer shards over dp_cp and expt_dp only; an extra domain belongs to
+                # its own DistributedOptimizer.
+                if buffer_key.is_managed_by_layer_wise_optimizer:
+                    raise ValueError(
+                        f"Parameters of domain {buffer_key.parallel_domain!r} cannot be managed "
+                        "by LayerWiseDistributedOptimizer; route them to the scalar optimizer."
+                    )
+                if buffer_key.parallel_domain not in (parallel_group_sizes or {}):
+                    raise ValueError(
+                        "No replica-group size was given for parameter domain "
+                        f"{buffer_key.parallel_domain!r}; pass parallel_group_sizes."
+                    )
+                dp_world_size = parallel_group_sizes[buffer_key.parallel_domain]
+            elif buffer_key.is_expert_parallel:
                 dp_world_size = (
                     expert_data_parallel_world_size
                     if expert_data_parallel_world_size is not None
@@ -861,6 +880,16 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             full_param_layouts: List of :class:`FullParamLayout` (one per model
                 chunk).  ``None`` triggers the legacy fallback.
         """
+        # Only dense and expert params are sharded here: each extra parameter domain replicates
+        # over its own group and has its own DistributedOptimizer.
+        for optimizer in optimizers:
+            for param_group in optimizer.param_groups:
+                if param_group.get('parallel_domain') is not None:
+                    raise ValueError(
+                        f"Parameters of domain {param_group['parallel_domain']!r} cannot be "
+                        "managed by LayerWiseDistributedOptimizer."
+                    )
+
         # Simplify when dp_cp group size is 1.
         dp_cp_size = get_pg_size(self.dp_cp)
         if dp_cp_size == 1:
