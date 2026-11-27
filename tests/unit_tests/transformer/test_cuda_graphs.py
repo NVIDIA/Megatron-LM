@@ -1659,6 +1659,134 @@ class TestTECudaGraphHelper:
         # Note: _unique_buffer_counts is intentionally NOT cleared here so we can
         # compare values across parametrized test runs
 
+    def test_mrope_replay_uses_current_positions(self):
+        """Graph replay must preserve position-dependent mRoPE forward and gradients."""
+        from megatron.training.utils import get_ltor_masks_and_position_ids
+
+        Utils.initialize_model_parallel()
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=1,
+            micro_batch_size=1,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            cuda_graph_impl="transformer_engine",
+            use_te_rng_tracker=True,
+            mrope_section=[2, 3, 3],
+        )
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+        current_stream = torch.cuda.current_stream()
+        init_stream = torch.cuda.Stream()
+        init_stream.wait_stream(current_stream)
+        with torch.cuda.stream(init_stream):
+            raw_model = GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=128,
+                max_sequence_length=128,
+                position_embedding_type="mrope",
+            ).cuda()
+            model = DistributedDataParallel(
+                config, DistributedDataParallelConfig(grad_reduce_in_fp32=True), raw_model
+            )
+        current_stream.wait_stream(init_stream)
+
+        def text_batch(document_break):
+            sequence = torch.arange(129, device="cuda").remainder(127).unsqueeze(0)
+            if document_break:
+                sequence[:, 63] = 127
+            tokens = sequence[:, :-1].contiguous()
+            labels = sequence[:, 1:].contiguous()
+            _, _, positions = get_ltor_masks_and_position_ids(
+                tokens,
+                eod_token=127,
+                pad_token=127,
+                reset_position_ids=True,
+                reset_attention_mask=False,
+                eod_mask_loss=False,
+                pad_mask_loss=False,
+                create_attention_mask=False,
+            )
+            return tokens, labels, positions.unsqueeze(0).expand(3, -1, -1).contiguous()
+
+        first, second = text_batch(False), text_batch(True)
+        assert not torch.equal(first[2], second[2])
+        batches = (first, second, first)
+
+        def train_step(batch):
+            tokens, labels, position_ids = batch
+            model.zero_grad_buffer()
+            model.set_is_first_microbatch()
+            losses = model(tokens, position_ids, None, labels=labels)
+            losses.mean().backward()
+            model.finish_grad_sync()
+            return losses.detach().clone(), {
+                name: p.main_grad.detach().clone() for name, p in model.named_parameters()
+            }
+
+        eager = [train_step(batch) for batch in batches]
+        helper = TECudaGraphHelper(
+            model=[model], config=config, seq_length=128, micro_batch_size=1, optimizers=[]
+        )
+        try:
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            replay = [train_step(batch) for batch in batches]
+            for expected, actual in zip(eager, replay, strict=True):
+                torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+        finally:
+            if helper.graphs_created():
+                helper.delete_cuda_graphs()
+
+    def test_packed_mrope_capture_keeps_global_positions(self):
+        """Capture and replay must agree on the rotary input shape for THD with CP."""
+        if Utils.world_size % 2:
+            pytest.skip("This context-parallel case requires two GPUs.")
+        Utils.initialize_model_parallel(context_parallel_size=2)
+        init_num_microbatches_calculator(
+            rank=0, global_batch_size=1, micro_batch_size=1, data_parallel_size=1
+        )
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            bf16=True,
+            use_cpu_initialization=True,
+            context_parallel_size=2,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            cuda_graph_thd_max_packed_sequences=4,
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=16,
+            pad_packed_seq_alignment="max",
+            use_te_rng_tracker=True,
+            mrope_section=[2, 3, 3],
+        )
+        model_parallel_cuda_manual_seed(321)
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=32,
+            position_embedding_type="mrope",
+        ).cuda()
+        positions = torch.arange(32, device="cuda").expand(3, 1, -1)
+        rotary = model.rotary_pos_emb(positions, config.mrope_section, packed_seq=True)
+        helper = TECudaGraphHelper([model], config, 32, 1, optimizers=[])
+        _, capture_kwargs = helper._get_cuda_graph_input_data()
+        for inputs in capture_kwargs["sample_kwargs"]:
+            assert inputs["rotary_pos_emb"].shape == rotary.shape
+
     @pytest.mark.parametrize("num_microbatches", [16, 64, 256])
     @pytest.mark.parametrize("pp_size", [1, 2, 4])
     @pytest.mark.parametrize("vpp_size", [None, 2])
