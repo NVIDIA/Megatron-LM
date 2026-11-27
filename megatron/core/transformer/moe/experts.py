@@ -419,13 +419,11 @@ class TEGroupedMLP(MegatronModule):
             self.offload_moe_act = True
 
         # Let TE keep small experts independent when they cannot be offloaded.
-        supports_bulk_offload = hasattr(self.linear_fc1, "min_offloaded_tensor_size")
-        if self.offload_expert_fc1 and supports_bulk_offload:
+        keep_fp8_input = self.config.fp8_recipe == Fp8Recipe.mxfp8
+        if self.offload_expert_fc1 and hasattr(self.linear_fc1, "min_offloaded_tensor_size"):
             self.linear_fc1.min_offloaded_tensor_size = self.config.min_offloaded_tensor_size
-        use_quantized_fp8 = self.config.fp8 and (
-            self.config.fp8_recipe == Fp8Recipe.mxfp8
-            or (supports_bulk_offload and self.config.fp8_recipe == Fp8Recipe.blockwise)
-        )
+            keep_fp8_input = keep_fp8_input or self.config.fp8_recipe == Fp8Recipe.blockwise
+        use_quantized_fp8 = self.config.fp8 and keep_fp8_input
         use_nvfp4 = self.config.fp4 and self.config.fp4_recipe == Fp4Recipe.nvfp4
         if self.offload_expert_fc1 and not (use_quantized_fp8 or use_nvfp4):
             from megatron.core.extensions.transformer_engine import set_save_original_input
