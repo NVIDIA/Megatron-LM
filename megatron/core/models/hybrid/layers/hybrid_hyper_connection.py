@@ -15,6 +15,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import (
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
+    estimate_layer_flops,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -41,6 +42,10 @@ class HyperConnectionHybridLayer(MegatronModule):
             convert_module_to_dtype_except_fp32_marked(self.hyper_connection, config.params_dtype)
         if hasattr(layer, 'tp_group'):
             self.tp_group = layer.tp_group
+
+    def estimate_flops(self, **kwargs) -> float:
+        """Delegate to the wrapped layer; residual mixing remains outside the estimate."""
+        return estimate_layer_flops(self.inner_layer, **kwargs)
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """Delegate Mamba inference state shape requests to the wrapped layer."""

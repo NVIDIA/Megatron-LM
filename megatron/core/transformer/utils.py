@@ -584,6 +584,32 @@ def transition_moe_cudagraphs(model, scope: str):
             module.transition_cudagraph_scope(scope)
 
 
+def capped_causal_attention_fraction(
+    total_real_tokens: float, seqlen_squared_sum: float, max_keys: Optional[int]
+) -> float:
+    """Fraction of causal pairs retained when each query attends to at most max_keys.
+
+    Integrate min(position, max_keys) using the same continuous L²/2 convention
+    as dense attention. For packed batches, individual lengths are unavailable,
+    so evaluate the fraction at the token-weighted mean length, sum(L²) / sum(L).
+    """
+    if not max_keys or total_real_tokens <= 0 or seqlen_squared_sum <= 0:
+        return 1.0
+    mean_length = seqlen_squared_sum / total_real_tokens
+    effective_keys = min(max_keys, mean_length)
+    attended = effective_keys * (1 - effective_keys / (2 * mean_length))
+    return attended / (mean_length / 2)
+
+
+def causal_window_max_keys(config, layer_number: Optional[int]) -> Optional[int]:
+    """Maximum past keys plus the current key for a constructed layer's causal window."""
+    window = getattr(config, "window_size", None)
+    if layer_number is not None and window and window[0] >= 0:
+        if is_layer_window_attention(window, config.window_attn_skip_freq, layer_number):
+            return window[0] + 1
+    return None
+
+
 def is_layer_window_attention(
     window_size: Optional[Tuple[int, int]], window_attn_skip_freq: int | list, layer_number: int
 ) -> bool:

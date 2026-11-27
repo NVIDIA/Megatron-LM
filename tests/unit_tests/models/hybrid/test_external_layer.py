@@ -8,6 +8,7 @@ from typing import ClassVar
 import pytest
 import torch
 
+from examples.custom_layer.example import GainLayer
 from megatron.core import dist_checkpointing
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -25,12 +26,13 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig, ExternalGainLayer
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, make_flops_test_layer
 
 
 def _root_config(**overrides):
@@ -51,6 +53,45 @@ def _single_rank_groups():
     """Only group size is consulted by the CPU, unsharded construction path."""
     group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
     return SimpleNamespace(tp=group, pp=group, cp=group, tp_cp=group, dp_cp=group)
+
+
+@pytest.mark.parametrize(("tokens", "training_flops"), [(0, 0), (1, 48), (7, 432)])
+def test_example_gain_counts_parameter_gradient_reduction(tokens, training_flops):
+    layer = make_flops_test_layer(GainLayer, _root_config(hidden_size=16))
+    stats = dict(total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=tokens**2)
+    assert layer.estimate_flops(**stats) == tokens * 16
+    assert layer.estimate_flops(**stats, include_backward=True) == training_flops
+
+
+def test_builtin_flops_accepts_an_explicit_config_on_class_or_instance():
+    built = _root_config(ffn_hidden_size=64)
+    override = _root_config(ffn_hidden_size=128)
+    mlp = make_flops_test_layer(MLP, built)
+    stats = dict(total_real_tokens_in_batch=7, seqlen_squared_sum_in_batch=49)
+    assert mlp.estimate_flops(**stats) == 4 * 7 * 32 * 64
+    expected = 4 * 7 * 32 * 128
+    assert MLP.estimate_flops(override, **stats) == expected
+    assert MLP.estimate_flops(config=override, **stats) == expected
+    assert mlp.estimate_flops(override, **stats) == expected
+    assert mlp.estimate_flops(config=override, **stats) == expected
+
+
+@pytest.mark.parametrize("wrap", [False, True])
+def test_legacy_external_layer_reports_forward_flops(wrap):
+    class LegacyGainLayer(MegatronModule):
+        @classmethod
+        def estimate_flops(cls, config, *, total_real_tokens_in_batch, seqlen_squared_sum_in_batch):
+            return config.hidden_size * total_real_tokens_in_batch
+
+    config = _root_config()
+    layer = make_flops_test_layer(LegacyGainLayer, config)
+    if wrap:
+        layer = make_flops_test_layer(HyperConnectionHybridLayer, config, inner_layer=layer)
+    stack = make_flops_test_layer(HybridStack, config, layers=torch.nn.ModuleList([layer]))
+    stats = dict(total_real_tokens_in_batch=7, seqlen_squared_sum_in_batch=49)
+    assert stack.estimate_flops(**stats, include_backward=False) == 7 * config.hidden_size
+    with pytest.raises(NotImplementedError, match="LegacyGainLayer.*include_backward"):
+        stack.estimate_flops(**stats, include_backward=True)
 
 
 def test_external_config_initializes_new_defaults_and_clones_mutable_fields():

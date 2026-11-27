@@ -52,8 +52,8 @@ def _expected_flops(tokens, squared_lengths, layer_counts, mtp_depth):
     # Full: Q/K/V/gate widths 8/4/4/8, output 8 -> hidden 8.
     full_projections = 1536  # 6 * (8 * (8 + 4 + 4 + 8) + 8 * 8)
     full_core = 48  # 6 * query width 8, including causal masking.
-    # GDN: input width 20, convolution 40, recurrence 72, output projection 48.
-    gdn_attention = 1920  # 6 * (8 * 20 + 40 + 72 + 48)
+    # GDN: input width 20, convolution 40, recurrence 48, output projection 48.
+    gdn_attention = 1776  # 6 * (8 * 20 + 40 + 48 + 48)
     dense_mlp = 2304  # SwiGLU: 6 * hidden 8 * intermediate 16 * 3.
     moe_mlp = 3456  # Routed and shared: 6 * 8 * 3 * (10 * topk 2 + 4).
     mtp_norms_and_projection = 912  # 6 * (3 * 8 + 2 * 8 * 8).
@@ -206,8 +206,8 @@ def test_mla_forward_flops_with_optional_query_projection(q_lora_rank, expected)
 @pytest.mark.parametrize(
     "layer_type,overrides,expected",
     [
-        # GDN2: 368 MACs per token across projections, convolution and recurrence.
-        (GatedDeltaNet2, {"experimental_attention_variant": "gdn2"}, 3680),
+        # GDN2: 344 MACs per token across projections, convolution and recurrence.
+        (GatedDeltaNet2, {"experimental_attention_variant": "gdn2"}, 3440),
         # MoE: 480 routed + 128 latent projections + 192 shared FLOPs per token.
         (MoELayer, {"moe_latent_size": 4}, 4000),
     ],

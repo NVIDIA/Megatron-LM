@@ -1124,6 +1124,8 @@ class TestDSAHelperEdgeCases:
 
         assert _dsa_sparse_core_scale(0, 0, 2048) == 1.0
         assert _dsa_sparse_core_scale(512, 512 * 4096, None) == 1.0
+        # Packed lengths 1 and 2 both fit inside a 128-key window.
+        assert _dsa_sparse_core_scale(3, 5, 128) == 1.0
 
     def test_hybrid_dsa_variant_attribute_ignored(self):
         """Hybrid DSA accounting keys off the 'D' symbols in the layer

@@ -44,6 +44,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.attention import Attention, LinearProjBuilder
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
+from megatron.core.transformer.module import accepts_flops_config
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
@@ -679,6 +680,61 @@ class MultiLatentAttention(Attention):
         return output, bias
 
 
+def mla_projection_flops_per_token(config: MLATransformerConfig) -> float:
+    """Count the Q, KV, and output projection work shared by dense and sparse MLA."""
+    q_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
+    q_term = (
+        config.hidden_size * config.num_attention_heads * q_dim
+        if config.q_lora_rank is None
+        else config.q_lora_rank * (config.hidden_size + config.num_attention_heads * q_dim + 1)
+    )
+    return 2 * (
+        q_term
+        + config.kv_lora_rank
+        * (
+            config.hidden_size
+            + config.num_attention_heads * (config.qk_head_dim + config.v_head_dim)
+            + 1
+        )
+        + config.hidden_size * config.qk_pos_emb_head_dim
+        + config.num_attention_heads * config.v_head_dim * config.hidden_size
+    )
+
+
+def mla_attention_flops(
+    config: MLATransformerConfig,
+    *,
+    total_real_tokens_in_batch: float,
+    seqlen_squared_sum_in_batch: float,
+    absorbed_mla: bool = False,
+) -> float:
+    """Count MLA projections and attention for one forward pass, excluding the indexer."""
+    from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import (
+        DSALayerConfig,
+    )
+    from megatron.core.transformer.mla_layer_config import MLALayerConfig
+
+    if isinstance(config, DSALayerConfig) or (
+        (absorbed_mla or not isinstance(config, MLALayerConfig))
+        and config.experimental_attention_variant == "dsa"
+    ):
+        from megatron.core.transformer.experimental_attention_variant.dsa import dsa_attention_flops
+
+        return dsa_attention_flops(
+            config,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            absorbed_mla=absorbed_mla,
+        )
+
+    q_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
+    projections = total_real_tokens_in_batch * mla_projection_flops_per_token(config)
+    attention = (
+        seqlen_squared_sum_in_batch * config.num_attention_heads * (q_dim + config.v_head_dim)
+    )
+    return projections + attention
+
+
 class MLASelfAttention(MultiLatentAttention):
     """MLA Self-attention layer class
 
@@ -686,53 +742,15 @@ class MLASelfAttention(MultiLatentAttention):
     and returns output of the same size.
     """
 
-    @classmethod
-    def estimate_flops(
-        cls,
-        config: MLATransformerConfig,
-        *,
-        total_real_tokens_in_batch: float,
-        seqlen_squared_sum_in_batch: float,
-    ) -> float:
-        """Estimate forward MLA projections and attention, excluding any DSA indexer."""
-        from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import (
-            DSALayerConfig,
-        )
-        from megatron.core.transformer.mla_layer_config import MLALayerConfig
-
-        if isinstance(config, DSALayerConfig) or (
-            not isinstance(config, MLALayerConfig)
-            and config.experimental_attention_variant == "dsa"
-        ):
-            from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
-
-            return DSAttention.estimate_flops(
-                config,
-                total_real_tokens_in_batch=total_real_tokens_in_batch,
-                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-                absorbed_mla=False,
+    @accepts_flops_config
+    def estimate_flops(self, *, include_backward: bool = False, **batch_stats: float) -> float:
+        """Include the constructed sparse core's indexer and optional backward work."""
+        if getattr(self.core_attention, "requires_dsa_inputs", False):
+            return getattr(self.core_attention, "estimate_flops")(
+                absorbed_mla=False, include_backward=include_backward, **batch_stats
             )
-        q_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
-        q_term = (
-            config.hidden_size * config.num_attention_heads * q_dim
-            if config.q_lora_rank is None
-            else config.q_lora_rank * (config.hidden_size + config.num_attention_heads * q_dim + 1)
-        )
-        projections = 2 * (
-            q_term
-            + config.kv_lora_rank
-            * (
-                config.hidden_size
-                + config.num_attention_heads * (config.qk_head_dim + config.v_head_dim)
-                + 1
-            )
-            + config.hidden_size * config.qk_pos_emb_head_dim
-            + config.num_attention_heads * config.v_head_dim * config.hidden_size
-        )
-        return (
-            total_real_tokens_in_batch * projections
-            + seqlen_squared_sum_in_batch * config.num_attention_heads * (q_dim + config.v_head_dim)
-        )
+        forward = mla_attention_flops(self.config, absorbed_mla=False, **batch_stats)
+        return (3 if include_backward else 1) * forward
 
     def __init__(
         self,

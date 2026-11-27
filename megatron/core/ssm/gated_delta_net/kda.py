@@ -64,6 +64,32 @@ class KimiDeltaAttention(_GDNBase):
     Recurrent inference is not implemented.
     """
 
+    def estimate_flops(
+        self,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
+    ) -> float:
+        """Estimate KDA projections, QKV convolution, and the channel-wise delta rule."""
+        config = self.config
+        heads = config.linear_num_key_heads
+        head_dim = config.linear_key_head_dim
+        channels = heads * head_dim  # KDA uses the same head geometry for Q, K, and V.
+        hidden = config.hidden_size
+
+        # QKV input, per-head beta, and output projections.
+        projection_macs = hidden * (3 * channels + heads) + channels * hidden
+        if config.kda_two_stage_gates:
+            gate_macs = 2 * head_dim * (hidden + channels)
+        else:
+            gate_macs = 2 * hidden * channels
+        delta_macs = self._conv_and_recurrence_macs_per_token(
+            config.linear_conv_kernel_dim, 3 * channels, head_dim, channels
+        )
+        forward = 2 * total_real_tokens_in_batch * (projection_macs + gate_macs + delta_macs)
+        return (3 if include_backward else 1) * forward
+
     def __init__(
         self,
         config: KDALayerConfig,
