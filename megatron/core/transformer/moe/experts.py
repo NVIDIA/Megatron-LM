@@ -418,13 +418,16 @@ class TEGroupedMLP(MegatronModule):
             self.offload_expert_fc1 = True
             self.offload_moe_act = True
 
-        # This is to avoid the CPU overhead of multiple d2h copies
-        use_block_scaled_fp8 = self.config.fp8 and self.config.fp8_recipe in (
-            Fp8Recipe.blockwise,
-            Fp8Recipe.mxfp8,
+        # Let TE keep small experts independent when they cannot be offloaded.
+        supports_bulk_offload = hasattr(self.linear_fc1, "min_offloaded_tensor_size")
+        if self.offload_expert_fc1 and supports_bulk_offload:
+            self.linear_fc1.min_offloaded_tensor_size = self.config.min_offloaded_tensor_size
+        use_quantized_fp8 = self.config.fp8 and (
+            self.config.fp8_recipe == Fp8Recipe.mxfp8
+            or (supports_bulk_offload and self.config.fp8_recipe == Fp8Recipe.blockwise)
         )
         use_nvfp4 = self.config.fp4 and self.config.fp4_recipe == Fp4Recipe.nvfp4
-        if self.offload_expert_fc1 and not (use_block_scaled_fp8 or use_nvfp4):
+        if self.offload_expert_fc1 and not (use_quantized_fp8 or use_nvfp4):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc1)
