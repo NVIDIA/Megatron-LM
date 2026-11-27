@@ -2276,6 +2276,15 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
         # so selecting another head count does not change checkpoint state.
         self._runtime_attentions: dict[int, torch.nn.Module] = {}
 
+    def get_context_parallel_backend(self):
+        """Get TE's local GDN state operations without binding CP head geometry."""
+        factory = getattr(self.te_attention, "get_context_parallel_backend", None)
+        if factory is None:
+            raise RuntimeError(
+                "gdn_cp_mode='chunkwise' requires Transformer Engine GDN state-summary support."
+            )
+        return factory()
+
     def _make_te_attention(self, num_attention_heads: int) -> torch.nn.Module:
         """Build a TE adapter whose head geometry remains fixed across forwards."""
         assert _TE_LINEAR_ATTENTION is not None
