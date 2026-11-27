@@ -176,9 +176,19 @@ def chaos_choice(autotuner, candidates, args, kwargs):
     A positive control: every other check is a negative one, and "the runs
     matched" cannot distinguish a working divergence detector from a blind one.
     """
+    return chaos_pick(candidates, kernel_name(autotuner), tuning_key(autotuner, args, kwargs))
+
+
+def chaos_pick(candidates, kernel: str, key: str):
+    """The chaos rule shared by every adapter: a candidate derived from rank, kernel and shape.
+
+    Ranks that share a Python RNG seed (tensor-parallel peers) would draw the same
+    sequence from ``random``; a hash of the rank keeps the control reproducible and
+    different per rank.
+    """
     from megatron.core._rank_utils import safe_get_rank
 
-    seed = f"{safe_get_rank()}|{kernel_name(autotuner)}|{tuning_key(autotuner, args, kwargs)}"
+    seed = f"{safe_get_rank()}|{kernel}|{key}"
     index = int(hashlib.sha256(seed.encode()).hexdigest()[:8], 16) % len(candidates)
     return candidates[index]
 

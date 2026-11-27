@@ -24,7 +24,7 @@ import torch
 
 _deterministic_override = None
 
-DEFAULT_MODULES = ("mamba_ssm", "transformer_engine", "megatron.core")
+DEFAULT_MODULES = ("mamba_ssm", "transformer_engine", "megatron.core", "cudnn")
 
 # Kernels whose outputs do not depend on the launch configuration, so a timed choice
 # cannot change results and pinning would only cost throughput. Only pure data movement
@@ -210,6 +210,19 @@ class AutotunePolicy:
         else:
             mode = "auto"
         return replace(self, mode=mode)
+
+    def covers(self, module: str) -> bool:
+        """Whether ``module`` falls under :attr:`modules`, matched at package boundaries."""
+        return any(module == prefix or module.startswith(prefix + ".") for prefix in self.modules)
+
+    def governs(self, module: str, qualified: str) -> bool:
+        """Whether this policy owns the kernel's pick: covered and not :attr:`config_invariant`.
+
+        A kernel outside this rule keeps the timed pick, which is neither recorded nor held
+        to the agreement check: an invariant kernel may time a different winner on every rank
+        by design.
+        """
+        return self.covers(module) and qualified not in self.config_invariant
 
     @property
     def intercepts(self) -> bool:

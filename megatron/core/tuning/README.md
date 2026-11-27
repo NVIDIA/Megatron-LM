@@ -110,6 +110,44 @@ uses the explicit deterministic-mode setter or PyTorch's deterministic flag and,
 if already installed, the policy's block sizes. An import-time singleton cannot
 later recover its discarded candidates.
 
+### cuTile linear-attention kernels (cudnn-frontend)
+
+The cuDNN frontend's cuTile engine for GDN and KDA (the engine Transformer
+Engine's `GatedDeltaNetAttention` reaches outside the FROST envelope) times
+`occupancy x num_worker_warps` launch candidates per process, and the
+worker-warp count changes the summation tree of the kernels that reduce with
+`ct.sum`. cudnn-frontend exposes two hooks on that launch
+(NVIDIA/cudnn-frontend#1735), and `megatron/core/tuning/cutile.py` binds them to
+the installed policy with the same modes, tables and diagnostics: `pinned` runs
+the table entry, or the sweep's first candidate (occupancy 1, 4 worker warps)
+when the table misses; `record` captures the timed winners into the same
+per-rank recording, so one `merge` builds a table that covers Triton and cuTile
+kernels alike; every choice is logged for the agreement check. Kernels are
+keyed by their qualified name (`cudnn.linear_attention.cutile.kernels.gdn.<kernel>`)
+and the launch's shape key, which carries no device. The scope prefix is `cudnn`.
+A cudnn-frontend without the hooks keeps its timed picks, with one warning.
+cudnn-frontend consults the hooks only when a shape misses its launch cache, so
+every policy change drops that cache: a pick timed before `install(mode="pinned")`
+does not outlive the installation on any rank. Hooks another host installed
+before Megatron are left in place while the policy does not intercept, and
+restored when an intercepting policy is replaced by one that does not.
+The packaged `sm103` table carries entries for every cuTile kernel the GDN
+and KDA plans launch, the Q/K normalization kernels of `use_qk_l2norm_in_kernel`
+included. The launch key names the heads, head dims, tile sizes and dtype, not
+the token count or batch, so a GB300 record sweep over eight shapes, two dtypes
+and 15 repeats covers a kernel with few keys: each recorded key carries its
+majority winner over the repeats (one timing per key and repeat), and a wildcard carries the majority over the head-dim-128
+keys for any other. Several winners follow the head dim (for the l2norm
+backward kernel occupancy 4 wins the vote of every head-dim-128 key and
+occupancy 8 wins every head-dim-64 key, 15 of 15 for all but one key; the
+forward kernel is 8 at head dim 64 in every repeat and a near-even split at
+head dim 128, where occupancy 8 won 18 of 30), which is why the keys are listed
+rather than one wildcard. A pinned run on GB300
+therefore never falls back to the first candidate (the fallback costs up to
+28% on the GDN forward output kernel at 4k tokens). `sm100` has no cuTile
+entries yet: record one on a B200 and merge it. A key from a user table takes
+precedence over the packaged one.
+
 ## Modes and precedence
 
 | Mode | Behavior |
@@ -211,7 +249,7 @@ The training arguments are generated from `AutotunePolicy`: each field has a
 `--triton-autotune-<field>` argument (underscores become hyphens) whose help is
 the field's docstring, for example `--triton-autotune-on-miss error` or
 `--triton-autotune-verify-strict`. Tuple fields take several values
-(`--triton-autotune-modules mamba_ssm transformer_engine megatron.core my_package`),
+(`--triton-autotune-modules mamba_ssm transformer_engine megatron.core cudnn my_package`),
 `--triton-autotune-config-invariant` without names pins every kernel in scope,
 and `--triton-autotune-block-sizes` takes `NAME=VALUE` pairs such as
 `BLOCK_C=512 BLOCK_S=1`.
