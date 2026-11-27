@@ -18,12 +18,16 @@ from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     Placements,
     PrefetchOrder,
     RuntimePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    FsdpParameterGroup,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
@@ -131,7 +135,8 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
     placements = _default_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=main_params_dtype)
     allocated_before = torch.cuda.memory_allocated(device)
-    with fully_shard_context(FsdpContext(device=device)):
+    context = FsdpContext(device=device)
+    with fully_shard_context(context):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
@@ -158,9 +163,14 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
         main_weight_nbytes = dim * dim * torch.empty((), dtype=main_params_dtype).element_size()
         expected_per_child_nbytes = 2 * child_weight_nbytes + main_weight_nbytes
 
-    # All persistent buffers are sharded over the data-parallel group. Small bookkeeping
-    # allocations stay below 1 MiB.
-    expected_persistent_nbytes = len(model.layers) * expected_per_child_nbytes // world_size
+    # All persistent buffers are sharded over the data-parallel group, except the
+    # partial-gradient slots: each holds one child's full BF16 gradient, the largest
+    # group. Small bookkeeping allocations stay below 1 MiB.
+    slot_nbytes = RuntimePolicy().partial_grad_buffers * child_weight_nbytes
+    assert sum(slot.storage.nbytes for slot in context.partial_grad_slots) == slot_nbytes
+    expected_persistent_nbytes = (
+        len(model.layers) * expected_per_child_nbytes // world_size + slot_nbytes
+    )
     assert (
         expected_persistent_nbytes <= persistent_allocated < expected_persistent_nbytes + 1024**2
     ), (
@@ -450,3 +460,137 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup, placements_
         f"Expected FSDP to reduce peak training memory on rank {rank}: "
         f"baseline={_mb(baseline_peak)}, sharded={_mb(sharded_peak)}"
     )
+
+
+def _parameter_groups(model: nn.Module) -> list[FsdpParameterGroup]:
+    return [
+        group
+        for module in model.modules()
+        for group in getattr(module, "parameter_groups", ())
+        if group.requires_grad
+    ]
+
+
+@pytest.mark.parametrize("num_slots", [1, 2])
+def test_partial_grad_slots_are_allocated_once_for_the_largest_group(
+    distributed_setup, monkeypatch, num_slots
+):
+    """Reductions reuse slots sized for the largest group instead of allocating buffers."""
+    device = distributed_setup.device
+    if distributed_setup.world_size < 2:
+        pytest.skip("Singleton meshes accumulate locally without reductions.")
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=64, num_children=3).to(device)
+    # A wider child makes the largest group differ from the others.
+    model.layers.append(nn.Linear(64, 64 * 4, bias=False).to(device))
+    model.layers.append(nn.Linear(64 * 4, 64, bias=False).to(device))
+    context = FsdpContext(
+        device=device,
+        runtime_policy=RuntimePolicy(partial_grad_buffers=num_slots),
+        gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
+    )
+    with fully_shard_context(context):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+
+    largest = max(group.partial_grad_nbytes for group in _parameter_groups(model))
+    assert largest == 64 * 64 * 4 * torch.empty((), dtype=torch.float32).element_size()
+    assert len(context.partial_grad_slots) == num_slots
+    assert all(slot.storage.numel() == largest for slot in context.partial_grad_slots)
+
+    def fail(*args, **kwargs):
+        raise AssertionError("A reduction allocated a partial-gradient buffer.")
+
+    monkeypatch.setattr(FsdpParameterGroup, "allocate_partial_grad_buffer", fail)
+    storage_ptrs = {slot.storage.data_ptr() for slot in context.partial_grad_slots}
+    for _ in range(2):
+        model(torch.randn(8, 64, device=device)).sum().backward()
+        context.finish_grad_sync()
+    assert {slot.storage.data_ptr() for slot in context.partial_grad_slots} == storage_ptrs
+
+
+@pytest.mark.parametrize(
+    "runtime_policy",
+    [
+        pytest.param(RuntimePolicy(partial_grad_buffers=0), id="disabled"),
+        pytest.param(RuntimePolicy(overlap_allgather_reduction=False), id="unified_stream"),
+    ],
+)
+def test_partial_grad_slots_are_not_allocated(distributed_setup, runtime_policy):
+    """Without slots, or with all-gathers on the reduction stream, reductions allocate."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = MultiChildModel(dim=64, num_children=2).to(device)
+    context = FsdpContext(device=device, runtime_policy=runtime_policy)
+    with fully_shard_context(context):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=_default_placements())
+        fully_shard(model, mesh=mesh, placements=_default_placements())
+    assert context.partial_grad_slots == ()
+
+
+class WideRootModel(nn.Module):
+    """Child layers followed by a root-owned output layer wider than any child."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Linear(dim, dim, bias=False) for _ in range(2)])
+        self.head = nn.Linear(dim, dim * 8, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run the child layers, then the root-owned head."""
+        for layer in self.layers:
+            x = torch.relu(layer(x))
+        return self.head(x)
+
+
+def test_partial_grad_slots_are_sized_without_root_groups(distributed_setup, monkeypatch):
+    """A root group larger than every child group is allocated per reduction."""
+    device = distributed_setup.device
+    if distributed_setup.world_size < 2:
+        pytest.skip("Singleton meshes accumulate locally without reductions.")
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    torch.manual_seed(1234 + distributed_setup.rank)
+    inputs = torch.randn(2, 8, 64, device=device)
+    allocate = FsdpParameterGroup.allocate_partial_grad_buffer
+
+    def train(num_slots):
+        torch.manual_seed(1234)
+        model = WideRootModel(dim=64).to(device)
+        context = FsdpContext(
+            device=device,
+            runtime_policy=RuntimePolicy(partial_grad_buffers=num_slots),
+            gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
+        )
+        with fully_shard_context(context):
+            for layer in model.layers:
+                fully_shard(layer, mesh=mesh, placements=_default_placements())
+            fully_shard(model, mesh=mesh, placements=_default_placements())
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=False)
+        fully_shard_optimizer(optimizer)
+        allocated_groups = []
+
+        def recording_allocate(group):
+            allocated_groups.append(group)
+            return allocate(group)
+
+        monkeypatch.setattr(FsdpParameterGroup, "allocate_partial_grad_buffer", recording_allocate)
+        for x in inputs:
+            optimizer.zero_grad(set_to_none=True)
+            model(x).square().mean().backward()
+            context.finish_grad_sync()
+            optimizer.step()
+        monkeypatch.undo()
+        return model, context, allocated_groups
+
+    reference, _, _ = train(0)
+    model, context, allocated_groups = train(2)
+
+    child_nbytes = 64 * 64 * torch.empty((), dtype=torch.float32).element_size()
+    (root_group,) = model.parameter_groups
+    assert root_group.partial_grad_nbytes == 8 * child_nbytes
+    assert [slot.storage.numel() for slot in context.partial_grad_slots] == [child_nbytes] * 2
+    assert allocated_groups == [root_group] * len(inputs)
+    for actual, expected in zip(model.parameters(), reference.parameters()):
+        torch.testing.assert_close(actual.full_tensor(), expected.full_tensor(), rtol=0, atol=0)

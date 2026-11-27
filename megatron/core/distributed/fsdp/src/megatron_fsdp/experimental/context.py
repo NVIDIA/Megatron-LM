@@ -14,6 +14,7 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
+import dataclasses
 import enum
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -51,6 +52,16 @@ class GradientFinalizationMode(enum.Enum):
     """Launch outer reduction and wait for all gradient reductions at autograd completion."""
 
 
+@dataclasses.dataclass
+class PartialGradSlot:
+    """A persistent DP-inner reduction input buffer and the reduction last reading it."""
+
+    storage: torch.Tensor
+    # Recorded on the inner reduction stream after the reduction that read this
+    # buffer; None when no reduction since the last finish_grad_sync() used it.
+    reduce_done: torch.cuda.Event | None = None
+
+
 class FsdpContext:
     """Runtime stream and prefetch state shared by FSDP roots constructed together."""
 
@@ -72,6 +83,9 @@ class FsdpContext:
     # this context's reduce-scatter stream. Each context owns its own stream, so
     # independent roots sharing a context need only one completion callback.
     _post_backward_hook_registered: bool
+    # Persistent DP-inner reduction inputs, allocated at finalization and reused
+    # round-robin; empty when each reduction allocates its own input.
+    partial_grad_slots: tuple[PartialGradSlot, ...]
 
     def __init__(
         self,
@@ -107,6 +121,17 @@ class FsdpContext:
 
         self._gradient_finalization_mode = gradient_finalization_mode
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
+        # Symmetric-memory buffers are allocated from their own pool per reduction. When
+        # all-gathers share the reduction stream, prefetches queue behind reductions that
+        # compute no longer waits for and lose their overlap; that mode also trades
+        # overlap for memory, so it keeps allocating per reduction.
+        self._num_partial_grad_slots = (
+            0
+            if self.use_symmetric_memory or not overlap_allgather_reduction
+            else runtime_policy.partial_grad_buffers
+        )
+        self.partial_grad_slots = ()
+        self._next_partial_grad_slot = 0
         self.execution_order = ExecutionOrder()
         self.prefetch_order = runtime_policy.prefetch_order
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
@@ -190,9 +215,58 @@ class FsdpContext:
             for root in reversed(list(self._roots)):
                 _collect_backward_order(root, registered_modules, self.execution_order)
 
+        if self._num_partial_grad_slots > 0:
+            self._allocate_partial_grad_slots()
+
         self._registered_modules.clear()
         self.parameter_to_owner = None
         self._is_finalized = True
+
+    def _allocate_partial_grad_slots(self) -> None:
+        """Allocate the persistent DP-inner reduction inputs.
+
+        Allocate before training, and so before any CUDA-graph capture, so every
+        reduction reuses fixed storage. Each slot is raw bytes viewed with the
+        reducing group's dtype and layout. Roots reduce last in backward, with no
+        later backward compute to overlap, yet often own the largest groups
+        (embeddings and output layers), so slots are sized for the other modules and
+        larger groups allocate per reduction.
+        """
+        sized_modules = [
+            module for module in self._registered_modules if module not in self._roots
+        ] or self._registered_modules
+        slot_nbytes = max(
+            (
+                group.partial_grad_nbytes
+                for module in sized_modules
+                for group in module.parameter_groups
+                if group.requires_grad and group.requires_inner_reduction
+            ),
+            default=0,
+        )
+        if slot_nbytes == 0:
+            return
+        device = self.allgather_stream.device
+        self.partial_grad_slots = tuple(
+            PartialGradSlot(torch.empty(slot_nbytes, dtype=torch.uint8, device=device))
+            for _ in range(self._num_partial_grad_slots)
+        )
+
+    def acquire_partial_grad_slot(self, nbytes: int) -> PartialGradSlot | None:
+        """Return the next persistent DP-inner reduction input of at least ``nbytes``.
+
+        Returns None if slots are disabled or smaller than ``nbytes``. The caller must
+        make the current stream wait for ``slot.reduce_done`` (if set) before writing
+        the slot, and record ``slot.reduce_done`` on the inner reduction stream after
+        the reduction that reads it.
+        """
+        if not self.partial_grad_slots or nbytes > self.partial_grad_slots[0].storage.numel():
+            return None
+        slot = self.partial_grad_slots[self._next_partial_grad_slot]
+        self._next_partial_grad_slot = (self._next_partial_grad_slot + 1) % len(
+            self.partial_grad_slots
+        )
+        return slot
 
     def is_root(self, module: nn.Module) -> bool:
         """Return whether ``module`` is an outermost FSDP module in this context."""
@@ -279,6 +353,11 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
+        # Every reduction reading a slot is now ordered before later current-stream
+        # work, so the next backward needs no per-slot waits. Dropping the events also
+        # keeps a CUDA-graph capture from waiting on events recorded before it.
+        for slot in self.partial_grad_slots:
+            slot.reduce_done = None
 
     def pre_backward(self) -> None:
         """Fork the reduce-scatter stream into any active CUDA-graph capture.

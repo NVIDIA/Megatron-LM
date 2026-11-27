@@ -506,18 +506,33 @@ class FsdpModule:
     def _reduce_inner_gradients(self, group: FsdpParameterGroup) -> None:
         """Pack on compute and enqueue reduction on the inner reduction stream.
 
-        Allocate the packing buffer on the inner stream. On return, that stream
-        contains the queued reduction and accumulation into main_grad.
+        Pack into a persistent slot when one fits, otherwise into a buffer allocated
+        on the inner stream. On return, that stream contains the queued reduction
+        and accumulation into main_grad.
         """
-        current_stream = self.context.current_stream()
-        inner_reduction_stream = self.context.inner_reduction_stream
-        with torch.cuda.stream(inner_reduction_stream):
-            partial_grad = group.allocate_partial_grad_buffer()
-        current_stream.wait_stream(inner_reduction_stream)
+        context = self.context
+        current_stream = context.current_stream()
+        inner_reduction_stream = context.inner_reduction_stream
+        slot = context.acquire_partial_grad_slot(group.partial_grad_nbytes)
+        if slot is None:
+            # Allocating on the inner stream may reuse memory that an earlier
+            # reduction still reads, so packing waits for every reduction queued there.
+            with torch.cuda.stream(inner_reduction_stream):
+                partial_grad = group.allocate_partial_grad_buffer()
+            current_stream.wait_stream(inner_reduction_stream)
+        else:
+            # A persistent slot is read only by the reduction that last used it, so
+            # packing waits for that one; more recent reductions keep overlapping
+            # compute.
+            if slot.reduce_done is not None:
+                current_stream.wait_event(slot.reduce_done)
+            partial_grad = group.partial_grad_buffer_in(slot.storage)
         group.copy_gradients_to_partial_buffer(partial_grad)
         inner_reduction_stream.wait_stream(current_stream)
         with torch.cuda.stream(inner_reduction_stream):
             group.reduce_inner_gradients(partial_grad)
+            if slot is not None:
+                slot.reduce_done = inner_reduction_stream.record_event()
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:

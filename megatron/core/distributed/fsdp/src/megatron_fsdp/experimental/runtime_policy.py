@@ -52,3 +52,23 @@ class RuntimePolicy:
     Recording currently requires the ordinary module hooks; combined 1F1B
     bypasses them. Discard the context if the recorded pass raises.
     """
+
+    partial_grad_buffers: int = 2
+    """Number of persistent DP-inner reduction input buffers, reused round-robin.
+
+    Each buffer is sized for the largest parameter group outside root modules (or
+    of the roots, if there are no other modules). Packing a group's gradients then
+    waits only for the reduction that last read its buffer, so more recent
+    reductions keep overlapping compute. With 0, and for groups larger than a
+    buffer, each reduction allocates its input on the inner reduction stream, and
+    packing waits for every reduction queued there. Ignored with
+    ``use_symmetric_memory``, whose buffers come from their own pool, and without
+    ``overlap_allgather_reduction``: prefetching all-gathers on the shared stream
+    would queue behind reductions that compute no longer waits for.
+    """
+
+    def __post_init__(self) -> None:
+        if self.partial_grad_buffers < 0:
+            raise ValueError(
+                f"partial_grad_buffers must be non-negative, got {self.partial_grad_buffers}."
+            )
