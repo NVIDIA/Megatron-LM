@@ -39,6 +39,8 @@ from megatron.core.inference.disaggregation.transfer_backends.base import (
 )
 from megatron.core.inference.disaggregation.utils import (
     drop_transfer_prefix_blocks,
+    dsa_index_key_transfer_view,
+    dsa_transfer_meta,
     transfer_block_count,
 )
 from megatron.core.inference.inference_request import (
@@ -92,6 +94,8 @@ class InferenceStateHandoffMixin:
         self._pinned_handoff_blocks: Dict[int, list] = {}  # Request ID -> pinned KV block IDs.
         self._pinned_handoff_ssm_slots: Dict[int, int] = {}  # Request ID -> detached live slot.
         self._kv_transfer_agent = None
+        self._dsa_transfer_agent = None  # DSA indexer-key cache, paged like the KV cache.
+        self._dsa_local_meta = None
         self._kv_peer_metas = None  # KV descriptors for this PP stage's TP ranks.
         self._pp_kv_peer_metas = None  # Each PP stage's set of TP KV descriptors.
         self._ssm_transfer_agents = {}
@@ -290,10 +294,10 @@ class InferenceStateHandoffMixin:
         """
         if role not in ("prefill", "decode"):
             raise ValueError(f"KV transfer role must be 'prefill' or 'decode', got {role!r}")
-        if self.context.cache_dsa_indexer_keys:
+        if self.context.cache_dsa_indexer_keys and self.context.num_speculative_tokens:
             raise ValueError(
-                "Disaggregated KV transfer does not support DSA models yet; "
-                "handoffs do not transfer the prompt's indexer keys"
+                "Disaggregated KV transfer does not support DSA models with MTP speculative "
+                "decoding; DSA inference decodes one token per request"
             )
         if self.context.is_hybrid_model:
             if role == "decode" and self.context.mamba_slot_allocator is not None:
@@ -380,6 +384,34 @@ class InferenceStateHandoffMixin:
             layer_start=layer_start,
             layer_end=layer_end,
         )
+        kv_meta = self._kv_transfer_agent.export_meta()
+
+        # DSA index keys share the KV block IDs. They are one TP-replicated head, so the
+        # KV reshard planner reads each decode rank's keys from one prefill replica.
+        if self.context.cache_dsa_indexer_keys:
+            dsa_view = dsa_index_key_transfer_view(self.context.dsa_memory_buffer)
+            self._dsa_transfer_agent = self._kv_transfer_agent.new_registered_buffer(
+                agent_name=f"{agent_name}-dsa",
+                memory_buffer=dsa_view,
+                expected_num_blocks=self.context.kv_block_allocator.pool_size,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                num_kv_heads_global=1,
+                heads_per_partition=1,
+                head_dim=int(dsa_view.shape[-1]),
+                tokens_per_block=int(dsa_view.shape[3]),
+                global_rank=rank,
+                pp_size=pp_size,
+                pp_rank=pp_rank,
+                num_layers_global=num_layers_global,
+                layer_start=layer_start,
+                layer_end=layer_end,
+            )
+            self._dsa_local_meta = self._dsa_transfer_agent.export_meta()
+            self._dsa_local_meta["index_key_dtype"] = getattr(
+                self.context, "dsa_indexer_key_dtype", "bf16"
+            )
+            kv_meta["dsa"] = self._dsa_local_meta
 
         # Both roles transfer directly between live recurrent-state slots. Prefill
         # detaches its source slot until decode acknowledges transfer completion.
@@ -462,7 +494,7 @@ class InferenceStateHandoffMixin:
 
         # Transport descriptors do not change between requests. Collect each
         # stage's TP descriptors once and reuse them for every handoff.
-        local_peer_metas = {"kv": self._kv_transfer_agent.export_meta(), "ssm": ssm_peer_metas}
+        local_peer_metas = {"kv": kv_meta, "ssm": ssm_peer_metas}
         if torch.distributed.is_initialized() and tp_size > 1:
             gathered_tp_metas: list = [None] * tp_size
             torch.distributed.all_gather_object(
@@ -536,6 +568,14 @@ class InferenceStateHandoffMixin:
         plans = [
             self._kv_transfer_agent.prepare_push_blocks(kv_peer, block_ids[cached_prefix_blocks:])
         ]
+        if self._dsa_transfer_agent is not None:
+            # Same blocks and order as the decode's receives.
+            plans.append(
+                self._dsa_transfer_agent.prepare_push_blocks(
+                    dsa_transfer_meta(kv_peer, self._dsa_local_meta),
+                    block_ids[cached_prefix_blocks:],
+                )
+            )
         # The source live slot remains detached until RELEASE_KV, so request
         # cleanup cannot reuse it while these sends are active.
         for agent, peer_metas, slots in ssm_pushes:
@@ -1005,6 +1045,7 @@ class InferenceStateHandoffMixin:
         )
 
         handle = None
+        dsa_handle = None
         start_error = None
         ssm_import = None
         if ssm_meta:
@@ -1020,12 +1061,21 @@ class InferenceStateHandoffMixin:
                 transfer_meta, transfer_src_blocks = drop_transfer_prefix_blocks(
                     handoff.kv_meta, handoff.src_block_ids, len(cached_blocks)
                 )
+                dsa_meta = None
+                if imported_blocks and self._dsa_transfer_agent is not None:
+                    dsa_meta = dsa_transfer_meta(transfer_meta, self._dsa_local_meta)
                 if self._kv_transfer_agent.is_push:
                     plans = []
                     if imported_blocks:
                         plans.append(
                             self._kv_transfer_agent.prepare_pull_blocks(
                                 transfer_meta, transfer_src_blocks, imported_blocks
+                            )
+                        )
+                    if dsa_meta is not None:
+                        plans.append(
+                            self._dsa_transfer_agent.prepare_pull_blocks(
+                                dsa_meta, transfer_src_blocks, imported_blocks
                             )
                         )
                     if ssm_import is not None:
@@ -1045,6 +1095,10 @@ class InferenceStateHandoffMixin:
                         handle = self._kv_transfer_agent.begin_pull_blocks(
                             transfer_meta, transfer_src_blocks, imported_blocks
                         )
+                    if dsa_meta is not None:
+                        dsa_handle = self._dsa_transfer_agent.begin_pull_blocks(
+                            dsa_meta, transfer_src_blocks, imported_blocks
+                        )
                     if ssm_import is not None:
                         self._start_ssm_handoff_import(handoff.request_id, ssm_meta, ssm_import)
             except Exception as exc:
@@ -1061,6 +1115,7 @@ class InferenceStateHandoffMixin:
             request_metadata=handoff.request_metadata,
             cached_prefix_block_count=len(cached_blocks),
             handle=handle,
+            dsa_handle=dsa_handle,
             future=handoff.future,
             ssm=ssm_import,
             resume_tokens=resume_tokens,
@@ -1189,7 +1244,7 @@ class InferenceStateHandoffMixin:
         Side: decode engine; pull and push transport paths.
         """
 
-        handles = [pending.handle]
+        handles = [pending.handle, pending.dsa_handle]
         if pending.ssm is not None:
             handles.extend(pending.ssm.handles)
         if isinstance(pending.local_error, TransferStartError):

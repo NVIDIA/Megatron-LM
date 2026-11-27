@@ -94,7 +94,8 @@ def real_engine(config, *, role=None, backend="nccl", weights=None):
         yield engine
     finally:
         # Safety assertions belong to the caller, before this fixture teardown.
-        for agent in [engine._kv_transfer_agent, *engine._ssm_transfer_agents.values()]:
+        agents = [engine._kv_transfer_agent, engine._dsa_transfer_agent]
+        for agent in [*agents, *engine._ssm_transfer_agents.values()]:
             close = getattr(agent, "close", None)
             if close is not None:
                 close()
@@ -220,16 +221,18 @@ def exchange(value, group):
     return values[dist.get_rank() ^ 1]
 
 
-def snapshot_source(engine, request):
+def snapshot_source(engine, request, request_id=101):
     metadata = request.disaggregated_params
     blocks = metadata["block_ids"]
     context = engine.context
     state = {"kv": context.memory_buffer[:, :, blocks].detach().cpu().clone()}
+    if context.cache_dsa_indexer_keys:
+        state["dsa"] = context.dsa_memory_buffer[:, blocks].detach().cpu().clone()
     if context.is_hybrid_model:
-        slot = engine._pinned_handoff_ssm_slots[101]
+        slot = engine._pinned_handoff_ssm_slots[request_id]
         state["conv"] = context.mamba_conv_states[:, slot].detach().cpu().clone()
         state["recurrent"] = context.mamba_ssm_states[:, slot].detach().cpu().clone()
-    assert engine._pinned_handoff_blocks[101] == blocks
+    assert engine._pinned_handoff_blocks[request_id] == blocks
     assert (context.kv_block_allocator.pc_state.block_ref_counts[blocks] > 0).all()
     return metadata, state
 
@@ -241,6 +244,8 @@ def decode_peer_meta(engine, pending):
         block_ids=pending.local_blocks[cached:],
         cached_prefix_blocks=cached,
     )
+    if engine._dsa_transfer_agent is not None:
+        metadata["dsa"] = engine._dsa_local_meta
     if pending.ssm is not None:
         metadata["ssm"] = {
             kind: dict(agent.export_meta(), block_ids=[pending.ssm.live_slot])
@@ -321,6 +326,9 @@ def assert_import_equal(engine, pending, source, prompt_length):
         count = min(block_size, prompt_length - index * block_size)
         actual = engine.context.memory_buffer[:, :, block, :count].cpu()
         assert torch.equal(actual, source["kv"][:, :, index, :count])
+        if "dsa" in source:
+            dsa = engine.context.dsa_memory_buffer
+            assert torch.equal(dsa[:, block, :count].cpu(), source["dsa"][:, index, :count])
     if pending.ssm is not None:
         slot = pending.ssm.live_slot
         assert torch.equal(engine.context.mamba_conv_states[:, slot].cpu(), source["conv"])
@@ -349,7 +357,8 @@ def complete_transfer(engine, metadata, tokens, params, control, request_id=101)
     if engine._kv_transfer_agent.is_push:
         assert len(handles) == 1
     elif not is_source:
-        assert len(handles) == 1 + len(engine._ssm_transfer_agents)
+        dsa_pulls = int(engine._dsa_transfer_agent is not None and pending.dsa_handle is not None)
+        assert len(handles) == 1 + dsa_pulls + len(engine._ssm_transfer_agents)
     for handle in handles:
         handle.wait()
         assert handle.poll()

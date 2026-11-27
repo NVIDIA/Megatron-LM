@@ -1893,6 +1893,106 @@ def test_fully_cached_handoff_skips_kv_but_imports_ssm(handoff_loop, is_push, hy
         engine._notify_kv_transfer_ready.assert_not_called()
 
 
+def _dsa_meta(agent, dtype="bf16"):
+    return {
+        "agent": agent,
+        "index_key_dtype": dtype,
+        "head_dim": 128,
+        "tokens_per_block": 4,
+        "element_size": 2,
+    }
+
+
+def test_dsa_push_sends_index_keys_after_kv_for_uncached_blocks():
+    engine = object.__new__(InferenceStateHandoffMixin)
+    engine._initialize_disaggregation_state()
+    engine._kv_transfer_agent = mock.Mock()
+    engine._dsa_transfer_agent = mock.Mock()
+    engine._dsa_local_meta = _dsa_meta("prefill-dsa")
+    engine._pinned_handoff_blocks[7] = [20, 21, 22]
+    decode_metas = [
+        {"agent": "decode-kv-0", "dsa": _dsa_meta("decode-dsa-0")},
+        {"agent": "decode-kv-1", "dsa": _dsa_meta("decode-dsa-1")},
+    ]
+    kv_plan, dsa_plan = object(), object()
+    engine._kv_transfer_agent.prepare_push_blocks.return_value = kv_plan
+    engine._dsa_transfer_agent.prepare_push_blocks.return_value = dsa_plan
+
+    engine.push_handoff_kv(7, decode_metas, cached_prefix_blocks=1)
+
+    engine._kv_transfer_agent.prepare_push_blocks.assert_called_once_with(
+        {"tp_metas": decode_metas}, [21, 22]
+    )
+    engine._dsa_transfer_agent.prepare_push_blocks.assert_called_once_with(
+        {"tp_metas": [_dsa_meta("decode-dsa-0"), _dsa_meta("decode-dsa-1")]}, [21, 22]
+    )
+    # The decode posts its receives in the same order inside one NCCL batch.
+    engine._kv_transfer_agent.start_prepared.assert_called_once_with([kv_plan, dsa_plan])
+
+
+@pytest.mark.parametrize("is_push", [False, True], ids=["pull", "push"])
+@pytest.mark.parametrize("dtype", ["bf16"])
+def test_dsa_handoff_imports_index_keys_for_uncached_blocks(handoff_loop, is_push, dtype):
+    engine = _HandoffHarness(handoff_loop)
+    engine._kv_transfer_agent.is_push = is_push
+    engine._dsa_transfer_agent = _TransferAgent()
+    engine._dsa_local_meta = _dsa_meta("decode-dsa", dtype)
+    engine._notify_kv_transfer_ready = mock.Mock()
+    prompt = [5] * 12
+    hashes = compute_block_hashes_batched(torch.tensor(prompt), engine.context.block_size_tokens)
+    # The cached prefix block already holds its index keys; only the suffix is imported.
+    engine.context.kv_block_allocator.registry.kv_hash_to_block_id[hashes[0]] = 4
+
+    stage = lambda rank: {"agent": f"kv-{rank}", "dsa": _dsa_meta(f"dsa-{rank}", dtype)}
+    meta = {
+        "request_id": 11,
+        "resume_tokens": [99],
+        "pp_metas": [
+            {"tp_metas": [stage(0), stage(1)], "block_ids": [100, 101, 102]},
+            {"tp_metas": [stage(2), stage(3)], "block_ids": [200, 201, 202]},
+        ],
+    }
+    engine.add_request_with_kv_handoff(
+        11, prompt, SamplingParams(num_tokens_to_generate=2), meta, [100, 101, 102]
+    )
+    _drain_loop(handoff_loop)
+
+    pending = engine._pending_kv_imports[0]
+    assert pending.local_blocks == [4, 10, 11]
+    assert pending.local_error is None
+    ((kv_meta, kv_src, kv_dst),) = engine._kv_transfer_agent.calls
+    ((dsa_meta, dsa_src, dsa_dst),) = engine._dsa_transfer_agent.calls
+    assert (dsa_src, dsa_dst) == (kv_src, kv_dst) == ([101, 102], [10, 11])
+    assert [entry["block_ids"] for entry in dsa_meta["pp_metas"]] == [[101, 102], [201, 202]]
+    assert [[rank["agent"] for rank in entry["tp_metas"]] for entry in dsa_meta["pp_metas"]] == [
+        ["dsa-0", "dsa-1"],
+        ["dsa-2", "dsa-3"],
+    ]
+    assert kv_meta["pp_metas"][0]["tp_metas"][0]["agent"] == "kv-0"
+    if is_push:
+        assert pending.dsa_handle is None  # Batched into the KV receive.
+        engine._notify_kv_transfer_ready.assert_called_once_with(11, 1)
+    else:
+        assert pending.dsa_handle is not None
+        assert pending.dsa_handle in engine._pending_transfer_handles(pending)
+
+
+def test_dsa_handoff_rejects_mismatched_index_key_cache(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    engine._dsa_transfer_agent = _TransferAgent()
+    engine._dsa_local_meta = dict(_dsa_meta("decode-dsa"), head_dim=64)
+    meta = {"request_id": 12, "resume_tokens": [99], "dsa": _dsa_meta("prefill-dsa")}
+    engine.add_request_with_kv_handoff(
+        12, [6] * 8, SamplingParams(num_tokens_to_generate=2), meta, [100, 101]
+    )
+    _drain_loop(handoff_loop)
+
+    pending = engine._pending_kv_imports[0]
+    assert isinstance(pending.local_error, ValueError)
+    assert "head_dim: peer=128 local=64" in str(pending.local_error)
+    assert not engine._kv_transfer_agent.calls and not engine._dsa_transfer_agent.calls
+
+
 def test_decode_role_rejects_prompt_scheduling(handoff_loop):
     engine = _HandoffHarness(handoff_loop)
     engine._kv_transfer_role = "decode"
@@ -1928,7 +2028,7 @@ def test_decode_role_rejects_prompt_scheduling(handoff_loop):
             "requires kv_cache_management_mode='persist'",
         ),
         (KVCacheManagementMode.PERSIST, True, False, "does not support MoE routing replay"),
-        (KVCacheManagementMode.PERSIST, False, True, "does not support DSA models"),
+        (KVCacheManagementMode.PERSIST, False, True, "does not support DSA models with MTP"),
     ],
 )
 @pytest.mark.parametrize("role", ["prefill", "decode"])
@@ -1941,6 +2041,7 @@ def test_transfer_rejects_unsupported_cache_state(mode, routing_replay, dsa, err
         kv_cache_management_mode=mode,
         moe_enable_routing_replay=routing_replay,
         cache_dsa_indexer_keys=dsa,
+        num_speculative_tokens=1 if dsa else 0,  # DSA itself is supported; DSA + MTP is not.
     )
     with pytest.raises(ValueError, match=error):
         engine.setup_kv_transfer(role)

@@ -30,6 +30,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
 from megatron.core.transformer.experimental_attention_variant.dsa_layer_specs import dsa_stack_spec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -109,7 +110,7 @@ def _model(config: TransformerConfig) -> HybridModel:
 
 
 @torch.inference_mode()
-def _serve(model, config, prompts, cuda_graphs):
+def _serve(model, config, prompts, dsa_backend, cuda_graphs):
     """Serve the prompts greedily; returns {request_id: request}."""
     context = DynamicInferenceContext(
         model_config=config,
@@ -124,6 +125,7 @@ def _serve(model, config, prompts, cuda_graphs):
             cuda_graph_max_tokens=256,
             materialize_only_last_token_logits=False,
             use_flashinfer_fused_rope=False,
+            dsa_backend=dsa_backend,
         ),
     )
     controller = TextGenerationController(
@@ -172,12 +174,26 @@ def _serve(model, config, prompts, cuda_graphs):
 
 
 @pytest.mark.parametrize(
-    "cuda_graphs, sequence_parallel",
-    [pytest.param(False, True, id="eager"), pytest.param(True, True, id="cuda_graphs")],
+    "dsa_backend, cuda_graphs, sequence_parallel",
+    [
+        *(
+            pytest.param(
+                backend, graphs, True, id=f"{backend}-{'cuda_graphs' if graphs else 'eager'}"
+            )
+            for backend in ("triton", "flashinfer")
+            for graphs in (False, True)
+        ),
+        # Without sequence parallelism every rank already holds all of the step's tokens.
+        pytest.param("flashinfer", False, False, id="flashinfer-eager-no_sp"),
+    ],
 )
-def test_tensor_parallel_matches_one_rank(tmp_path_dist_ckpt, cuda_graphs, sequence_parallel):
+def test_tensor_parallel_matches_one_rank(
+    tmp_path_dist_ckpt, dsa_backend, cuda_graphs, sequence_parallel
+):
     """TP2 (with or without sequence parallelism) reproduces TP1 tokens and log-probs."""
     pytest.importorskip("cutlass.cute")
+    if dsa_backend == "flashinfer" and not dsa_gqa_flashinfer.HAVE_FLASHINFER_DSA:
+        pytest.skip("FlashInfer's DSA kernels are not installed")
 
     generator = torch.Generator().manual_seed(7)
     prompts = [
@@ -186,7 +202,7 @@ def test_tensor_parallel_matches_one_rank(tmp_path_dist_ckpt, cuda_graphs, seque
     ]
     served = {}
     Utils.initialize_model_parallel(1, 1)  # The checkpoint directory syncs ranks.
-    name = f"dsa_gqa_tp_{cuda_graphs}_{sequence_parallel}"
+    name = f"dsa_gqa_tp_{dsa_backend}_{cuda_graphs}_{sequence_parallel}"
     with TempNamedDir(tmp_path_dist_ckpt / name) as checkpoint:
         for tp in (1, 2):
             Utils.initialize_model_parallel(tp, 1)
@@ -205,7 +221,7 @@ def test_tensor_parallel_matches_one_rank(tmp_path_dist_ckpt, cuda_graphs, seque
                 model.load_state_dict(
                     dist_checkpointing.load(model.sharded_state_dict(), checkpoint)
                 )
-            served[tp] = _serve(model, config, prompts, cuda_graphs)
+            served[tp] = _serve(model, config, prompts, dsa_backend, cuda_graphs)
             del model
     Utils.destroy_model_parallel()
 
@@ -235,7 +251,7 @@ def test_tensor_parallel_matches_one_rank(tmp_path_dist_ckpt, cuda_graphs, seque
     prompt_deltas = torch.cat(prompt_deltas)
     generated_deltas = torch.tensor(generated_deltas)
     print(
-        f"TP2 vs TP1 (graphs={cuda_graphs}, "
+        f"TP2 vs TP1 ({dsa_backend}, graphs={cuda_graphs}, "
         f"sp={sequence_parallel}): prompt "
         f"mean {prompt_deltas.mean():.2e} max {prompt_deltas.max():.2e}; generated "
         f"{generated_deltas.numel()} tokens, max {generated_deltas.max():.2e}"
