@@ -346,10 +346,10 @@ class LayerShardedMuon(TensorParallelMuon):
             be disjoint; groups sharing a (gtp_remat, tp) domain are automatically
             serialized (NCCL forbids concurrent collectives on one communicator).
         All other args: same as :class:`TensorParallelMuon`. In particular
-            ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode`` and
-            ``pg_collection`` only take effect on the path that delegates to the
-            parent: the fallback taken before ``set_param_ns_homes`` is called,
-            which runs the parent's TP-aware full-matrix Newton-Schulz. The layer-wise
+            ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode``,
+            ``distributed_reshard_wide`` and ``pg_collection`` only take effect on the path
+            that delegates to the parent: the fallback taken before ``set_param_ns_homes`` is
+            called, which runs the parent's TP-aware full-matrix Newton-Schulz. The layer-wise
             wiring sets homes even when the assignment is empty; groups in a single-rank
             domain then run local Newton-Schulz, batched by shape (``ns_batch_size``).
 
@@ -389,6 +389,7 @@ class LayerShardedMuon(TensorParallelMuon):
         qkv_split_shapes: list[int] | None = None,
         pg_collection: ProcessGroupCollection | None = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed", "auto"] = "duplicated",
+        distributed_reshard_wide: bool = False,
     ) -> None:
         if not HAVE_EMERGING_OPTIMIZERS:
             raise ImportError(
@@ -439,6 +440,7 @@ class LayerShardedMuon(TensorParallelMuon):
             pg_collection=pg_collection,
             tp_mode=tp_mode,
             use_syrk=use_syrk,
+            distributed_reshard_wide=distributed_reshard_wide,
         )
         self.gtp_remat_group = gtp_remat_group
         self.tp_group = tp_group

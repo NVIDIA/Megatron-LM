@@ -318,6 +318,16 @@ class OptimizerConfig:
     muon_use_syrk: bool = False
     """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
 
+    muon_distributed_reshard_wide: bool = False
+    """Run the distributed Newton-Schulz chain of a wide (logical out < in) weight whose only
+    sharding axis is GTP on dim-1 shards [out, in/G]: two all_to_all of the fp32 momentum shard,
+    and the Gram all-reduce is over the short dim (out^2 instead of in^2). muon_tp_mode 'auto'
+    then decides every such weight between duplicated and this chain, charging both a latency
+    per collective, so a decision can move either way. Same math as the whole-matrix
+    Newton-Schulz, rounding differs. Requires muon, dist_muon or adaptive_muon with
+    muon_tp_mode 'distributed' or 'auto'. See megatron.core.optimizer.muon_ns_reshard.
+    Defaults to False."""
+
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
@@ -530,6 +540,21 @@ class OptimizerConfig:
                 raise ValueError(
                     "muon_tp_mode='layer_sharded' does not implement split-QKV Newton-Schulz; "
                     "set muon_split_qkv=False."
+                )
+        if self.muon_distributed_reshard_wide:
+            # The flag only changes TensorParallelMuon's distributed Newton-Schulz chain; reject
+            # the configurations that never run it instead of ignoring the flag silently.
+            if self.optimizer not in ('muon', 'dist_muon', 'adaptive_muon'):
+                raise ValueError(
+                    "muon_distributed_reshard_wide changes the distributed Newton-Schulz chain "
+                    "of the Muon optimizers (muon, dist_muon, adaptive_muon); got "
+                    f"optimizer={self.optimizer!r}."
+                )
+            if self.muon_tp_mode not in ('distributed', 'auto'):
+                raise ValueError(
+                    "muon_distributed_reshard_wide changes the distributed Newton-Schulz chain, "
+                    f"but muon_tp_mode={self.muon_tp_mode!r} never runs it. Use muon_tp_mode "
+                    "'auto' or 'distributed', or drop the flag."
                 )
 
         # Dtypes may still be CLI strings here; finalize_optimizer_config maps them to torch.dtype.
