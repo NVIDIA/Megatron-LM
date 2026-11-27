@@ -18,10 +18,10 @@ class DistributedDataParallelConfig:
     """Configuration for DistributedDataParallel."""
 
     grad_reduce_in_fp32: bool = False
-    """If true, accumulate and reduce grads in fp32 with DDP. With Megatron-FSDP,
-    explicitly set megatron_fsdp_main_grads_dtype to torch.float32 and
-    megatron_fsdp_grad_comm_dtype to torch.float32 or None (inherit main grads).
-    This flag validates those MFSDP settings; it does not override them.
+    """If true, accumulate grads in fp32 with DDP or Megatron-FSDP.
+    With Megatron-FSDP, an unset megatron_fsdp_main_grads_dtype resolves to torch.float32.
+    An explicit MFSDP main-gradient dtype must be FP32. DDP also reduces in FP32;
+    MFSDP communication precision is controlled independently by megatron_fsdp_grad_comm_dtype.
     """
 
     overlap_grad_reduce: bool = False
@@ -250,11 +250,13 @@ class DistributedDataParallelConfig:
     megatron_fsdp_main_grads_dtype: Optional[torch.dtype] = None
     """Data type for the main gradient buffer utilized for distributed optimization with
       Megatron-FSDP. If set to None, main gradients will match the dtype of the model
-      compute parameters specified by the user model. Defaults to None.
+      compute parameters specified by the user model, unless grad_reduce_in_fp32 is true,
+      in which case it resolves to torch.float32. Defaults to None.
     """
 
     megatron_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
-    """Data type for gradient gather / scatter communications. Can be utilized to reduce
+    """Data type for gradient gather / scatter communications, independent of the
+      gradient-accumulation flags and main-gradient storage dtype. Can be utilized to reduce
       communication latency, but adds overhead for type-casting and copy operations.
       If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
       depending on the network domain (NVLink or IB), and can enable mixed-precision
@@ -378,6 +380,12 @@ class DistributedDataParallelConfig:
             self.fsdp_double_buffer = True
         if self.use_megatron_fsdp and self.megatron_fsdp_version == 1 and self.nccl_ub:
             self.fsdp_double_buffer = True
+        if (
+            self.use_megatron_fsdp
+            and self.grad_reduce_in_fp32
+            and self.megatron_fsdp_main_grads_dtype is None
+        ):
+            self.megatron_fsdp_main_grads_dtype = torch.float32
 
     def validate(self) -> None:
         """Check user settings without mutation, including edits after construction.
@@ -411,19 +419,11 @@ class DistributedDataParallelConfig:
                 "expert_num_distributed_optimizer_instances can only differ with MFSDP v2."
             )
         if self.use_megatron_fsdp and self.grad_reduce_in_fp32:
-            if self.megatron_fsdp_main_grads_dtype != torch.float32:
+            if self.megatron_fsdp_main_grads_dtype not in (None, torch.float32):
                 raise ValueError(
                     "grad_reduce_in_fp32=True with Megatron-FSDP requires "
-                    "megatron_fsdp_main_grads_dtype=torch.float32 for FP32 accumulation. "
-                    "The legacy flag does not override MFSDP dtypes. Set this explicitly "
-                    "or set grad_reduce_in_fp32=False to use the configured precision policy."
-                )
-            if self.megatron_fsdp_grad_comm_dtype not in (None, torch.float32):
-                raise ValueError(
-                    "grad_reduce_in_fp32=True with Megatron-FSDP requires "
-                    "megatron_fsdp_grad_comm_dtype=torch.float32 or None "
-                    "(inherit the FP32 main-gradient dtype) for FP32 communication. "
-                    "The legacy flag does not override MFSDP dtypes. Set this explicitly "
+                    "megatron_fsdp_main_grads_dtype=torch.float32 or None "
+                    "(resolve to FP32) for FP32 accumulation. Use a compatible dtype "
                     "or set grad_reduce_in_fp32=False to use the configured precision policy."
                 )
         if self.megatron_fsdp_version not in (1, 2):
