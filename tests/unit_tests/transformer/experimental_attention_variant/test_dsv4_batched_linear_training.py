@@ -18,7 +18,10 @@ from megatron.core.optimizer.emerging_optimizers import (
     TensorParallelMuon,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import (
+    MegatronModule,
+    convert_module_to_dtype_except_fp32_marked,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -141,6 +144,34 @@ class _Projection(MegatronModule):
 
         with te.autocast(enabled=True, recipe=self.recipe):
             return self.projection(inputs)
+
+
+@pytest.mark.parametrize("conversion", ["cuda", "dtype"])
+def test_preserved_initializer_survives_module_conversion(conversion):
+    """Module conversions swap the MXFP8 weight's payload but must keep its initializer.
+
+    ``nn.Module._apply`` moves tensor-subclass parameters with ``swap_tensors``, which also
+    exchanges ``__dict__``. Model setup applies both conversions below (device placement and
+    Float16Module's dtype cast) before the optimizer reads the preserved initializer.
+    """
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=2, params_dtype=torch.bfloat16, bf16=True
+    )
+    module = _Projection(config, "primary_mxfp8")
+    expected_initial = torch.empty(128, 64, device="cuda", dtype=torch.bfloat16)
+    _initialize(expected_initial)
+
+    if conversion == "cuda":
+        module.cuda(torch.cuda.current_device())
+    else:
+        convert_module_to_dtype_except_fp32_marked(module, torch.bfloat16)
+
+    weight = module.projection_weight()
+    torch.testing.assert_close(
+        weight.get_high_precision_init_val(), expected_initial.cpu(), rtol=0, atol=0
+    )
+    weight.clear_high_precision_init_val()
+    assert weight.get_high_precision_init_val() is None
 
 
 @pytest.mark.skipif(not HAVE_EMERGING_OPTIMIZERS, reason="Requires emerging-optimizers")
