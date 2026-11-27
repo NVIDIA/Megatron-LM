@@ -127,10 +127,10 @@ from dist_checkpoint_io import (
     save_dist_checkpoint_full,
     write_latest_iteration_marker,
 )
-
+from megatron.core.models.hybrid.recurrence import parse_recurrence_pattern
 
 # ---------------------------------------------------------------------------
-# Hybrid layer pattern parsing (standalone, no Megatron imports needed)
+# Hybrid layer pattern parsing
 # ---------------------------------------------------------------------------
 
 VALID_LAYER_SYMBOLS = {'M', 'G', '*', '-', 'E'}
@@ -152,14 +152,13 @@ GPT_COMPATIBLE_PATTERN_SYMBOLS = {'M', '*', '-', 'E'}
 def parse_hybrid_layer_pattern(pattern):
     """Parse a hybrid layer pattern string into a list of layer types.
 
-    Strips MTP separators (/) and pipeline stage separators (|), returning only
-    the main decoder pattern as a list of single-character layer types.
+    Strips recurrence and pipeline boundaries from the main decoder pattern
+    (before the first '/'), returning one symbol per physical layer.
 
     Returns:
         list[str]: e.g. ['M', '*', '-', 'M', '*', '-']
     """
-    # Take only the main pattern (before first '/')
-    main_pattern = pattern.split('/')[0]
+    main_pattern, _ = parse_recurrence_pattern(pattern.split('/', 1)[0])
     # Remove pipeline stage separators
     main_pattern = main_pattern.replace('|', '')
     layer_types = list(main_pattern)
@@ -742,11 +741,10 @@ def _save_dist_full(target_state_dict, common_state, model_prefix, backend,
     if 'args' in common_state and common_state['args'] is not None:
         ckpt_args = common_state['args']
         ckpt_args.num_layers = args.target_num_layers
-        if hasattr(ckpt_args, 'hybrid_layer_pattern'):
-            if args.direction == 'gpt-to-hybrid':
-                ckpt_args.hybrid_layer_pattern = args.hybrid_layer_pattern
-            else:
-                ckpt_args.hybrid_layer_pattern = None
+        if args.direction == 'gpt-to-hybrid':
+            ckpt_args.hybrid_layer_pattern = args.hybrid_layer_pattern
+        elif hasattr(ckpt_args, 'hybrid_layer_pattern'):
+            ckpt_args.hybrid_layer_pattern = None
         if args.reset_iterations:
             for attr in ('iteration', 'consumed_valid_samples',
                          'consumed_train_samples', 'train_iters', 'train_samples'):

@@ -19,4 +19,5 @@ See the [Megatron Bridge supported models list](https://github.com/NVIDIA-NeMo/M
 
 - [Language Models](llms.md)
 - [Multimodal Models](multimodal.md)
+- [Depth recurrence in HybridModel](hybrid-recurrence.md)
 - [Llama, Mistral and other Llama-like model support in Megatron-LM](../llama_mistral.md)
