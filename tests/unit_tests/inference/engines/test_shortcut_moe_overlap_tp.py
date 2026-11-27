@@ -2,11 +2,12 @@
 
 """Shortcut-MoE inference overlap at tensor-parallel size 2.
 
-With overlap, routing, NVLS dispatch, experts and combine run on a side stream while the
-paired GDP or attention layer and the shared expert run on the main stream, together with
-every TP sequence-parallel collective. The kernels and their inputs are the same as in the
-serial schedule, so the generated tokens and their log-probs must match it exactly, in
-eager mode and with CUDA graphs, for expert-tensor-parallel and expert-parallel layouts.
+With overlap, only routed expert compute runs on a side stream. Routing, NVLS dispatch
+and combine, the paired GDP or attention layer and the shared expert run on the calling
+stream, together with every TP sequence-parallel collective. The kernels and their inputs
+are the same as in the serial schedule, so the generated tokens and their log-probs must
+match it exactly, in eager mode and with CUDA graphs, for expert-tensor-parallel and
+expert-parallel layouts.
 """
 
 import gc
@@ -63,8 +64,8 @@ _SM90 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
 _FLASH_VERSION = (3 if HAVE_FA3 else None) if _SM90 else FLASH_ATTENTION_VERSION
 
 # (expert TP, EP, TP collectives, layer pattern) at TP 2. "nccl" forces the TP layers onto
-# their NCCL fallback, so NCCL TP collectives on the main stream overlap the NVLS dispatch on
-# the side stream. "*E*E" pairs each MoE with attention; "ME*E" also pairs one with GDP.
+# their NCCL fallback. NCCL TP and NVLS dispatch collectives both run on the calling stream.
+# "*E*E" pairs each MoE with attention; "ME*E" also pairs one with GDP.
 LAYOUTS = [
     pytest.param(2, 1, "nvls", "*E*E", id="tp2_etp2"),
     pytest.param(1, 2, "nvls", "*E*E", id="tp2_ep2"),
