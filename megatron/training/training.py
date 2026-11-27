@@ -98,7 +98,6 @@ from megatron.core.optimizer_param_scheduler import (
     get_canonical_lr_for_logging,
 )
 from megatron.core.parallel_state import (
-    create_all_gather_groups,
     destroy_global_memory_buffer,
     destroy_model_parallel,
     get_context_parallel_group,
@@ -1446,7 +1445,7 @@ def pretrain(
     skip_random_seed = isinstance(pg_collection, MultiModuleProcessGroupCollection)
 
     # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(
+    initialized_pg_collection = initialize_megatron(
         training=True,
         build_tokenizer=build_tokenizer,
         get_embedding_ranks=get_embedding_ranks,
@@ -1731,6 +1730,16 @@ def pretrain(
             args, train_valid_test_dataset_provider
         )
 
+    # Retain bootstrap groups for model setup without changing the schedule's
+    # caller-provided pg_collection/p2p_communicator pair.
+    model_pg_collection = pg_collection
+    if isinstance(initialized_pg_collection, ProcessGroupCollection):
+        if model_pg_collection is None:
+            model_pg_collection = initialized_pg_collection
+        elif cfg_container.dist.create_separate_param_all_gather_groups:
+            model_pg_collection.dp_cp_ag = initialized_pg_collection.dp_cp_ag
+            model_pg_collection.expt_dp_ag = initialized_pg_collection.expt_dp_ag
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     with _otel_managed_span('model_init', 'megatron.startup.model_init', is_goodput_span=True):
@@ -1739,10 +1748,9 @@ def pretrain(
             model_provider_func=model_provider,
             checkpointing_context=checkpointing_context,
             cfg_container=cfg_container,
-            # TODO (@maanug): temporary until initialize.py builds a pgcollection as bridge does.
             pg_collection=(
-                pg_collection
-                if pg_collection is not None
+                model_pg_collection
+                if model_pg_collection is not None
                 else ProcessGroupCollection.use_mpu_process_groups()
             ),
             run_train_loop_without_updates=run_train_loop_without_updates,
@@ -2245,20 +2253,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         config = cfg.model.transformer
     args.model_type = model_type
     if pg_collection is None:
+        if wrap_with_ddp and cfg.dist.create_separate_param_all_gather_groups:
+            raise RuntimeError("Attach the returned AG handles to pg_collection before get_model")
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-
-        if wrap_with_ddp and ddp_config.create_all_gather_group:
-            timeout = timedelta(minutes=cfg.dist.distributed_timeout_minutes) if cfg.dist.distributed_timeout_minutes else None
-            dp_cp_ag, expt_dp_ag = create_all_gather_groups(
-                for_expert_parallelism=(config.expert_model_parallel_size > 1),
-                timeout=timeout,
-            )
-            pg_collection.dp_cp_ag = dp_cp_ag
-            pg_collection.expt_dp_ag = expt_dp_ag
-
-            print_rank_0("> created all-gather process groups for AG/RS overlap")
-            if expt_dp_ag is not None:
-                print_rank_0(">   including expert parallelism AG group")
 
     # Build model.
     def build_model():

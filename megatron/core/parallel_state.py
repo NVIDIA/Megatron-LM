@@ -34,7 +34,7 @@ import logging
 import os
 import warnings
 from datetime import timedelta
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -43,6 +43,9 @@ from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
 from .tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from .utils import GlobalMemoryBuffer, is_torch_min_version
+
+if TYPE_CHECKING:
+    from .process_groups_config import ProcessGroupCollection
 
 logger = logging.getLogger(__name__)
 
@@ -683,7 +686,8 @@ def initialize_model_parallel(
     min_dynamic_context_parallel_size: int = 1,
     gtp_remat_num_sequence_shards: int = 1,
     expert_num_distributed_optimizer_instances: Optional[int] = None,
-) -> None:
+    create_separate_param_all_gather_groups: bool = False,
+) -> "ProcessGroupCollection":
     """Initialize model data parallel groups.
 
     Args:
@@ -833,6 +837,20 @@ def initialize_model_parallel(
         expert_num_distributed_optimizer_instances (int, default = None):
             Same as ``num_distributed_optimizer_instances``, for the expert data-parallel
             domain. Defaults to ``num_distributed_optimizer_instances``.
+
+        create_separate_param_all_gather_groups (bool, default = False):
+            Create separate dense and, when EP > 1, expert all-gather communicators
+            over the inner shard ranks. Include them in the returned collection.
+            This creates communicators; parameter-gather overlap is configured separately.
+
+    Returns:
+        ProcessGroupCollection containing the initialized ordinary groups and optional
+        all-gather groups. The AG fields are None when create_separate_param_all_gather_groups is False;
+        expt_dp_ag is also None when EP is 1. Retain this collection and pass it to model
+        components. Ordinary groups still use the existing single-grid MPU bootstrap;
+        no AG handles are stored in MPU globals. Callers may ignore the return value,
+        but it is no longer None.
+
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -1783,13 +1801,32 @@ def initialize_model_parallel(
     # we could stick it there
     _set_global_memory_buffer()
 
+    # Bootstrap compatibility: ordinary groups still come from the existing MPU grid.
+    # Import here because process_groups_config itself imports parallel_state.
+    from .process_groups_config import ProcessGroupCollection
+
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    if create_separate_param_all_gather_groups:
+        pg_collection.dp_cp_ag, pg_collection.expt_dp_ag = create_all_gather_groups(
+            for_expert_parallelism=expert_model_parallel_size > 1,
+            timeout=timeout,
+            nccl_comm_cfgs=nccl_comm_cfgs,
+        )
+    return pg_collection
+
 
 def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None):
     """
     Helper function to create all-gather process groups for AG/RS overlap.
 
-    Creates separate communicators with the same ranks as data parallel groups
-    to enable overlapping all-gather operations with reduce-scatter operations.
+    Creates separate communicators with the same ordered ranks as the inner data
+    parallel shard groups, including CP for dense parameters. With one optimizer
+    instance these are the full data parallel groups. This enables overlapping
+    all-gather operations with reduce-scatter operations. Megatron-FSDP v1 rejects
+    separate AG groups with HSDP and HFSDP.
+    Prefer initialize_model_parallel(create_separate_param_all_gather_groups=True) for standard bootstrap
+    and retain its returned collection. This helper always creates new, caller-owned groups;
+    do not call it again to retrieve groups already created by the initializer.
 
     Args:
         for_expert_parallelism (bool): If True, also creates AG group for expert parameters.
@@ -1824,15 +1861,22 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     # Reconstructing it from CP and GTP sizes would count shared ranks twice.
     dp_cp_ag_group = None
     assert _WEIGHT_REPLICA_RANK_SETS is not None
-    for ranks_with_cp in _WEIGHT_REPLICA_RANK_SETS:
-        group_with_cp_ag = create_group(
-            ranks_with_cp,
-            timeout=timeout,
-            pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
-            group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
-        )
-        if rank in ranks_with_cp:
-            dp_cp_ag_group = group_with_cp_ag
+    inner_dp_size = get_data_parallel_group(
+        with_context_parallel=True, with_gtp_remat=False, partial_data_parallel=True
+    ).size()
+    for replica_ranks in _WEIGHT_REPLICA_RANK_SETS:
+        # Match initialize_model_parallel's contiguous inner-DP partition. Enumerate
+        # every group on every rank to preserve collective group-creation order.
+        for start in range(0, len(replica_ranks), inner_dp_size):
+            shard_ranks = replica_ranks[start : start + inner_dp_size]
+            group_with_cp_ag = create_group(
+                shard_ranks,
+                timeout=timeout,
+                pg_options=get_nccl_options('dp_cp', nccl_comm_cfgs or {}),
+                group_desc='DATA_PARALLEL_GROUP_WITH_CP_AG',
+            )
+            if rank in shard_ranks:
+                dp_cp_ag_group = group_with_cp_ag
 
     # Create expert DP all-gather group if requested
     expt_dp_ag_group = None
@@ -1852,15 +1896,20 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
             rank_offset=0,
         )
 
+        inner_expert_dp_size = get_expert_data_parallel_group(
+            with_gtp_remat=False, partial_expert_data_parallel=True
+        ).size()
         for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
-            expert_dp_ag = create_group(
-                expert_dp_ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
-                group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
-            )
-            if rank in expert_dp_ranks:
-                expt_dp_ag_group = expert_dp_ag
+            for start in range(0, len(expert_dp_ranks), inner_expert_dp_size):
+                shard_ranks = expert_dp_ranks[start : start + inner_expert_dp_size]
+                expert_dp_ag = create_group(
+                    shard_ranks,
+                    timeout=timeout,
+                    pg_options=get_nccl_options("ep_dp", nccl_comm_cfgs or {}),
+                    group_desc='EXPERT_DATA_PARALLEL_GROUP_AG',
+                )
+                if rank in shard_ranks:
+                    expt_dp_ag_group = expert_dp_ag
 
     return dp_cp_ag_group, expt_dp_ag_group
 
