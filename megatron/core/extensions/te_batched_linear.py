@@ -26,6 +26,13 @@ def _clear_high_precision_init_val(param):
     param._high_precision_init_val = None
 
 
+def _attach_high_precision_init_val(param, initial_value):
+    """Attach TE's preserved-initializer accessors to ``param``."""
+    param._high_precision_init_val = initial_value
+    param.get_high_precision_init_val = MethodType(_get_high_precision_init_val, param)
+    param.clear_high_precision_init_val = MethodType(_clear_high_precision_init_val, param)
+
+
 TEBatchedLinear: type | None = None
 
 if BatchedLinear is not None:
@@ -92,13 +99,25 @@ if BatchedLinear is not None:
                 self._init_method = initializer
             self._flatten_weight()
             if initial_value is not None:
-                self.weight._high_precision_init_val = initial_value
-                self.weight.get_high_precision_init_val = MethodType(
-                    _get_high_precision_init_val, self.weight
-                )
-                self.weight.clear_high_precision_init_val = MethodType(
-                    _clear_high_precision_init_val, self.weight
-                )
+                _attach_high_precision_init_val(self.weight, initial_value)
+
+        def _apply(self, *args, **kwargs):
+            """Keep the preserved initializer when ``_apply`` swaps the quantized weight.
+
+            ``nn.Module._apply`` (dtype or device conversion) moves tensor-subclass
+            parameters with ``swap_tensors``, which exchanges their whole ``__dict__``
+            and drops the accessors attached above. TE's own modules restore attached
+            state the same way. Without this, FP32 master weights are initialized from
+            the quantized values, and MFSDP v2 rejects the parameter.
+            """
+            weight = self._parameters.get("weight")
+            preserved = hasattr(weight, "get_high_precision_init_val")
+            initial_value = getattr(weight, "_high_precision_init_val", None)
+            out = super()._apply(*args, **kwargs)
+            weight = self._parameters.get("weight")
+            if preserved and not hasattr(weight, "get_high_precision_init_val"):
+                _attach_high_precision_init_val(weight, initial_value)
+            return out
 
         def _grouped_operation(self):
             """Make an operation-local view; keep the parameter and optimizer state 2D."""
