@@ -23,6 +23,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
     get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -966,5 +967,44 @@ def test_word_embedding_marker_reaches_tied_copies_only(share_embeddings_and_out
     if parallel_state.is_pipeline_last_stage():
         marked = getattr(model.output_layer.weight, "is_word_embedding_parameter", False)
         assert marked == share_embeddings_and_output_weights
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("share_embeddings_and_output_weights", [False, True])
+@pytest.mark.parametrize("mtp_num_layers", [None, 1])
+def test_mtp_output_layer_gets_zero_tensor_dummy_wgrad(
+    mtp_num_layers, share_embeddings_and_output_weights
+):
+    """With MTP the main and MTP heads use one output weight in one backward pass, so the weight
+    they receive asks for ZeroTensor dummy weight gradients, whose sum is free. With tied weights
+    at PP=1 that is the embedding weight (output_layer.weight is None)."""
+    Utils.initialize_model_parallel()
+    model_parallel_cuda_manual_seed(123)
+    config = TransformerConfig(
+        num_layers=2, hidden_size=128, num_attention_heads=4, mtp_num_layers=mtp_num_layers
+    )
+    layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    mtp_block_spec = (
+        get_gpt_mtp_block_spec(config=config, spec=layer_spec, use_transformer_engine=True)
+        if mtp_num_layers
+        else None
+    )
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=layer_spec,
+        mtp_block_spec=mtp_block_spec,
+        vocab_size=128,
+        max_sequence_length=8,
+        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+    )
+
+    if share_embeddings_and_output_weights:
+        assert model.output_layer.weight is None
+        head_weight = model.embedding.word_embeddings.weight
+    else:
+        head_weight = model.output_layer.weight
+    marked = getattr(head_weight, "zero_tensor_dummy_wgrad", False)
+    assert marked == bool(mtp_num_layers)
 
     Utils.destroy_model_parallel()
