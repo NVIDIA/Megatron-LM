@@ -252,6 +252,22 @@ def compute_expert_offsets(tokens_per_expert: torch.Tensor, alignment: int = 1) 
     return exclusive_cumsum, inclusive_cumsum
 
 
+# Tiling of the unpermute below. Each program strides over (token tile, column tile)
+# pairs of the live tokens, _TOKEN_TILE tokens by up to _COL_TILE columns per tile, so
+# the work scales with the live tokens (read on device) while the number of programs is
+# capped per SM: enough programs to saturate HBM, but not a worst-case-sized grid of
+# empty programs when few tokens are live. The tiles are latency-bound (top-k dependent
+# row loads per tile), so the unpermute wants many programs in flight.
+_TOKEN_TILE = 8
+_COL_TILE = 256
+_UNPERMUTE_PROGRAMS_PER_SM = 16
+
+
+def _persistent_grid(max_tiles: int, device: torch.device, programs_per_sm: int) -> int:
+    """Programs for a persistent tiled kernel over at most ``max_tiles`` tiles."""
+    return max(1, min(max_tiles, programs_per_sm * _get_num_sms(device)))
+
+
 @triton.jit
 def _permute_tokens_kernel(
     hidden_ptr,  # [max_tokens, hidden_dim] input hidden states
@@ -261,6 +277,7 @@ def _permute_tokens_kernel(
     out_probs_ptr,  # [output_size] output: permuted probabilities
     out_src_idx_ptr,  # [output_size] output: permutation_map (original token index, -1 for padding)
     inverse_map_ptr,  # [max_tokens, num_local_experts] token/local-expert -> permuted row
+    slot_map_ptr,  # [max_tokens, topk] output: permuted row of each (token, slot), -1 if non-local
     counters_ptr,  # [num_local_experts] exclusive offsets, atomically incremented
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
     hidden_dim,  # hidden dimension
@@ -271,12 +288,15 @@ def _permute_tokens_kernel(
     BLOCK_H: tl.constexpr,  # tile size for copying hidden_dim
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
     HAS_INVERSE: tl.constexpr,  # whether to write inverse_map_ptr
+    HAS_SLOT_MAP: tl.constexpr,  # whether to write slot_map_ptr
 ):
     """Permute tokens into expert-grouped order.
 
     Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple (token, topk) pairs.
     valid_tokens gates which pairs are actually processed — required for CUDA graph
-    compatibility since the grid size never changes across steps.
+    compatibility since the grid size never changes across steps. With HAS_SLOT_MAP, every
+    live (token, slot) pair records its permuted row in slot_map, -1 when its expert is
+    not local.
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
@@ -307,6 +327,10 @@ def _permute_tokens_kernel(
                 tl.store(out_src_idx_ptr + pos, tok)
                 if HAS_INVERSE:
                     tl.store(inverse_map_ptr + tok * num_local_experts + lid, pos)
+                if HAS_SLOT_MAP:
+                    tl.store(slot_map_ptr + pair, pos)
+            elif HAS_SLOT_MAP:
+                tl.store(slot_map_ptr + pair, -1)
 
 
 @triton.jit
@@ -344,6 +368,7 @@ def permute_tokens(
     return_batch_invariant_inverse_map: bool = False,
     row_alignment: int = 1,
     zero_padding: bool = False,
+    return_slot_map: bool = False,
 ) -> tuple:
     """Permute tokens into expert-grouped order.
 
@@ -366,20 +391,24 @@ def permute_tokens(
         zero_padding: explicitly zero alignment-padding rows inside the used prefix.
             Rows beyond the used prefix remain undefined. This is required by grouped
             GEMM backends that consume padding values rather than masking them.
+        return_slot_map: if True, also return the map used by the default (slot-order)
+            unpermute_tokens.
 
     Returns:
         By default, returns the original 4-tuple:
         (permuted_hidden, permuted_probs, permutation_map, inclusive_offsets).
-        If return_batch_invariant_inverse_map=True, appends the inverse map as a
-        fifth return value.
+        If return_batch_invariant_inverse_map=True, appends the inverse map; if
+        return_slot_map=True, appends the slot map after it.
         - permuted_hidden: [output_size, hidden_size]
         - permuted_probs: [output_size]
         - permutation_map: [output_size] int32, maps each permuted row back to
-          its original token index. Used by unpermute_tokens to scatter expert
-          outputs back and by activation kernels to skip padding rows (-1).
+          its original token index. Used by activation kernels to skip padding rows (-1).
         - inclusive_offsets: [num_local_experts] int32 cumulative offsets for grouped_mm
         - inverse map: [max_tokens, num_local_experts] int32 map from token/local-expert
           to permuted row, only present when requested.
+        - slot map: [max_tokens, topk] int32 permuted row of each (token, slot), -1 when
+          the slot's expert is not local, only present when requested. Rows at or beyond
+          valid_tokens are undefined.
     """
     max_tokens, hidden_dim = hidden_states.shape
     topk = probs.shape[1]
@@ -413,17 +442,22 @@ def permute_tokens(
         batch_invariant_inverse_map = torch.full(
             (max_tokens, num_local_experts), -1, dtype=torch.int32, device=probs.device
         )
-    # Only initialize [0, n_used) to -1; activation and unpermute kernels are gated
-    # by the same inclusive_expert_offsets[-1] pointer so they never read beyond n_used.
+    slot_map = None
+    if return_slot_map:
+        slot_map = torch.empty(max_tokens, topk, dtype=torch.int32, device=probs.device)
+    # Only initialize [0, n_used) to -1; the activation kernels are gated by the same
+    # inclusive_expert_offsets[-1] pointer so they never read beyond n_used.
     init_permutation_map(permutation_map, inclusive_expert_offsets[-1:])
     BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
     max_pairs = max_tokens * topk
     NUM_BLOCKS = min(max_pairs, 512)
-    # The inverse-map pointer is unused when HAS_INVERSE=False. Reuse an existing
-    # int32 device tensor instead of allocating a dummy buffer for that kernel variant.
+    # The inverse-map and slot-map pointers are unused when HAS_INVERSE / HAS_SLOT_MAP is
+    # False. Reuse an existing int32 device tensor instead of allocating a dummy buffer
+    # for those kernel variants.
     inverse_map_ptr = (
         batch_invariant_inverse_map if batch_invariant_inverse_map is not None else permutation_map
     )
+    slot_map_ptr = slot_map if slot_map is not None else permutation_map
     _permute_tokens_kernel[(NUM_BLOCKS,)](
         hidden_states,
         probs,
@@ -432,6 +466,7 @@ def permute_tokens(
         permuted_probs,
         permutation_map,
         inverse_map_ptr,
+        slot_map_ptr,
         exclusive_expert_offsets,
         valid_tokens,
         hidden_dim,
@@ -442,6 +477,7 @@ def permute_tokens(
         BLOCK_H=BLOCK_H,
         NUM_BLOCKS=NUM_BLOCKS,
         HAS_INVERSE=batch_invariant_inverse_map is not None,
+        HAS_SLOT_MAP=slot_map is not None,
     )
     if zero_padding:
         zero_blocks = min(output_size, 512)
@@ -454,126 +490,99 @@ def permute_tokens(
             BLOCK_H=BLOCK_H,
             NUM_BLOCKS=zero_blocks,
         )
+    result = [permuted_hidden, permuted_probs, permutation_map, inclusive_expert_offsets]
     if return_batch_invariant_inverse_map:
-        return (
-            permuted_hidden,
-            permuted_probs,
-            permutation_map,
-            inclusive_expert_offsets,
-            batch_invariant_inverse_map,
-        )
-    return permuted_hidden, permuted_probs, permutation_map, inclusive_expert_offsets
-
-
-@triton.jit
-def _zero_output_rows_kernel(
-    output_ptr,  # [num_tokens, hidden_dim] fp32 buffer to partially zero
-    valid_tokens_ptr,  # scalar int32 CUDA tensor: number of rows to zero
-    hidden_dim,  # hidden dimension
-    num_tokens,  # max token count (fixed for CG)
-    BLOCK_H: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
-):
-    """Zero rows [0, valid_tokens) of the fp32 output buffer.
-
-    Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple rows.
-    valid_tokens gates which rows are zeroed — required for CUDA graph compatibility.
-    """
-    pid = tl.program_id(0)
-    valid_tokens = tl.load(valid_tokens_ptr)
-    if pid >= valid_tokens:
-        return
-    zero = tl.zeros([BLOCK_H], dtype=tl.float32)
-    for row in tl.range(pid, num_tokens, NUM_BLOCKS):
-        if row < valid_tokens:
-            for h in tl.range(0, hidden_dim, BLOCK_H):
-                o = h + tl.arange(0, BLOCK_H)
-                m = o < hidden_dim
-                tl.store(output_ptr + row.to(tl.int64) * hidden_dim + o, zero, mask=m)
+        result.append(batch_invariant_inverse_map)
+    if return_slot_map:
+        result.append(slot_map)
+    return tuple(result)
 
 
 @triton.jit
 def _unpermute_tokens_kernel(
     expert_out_ptr,  # [output_size, hidden_dim] expert outputs in permuted order
     probs_ptr,  # [output_size] fp32 routing probabilities (permuted)
-    src_idx_ptr,  # [output_size] permutation_map: original token index, or -1 for padding
-    output_ptr,  # [max_tokens, hidden_dim] fp32 output buffer (zeroed by caller)
-    n_used_ptr,  # pointer to inclusive_expert_offsets[-1]: number of used rows this iteration
+    slot_map_ptr,  # [max_tokens, topk] permuted row of each (token, slot), -1 if non-local
+    output_ptr,  # [max_tokens, hidden_dim] output buffer
+    valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens
     hidden_dim,  # hidden dimension
-    max_rows,  # output_size (fixed for CG)
-    BLOCK_H: tl.constexpr,  # tile size for processing hidden_dim
-    NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
+    n_col_tiles,  # cdiv(hidden_dim, BLOCK_H)
+    topk: tl.constexpr,
+    BLOCK_T: tl.constexpr,  # tokens per tile
+    BLOCK_H: tl.constexpr,  # hidden columns per tile
+    NUM_PROGRAMS: tl.constexpr,  # grid size (fixed for CG)
 ):
-    """Scatter weighted expert outputs back to original token positions.
+    """Gather each token's weighted local expert outputs, summing over its top-k slots.
 
-    Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple rows.
-    Rows beyond n_used and alignment-padding rows (src_idx == -1) are skipped.
-    Multiple topk selections for the same token are accumulated via atomic adds.
-    All arithmetic is in fp32 to avoid precision loss.
+    Grid: NUM_PROGRAMS persistent programs striding over the (token tile, column tile)
+    pairs of the live tokens, whose count is read on device, so the grid is CUDA-graph
+    safe. Every row below valid_tokens is written, including zeros for tokens without a
+    local expert, so no zeroing pass is needed. The fp32 accumulation runs in slot order
+    for each token, so the result is deterministic and unaffected by the other tokens.
     """
-    pid = tl.program_id(0)
-    n_used = tl.load(n_used_ptr)
-    if pid >= n_used:
-        return
-    for row in tl.range(pid, max_rows, NUM_BLOCKS):
-        if row < n_used:
-            source_idx = tl.load(src_idx_ptr + row)
-            # Skip alignment-padding rows within the used range
-            if source_idx >= 0:
-                prob = tl.load(probs_ptr + row)  # fp32
-                for h in tl.range(0, hidden_dim, BLOCK_H):
-                    offsets = h + tl.arange(0, BLOCK_H)
-                    m = offsets < hidden_dim
-                    # Upcast bf16 expert output to fp32 before multiply + accumulate
-                    v = tl.load(
-                        expert_out_ptr + row.to(tl.int64) * hidden_dim + offsets, mask=m
-                    ).to(tl.float32)
-                    tl.atomic_add(
-                        output_ptr + source_idx.to(tl.int64) * hidden_dim + offsets,
-                        v * prob,
-                        mask=m,
-                    )
+    valid_tokens = tl.load(valid_tokens_ptr)
+    num_tiles = tl.cdiv(valid_tokens, BLOCK_T) * n_col_tiles
+    for tile in tl.range(tl.program_id(0), num_tiles, NUM_PROGRAMS):
+        toks = (tile // n_col_tiles) * BLOCK_T + tl.arange(0, BLOCK_T)
+        cols = (tile % n_col_tiles) * BLOCK_H + tl.arange(0, BLOCK_H)
+        tok_mask = toks < valid_tokens
+        col_mask = cols < hidden_dim
+        acc = tl.zeros([BLOCK_T, BLOCK_H], dtype=tl.float32)
+        for k in tl.static_range(topk):
+            pos = tl.load(slot_map_ptr + toks * topk + k, mask=tok_mask, other=-1)
+            live = tok_mask & (pos >= 0)
+            prob = tl.load(probs_ptr + pos, mask=live, other=0.0)
+            v = tl.load(
+                expert_out_ptr + pos.to(tl.int64)[:, None] * hidden_dim + cols[None, :],
+                mask=live[:, None] & col_mask[None, :],
+                other=0.0,
+            )
+            acc += v.to(tl.float32) * prob[:, None]
+        tl.store(
+            output_ptr + toks.to(tl.int64)[:, None] * hidden_dim + cols[None, :],
+            acc,
+            mask=tok_mask[:, None] & col_mask[None, :],
+        )
 
 
 def unpermute_tokens(
     expert_output: torch.Tensor,
     permuted_probs: Optional[torch.Tensor],
-    permutation_map: torch.Tensor,
+    slot_map: Optional[torch.Tensor],
     num_tokens: int,
-    n_used: torch.Tensor,
     valid_tokens: torch.Tensor,
-    out: torch.Tensor = None,
-    batch_invariant_inverse_map: torch.Tensor = None,
+    out: Optional[torch.Tensor] = None,
+    batch_invariant_inverse_map: Optional[torch.Tensor] = None,
     ep_invariant_leaves: Optional[int] = None,
 ) -> torch.Tensor:
     """Unpermute expert outputs back to original token order.
 
-    Accumulates in fp32 to avoid precision loss from multiple topk atomic adds.
-    Returns fp32 output.
+    Each token gathers its local expert rows through ``slot_map`` and sums them in fp32
+    in top-k slot order, so the result is deterministic. Returns fp32 output.
 
     Args:
         expert_output: [output_size, hidden_dim] expert outputs in permuted order.
         permuted_probs: [output_size] fp32 routing probabilities, or None when
             batch-invariant inference applied them before FC2.
-        permutation_map: [output_size] int32, original token index or -1 for padding.
+        slot_map: [num_tokens, topk] int32 permuted row of each (token, slot), -1 when the
+            slot's expert is not local (from ``permute_tokens(..., return_slot_map=True)``),
+            or None in batch-invariant mode, which reads the inverse map instead.
         num_tokens: max token count (output buffer height); always fixed for CG.
-        n_used: scalar int32 CUDA tensor = inclusive_expert_offsets[-1]. Rows
-            beyond this are skipped without reading permutation_map.
         valid_tokens: scalar int32 CUDA tensor = number of valid input tokens.
-            Only rows [0, valid_tokens) are zeroed; all atomic_adds target
-            source_idx < valid_tokens so rows beyond are never written.
+            Rows [0, valid_tokens) are written; rows beyond are never touched.
         out: optional pre-allocated [num_tokens, hidden_dim] fp32 output buffer.
-            Pass a symmetric memory tensor to scatter directly into it, avoiding
+            Pass a symmetric memory tensor to write directly into it, avoiding
             a separate copy before RSV. If None, a local buffer is allocated.
+        batch_invariant_inverse_map: [num_tokens, num_local_experts] map used by the
+            batch-invariant path, which reduces in fixed local-expert order instead.
         ep_invariant_leaves: batch-invariant mode only (``moe_ep_invariant_combine``):
             sum each token over this rank's subtree of the EP-invariant combine tree,
             which has this many leaves (see ``unpermute_tokens_in_expert_order``).
     """
-    output_size, hidden_dim = expert_output.shape
+    hidden_dim = expert_output.shape[1]
 
-    # Triton kernel below uses tl.atomic_add (non-deterministic). Batch-invariant
-    # MoE instead reduces each token independently in fixed local-expert order,
-    # so unrelated tokens cannot affect the accumulation tree.
+    # Batch-invariant MoE reduces each token in fixed local-expert order, in fp64,
+    # matching training's batch-invariant unpermute.
     if batch_invariant.enabled():
         assert (
             batch_invariant_inverse_map is not None
@@ -590,24 +599,30 @@ def unpermute_tokens(
     assert (
         permuted_probs is not None and permuted_probs.dtype == torch.float32
     ), "permuted_probs must be fp32"
-    BLOCK_H = min(triton.next_power_of_2(hidden_dim), 1024)
+    assert (
+        slot_map is not None and slot_map.dim() == 2 and slot_map.shape[0] == num_tokens
+    ), "unpermute_tokens needs the [num_tokens, topk] slot map from the permute"
+    assert slot_map.is_contiguous()
+    topk = slot_map.shape[1]
     if out is None:
         out = torch.empty(num_tokens, hidden_dim, dtype=torch.float32, device=expert_output.device)
-    NUM_BLOCKS_ZERO = min(num_tokens, 512)
-    _zero_output_rows_kernel[(NUM_BLOCKS_ZERO,)](
-        out, valid_tokens, hidden_dim, num_tokens, BLOCK_H=BLOCK_H, NUM_BLOCKS=NUM_BLOCKS_ZERO
+    BLOCK_H = min(triton.next_power_of_2(hidden_dim), _COL_TILE)
+    n_col_tiles = _ceil_div(hidden_dim, BLOCK_H)
+    num_programs = _persistent_grid(
+        _ceil_div(num_tokens, _TOKEN_TILE) * n_col_tiles, out.device, _UNPERMUTE_PROGRAMS_PER_SM
     )
-    NUM_BLOCKS = min(output_size, 512)
-    _unpermute_tokens_kernel[(NUM_BLOCKS,)](
+    _unpermute_tokens_kernel[(num_programs,)](
         expert_output,
         permuted_probs,
-        permutation_map,
+        slot_map,
         out,
-        n_used,
+        valid_tokens,
         hidden_dim,
-        output_size,
+        n_col_tiles,
+        topk=topk,
+        BLOCK_T=_TOKEN_TILE,
         BLOCK_H=BLOCK_H,
-        NUM_BLOCKS=NUM_BLOCKS,
+        NUM_PROGRAMS=num_programs,
     )
     return out
 
@@ -622,6 +637,7 @@ def _permute_quantize_mxfp8_kernel(
     out_probs_ptr,
     out_src_idx_ptr,
     inverse_map_ptr,
+    slot_map_ptr,  # [max_tokens, topk] permuted row of each (token, slot), -1 if non-local
     counters_ptr,
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
     K,
@@ -635,12 +651,14 @@ def _permute_quantize_mxfp8_kernel(
     BLOCK_GROUPS: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,  # grid size (fixed for CG)
     HAS_INVERSE: tl.constexpr,
+    HAS_SLOT_MAP: tl.constexpr,
 ):
     """Fused permute + MXFP8 quantize + swizzle in one kernel.
 
     Grid: fixed NUM_BLOCKS CTAs, each iterating over multiple (token, topk) pairs.
     valid_tokens gates which pairs are actually processed — required for CUDA graph
-    compatibility since the grid size never changes across steps.
+    compatibility since the grid size never changes across steps. The slot map is
+    recorded as in _permute_tokens_kernel.
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
@@ -702,6 +720,10 @@ def _permute_quantize_mxfp8_kernel(
                 tl.store(out_src_idx_ptr + pos, tok)
                 if HAS_INVERSE:
                     tl.store(inverse_map_ptr + tok * num_local_experts + lid, pos)
+                if HAS_SLOT_MAP:
+                    tl.store(slot_map_ptr + pair, pos)
+            elif HAS_SLOT_MAP:
+                tl.store(slot_map_ptr + pair, -1)
 
 
 def permute_and_quantize_mxfp8(
@@ -714,6 +736,7 @@ def permute_and_quantize_mxfp8(
     alignment: int = 128,
     return_batch_invariant_inverse_map: bool = False,
     zero_padding: bool = False,
+    return_slot_map: bool = False,
 ) -> tuple:
     """Fused permute + MXFP8 quantize + swizzle.
 
@@ -735,18 +758,21 @@ def permute_and_quantize_mxfp8(
             batch-invariant unpermute to the returned tuple.
         zero_padding: initialize alignment-padding rows to MXFP8 zero. This is required
             by grouped GEMM backends that consume padding values rather than masking them.
+        return_slot_map: if True, also return the [max_tokens, topk] slot map used by the
+            default (slot-order) unpermute_tokens (see permute_tokens).
 
     Returns:
         By default, returns the original 4-tuple:
         (permuted_mxfp8, permuted_probs, permutation_map, inclusive_offsets).
-        If return_batch_invariant_inverse_map=True, appends the inverse map as a
-        fifth return value.
+        If return_batch_invariant_inverse_map=True, appends the inverse map; if
+        return_slot_map=True, appends the slot map after it.
         - permuted_mxfp8: MXFP8Tensor with .data [output_size, K] and .scale (swizzled)
         - permuted_probs: [output_size] routing probs
         - permutation_map: [output_size] int32, original token index or -1 for padding
         - inclusive_offsets: [num_local_experts] int32 cumulative offsets for scaled_grouped_mm
         - inverse map: [max_tokens, num_local_experts] int32 map from token/local-expert
           to permuted row, only present when requested.
+        - slot map: as in permute_tokens, only present when requested.
     """
     from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
@@ -789,6 +815,9 @@ def permute_and_quantize_mxfp8(
         batch_invariant_inverse_map = torch.full(
             (max_tokens, num_local_experts), -1, dtype=torch.int32, device=probs.device
         )
+    slot_map = None
+    if return_slot_map:
+        slot_map = torch.empty(max_tokens, topk, dtype=torch.int32, device=probs.device)
     init_permutation_map(permutation_map, inclusive_expert_offsets[-1:])
 
     BLOCK_K = triton.next_power_of_2(K)
@@ -798,6 +827,7 @@ def permute_and_quantize_mxfp8(
     inverse_map_ptr = (
         batch_invariant_inverse_map if batch_invariant_inverse_map is not None else permutation_map
     )
+    slot_map_ptr = slot_map if slot_map is not None else permutation_map
     _permute_quantize_mxfp8_kernel[(NUM_BLOCKS,)](
         hidden_states,
         probs,
@@ -807,6 +837,7 @@ def permute_and_quantize_mxfp8(
         permuted_probs,
         permutation_map,
         inverse_map_ptr,
+        slot_map_ptr,
         exclusive_expert_offsets,
         valid_tokens,
         K,
@@ -820,6 +851,7 @@ def permute_and_quantize_mxfp8(
         BLOCK_GROUPS=BLOCK_GROUPS,
         NUM_BLOCKS=NUM_BLOCKS,
         HAS_INVERSE=batch_invariant_inverse_map is not None,
+        HAS_SLOT_MAP=slot_map is not None,
     )
     if zero_padding:
         # MXFP8 zero is the all-zero byte; padding rows keep their zero scales.
@@ -840,12 +872,9 @@ def permute_and_quantize_mxfp8(
         dtype=hidden_states.dtype,
         backend="triton",
     )
+    result = [permuted_mxfp8, permuted_probs, permutation_map, inclusive_expert_offsets]
     if return_batch_invariant_inverse_map:
-        return (
-            permuted_mxfp8,
-            permuted_probs,
-            permutation_map,
-            inclusive_expert_offsets,
-            batch_invariant_inverse_map,
-        )
-    return permuted_mxfp8, permuted_probs, permutation_map, inclusive_expert_offsets
+        result.append(batch_invariant_inverse_map)
+    if return_slot_map:
+        result.append(slot_map)
+    return tuple(result)
