@@ -6,6 +6,8 @@
   unique stores -- replay and agree with the torch reference.
 * ``fused_row_copy``: copy with unique stores -- replays and agrees bit for bit with
   ``Tensor.contiguous`` on row-strided views.
+* ``fused_float_upcast``: BF16/FP16 to FP32 conversion with unique stores -- replays and agrees
+  bit for bit with ``Tensor.float()`` on storage ranges at unaligned offsets.
 * ``fused_moe_residual_add``: elementwise with unique stores -- forward and backward replay and
   agree bit for bit with the two unfused adds it replaces.
 * MLA YaRN RoPE (``fused_mla_yarn_rope_apply``): elementwise rotations under a timing-based
@@ -28,6 +30,7 @@ from torch.utils.checkpoint import checkpoint
 
 from megatron.core import config as mcore_config
 from megatron.core.fusions import fused_mhc_kernels
+from megatron.core.fusions.fused_float_upcast import upcast_storage_range_to_fp32
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_moe_residual_add import fused_moe_residual_add
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
@@ -318,6 +321,25 @@ def test_contiguous_rows_replays_and_matches_torch(width, start, stop, dtype):
     )
     assert outputs["out"].is_contiguous()
     assert bytes_equal(outputs["out"], view.detach().contiguous())
+
+
+# --- BF16/FP16 to FP32 upcast ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("start, end", [(0, 1 << 20), (7, 300_013), (1_000_003, 1_048_570)])
+def test_upcast_storage_range_replays_and_matches_torch(dtype, start, end):
+    seeded()
+    buffer = torch.randn(1 << 20, device="cuda", dtype=dtype)
+    outputs, _ = assert_replays_bit_exact(
+        lambda b: upcast_storage_range_to_fp32(b, start, end),
+        (buffer,),
+        replays=3,
+        backward=False,
+        contention=True,
+        what="upcast_storage_range_to_fp32",
+    )
+    assert bytes_equal(outputs["out"], buffer[start:end].float())
 
 
 # --- MoE output residual add ---------------------------------------------------------------

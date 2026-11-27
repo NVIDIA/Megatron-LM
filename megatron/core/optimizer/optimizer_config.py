@@ -392,6 +392,13 @@ class OptimizerConfig:
     overlap_param_gather_with_optimizer_step: bool = False
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
+    fused_main_grad_copy: bool = False
+    """Distributed optimizer only: build the FP32 main grads from the BF16/FP16 grad buffer with
+    one vectorized conversion per run of adjacent gradient shards (normally one per bucket)
+    instead of one ``.float()`` per parameter. The main grads are views of the run's FP32
+    tensor and have the same values. Not used with the precision-aware optimizer, which reads
+    the grad buffer directly."""
+
     #######################
     # Optimizer Offload
     #######################
