@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import bisect
 import inspect
+import itertools
 import os
 
 import pytest
@@ -22,6 +24,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     _get_qkv_split_shapes,
     _select_tp_mode,
     get_supported_coefficient_types,
+    split_qkv_shard_rows,
     validate_coefficient_type,
 )
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
@@ -189,6 +192,101 @@ def test_resolve_tp_mode_caches(monkeypatch):
     assert first == second == "distributed"
     assert call_count == 1
     assert list(optimizer._tp_mode_cache) == [(4096, 1024, 8)]
+
+
+@pytest.mark.parametrize(
+    "tp_mode, case, expected",
+    [
+        ("distributed", {}, (True, True, True)),
+        ("auto", {"resolve": {128: "distributed", 32: "duplicated"}}, (True, False, False)),
+        ("auto", {"resolve": {128: "duplicated", 32: "duplicated"}}, (False, False, False)),
+        ("duplicated", {}, None),
+        ("blockwise", {}, None),
+        ("distributed", {"split": None}, None),
+        ("distributed", {"gtp_active": False}, None),
+        ("distributed", {"is_expert": True}, None),
+    ],
+)
+def test_split_qkv_piece_modes(tp_mode, case, expected):
+    """Which split qkv weights the distributed split chain serves and which of their q / k / v
+    pieces run the distributed Newton-Schulz: every piece under distributed; under auto the
+    cost model (a stand-in here) is asked once per piece with the piece's logical shape.
+    [q 64 | k 16 | v 16] x 2 query groups in 4 GTP shards of 64 rows, 64 of them padding.
+
+    TODO: no test runs the chain with use_syrk (it needs emerging_optimizers >= 0.4.0)."""
+    optimizer = TensorParallelMuon(
+        params=[torch.nn.Parameter(torch.zeros(1))], tp_mode=tp_mode, pg_collection=None
+    )
+    asked = []
+
+    def resolve(m, n, group_size):
+        asked.append((m, n, group_size))
+        return case["resolve"][m]
+
+    optimizer._resolve_tp_mode = resolve
+    p = torch.nn.Parameter(torch.zeros(64, 64))
+    p.pad_length = 64
+    args = (
+        p,
+        case.get("split", [64, 16, 16]),
+        case.get("gtp_active", True),
+        4,
+        case.get("is_expert", False),
+        None,
+        None,
+    )
+
+    assert optimizer._split_qkv_piece_modes(*args) == expected
+    assert optimizer._split_qkv_piece_modes(*args) == expected
+    assert len(optimizer._split_qkv_modes_cache) == (expected is not None)
+    assert asked == ([(128, 64, 4), (32, 64, 4), (32, 64, 4)] if tp_mode == "auto" else [])
+
+
+def _row_labels(split, rows):
+    """``(piece, piece_row)`` of every fused row, counted row by row."""
+    bounds, next_row, labels = list(itertools.accumulate(split)), [0] * len(split), []
+    for row in range(rows):
+        piece = bisect.bisect_right(bounds, row % bounds[-1])
+        labels.append((piece, next_row[piece]))
+        next_row[piece] += 1
+    return labels
+
+
+@pytest.mark.parametrize(
+    "split, rows, shard_rows, world",
+    [
+        ([64, 16, 16], 192, 48, 4),
+        # Seven groups padded to 704 rows: pieces in several runs per shard, trailing padding.
+        ([64, 16, 16], 672, 176, 4),
+        ([64, 16, 16], 672, 88, 8),
+        # One query group, padded: Q ends early and the last shard is padding only.
+        ([64, 16, 16], 96, 32, 4),
+        ([64, 64, 16, 16], 160, 48, 4),  # [q | gate | k | v]
+        # Q much larger than K and V, in 64 shards: K and V in shards 59-60, 61-63 padding only.
+        ([768, 8, 8], 784, 13, 64),
+    ],
+)
+def test_split_qkv_shard_rows_place_every_row_once(split, rows, shard_rows, world):
+    """Against a reference that counts row by row: every run maps its local rows to the right
+    piece rows, every logical row is in exactly one run, and padding rows are in none."""
+    claimed = {}
+    for rank in range(world):
+        runs = split_qkv_shard_rows(split, rows, shard_rows, rank)
+        assert len(runs) == len(split)
+        for piece, piece_runs in enumerate(runs):
+            assert piece_runs == sorted(piece_runs, key=lambda run: run[2]), "piece-row order"
+            for start, end, piece_start in piece_runs:
+                assert 0 <= start < end <= shard_rows
+                for i in range(end - start):
+                    row = rank * shard_rows + start + i
+                    assert row not in claimed, f"fused row {row} is in two runs"
+                    claimed[row] = (piece, piece_start + i)
+    assert claimed == dict(enumerate(_row_labels(split, rows)))
+
+
+def test_split_qkv_shard_rows_reject_shape_mismatch():
+    with pytest.raises(RuntimeError, match="QKV split shape mismatch"):
+        split_qkv_shard_rows([64, 16, 16], 200, 50, 0)
 
 
 def test_muon_qkv_split_shapes():
