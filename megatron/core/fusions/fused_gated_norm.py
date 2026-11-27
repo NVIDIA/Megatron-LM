@@ -33,7 +33,7 @@ def gated_norm_fwd(
     weight,
     out,
     rstd,
-    ROWS: tl.constexpr,
+    ROWS,
     HEADS: tl.constexpr,
     D: tl.constexpr,
     SEQUENCE: tl.constexpr,
@@ -83,7 +83,7 @@ def gated_norm_bwd(
     dx,
     dgate,
     dw_partial,
-    ROWS: tl.constexpr,
+    ROWS,
     HEADS: tl.constexpr,
     D: tl.constexpr,
     SEQUENCE: tl.constexpr,
@@ -144,6 +144,11 @@ def forward_impl(
     batch, sequence, heads, d = x.shape
     rows = batch * sequence * heads
     x_strides, gate_strides = x.stride(), gate.stride()
+    x_flat = batch == 1 or x_strides[0] == sequence * x_strides[1]
+    gate_flat = batch == 1 or gate_strides[0] == sequence * gate_strides[1]
+    # Flat token addressing ignores the batch stride.
+    x_strides = (0, *x_strides[1:]) if x_flat else x_strides
+    gate_strides = (0, *gate_strides[1:]) if gate_flat else gate_strides
     out = torch.empty_like(x, memory_format=torch.contiguous_format)
     rstd = torch.empty((rows,), device=x.device, dtype=torch.float32)
     gated_norm_fwd[(triton.cdiv(rows, bt),)](
@@ -155,11 +160,11 @@ def forward_impl(
         ROWS=rows,
         HEADS=heads,
         D=d,
-        SEQUENCE=sequence,
+        SEQUENCE=0 if x_flat and gate_flat else sequence,
         X_STRIDES=x_strides,
         GATE_STRIDES=gate_strides,
-        X_FLAT_TOKENS=batch == 1 or x_strides[0] == sequence * x_strides[1],
-        GATE_FLAT_TOKENS=batch == 1 or gate_strides[0] == sequence * gate_strides[1],
+        X_FLAT_TOKENS=x_flat,
+        GATE_FLAT_TOKENS=gate_flat,
         EPS=eps,
         ZERO_CENTERED=zero_centered,
         BT=bt,
@@ -184,6 +189,11 @@ def backward_impl(
     batch, sequence, heads, d = x.shape
     rows = batch * sequence * heads
     x_strides, gate_strides = x.stride(), gate.stride()
+    x_flat = batch == 1 or x_strides[0] == sequence * x_strides[1]
+    gate_flat = batch == 1 or gate_strides[0] == sequence * gate_strides[1]
+    # Flat token addressing ignores the batch stride.
+    x_strides = (0, *x_strides[1:]) if x_flat else x_strides
+    gate_strides = (0, *gate_strides[1:]) if gate_flat else gate_strides
     dx = torch.empty_like(x, memory_format=torch.contiguous_format)
     dgate = torch.empty_like(gate, memory_format=torch.contiguous_format)
     dw = torch.empty((triton.cdiv(rows, bt), d), device=x.device, dtype=torch.float32)
@@ -199,11 +209,11 @@ def backward_impl(
         ROWS=rows,
         HEADS=heads,
         D=d,
-        SEQUENCE=sequence,
+        SEQUENCE=0 if x_flat and gate_flat else sequence,
         X_STRIDES=x_strides,
         GATE_STRIDES=gate_strides,
-        X_FLAT_TOKENS=batch == 1 or x_strides[0] == sequence * x_strides[1],
-        GATE_FLAT_TOKENS=batch == 1 or gate_strides[0] == sequence * gate_strides[1],
+        X_FLAT_TOKENS=x_flat,
+        GATE_FLAT_TOKENS=gate_flat,
         ZERO_CENTERED=zero_centered,
         BT=bt,
         num_warps=warps,

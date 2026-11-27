@@ -55,6 +55,44 @@ def test_strided_output_norm_forward_backward(length, scale, zero_centered, cont
     )
 
 
+def test_flat_token_lengths_reuse_kernels(monkeypatch):
+    """Changing token counts reuses GPU code while preserving outputs and gradients."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+    te = pytest.importorskip("transformer_engine.pytorch")
+    norm = te.RMSNorm(128, eps=1e-6, params_dtype=torch.bfloat16, device="cuda")
+    hashes = {"forward": [], "backward": []}
+
+    def record(name, run):
+        def launch(*args, **kwargs):
+            kernel = run(*args, **kwargs)
+            hashes[name].append(kernel.hash)
+            return kernel
+
+        return launch
+
+    for name, kernel in (
+        ("forward", gated_norm.gated_norm_fwd),
+        ("backward", gated_norm.gated_norm_bwd),
+    ):
+        monkeypatch.setattr(kernel, "run", record(name, kernel.run))
+    for length in (41, 73, 137):
+        x = torch.randn((1, length, 16, 128), device="cuda", dtype=torch.bfloat16).requires_grad_()
+        projection = torch.randn((1, length, 5152), device="cuda", dtype=x.dtype)
+        gate = projection[..., 3072:5120].reshape_as(x).detach().requires_grad_()
+        expected = (norm(x.reshape(-1, 128)).reshape_as(x) * F.silu(gate.float())).to(x.dtype)
+        actual = gated_norm.fused_gated_norm(x, gate, norm.weight, norm.eps)
+        torch.testing.assert_close(actual, expected, atol=0.03, rtol=0.03)
+        dy = torch.randn_like(x)
+        inputs = (x, gate, norm.weight)
+        _assert_gradients_close(
+            torch.autograd.grad(actual, inputs, dy),
+            torch.autograd.grad(expected, inputs, dy),
+            atol=0.05,
+        )
+    assert all(len(values) == 3 and len(set(values)) == 1 for values in hashes.values())
+
+
 @pytest.fixture
 def norm_inputs():
     if not torch.cuda.is_available():
