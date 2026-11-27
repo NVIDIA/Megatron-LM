@@ -442,8 +442,14 @@ class TestHybridStackMHC:
             layer.hyper_connection.mapping_proj.weight.grad is not None for layer in stack.layers
         )
 
-    def test_real_attention_mlp_forward_backward(self):
-        config = _get_config(num_layers=2)
+    @pytest.mark.parametrize("recompute", [False, True], ids=["eager", "full_recompute"])
+    def test_real_attention_mlp_forward_backward(self, recompute):
+        config = _get_config(
+            num_layers=2,
+            recompute_granularity="full" if recompute else None,
+            recompute_method="uniform" if recompute else None,
+            recompute_num_layers=1 if recompute else None,
+        )
         stack = HybridStack(
             config=config,
             submodules=hybrid_stack_spec.submodules,
@@ -459,7 +465,9 @@ class TestHybridStackMHC:
         assert output.shape == hidden_states.shape
         assert all(isinstance(layer, HyperConnectionHybridLayer) for layer in stack.layers)
         assert all(isinstance(layer.inner_layer, TransformerLayer) for layer in stack.layers)
+        assert stack.layers[0].inner_layer.attn_norm_manager is None
         output.float().sum().backward()
+        assert stack.layers[0].inner_layer.attn_norm_manager is None
         assert hidden_states.grad is not None
         assert all(
             layer.hyper_connection.mapping_proj.weight.grad is not None for layer in stack.layers
