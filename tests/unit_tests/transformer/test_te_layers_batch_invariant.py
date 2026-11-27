@@ -149,6 +149,115 @@ def _random_splits(total, num_parts):
     return lens
 
 
+_FP32, _BF16 = torch.float32, torch.bfloat16
+# name: (A shape, B shape, (out shape, out dtype), calls). test_te_linear_parity covers TE's
+# linears, whose weight gradients add into main_grad; these are TE's other general_gemm calls.
+_GEMM_CASES = {
+    # A weight gradient into fp32 main_grad with both operands [s, b, ...], as the op fuser's
+    # BasicLinear passes them, with alpha and beta None.
+    "wgrad-3d": (
+        (24, 2, 128),
+        (24, 2, 96),
+        ((96, 128), _FP32),
+        [dict(accumulate=True, layout="NT", grad=True, alpha=None, beta=None)],
+    ),
+    # A tracked first microbatch overwrites main_grad, and the next one adds into it.
+    "overwrite-then-accumulate": (
+        (64, 128),
+        (64, 96),
+        ((96, 128), _FP32),
+        [dict(layout="NT", grad=True), dict(accumulate=True, layout="NT", grad=True)],
+    ),
+    # A weight gradient into a bf16 main_grad (--grad-reduce-in-bf16), added in place.
+    "wgrad-bf16": (
+        (64, 128),
+        (64, 96),
+        ((96, 128), _BF16),
+        [dict(accumulate=True, layout="NT", grad=True)],
+    ),
+    # A scaled linear plus bias, added into a scaled bf16 residual.
+    "alpha-beta-bias": (
+        (96, 128),
+        (64, 128),
+        ((64, 96), _BF16),
+        [dict(accumulate=True, alpha=0.5, beta=2.0)],
+    ),
+    "alpha": ((96, 128), (64, 128), ((64, 96), _BF16), [dict(alpha=0.25)]),
+}
+
+
+@pytest.mark.parametrize("case", list(_GEMM_CASES))
+def test_bik_te_general_gemm_honors_accumulate_alpha_beta(case):
+    """The batch-invariant general_gemm computes TE's alpha * op(A) @ op(B) + bias + beta * out,
+    adding into out instead of overwriting it. Into fp32 or a bf16 main_grad it adds exactly the
+    bf16 product that the same call without accumulate returns, rounded once."""
+    import transformer_engine.pytorch.cpp_extensions as te_cpp
+
+    torch.manual_seed(5)
+    a_shape, b_shape, (out_shape, out_dtype), calls = _GEMM_CASES[case]
+    bf16 = _device(torch.bfloat16)
+    operands = [(torch.randn(*a_shape, **bf16), torch.randn(*b_shape, **bf16)) for _ in calls]
+    out0 = torch.randn(out_shape, device="cuda").to(out_dtype)
+    bias = torch.randn(96, **bf16) if case == "alpha-beta-bias" else None
+
+    def run():
+        out = out0.clone()
+        for (A, B), kwargs in zip(operands, calls):
+            gemm = te_cpp.general_gemm(A, B, out_dtype=out_dtype, out=out, bias=bias, **kwargs)
+            assert gemm[0] is out
+        return out
+
+    reference = run()
+    with set_batch_invariant_mode(True, backend="triton"):
+        actual = run()
+        products = [
+            te_cpp.general_gemm(A, B, out_dtype=_BF16, layout=kwargs.get("layout", "TN"))[0]
+            for (A, B), kwargs in zip(operands, calls)
+        ]
+    # Within a few bf16 ulps of the largest value: the batch-invariant product is rounded to
+    # bf16 before it is scaled and added, TE's is not.
+    scale = reference.float().abs().max().item()
+    torch.testing.assert_close(actual.float(), reference.float(), rtol=0, atol=2**-6 * scale)
+    if out_dtype == _FP32 or case == "wgrad-bf16":
+        expected = out0
+        for product, kwargs in zip(products, calls):
+            kept = expected.float() if kwargs.get("accumulate") else 0.0
+            expected = (kept + product.float().reshape(out_shape)).to(out_dtype)
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("transformer_impl", ["transformer_engine", "inference_optimized"])
+def test_triton_backend_rejects_fp8_te_gemms(transformer_impl):
+    """The triton backend's dense GEMM takes no quantized operands, so TransformerConfig rejects
+    FP8 for TE layers. Inference-optimized layers run their own GEMMs in inference, so their FP8
+    is accepted. (TE layers reject a per-module quant_recipe precision when they resolve it.)"""
+
+    def build():
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=_BIK_FA_VERSION,
+            attention_dropout=0.0,
+            batch_invariant_mode=True,
+            batch_invariant_backend="triton",
+            transformer_impl=transformer_impl,
+            add_bias_linear=transformer_impl != "inference_optimized",
+            normalization="RMSNorm",
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+        )
+
+    if transformer_impl == "transformer_engine":
+        with pytest.raises(AssertionError, match="batch_invariant_backend='triton'"):
+            build()
+    else:
+        build()
+
+
 # ============================================================================
 # Randomized Batch Invariant Tests
 # ============================================================================
@@ -474,100 +583,99 @@ def test_te_attention_layer_batch_invariant_randomized():
 # ============================================================================
 
 
-def test_te_column_parallel_linear_parity():
-    """Test that batch-invariant and regular TE linear produce same forward/backward results."""
+@pytest.mark.parametrize("fused_wgrad", [False, True], ids=["grad", "main-grad"])
+@pytest.mark.parametrize("input_shape", [(64,), (32, 1), (16, 4)], ids=["2d", "sbh-b1", "sbh-b4"])
+@pytest.mark.parametrize(
+    "layer_cls",
+    [TEColumnParallelLinear, TELayerNormColumnParallelLinear],
+    ids=["linear", "layernorm-linear"],
+)
+def test_te_linear_parity(layer_cls, input_shape, fused_wgrad):
+    """Batch-invariant and regular TE linears give the same outputs and gradients over two
+    microbatches, for 2D and [s, b, h] inputs. With gradient_accumulation_fusion, main_grad
+    gains each microbatch's bf16 weight gradient instead of keeping only the last one."""
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
 
-    cfg_bik = TransformerConfig(
-        num_layers=1,
-        hidden_size=128,
-        num_attention_heads=4,
-        use_cpu_initialization=True,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        batch_invariant_mode=True,
-        flash_attention_version=_BIK_FA_VERSION,
-        params_dtype=torch.bfloat16,
-        normalization="RMSNorm",
-        layernorm_epsilon=1e-5,
-        attention_backend=AttnBackend.flash,
-    )
+    def build(batch_invariant):
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            batch_invariant_mode=batch_invariant,
+            params_dtype=torch.bfloat16,
+            normalization="RMSNorm",
+            layernorm_epsilon=1e-5,
+            attention_backend=AttnBackend.flash,
+            # The regular layer's per-microbatch weight gradients are the reference.
+            gradient_accumulation_fusion=batch_invariant and fused_wgrad,
+            **({"flash_attention_version": _BIK_FA_VERSION} if batch_invariant else {}),
+        )
+        torch.manual_seed(456)  # Same seed for same initialization
+        layer = layer_cls(
+            input_size=cfg.hidden_size,
+            output_size=256,
+            config=cfg,
+            init_method=init_method_normal(cfg.init_method_std),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        if cfg.gradient_accumulation_fusion:
+            layer.weight.main_grad = torch.zeros(
+                layer.weight.shape, device="cuda", dtype=torch.float32
+            )
+        return layer
 
-    cfg_regular = TransformerConfig(
-        num_layers=1,
-        hidden_size=128,
-        num_attention_heads=4,
-        use_cpu_initialization=True,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        batch_invariant_mode=False,
-        params_dtype=torch.bfloat16,
-        normalization="RMSNorm",
-        layernorm_epsilon=1e-5,
-        attention_backend=AttnBackend.flash,
-    )
-
-    # Create layers with same weights
-    torch.manual_seed(456)
-    layer_bik = TEColumnParallelLinear(
-        input_size=cfg_bik.hidden_size,
-        output_size=256,
-        config=cfg_bik,
-        init_method=init_method_normal(cfg_bik.init_method_std),
-        gather_output=False,
-        bias=True,
-        skip_bias_add=False,
-        is_expert=False,
-    ).cuda()
-
-    torch.manual_seed(456)  # Same seed for same initialization
-    layer_regular = TEColumnParallelLinear(
-        input_size=cfg_regular.hidden_size,
-        output_size=256,
-        config=cfg_regular,
-        init_method=init_method_normal(cfg_regular.init_method_std),
-        gather_output=False,
-        bias=True,
-        skip_bias_add=False,
-        is_expert=False,
-    ).cuda()
-
-    # Test forward pass
-    x = torch.randn(
-        64, cfg_bik.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
-    )
-    x_clone = x.clone().detach().requires_grad_(True)
-
-    with set_batch_invariant_mode(True):
-        out_bik, _ = layer_bik(x)
-
-    with set_batch_invariant_mode(False):
-        out_regular, _ = layer_regular(x_clone)
-
-    # Check forward outputs are close
-    assert (
-        out_bik.shape == out_regular.shape
-    ), f"Shape mismatch: {out_bik.shape} vs {out_regular.shape}"
-    max_diff = (out_bik - out_regular).abs().max().item()
-    assert max_diff < 1e-3, f"Forward output difference too large: {max_diff}"
-
-    # Test backward pass
-    grad_output = torch.randn_like(out_bik)
-
-    out_bik.backward(grad_output)
-    out_regular.backward(grad_output.clone())
-
-    # Check gradients are close
-    grad_diff = (x.grad - x_clone.grad).abs().max().item()
-    assert grad_diff < 1e-3, f"Input gradient difference too large: {grad_diff}"
-
-    weight_grad_diff = (layer_bik.weight.grad - layer_regular.weight.grad).abs().max().item()
-    assert weight_grad_diff < 1e-3, f"Weight gradient difference too large: {weight_grad_diff}"
-
-    Utils.destroy_model_parallel()
+    try:
+        layer_bik, layer_regular = build(True), build(False)
+        main_grad = torch.zeros(layer_regular.weight.shape, device="cuda", dtype=torch.float32)
+        torch.manual_seed(789)
+        for _ in range(2):
+            x = torch.randn(*input_shape, 128, device="cuda", dtype=torch.bfloat16)
+            grad_output = torch.randn(*input_shape, 256, device="cuda", dtype=torch.bfloat16)
+            results = []
+            for layer, batch_invariant in ((layer_bik, True), (layer_regular, False)):
+                layer.weight.grad = None
+                x_in = x.clone().requires_grad_(True)
+                with set_batch_invariant_mode(batch_invariant):
+                    out, _ = layer(x_in)
+                    out.backward(grad_output)
+                results.append((out.detach(), x_in.grad, layer.weight.grad))
+            (out_bik, dx_bik, dw_bik), (out_regular, dx_regular, dw_regular) = results
+            assert out_bik.shape == out_regular.shape
+            pairs = [
+                ("Forward output", out_bik, out_regular),
+                ("Input gradient", dx_bik, dx_regular),
+            ]
+            if fused_wgrad:
+                main_grad += dw_regular.float()
+            else:
+                pairs.append(("Weight gradient", dw_bik, dw_regular))
+            # bf16 tolerances: the batch-invariant RMSNorm can round an ln_out element one
+            # ulp away from TE's, which moves a layernorm-linear output by an ulp.
+            for label, actual, expected in pairs:
+                torch.testing.assert_close(
+                    actual,
+                    expected,
+                    **_tols(torch.bfloat16),
+                    msg=lambda m, label=label: f"{label}: {m}",
+                )
+        if fused_wgrad:
+            torch.testing.assert_close(
+                layer_bik.weight.main_grad,
+                main_grad,
+                **_tols(torch.bfloat16),
+                msg=lambda m: f"main_grad: {m}",
+            )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_te_rmsnorm_parity():
@@ -641,95 +749,6 @@ def test_te_rmsnorm_parity():
     out_regular.backward(grad_output.clone())
 
     # Check gradients are close
-    grad_diff = (x.grad - x_clone.grad).abs().max().item()
-    assert grad_diff < 1e-3, f"Input gradient difference too large: {grad_diff}"
-
-    weight_grad_diff = (layer_bik.weight.grad - layer_regular.weight.grad).abs().max().item()
-    assert weight_grad_diff < 1e-3, f"Weight gradient difference too large: {weight_grad_diff}"
-
-    Utils.destroy_model_parallel()
-
-
-def test_te_layernorm_linear_parity():
-    """Test that batch-invariant and regular fused LayerNorm+Linear produce same results."""
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    Utils.initialize_model_parallel(1, 1)
-    model_parallel_cuda_manual_seed(123)
-
-    cfg_bik = TransformerConfig(
-        num_layers=1,
-        hidden_size=128,
-        num_attention_heads=4,
-        use_cpu_initialization=True,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        batch_invariant_mode=True,
-        flash_attention_version=_BIK_FA_VERSION,
-        params_dtype=torch.bfloat16,
-        normalization="RMSNorm",
-        layernorm_epsilon=1e-5,
-        attention_backend=AttnBackend.flash,
-    )
-
-    cfg_regular = TransformerConfig(
-        num_layers=1,
-        hidden_size=128,
-        num_attention_heads=4,
-        use_cpu_initialization=True,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        batch_invariant_mode=False,
-        params_dtype=torch.bfloat16,
-        normalization="RMSNorm",
-        layernorm_epsilon=1e-5,
-        attention_backend=AttnBackend.flash,
-    )
-
-    torch.manual_seed(321)
-    layer_bik = TELayerNormColumnParallelLinear(
-        input_size=cfg_bik.hidden_size,
-        output_size=256,
-        config=cfg_bik,
-        init_method=init_method_normal(cfg_bik.init_method_std),
-        gather_output=False,
-        bias=True,
-        skip_bias_add=False,
-        is_expert=False,
-    ).cuda()
-
-    torch.manual_seed(321)
-    layer_regular = TELayerNormColumnParallelLinear(
-        input_size=cfg_regular.hidden_size,
-        output_size=256,
-        config=cfg_regular,
-        init_method=init_method_normal(cfg_regular.init_method_std),
-        gather_output=False,
-        bias=True,
-        skip_bias_add=False,
-        is_expert=False,
-    ).cuda()
-
-    x = torch.randn(
-        48, cfg_bik.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
-    )
-    x_clone = x.clone().detach().requires_grad_(True)
-
-    with set_batch_invariant_mode(True):
-        out_bik, _ = layer_bik(x)
-
-    with set_batch_invariant_mode(False):
-        out_regular, _ = layer_regular(x_clone)
-
-    assert out_bik.shape == out_regular.shape
-    max_diff = (out_bik - out_regular).abs().max().item()
-    assert max_diff < 1e-3, f"Forward output difference too large: {max_diff}"
-
-    grad_output = torch.randn_like(out_bik)
-
-    out_bik.backward(grad_output)
-    out_regular.backward(grad_output.clone())
-
     grad_diff = (x.grad - x_clone.grad).abs().max().item()
     assert grad_diff < 1e-3, f"Input gradient difference too large: {grad_diff}"
 

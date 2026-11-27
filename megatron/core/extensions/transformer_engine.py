@@ -536,6 +536,30 @@ def _get_should_context_be_quantized_params(
         )
 
 
+def _check_batch_invariant_gemm_precision(module) -> None:
+    """Reject a dense TE module whose per-module precision is FP8 or FP4 under the triton
+    batch-invariant backend, which replaces TE's dense GEMM with a BF16 kernel.
+
+    TransformerConfig rejects a global FP8/FP4 recipe; a quant_recipe resolves per module.
+    """
+    config = module.config
+    if not (
+        config.batch_invariant_mode
+        and config.batch_invariant_backend == "triton"
+        and config.transformer_impl == "transformer_engine"
+    ):
+        return
+    if any(
+        _get_should_context_be_quantized_params(module.te_quant_params, training, False)
+        for training in (True, False)
+    ):
+        raise ValueError(
+            "batch_invariant_backend='triton' runs TE's dense GEMMs on a BF16 batch-invariant "
+            "kernel and does not support the FP8/FP4 precision quant_recipe gives this "
+            "module; use batch_invariant_backend='te_native'."
+        )
+
+
 def _resolve_is_first_microbatch(module) -> Optional[bool]:
     """The value to pass TE, or ``None`` meaning "no opinion, just accumulate".
 
@@ -1522,6 +1546,7 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params = TEQuantizationParams.parse_from_config(
                 quantization_config, model_config=self.config
             )
+        _check_batch_invariant_gemm_precision(self)
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
@@ -1774,6 +1799,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             self.te_quant_params = TEQuantizationParams.parse_from_config(
                 quantization_config, model_config=self.config
             )
+        _check_batch_invariant_gemm_precision(self)
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
