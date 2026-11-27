@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
 
 import torch
@@ -167,6 +169,21 @@ class RecomputeSegment:
         self.rng_states = None
 
 
+@dataclass
+class LayerScheduleGroup:
+    """Schedule slots supplied by a model for a contiguous group of physical layers.
+
+    The callables enter each layer's quantization context. The terminal layer config
+    controls dispatch and activation storage for an MoE group.
+    """
+
+    layers: tuple[torch.nn.Module, ...]
+    forward: list
+    backward_dw: dict
+    is_moe: bool
+    num_local_experts: Optional[int]
+
+
 class TransformerLayerSchedulePlan:
     """Schedule the executing plan of the nodes in a transformer/mtp layer.
 
@@ -197,12 +214,14 @@ class TransformerLayerSchedulePlan:
     moe_combine = None
     mtp_post_process = None
 
-    def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args={}):
+    def __init__(self, layer, event, chunk_state, comp_stream, comm_stream, extra_args=None):
         """Initializes a transformer layer schedule plan.
 
         Args:
-            layer (TransformerLayer):
-                split a transformer layer into multiple nodes for fine-grained scheduling.
+            layer (TransformerLayer | MultiTokenPredictionLayer | LayerScheduleGroup):
+                Layer or group of physical layers to split into schedule nodes. A group
+                supplies its own callables and MoE metadata. Its terminal layer's config
+                controls dispatch and activation storage for the group's nodes.
             event (torch.cuda.Event):
                 record CUDA event across multiple nodes on different streams for synchronization.
             chunk_state (ModelChunkState): model state shared in the model chunk.
@@ -215,7 +234,11 @@ class TransformerLayerSchedulePlan:
         """
         from megatron.core.models.common.utils import LayerState
 
-        self.config = layer.config
+        if extra_args is None:
+            extra_args = {}
+        self.config = (
+            layer.layers[-1].config if isinstance(layer, LayerScheduleGroup) else layer.config
+        )
         self.layer_state = LayerState()
         self.chunk_state = chunk_state
         self.layer = layer
@@ -266,15 +289,26 @@ class TransformerLayerSchedulePlan:
         from megatron.core.models.common.utils import TransformerLayerNode
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
-        fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
-        is_moe, num_local_experts = get_layer_moe_metadata(self.layer)
+        if isinstance(self.layer, LayerScheduleGroup):
+            fwd_callables = self.layer.forward
+            bwd_dw_callable_map = self.layer.backward_dw
+            is_moe = self.layer.is_moe
+            num_local_experts = self.layer.num_local_experts
+        else:
+            fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
+            is_moe, num_local_experts = get_layer_moe_metadata(self.layer)
 
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
 
-        extra_args["config"] = self.layer.config
+        extra_args["config"] = self.config
         extra_args["is_moe"] = is_moe
         extra_args["num_local_experts"] = num_local_experts
-        extra_args["delay_wgrad_compute"] = self.layer.config.delay_wgrad_compute
+        # A group supplies only the wgrad callables its physical layers actually defer.
+        extra_args["delay_wgrad_compute"] = (
+            bool(bwd_dw_callable_map)
+            if isinstance(self.layer, LayerScheduleGroup)
+            else self.config.delay_wgrad_compute
+        )
         extra_args["is_mtp"] = is_mtp
 
         # wrapper to help create TransformerLayerNode
@@ -319,7 +353,9 @@ class TransformerLayerSchedulePlan:
         else:
             self.mtp_post_process = NoopScheduleNode()
 
-    def set_fsdp_reshard_hooks(self, post_forward_hook, post_backward_hook):
+    def set_fsdp_reshard_hooks(
+        self, post_forward_hook, post_backward_hook, *, include_nested_units=False
+    ):
         """Wire FSDP parameter release callbacks for the fine-grained overlap schedule.
 
         The EP overlap schedule bypasses the normal FSDP forward/backward hooks
@@ -333,26 +369,34 @@ class TransformerLayerSchedulePlan:
                 (bwd=False). Typically ``fsdp_wrapper.post_forward_release_module``.
             post_backward_hook: Callable(module) that releases backward-pass params
                 (bwd=True). Typically ``fsdp_wrapper.post_backward_release_module``.
+            include_nested_units: Also release separately sharded MFSDP v2 descendants
+                (such as routed experts) after the forward pass.
         """
-        from megatron.core.models.hybrid.hybrid_block import HybridStack
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
-        from megatron.core.transformer.transformer_layer import TransformerLayer
 
-        assert isinstance(self.layer, (TransformerLayer, HybridStack, MultiTokenPredictionLayer)), (
-            f"Megatron FSDP with EP Overlap only supports TransformerLayer, "
-            f"HybridStack and MultiTokenPredictionLayer, "
-            f"but got {type(self.layer).__name__}."
-        )
-
-        if isinstance(self.layer, (TransformerLayer, HybridStack)):
-            hook_module = self.layer
+        if isinstance(self.layer, LayerScheduleGroup):
+            hook_modules = self.layer.layers
+        elif isinstance(self.layer, MultiTokenPredictionLayer):
+            hook_modules = (self.layer.mtp_model_layer,)
         else:
-            hook_module = self.layer.mtp_model_layer
+            hook_modules = (self.layer,)
 
-        # After the last backward op (pre_dispatch_computation), release backward-pass params.
-        self.pre_dispatch_computation.set_post_backward_hook(
-            lambda: post_backward_hook(hook_module)
-        )
+        forward_units = hook_modules
+        if include_nested_units:
+            if any(not isinstance(module, FsdpModule) for module in hook_modules):
+                raise ValueError("EP overlap requires each scheduled layer to be an MFSDP v2 unit.")
+            forward_units = tuple(
+                unit
+                for module in hook_modules
+                for unit in module.modules()
+                if isinstance(unit, FsdpModule)
+            )
+
+        def release_backward():
+            for module in reversed(hook_modules):
+                post_backward_hook(module)
+
+        self.pre_dispatch_computation.set_post_backward_hook(release_backward)
 
         # Determine the last node in forward order.
         if isinstance(self.moe_combine, NoopScheduleNode):
@@ -361,7 +405,18 @@ class TransformerLayerSchedulePlan:
             last_fwd_node = self.moe_combine
 
         # After the last forward op, release forward-pass params.
-        last_fwd_node.set_post_forward_hook(lambda: post_forward_hook(hook_module))
+        release_stream = last_fwd_node.stream
+
+        def release_forward():
+            # The combine node can run on the communication stream. Release on the
+            # consuming stream so FSDP can order storage reclamation after its kernels.
+            with torch.cuda.stream(
+                release_stream() if callable(release_stream) else release_stream
+            ):
+                for module in forward_units:
+                    post_forward_hook(module)
+
+        last_fwd_node.set_post_forward_hook(release_forward)
 
     def _iter_layer_nodes(self):
         """Yield this layer's nodes in forward order, NoopScheduleNodes included.
@@ -420,7 +475,9 @@ class TransformerLayerSchedulePlan:
             self.layer_state.__dict__.clear()
 
     def get_low_precision_context(self):
-        """Get the low-precision context for the transformer layer."""
+        """A group enters each physical layer's context within its own callables."""
+        if isinstance(self.layer, LayerScheduleGroup):
+            return nullcontext()
         return self.layer.get_inner_quantization_context()
 
     @staticmethod
@@ -530,8 +587,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     └── post_process: PostProcessNode
 
     Subclasses can swap the per-layer schedule plan by overriding the
-    ``LAYER_SCHEDULE_PLAN_CLASS`` class attribute (e.g. HybridStack uses a
-    layer plan that understands grouped/inferred layer types). They can also
+    ``LAYER_SCHEDULE_PLAN_CLASS`` class attribute. They can also
     swap the pre/post-process node classes via ``PRE_PROCESS_NODE_CLASS`` /
     ``POST_PROCESS_NODE_CLASS`` so each model owns its own embedding / output
     layer node implementations.
@@ -541,11 +597,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
     #: schedule plans. Subclasses override this to inject a layer-plan variant.
     LAYER_SCHEDULE_PLAN_CLASS = None
 
-    #: Pre/post-process node classes. Defaults below pull in the GPT-side
-    #: ``PreProcessNode`` / ``PostProcessNode`` (which call ``GPTModel._preprocess`` /
-    #: ``GPTModel._postprocess``). Subclasses set these to model-specific node
-    #: classes so the node calls the right model's ``_preprocess`` /
-    #: ``_postprocess`` methods.
+    #: The default nodes call the supplied model's _preprocess and _postprocess methods.
     PRE_PROCESS_NODE_CLASS = None
     POST_PROCESS_NODE_CLASS = None
 
@@ -566,6 +618,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         mtp_input_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
+        decoder_layer_groups: Optional[list[LayerScheduleGroup]] = None,
     ):
         """Initialize the schedule plan of all Transformer layers' sub-modules.
 
@@ -592,6 +645,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 default logits/loss path.
             output_processor_context (Any): User-defined context object forwarded to
                 `output_processor`.
+            decoder_layer_groups: Model-supplied schedule slots over the decoder layers.
 
         Returns:
             The model chunk schedule plan.
@@ -643,12 +697,16 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # build layer schedule plan for each layer.
         # The methods to obtain layers are different for MTP so we need the other build plan for
         # MTP. Also, this can help annotate MTP layer so that it can know where MTP is.
-        self._build_layer_schedule_plan(model.decoder, get_comp_stream, get_comm_stream)
+        self._build_layer_schedule_plan(
+            model.decoder.layers if decoder_layer_groups is None else decoder_layer_groups,
+            get_comp_stream,
+            get_comm_stream,
+        )
         # Segmentation applies different rules to the decoder and MTP; mark the split.
         self._num_decoder_layers = len(self._transformer_layers)
-        self._build_layer_schedule_plan(
-            getattr(model, "mtp", None), get_comp_stream, get_comm_stream
-        )
+        mtp = getattr(model, "mtp", None)
+        if mtp is not None:
+            self._build_layer_schedule_plan(mtp.layers, get_comp_stream, get_comm_stream)
 
         # build post process
         if model.post_process:
@@ -663,16 +721,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 # Forward resharding follows the schedule. Backward resharding and
                 # reduction are triggered by each FsdpModule's gradient countdown.
                 #
-                # One hook per layer plan pins the reshard boundary to "one transformer
-                # layer == one FSDP unit": the plan registers it on its own layer module
-                # (TransformerLayer / HybridStack / MTP layer) and fires it on that layer's
-                # last forward node, so the layer's all-gathered parameters are released at
-                # the layer boundary. That only holds while the FSDP unit is the layer
-                # itself -- the granularity `set_fsdp_reshard_hooks` asserts and the MFSDP
-                # v2 adapter forms for EP overlap (``fsdp_unit_modules``). A sub-layer unit
-                # would need a hook per unit; a coarser one would need this hoisted to the
-                # enclosing plan.
-                layer_plan.set_fsdp_reshard_hooks(reshard_fsdp_module, lambda _: None)
+                # Schedule groups release the underlying FSDP units at the group boundary.
+                layer_plan.set_fsdp_reshard_hooks(
+                    reshard_fsdp_module,
+                    lambda _: None,
+                    include_nested_units=isinstance(layer_plan.layer, LayerScheduleGroup),
+                )
 
         # Split into segments; pre_process and post_process keep their graphs.
         self._build_recompute_segments(model.config)
@@ -728,30 +782,18 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         for i, layer in enumerate(mtp_layers):
             add_segment([layer], self._num_decoder_layers + i)
 
-    def _build_layer_schedule_plan(self, module, comp_stream, comm_stream):
-        if module is None:
-            return
+    def _build_layer_schedule_plan(self, layers, comp_stream, comm_stream):
         plan_cls = self.LAYER_SCHEDULE_PLAN_CLASS or TransformerLayerSchedulePlan
-        num_layers = len(module.layers)
-        for layer_idx in range(num_layers):
-            extra_args = self._extra_args_for_layer(module, layer_idx, num_layers)
+        for layer_idx, layer in enumerate(layers):
             layer_plan = plan_cls(
-                module.layers[layer_idx],
+                layer,
                 self.event,
                 self.state,
                 comp_stream,
                 comm_stream,
-                extra_args,
+                {"is_first_layer": layer_idx == 0, "is_last_layer": layer_idx == len(layers) - 1},
             )
             self._transformer_layers.append(layer_plan)
-
-    def _extra_args_for_layer(self, module, layer_idx, num_layers):
-        """Per-layer ``extra_args`` dict passed to the layer plan constructor.
-
-        Subclasses extend this hook to thread additional metadata (e.g. hybrid
-        layer-type symbols) without overriding ``_build_layer_schedule_plan``.
-        """
-        return {"is_first_layer": layer_idx == 0, "is_last_layer": layer_idx == num_layers - 1}
 
     @property
     def event(self):

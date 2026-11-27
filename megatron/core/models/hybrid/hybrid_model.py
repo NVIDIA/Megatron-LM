@@ -66,11 +66,18 @@ def _get_hash_moe_layer_threshold(
     if n_hash_layers <= 0:
         return 0
 
-    from megatron.core.models.hybrid.hybrid_layer_allocation import PipelineSplit, Symbols
+    from megatron.core.models.hybrid.hybrid_layer_allocation import (
+        PipelineSplit,
+        Symbols,
+        flatten_layer_type_list,
+        parse_segment_layers,
+    )
     from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
     if isinstance(main_pattern, str) or main_pattern is None:
-        global_layers = (main_pattern or '').replace(Symbols.PIPE, '')
+        global_layers = flatten_layer_type_list(
+            parse_segment_layers((main_pattern or '').replace(Symbols.PIPE, ''))
+        )
     else:
         global_layers = [entry for entry in main_pattern if entry is not PipelineSplit]
     moe_layer_numbers = [
@@ -87,7 +94,9 @@ def _get_hash_moe_layer_threshold(
 
 
 def _validate_hash_moe_pipeline_placement(
-    layer_type_list: Sequence[str | TransformerConfig],
+    layer_type_list: Sequence[
+        str | tuple[str, ...] | TransformerConfig | tuple[TransformerConfig, ...]
+    ],
     layer_offset: int,
     hash_moe_layer_threshold: int,
     pre_process: bool,
@@ -96,12 +105,14 @@ def _validate_hash_moe_pipeline_placement(
     if hash_moe_layer_threshold <= 0 or pre_process:
         return
 
-    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, flatten_layer_type_list
     from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 
     local_hash_layer_numbers = [
         layer_offset + local_layer_number
-        for local_layer_number, layer_type in enumerate(layer_type_list, start=1)
+        for local_layer_number, layer_type in enumerate(
+            flatten_layer_type_list(layer_type_list), start=1
+        )
         if (layer_type == Symbols.MOE or type(layer_type) is MoELayerConfig)
         and layer_offset + local_layer_number <= hash_moe_layer_threshold
     ]
@@ -126,11 +137,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
             pipeline stage boundaries.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
-            The main pattern may contain "|" to define pipeline stage boundaries.
+            The main pattern may contain "|" to define pipeline stage boundaries and
+            "[...]" to group layers for the EP-overlap scheduler (see "Bracketed layer groups"
+            in docs/user-guide/hybrid-model-migration.md).
             Examples:
                 - "M*M*" -> main decoder only, no MTP
                 - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths
                 - "M-M-|M-M*-|M-M-|M-M*-" -> 4 pipeline segments
+                - "[M*E][M*E]" -> 6 physical layers in 2 EP-overlap schedule entries
         hybrid_attention_ratio (float, optional): Deprecated. Use hybrid_layer_pattern instead.
             If set to a value > 0.0 and hybrid_layer_pattern is None, a pattern will be
             generated from the ratio with a deprecation warning.
@@ -436,7 +450,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         ):
             raise ValueError(
                 "Hybrid MTP does not support overlap_moe_expert_parallel_comm because the "
-                "overlap scheduler does not expand the nested HybridStack."
+                "overlap schedule supports decoder layers only."
             )
         if self.config.freeze_base_model_for_mtp and self.mtp_num_depths < 1:
             raise ValueError(
@@ -615,6 +629,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
+        if self.config.overlap_moe_expert_parallel_comm:
+            from .fine_grained_callables import validate_overlap_schedule
+
+            validate_overlap_schedule(self)
+
         for name, module in self.named_modules():
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
@@ -701,6 +720,51 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
             self.cudagraph_manager = CudaGraphManager(config)
 
+    def build_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor,
+        decoder_input: Tensor = None,
+        labels: Tensor = None,
+        *,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output: Optional[bool] = None,
+        loss_mask: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+        mtp_input_mask: Optional[Tensor] = None,
+        output_processor: Optional[Callable[..., Any]] = None,
+        output_processor_context: Optional[Any] = None,
+    ):
+        """Build a combined-1F1B training plan with one entry per logical decoder layer.
+
+        For compatibility with other schedule builders, ``extra_block_kwargs`` accepts
+        ``None`` or an empty mapping.
+        """
+        from .fine_grained_callables import build_hybrid_schedule_plan
+
+        # TODO: Support block kwargs once the Hybrid layer callables can consume them.
+        if extra_block_kwargs:
+            raise ValueError(
+                "HybridModel.build_schedule_plan does not support nonempty extra_block_kwargs."
+            )
+        return build_hybrid_schedule_plan(
+            self,
+            input_ids,
+            position_ids,
+            attention_mask,
+            decoder_input,
+            labels,
+            packed_seq_params,
+            runtime_gather_output=runtime_gather_output,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
+            mtp_input_mask=mtp_input_mask,
+            output_processor=output_processor,
+            output_processor_context=output_processor_context,
+        )
+
     def forward(
         self,
         input_ids: Tensor,
@@ -759,20 +823,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
 
-        use_precomputed_mtp_embeddings = decoder_input is not None
+        mtp_decoder_input = decoder_input
 
-        # Decoder embedding.
-        if decoder_input is not None:
-            pass
-        elif self.pre_process:
-            decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
-
-            if self.config.sequence_parallel and not self.embedding.scatter_to_sequence_parallel:
-                # The embedding skips SP scatter for models whose outer wrapper scatters instead
-                # (e.g. VLM LMs); scatter here so a standalone LM forward isn't double-gathered.
-                decoder_input = tensor_parallel.scatter_to_sequence_parallel_region(
-                    decoder_input, group=self.pg_collection.tp
-                )
+        if decoder_input is None and self.pre_process:
+            decoder_input = _embed_tokens(self, input_ids, position_ids)
 
             # Clear the outputs for padding tokens when using dynamic batching with
             # quantization scales to avoid corrupting amax calculations. Under sequence
@@ -789,10 +843,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                         get_pg_rank(self.pg_collection.tp) if self.config.sequence_parallel else 0
                     ),
                 )
-        else:
-            # intermediate stage of pipeline
-            # decoder will get hidden_states from encoder.input_tensor
-            decoder_input = None
 
         # Hash routing consumes batch-major token IDs. Under sequence parallelism,
         # shard them with decoder activations so each TP rank hashes its local tokens.
@@ -813,45 +863,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 .contiguous()
             )
 
-        # TODO: Apply the same later-stage SP mask alignment in GPTModel.
-        # Later pipeline stages receive activations through set_input_tensor.
-        decoder_reference = decoder_input
-        if padding_mask is not None and self.config.sequence_parallel and decoder_reference is None:
-            decoder_reference = self.decoder.input_tensor
-        if (
-            padding_mask is not None
-            and self.config.sequence_parallel
-            and decoder_reference is not None
-            and padding_mask.shape[1] != decoder_reference.shape[0]
-        ):
-            padding_mask = (
-                tensor_parallel.scatter_to_sequence_parallel_region(
-                    padding_mask.transpose(0, 1).contiguous(), group=self.pg_collection.tp
-                )
-                .transpose(0, 1)
-                .contiguous()
-            )
-
-        rotary_pos_emb = None
-        if self.position_embedding_type == 'rope' and hasattr(self, 'rotary_pos_emb'):
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-            )
-            rotary_pos_emb = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-            )
-        elif self.position_embedding_type == 'yarn' and hasattr(self, 'rotary_pos_emb'):
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
-            )
-            # YarnRotaryEmbedding.forward returns (emb, mscale); discard mscale here
-            rotary_pos_emb, _ = self.rotary_pos_emb(
-                rotary_seq_len,
-                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
-                cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
-            )
+        padding_mask = _align_padding_mask(self, decoder_input, padding_mask)
+        rotary_pos_emb = _rotary_embedding(
+            self, decoder_input, packed_seq_params, inference_context
+        )
 
         # Wrap decoder_input to allow the decoder (HybridStack) to delete the
         # reference held by this caller function, enabling early garbage collection
@@ -946,7 +961,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
-                decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
+                decoder_input=mtp_decoder_input,
                 mhc_multistream=mhc_multistream,
                 labels=labels,
                 loss_mask=loss_mask,
@@ -966,7 +981,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 hidden_states=mtp_inputs.hidden_states,
                 mhc_multistream=mtp_inputs.mhc_multistream,
                 attention_mask=attention_mask,
-                inference_params=inference_params,
+                inference_params=inference_context,
                 rotary_pos_emb=(
                     None
                     if self.hybrid_layer_config_list is not None and self._mtp_uses_mla
@@ -1025,11 +1040,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     ),
                     main_hidden_states=hidden_states,
                 )
+
         # Give callers a post-decoder hook before the default output projection and loss path.
         if output_processor is not None:
-            return output_processor(
+            return _run_output_processor(
+                self,
+                output_processor,
                 hidden_states=hidden_states,
-                output_layer=self.output_layer,
                 output_weight=output_weight,
                 labels=labels,
                 loss_mask=loss_mask,
@@ -1041,9 +1058,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 packed_seq_params=packed_seq_params,
                 runtime_gather_output=runtime_gather_output,
                 context=output_processor_context,
-                compute_language_model_loss=self.compute_language_model_loss,
-                scale_logits=self._scale_logits,
-                config=self.config,
             )
         sequence_parallel_override = False
         if (
@@ -1069,38 +1083,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
-        emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
-        logits, _ = self.output_layer(
-            hidden_states,
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-            output_dtype=torch.float32 if emit_fp32 else None,
-        )
-        # Apply MuP output scaling to logits
-        logits = self._scale_logits(logits)
-        if in_inference_mode:
-            logits = logits.float()
-        # Dynamic inference under CUDA graphs: write the logits into the controller's
-        # persistent buffer and return a view of it, so no graph pins its own copy.
-        logits_buffer = getattr(inference_context, "logits_output_buffer", None)
-        if logits_buffer is not None:
-            buffer_rows = logits_buffer[0, : logits.shape[0]]
-            buffer_rows.copy_(logits.squeeze(1))
-            logits = buffer_rows.unsqueeze(1)
-        gather_output = (
-            self.output_layer.gather_output
-            if runtime_gather_output is None
-            else runtime_gather_output
-        )
-        observe_tensor(
-            self.output_layer,
-            "output_logits",
-            "output_logits",
-            logits,
-            tp_shard_dim=None if gather_output else -1,
-            sequence_dim=0,
-            batch_dim=1,
+        logits = _project_logits(
+            self, hidden_states, output_weight, runtime_gather_output, inference_context
         )
 
         # Restore sequence parallel execution to the output layer if necessary.
@@ -1119,3 +1103,97 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss
+
+
+def _embed_tokens(model, input_ids, position_ids):
+    """Embed tokens in the sequence layout consumed by the decoder."""
+    embeddings = model.embedding(input_ids=input_ids, position_ids=position_ids)
+    if model.config.sequence_parallel and not model.embedding.scatter_to_sequence_parallel:
+        embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+            embeddings, group=model.pg_collection.tp
+        )
+    return embeddings
+
+
+def _align_padding_mask(model, decoder_input, padding_mask):
+    """Shard the batch-major mask to match embeddings or incoming pipeline activations."""
+    if padding_mask is None or not model.config.sequence_parallel:
+        return padding_mask
+    reference = decoder_input if decoder_input is not None else model.decoder.input_tensor
+    if reference is None or padding_mask.shape[1] == reference.shape[0]:
+        return padding_mask
+    return (
+        tensor_parallel.scatter_to_sequence_parallel_region(
+            padding_mask.transpose(0, 1).contiguous(), group=model.pg_collection.tp
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
+
+
+def _rotary_embedding(model, decoder_input, packed_seq_params, inference_context=None):
+    """Build the shared rotary embedding when this model owns one."""
+    if model.position_embedding_type not in ("rope", "yarn") or not hasattr(
+        model, "rotary_pos_emb"
+    ):
+        return None
+    seq_len = model.rotary_pos_emb.get_rotary_seq_len(
+        inference_context, model.decoder, decoder_input, model.config, packed_seq_params
+    )
+    embedding = model.rotary_pos_emb(
+        seq_len,
+        packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == "thd",
+        cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+    )
+    return embedding[0] if model.position_embedding_type == "yarn" else embedding
+
+
+def _run_output_processor(model, output_processor, **inputs):
+    """Bind the model's output layer and loss functions to the caller's hook."""
+    return output_processor(
+        output_layer=model.output_layer,
+        compute_language_model_loss=model.compute_language_model_loss,
+        scale_logits=model._scale_logits,
+        config=model.config,
+        **inputs,
+    )
+
+
+def _project_logits(
+    model, hidden_states, output_weight, runtime_gather_output, inference_context=None
+):
+    """Project decoder outputs, apply MuP scaling and publish the logits observation."""
+    in_inference_mode = InferenceMode.is_active()
+    # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
+    emit_fp32 = in_inference_mode and model.lm_head_can_emit_fp32
+    logits, _ = model.output_layer(
+        hidden_states,
+        weight=output_weight,
+        runtime_gather_output=runtime_gather_output,
+        output_dtype=torch.float32 if emit_fp32 else None,
+    )
+    # Apply MuP output scaling to logits
+    logits = model._scale_logits(logits)
+    if in_inference_mode:
+        logits = logits.float()
+    # Dynamic inference under CUDA graphs: write the logits into the controller's
+    # persistent buffer and return a view of it, so no graph pins its own copy.
+    logits_buffer = getattr(inference_context, "logits_output_buffer", None)
+    if logits_buffer is not None:
+        buffer_rows = logits_buffer[0, : logits.shape[0]]
+        buffer_rows.copy_(logits.squeeze(1))
+        logits = buffer_rows.unsqueeze(1)
+    gather_output = (
+        model.output_layer.gather_output if runtime_gather_output is None else runtime_gather_output
+    )
+    observe_tensor(
+        model.output_layer,
+        "output_logits",
+        "output_logits",
+        logits,
+        tp_shard_dim=None if gather_output else -1,
+        sequence_dim=0,
+        batch_dim=1,
+    )
+
+    return logits

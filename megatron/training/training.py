@@ -949,17 +949,20 @@ def num_floating_point_operations(
         else:
             from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 Symbols,
+                flatten_layer_type_list,
                 parse_hybrid_pattern,
+                parse_segment_layers,
             )
 
             parsed = parse_hybrid_pattern(hybrid_layer_pattern)
 
             def count_pattern(pattern):
-                # All positions advance numbering; pipeline separators do not.
+                # The index-sharing schedule uses physical layer numbers across pipeline stages.
+                layers = flatten_layer_type_list(
+                    parse_segment_layers(pattern.replace(Symbols.PIPE, ""))
+                )
                 return count_indexers(
-                    i
-                    for i, symbol in enumerate(pattern.replace(Symbols.PIPE, ""), start=1)
-                    if symbol == Symbols.DS_ATTENTION
+                    i for i, symbol in enumerate(layers, start=1) if symbol == Symbols.DS_ATTENTION
                 )
 
             num_indexers = count_pattern(parsed.main_pattern or "")

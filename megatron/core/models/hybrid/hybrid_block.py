@@ -23,7 +23,14 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    LayerConfigItem,
+    LayerPatternItem,
+    flatten_layer_type_list,
     get_layer_type_list_from_layer_config_list,
+    get_layer_type_physical_count,
+    is_layer_group,
+    layer_type_list_to_str,
+    validate_layer_group,
     validate_segment_layers,
 )
 from megatron.core.models.hybrid.layers import utils as layer_utils
@@ -91,6 +98,17 @@ class HybridStackSubmodules:
     final_norm: ModuleSpec | type = TENorm
 
 
+def _is_layer_type_entry(layer_type) -> bool:
+    """Return whether a ``layer_type_list`` entry is a layer symbol or a bracketed group."""
+    if isinstance(layer_type, str):
+        return len(layer_type) == 1
+    return (
+        isinstance(layer_type, tuple)
+        and len(layer_type) > 0
+        and all(isinstance(symbol, str) and len(symbol) == 1 for symbol in layer_type)
+    )
+
+
 class HybridStack(MegatronModule):
     """
     Constructor for the HybridStack class.
@@ -100,14 +118,17 @@ class HybridStack(MegatronModule):
         submodules (HybridStackSubmodules): the submodules for the stack
         pre_process (bool, optional): whether to include an embedding layer.
             Defaults to True.
-        layer_type_list (list[str], optional): This argument exists for backwards-compatibility
-            reasons, allowing callers to construct ``HybridStack`` directly with layer symbols.
+        layer_type_list (list[LayerPatternItem], optional): This argument exists for
+            backwards-compatibility reasons, allowing callers to construct ``HybridStack``
+            directly with layer symbols (bracketed groups as tuples of symbols).
             It is immediately converted to independent per-layer configs.
-        layer_config_list (Sequence[TransformerConfig], optional): per-layer configs for this
-            pipeline segment. When provided by HybridModel, pipeline stage selection has already
-            been done via '|' separators in the pattern. Exactly one of ``layer_type_list`` or
-            ``layer_config_list`` must be provided.
-        pp_layer_offset (int, optional): the global layer offset for this pipeline
+        layer_config_list (Sequence[LayerConfigItem], optional): per-layer configs for this
+            pipeline segment. A tuple of configs denotes a bracketed group (e.g. ``[M*E]``)
+            whose members share an EP-overlap schedule entry. When provided by
+            HybridModel, pipeline stage selection has already been done via '|' separators
+            in the pattern. Exactly one of ``layer_type_list`` or ``layer_config_list`` must
+            be provided.
+        pp_layer_offset (int, optional): the global physical layer offset for this pipeline
             segment. Defaults to 0.
         post_layer_norm (bool, optional): whether to include a final layer norm.
             Defaults to True.
@@ -129,7 +150,7 @@ class HybridStack(MegatronModule):
         config: TransformerConfig,
         submodules: HybridStackSubmodules,
         pre_process: bool = True,
-        layer_type_list: list[str] | None = None,
+        layer_type_list: list[LayerPatternItem] | None = None,
         pp_layer_offset: int = 0,
         post_layer_norm: bool = True,
         post_process: bool = True,
@@ -140,7 +161,7 @@ class HybridStack(MegatronModule):
         mtp_layer_number: Optional[int] = None,
         hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
-        layer_config_list: Sequence[TransformerConfig] | None = None,
+        layer_config_list: Sequence[LayerConfigItem] | None = None,
         boundary_layout: CPLayout | None = None,
     ) -> None:
         """
@@ -150,12 +171,12 @@ class HybridStack(MegatronModule):
         if (layer_type_list is None) == (layer_config_list is None):
             raise ValueError("Exactly one of layer_type_list or layer_config_list must be provided")
         if layer_type_list is not None:
-            if any(
-                not isinstance(layer_symbol, str) or len(layer_symbol) != 1
-                for layer_symbol in layer_type_list
-            ):
-                raise ValueError("Each entry in layer_type_list must be a single layer symbol")
-            segment = ''.join(layer_type_list)
+            if any(not _is_layer_type_entry(layer_type) for layer_type in layer_type_list):
+                raise ValueError(
+                    "Each entry in layer_type_list must be a single layer symbol or a tuple of "
+                    "single layer symbols (a bracketed group)"
+                )
+            segment = layer_type_list_to_str(layer_type_list)
             warnings.warn(
                 "DEPRECATED(layer_type_list): please use `layer_config_list` instead",
                 DeprecationWarning,
@@ -163,6 +184,18 @@ class HybridStack(MegatronModule):
             )
             layer_config_list = validate_segment_layers(segment, config)
 
+        schedule_group_sizes = None
+        if any(is_layer_group(item) for item in layer_config_list):
+            for item in layer_config_list:
+                if is_layer_group(item):
+                    validate_layer_group(
+                        [layer_utils.get_layer_symbol_from_config(config) for config in item]
+                    )
+            # Brackets group EP-overlap schedule slots. All modules and configs stay physical.
+            schedule_group_sizes = tuple(
+                get_layer_type_physical_count(item) for item in layer_config_list
+            )
+            layer_config_list = flatten_layer_type_list(layer_config_list)
         for layer_config in layer_config_list:
             if layer_utils.get_custom_layer_type(layer_config) is None:
                 segment = layer_utils.get_layer_symbol_from_config(layer_config)
@@ -200,6 +233,7 @@ class HybridStack(MegatronModule):
         self._mhc_block_end_plan: Optional[Tuple[bool, ...]] = None
 
         self.layer_config_list = layer_config_list
+        self.schedule_group_sizes = schedule_group_sizes
         self._has_custom_layers = any(
             layer_utils.get_custom_layer_type(layer_config) is not None
             for layer_config in self.layer_config_list

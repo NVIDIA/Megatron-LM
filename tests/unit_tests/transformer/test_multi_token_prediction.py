@@ -38,6 +38,7 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.multi_token_prediction import (
@@ -4753,6 +4754,7 @@ class TestMultiTokenPredictionHybrid:
             assert kwargs["mtp_input_mask"] is mtp_input_mask
             assert kwargs["metric_avg_group"] is metric_avg_group
             assert kwargs["main_hidden_states"] is hidden_states
+            assert kwargs["tp_group"] is model.tp_group
             return kwargs["main_hidden_states"]
 
         monkeypatch.setattr(
@@ -4932,15 +4934,20 @@ class TestMultiTokenPredictionHybrid:
         torch.testing.assert_close(output, labels.to(dtype=hidden_states.dtype) + 1000.0)
 
     @pytest.mark.parametrize("compute_mtp_loss", [True, False])
+    @pytest.mark.parametrize("spec_tokens,block_graph", [(1, False), (1, True), (0, False)])
     def test_compute_mtp_loss_does_not_control_speculative_decoding(
-        self, monkeypatch, compute_mtp_loss
+        self, monkeypatch, compute_mtp_loss, spec_tokens, block_graph
     ):
         """Test the auxiliary MTP switch does not disable speculative-decoding state capture."""
         model, hidden_states, call_counts, _ = self._make_forward_stub()
+        buffer = None
+        if block_graph:
+            model.config.inference_cuda_graph_scope = InferenceCudaGraphScope.block
+            buffer = hidden_states.new_full((4, *hidden_states.shape[1:]), -1)
         inference_context = types.SimpleNamespace(
             is_dynamic_batching=lambda: True,
-            num_speculative_tokens=1,
-            mtp_decoder_hidden_states=None,
+            num_speculative_tokens=spec_tokens,
+            mtp_decoder_hidden_states=buffer,
             config=types.SimpleNamespace(materialize_only_last_token_logits=False),
         )
 
@@ -4965,7 +4972,14 @@ class TestMultiTokenPredictionHybrid:
             )
 
         torch.testing.assert_close(output, hidden_states.transpose(0, 1).contiguous())
-        torch.testing.assert_close(inference_context.mtp_decoder_hidden_states, hidden_states)
+        if block_graph:
+            assert inference_context.mtp_decoder_hidden_states is buffer
+            torch.testing.assert_close(buffer[: hidden_states.shape[0]], hidden_states)
+            assert torch.all(buffer[hidden_states.shape[0] :] == -1)
+        elif spec_tokens:
+            assert inference_context.mtp_decoder_hidden_states is hidden_states
+        else:
+            assert inference_context.mtp_decoder_hidden_states is None
         assert call_counts.pop("decoder_input") is None
         assert call_counts.pop("mtp_input_mask") is None
         assert call_counts == {"mtp": 0, "mtp_loss": 0, "main_loss": 0}

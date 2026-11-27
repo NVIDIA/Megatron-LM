@@ -533,12 +533,14 @@ class TestHybridModel:
             def __init__(self):
                 super().__init__()
                 self.mtp_input_mask = None
+                self.inference_context = None
 
             def prepare_cp_layout(self, **kwargs):
                 return SimpleNamespace(**kwargs)
 
             def forward(self, **kwargs):
                 self.mtp_input_mask = kwargs["mtp_input_mask"]
+                self.inference_context = kwargs["inference_params"]
                 hidden_states = kwargs["hidden_states"]
                 return torch.cat((hidden_states, hidden_states), dim=0)
 
@@ -567,6 +569,7 @@ class TestHybridModel:
         labels = input_ids.clone()
         loss_mask = torch.ones_like(input_ids, dtype=torch.float32)
         mtp_input_mask = input_ids != 2
+        inference_context = StaticInferenceContext(micro_batch_size, sequence_length)
 
         output = self.model(
             input_ids=input_ids,
@@ -575,10 +578,12 @@ class TestHybridModel:
             labels=labels,
             loss_mask=loss_mask,
             mtp_input_mask=mtp_input_mask,
+            inference_context=inference_context,
         )
 
         assert output.shape == labels.shape
         assert self.model.mtp.mtp_input_mask is mtp_input_mask
+        assert self.model.mtp.inference_context is inference_context
         assert captured_loss_args["mtp_input_mask"] is mtp_input_mask
         assert captured_loss_args["metric_avg_group"] is self.model.pg_collection.dp_cp
 
@@ -794,6 +799,52 @@ class TestHybridModel:
         torch.save(self.model.state_dict(), path)
 
         self.model.load_state_dict(torch.load(path))
+
+    def test_grouped_sharded_state_dict_keeps_ungrouped_checkpoint_keys(self):
+        """A bracketed pattern saves the same checkpoint keys as its ungrouped pattern."""
+
+        def sharded_state_dict(hybrid_layer_pattern):
+            model_config = TransformerConfig(
+                num_layers=2, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+            )
+            model = HybridModel(
+                config=model_config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern=hybrid_layer_pattern,
+            )
+            return model.sharded_state_dict()
+
+        grouped_state_dict = sharded_state_dict("[*-]")
+        grouped_keys = {value.key for value in grouped_state_dict.values() if hasattr(value, "key")}
+        ungrouped_keys = {
+            value.key for value in sharded_state_dict("*-").values() if hasattr(value, "key")
+        }
+
+        assert grouped_keys == ungrouped_keys
+        assert "decoder.layers.0.self_attention.linear_qkv.weight" in grouped_keys
+        assert "decoder.layers.1.mlp.linear_fc1.weight" in grouped_keys
+        assert "decoder.final_norm.weight" in grouped_keys
+
+    def test_ungrouped_sharded_state_dict_keeps_hybrid_final_norm_key(self):
+        """Non-grouped patterns keep ``final_norm`` so older hybrid checkpoints load."""
+        model_config = TransformerConfig(
+            num_layers=2, hidden_size=256, num_attention_heads=4, use_cpu_initialization=True
+        )
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="*-",
+        )
+
+        sharded_state_dict = model.sharded_state_dict()
+        sharded_keys = {value.key for value in sharded_state_dict.values() if hasattr(value, "key")}
+
+        assert "decoder.final_norm.weight" in sharded_keys
+        assert "decoder.final_layernorm.weight" not in sharded_keys
 
     def test_layer_numbers(self):
         """

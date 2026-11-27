@@ -36,6 +36,11 @@ class Symbols:
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
+    # Brackets mark layers that share one EP-overlap schedule entry, e.g. ``[M*E]``.
+    # See "Bracketed layer groups" in
+    # docs/user-guide/hybrid-model-migration.md.
+    GROUP_START = "["
+    GROUP_END = "]"
     LAYER_CONFIG_MAP = {
         MAMBA: MambaLayerConfig,
         GDN: GDNLayerConfig,
