@@ -194,22 +194,40 @@ class MTPControllerMixin:
         active_request_count: int,
         padded_count: int,
         base_position,
+        token_row_indices: Optional[Tensor] = None,
     ) -> None:
         """Fixed-shape commit pass for a graphed decode-only step.
 
-        Same KV writes as `_mtp_commit_pass` on a decode-only step: request r's accepted drafts
-        are refreshed from the main hiddens at positions `base_r - 1 - a_r ..`. Instead of
-        packing the variable number of refreshed rows, every request gets
-        `num_speculative_tokens` rows whose unused tail writes the dummy block, so the forward's
-        shape depends only on `padded_count` and its metadata is staged on the GPU from the
-        accepted counts, with no host sync. The forward itself still runs eagerly here.
+        Same KV writes as `_mtp_commit_pass` on a decode-only step, given the same
+        `token_row_indices`: request r's accepted drafts are refreshed from the main hiddens at
+        positions `base_r - 1 - a_r ..`. Instead of packing the variable number of refreshed rows,
+        every request gets `num_speculative_tokens` rows whose unused tail writes the dummy block,
+        so the forward's shape depends only on `padded_count` and its metadata is staged on the
+        GPU from the accepted counts, with no host sync. The forward itself still runs eagerly
+        here.
+
+        `token_row_indices` is async scheduling's map from each token row of the survivor-ordered
+        batch to its row in the forward that produced `gathered_hidden` (see `_mtp_commit_pass`);
+        None means the two orders agree. The gather reads through it on the GPU, so it stays
+        sync-free and leaves the forward's shape unchanged.
         """
         num_slots = self.num_speculative_tokens
         real_rows = active_request_count * num_slots
         rows = self._mtp_commit_row_indices(padded_count)
-        hidden = gathered_hidden.index_select(0, rows.clamp(max=gathered_hidden.shape[0] - 1))
+        hidden_rows = rows
+        token_rows = rows + 1
+        if token_row_indices is not None:
+            # Async compaction leaves the hidden states and input tokens in the pending forward's
+            # row order; read them through the same row map as verification. Padded rows past
+            # the map are clamped here and zeroed below.
+            last = token_row_indices.shape[0] - 1
+            hidden_rows = token_row_indices[hidden_rows.clamp(max=last)]
+            token_rows = token_row_indices[token_rows.clamp(max=last)]
+        hidden = gathered_hidden.index_select(
+            0, hidden_rows.clamp(max=gathered_hidden.shape[0] - 1)
+        )
         input_ids = context.gpu_view.token_to_input_ids
-        tokens = input_ids.index_select(0, (rows + 1).clamp(max=input_ids.shape[0] - 1))
+        tokens = input_ids.index_select(0, token_rows.clamp(max=input_ids.shape[0] - 1))
         # Rows past the real requests read padding (or clamped) main-forward rows.
         hidden[real_rows:] = 0
         tokens[real_rows:] = 0

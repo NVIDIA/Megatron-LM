@@ -909,6 +909,37 @@ class TestGraphedCommitPass:
         assert kwargs["accepted_counts"] is controller._accepted_token_counts_per_request
         assert kwargs["base_positions"] is base_position
 
+    def test_async_compaction_reads_each_request_from_its_own_forward_rows(self):
+        """The fixed-shape commit reads the pending forward's rows through the row map.
+
+        The pending forward ran requests A, B, C and D in rows 0-2, 3-5, 6-8 and 9-11. A
+        finished, and compaction moved D into A's slot, so the batch is now (D, B, C) while the
+        hidden states and input tokens keep the forward's order. D must commit rows 9 and 10,
+        not A's rows 0 and 1.
+        """
+        controller, model, context = self._setup()
+        token_row_indices = torch.tensor([9, 10, 11, 3, 4, 5, 6, 7, 8], device=DEVICE)
+        base_position = torch.tensor([10, 20, 30], dtype=torch.int64, device=DEVICE)
+        controller._compute_serial_mtp_and_sample(
+            base_position=base_position, token_row_indices=token_row_indices
+        )
+
+        controller._mtp_commit_pass.assert_not_called()
+        assert len(model.kv_write_calls) == 1
+        call = model.kv_write_calls[0]
+        stride = self.NUM_SPEC + 1
+        slots = [r * stride + j for r in range(self.NUM_DECODE) for j in range(self.NUM_SPEC)]
+        padding = (self.PADDED - self.NUM_DECODE) * self.NUM_SPEC
+        rows = token_row_indices.cpu().tolist()
+        expected_hidden = torch.tensor(
+            [rows[s] for s in slots] + [0] * padding, dtype=torch.float32, device=DEVICE
+        )
+        expected_tokens = torch.tensor(
+            [1000 + rows[s + 1] for s in slots] + [0] * padding, dtype=torch.int64, device=DEVICE
+        )
+        assert torch.equal(call["hidden_states"][:, 0, 0], expected_hidden)
+        assert torch.equal(call["next_token_ids"][0], expected_tokens)
+
     def test_mixed_step_takes_eager_commit(self):
         controller, model, context = self._setup(prefill_req_count=1)
         self._run(controller)
