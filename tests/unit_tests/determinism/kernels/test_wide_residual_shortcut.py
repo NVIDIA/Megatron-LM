@@ -30,9 +30,9 @@ from tests.unit_tests.determinism.kernels.harness import seeded
 from tests.unit_tests.fusions.test_wide_residual_shortcut import (
     BF16,
     F32,
-    FLAGSHIPS,
     GPU,
     MX_SHAPES,
+    NANO_SUPER_ULTRA_SHAPES,
     QUALIFIED,
     REQUIRES_FUSED_BACKWARD,
     SEAMS,
@@ -149,7 +149,7 @@ FORWARD = [
 ] + [
     # Three-stream BF16 inference recipes at the upper end of the 512-1024 row window.
     pytest.param(1024, h, 3, n, u, T, q, T, BF16, 1e-5, F, T, marks=QUALIFIED if q else ())
-    for _, h in FLAGSHIPS for n, u in ((1, 1), (2, 1), (2, 2)) for q in (F, T)
+    for _, h in NANO_SUPER_ULTRA_SHAPES for n, u in ((1, 1), (2, 1), (2, 2)) for q in (F, T)
 ] + [
     # Every leaf of the prefill tree (inference rows > 1024).
     pytest.param(m, h, s, len(o), u, T, o, T, d, 1e-5, F, T, marks=QUALIFIED)
@@ -214,7 +214,7 @@ INFERENCE = [
 EXPLICIT_GRIDS = [(32, 1), (96, 1), (128, 64), (288, 4), (4128, 34), (4096, 32)]
 EXPLICIT_GRIDS += [(4096, 960), (3072, 24), (10240, 80)]
 _BF16_BACKWARD = [(3, 4128, 1024, "auto"), (6, 96, 160, "auto"), (2, 3072, 1024, 24)]
-_BF16_BACKWARD += [(3, h, m, "auto") for m, h in FLAGSHIPS]
+_BF16_BACKWARD += [(3, h, m, "auto") for m, h in NANO_SUPER_ULTRA_SHAPES]
 BACKWARD = (
     [
         ((1, 2, 4, 5, 6)[i % 5], n, h, 1024, i % 3 > 0, grid, (n == 2,) * n, n, F)

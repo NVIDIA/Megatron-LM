@@ -68,9 +68,9 @@ QUALIFIED = pytest.mark.skipif(
 )
 F, T = False, True
 BF16, F32 = torch.bfloat16, torch.float32
-FLAGSHIPS = configs.FLAGSHIPS
-# Rows x width of the Nano/Super/Ultra flagships and of expanded admitted shapes.
-MX_SHAPES = [*FLAGSHIPS, (2048, 2048), (2048, 16384), (16384, 2048), (6144, 12288)]
+# (local token rows, hidden size)
+NANO_SUPER_ULTRA_SHAPES = ((16384, 3072), (8192, 4096), (8192, 10240))
+MX_SHAPES = [*NANO_SUPER_ULTRA_SHAPES, (2048, 2048), (2048, 16384), (16384, 2048), (6144, 12288)]
 # Seams as (readers, updates): one reader, a shortcut add read twice, a single write read twice,
 # a shortcut add read once (a fused block into a lone layer).
 SEAMS = [(1, 1), (2, 2), (2, 1), (1, 2)]
@@ -459,7 +459,7 @@ SEAM_CASES = (
     + [seam(6, 2, 1, 288, 1024, BF16, BF16, ret=F)]
     + [
         seam(3, *SEAMS[(i + j) % 4], h, m, d, d, ret=j == 0, marks=QUALIFIED)
-        for i, (m, h) in enumerate(FLAGSHIPS)
+        for i, (m, h) in enumerate(NANO_SUPER_ULTRA_SHAPES)
         for j, d in enumerate((F32, F32, BF16))
     ]
     + [seam(s, 2, u, 4096, 8192, marks=QUALIFIED) for s, u in [(2, 1), (6, 2)]]
@@ -681,6 +681,19 @@ def offset_view(tensor, offset=1):
 
 
 @QUALIFIED
+@pytest.mark.parametrize("rows,outputs", [(1, ("bf16",)), (128, ("bf16", "both"))])
+def test_batch_invariant_inference_across_prefill(rows, outputs):
+    raw = inputs(3, len(outputs), 4096, 1152, residual_dtype=BF16)
+    small = raw[0][:rows], tuple(u[:rows] for u in raw[1]), *raw[2:]
+    opts = dict(inference=True, batch_invariant=True, outputs=outputs)
+    short = written(*fwd(small, **opts))
+    long = written(*fwd(raw, **opts))
+    # A whole 128-row tile is also a contiguous prefix of the swizzled MXFP8 scales.
+    for a, b in zip(short, long, strict=True):
+        assert bytes_equal(a.flatten(), b.flatten()[: a.numel()])
+
+
+@QUALIFIED
 def test_rejects_invalid_inputs():
     """Inputs, shapes, alignment, grids and counter capacity are checked before any compile or
     launch."""
@@ -768,11 +781,9 @@ def test_reader_formats_store_one_normalization(dtype, readers, updates, inferen
 
 
 def test_config_tables():
-    """Training and prefill forwards follow their decision trees; BF16 overrides serve
-    512-1024-row inference; cached backward grids; every forward/backward config is valid;
-    training and prefill own one CTA per row."""
+    """Check forward schedule legality, long-row stability and cached backward grids."""
     choose = configs.choose_forward_config
-    for (m, h), readers, mxfp8 in itertools.product(FLAGSHIPS, (1, 2), (F, T)):
+    for (m, h), readers, mxfp8 in itertools.product(NANO_SUPER_ULTRA_SHAPES, (1, 2), (F, T)):
         knobs = configs.get_backward_knobs(m, h, 3, readers)
         assert knobs.TARGET_CTAS == {3072: 456, 4096: 448, 10240: 440}[h]
         # Shared memory sets the CTAs per SM: four BF16 one-reader CTAs (128 registers), three
@@ -782,18 +793,6 @@ def test_config_tables():
         assert (bf16.TARGET_CTAS, bf16.MAXNREG) == (four, 128 if readers == 1 else 168)
         second = configs.get_backward_knobs(m, h, 3, 2, second=True)
         assert (second.TARGET_CTAS, second.MAXNREG) == ({3072: 300, 4096: 304, 10240: 280}[h], 255)
-    # The 4096-wide single reader uses the same measured BF16 schedule for both handoffs.
-    bf16_leaf = configs._ForwardConfig(
-        2048, REDUCE_VECTOR=0, MAXNREG=128, LOADS_FIRST=True, VECTOR=8
-    )
-    for quantized in (F, T):
-        options = dict(outputs=formats(1, quantized), bf16_residual=True, inference=True)
-        assert choose(512, 4096, 3, **options) == choose(1024, 4096, 3, **options) == bf16_leaf
-        assert choose(512, 4096, 4, **options) != bf16_leaf
-        assert choose(511, 4096, 3, **options) != bf16_leaf
-        assert choose(1025, 4096, 3, **options) != bf16_leaf
-        assert choose(512, 4096, 3, **dict(options, bf16_residual=False)) != bf16_leaf
-        assert choose(512, 4096, 3, updates=2, **options) != bf16_leaf
     # Training (2048+ rows, hidden 2048-16384, 1-6 streams): the tree's schedule, independent
     # of the readers' output formats and of a shortcut add.
     for h, s, (n, u), bf16 in itertools.product(
@@ -802,8 +801,7 @@ def test_config_tables():
         tree = configs._training_config(h, s, n, bf16)
         tree = tree._replace(PAIRED_REDUCE=tree.PAIRED_REDUCE and n == 2)
         for outputs in itertools.product(forward_kernel.OUTPUT_FORMATS, repeat=n):
-            prefill = configs._prefill_config(h, s, n, bf16, outputs)
-            prefill = prefill._replace(PAIRED_REDUCE=prefill.PAIRED_REDUCE and n == 2)
+            prefill = choose(2048, h, s, n, outputs=outputs, inference=True, bf16_residual=bf16)
             for rows in (2048, 8192, 65536):
                 options = dict(outputs=outputs, updates=u, bf16_residual=bf16)
                 assert choose(rows, h, s, n, **options) == tree
@@ -826,7 +824,7 @@ def test_config_tables():
         assert cfg.MAXNREG is None or cfg.MAXNREG * 32 * cfg.NUM_WARPS <= 65536
         assert not (cfg.SPLIT or cfg.PAIRED_REDUCE) or n == 2
         assert cfg.PARTS == 1 or h % (32 * cfg.PARTS) == 0
-        tuned = 3072 <= h <= 16384 and inference and m <= 1024
+        tuned = 2048 <= h <= 16384 and inference and m <= 1024
         assert cfg.LOADS_FIRST or not tuned
         if not inference or m > 1024:
             # Training and long prefill: one CTA per row, shared by one and two updates.
@@ -1151,7 +1149,7 @@ def test_saved_weight_keeps_identity_and_metadata(native_fp8_weight):
 
 
 @mxfp8_test
-@pytest.mark.parametrize("m,h", configs.FLAGSHIPS)
+@pytest.mark.parametrize("m,h", NANO_SUPER_ULTRA_SHAPES)
 @torch.no_grad()
 def test_native_update_rebinding_and_captured_descriptors(m, h):
     """Each captured graph must retain the descriptor for its own saved update."""

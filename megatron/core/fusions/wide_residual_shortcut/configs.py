@@ -3,7 +3,6 @@
 and each kernel's schedule selection. Plain Python (no GPU
 imports), so the op module can consult it eagerly."""
 
-from functools import lru_cache
 from typing import NamedTuple
 
 import torch
@@ -30,10 +29,6 @@ def qualified_device(properties):
         and properties.minor == 3
         and properties.multi_processor_count == 152
     )
-
-
-# Nano/Super/Ultra (rows, hidden): the shapes the tuned tables and tests anchor on.
-FLAGSHIPS = ((16384, 3072), (8192, 4096), (8192, 10240))
 
 
 # ---------------------------------------------------------------- forward
@@ -69,45 +64,6 @@ class _ForwardConfig(NamedTuple):
 _BATCH_INVARIANT_ROWS = 32
 
 
-def _inference_leaf(m, h, streams, readers, mxfp8):
-    """Inference decision tree: ``(leading config fields, CTAs per row)``.
-
-    Fit to ~10K timed GB300 configs (hidden 3072-16384, 1-6 streams, 1/2 readers, BF16/MXFP8,
-    rows 32-1024) minimizing the mean slowdown against the best of 16 recipes x CTAs per row.
-    """
-    if h <= 5632:
-        if m <= 88:
-            if h <= 3584:
-                return (4096, 2, 0, True, 0, 8, 128, True), 2
-            return (4096, 1, 0, False, 0, 16, 128, True), 2
-        if h <= 3584:
-            if streams <= 3:
-                return (4096, 1, 0, readers == 2, 0, 8, None, True), 1
-            return (4096, 2, 0, True, 0, 8, 128, True), 1
-        if readers == 1:
-            if streams <= 4:
-                return (4096, 4, 1, False, 0, 16, 64, True), 1
-            return (4096, 2, 0, True, 0, 8, 128, True), 1
-        if streams <= 4:
-            return (2048, 2, 0, True, 0, 16, None, False), 1
-        return (2048, 2, 1, True, 0, 8, 128, False), 1
-    if m <= 40:
-        return (4096, 4, 0, False, 0, 16, 128, True), 4
-    if m <= 72:
-        if streams <= 4:
-            return (4096, 2, 1, False, 0, 16, 128, True), 2
-        return (4096, 1, 0, True, 0, 8, None, True), 2
-    if h <= 9728:
-        if m <= 128:
-            return (4096, 4, 0, False, 0, 16, 128, True), 1
-        return (2048, 2, 1, True, 0, 8, 128, False), 1
-    if readers == 1:
-        return (4096, 1, 0, False, 0, 16, 128, True), 1
-    if not mxfp8:
-        return (4096, 4, 0, False, 0, 16, 128, True), 1
-    return (4096, 2, 0, True, 0, 16, None, True), 1
-
-
 def _replicated(cfg, replicas, readers, h):
     """Spread ``replicas`` CTAs per row over split readers and column parts."""
     split = replicas > 1 and readers == 2
@@ -116,74 +72,43 @@ def _replicated(cfg, replicas, readers, h):
     return cfg._replace(PARTS=parts, SPLIT=split)
 
 
-def _inference_config(m, h, streams, readers, mxfp8, updates, bf16_residual):
-    if bf16_residual and streams == 3 and m >= 512:
-        return _bf16_inference_rows(h, readers, updates, mxfp8)
-    if h * streams >= 8192 and m <= (64 if readers == 1 else 32):
-        # Decode rows: a cluster per row (per reader with two readers), one slice per CTA.
-        warps = 4 if readers == 1 else 8
-        for columns in (512, 1024, 2048) if h <= 4096 else (2048, 1024):
-            if h % columns == 0 and h // columns <= 8 and columns >= 128 * warps:
-                split = readers == 2
-                return _ForwardConfig(
-                    columns, 0, 0, False, 0, warps, None, True, 1, split, True, h // columns
-                )
-    return _inference_rows(m, h, streams, readers, mxfp8, updates)
+def _inference_config(m, h, streams, readers, bf16_residual, outputs):
+    """GB300 inference tuned over 1–8192 rows, H=2048–16384 and 1–6 residual streams.
 
-
-def _inference_rows(m, h, streams, readers, mxfp8, updates, *, bf16_residual=False):
-    fields, replicas = _inference_leaf(m, h, streams, readers, mxfp8)
-    if readers == 2 and updates == 1:
-        # One update read twice: regions where the shortcut add's leaves measured slower.
-        if mxfp8 and 3584 < h <= 5632 and m > 88 and (streams == 3 or (streams == 4 and h > 4096)):
-            fields, replicas = (4096, 2, 0, True, 0, 16, None, True), 1
-        elif h == 10240 and 160 < m <= 256:
-            fields, replicas = (2048, 2, 1, True, 0, 8, 128, False), 1
-    vector = 4
-    if bf16_residual:
-        match h, readers, updates or readers, mxfp8:
-            case (3072, 1, 1, True) | (3072, 2, 1, False):
-                fields = (4096, 2, 0, readers == 2, 0, 8, 80, False)
-            case (3072, 2, 1, True) | (4096, 2, 2, True):
-                fields, vector = (2048, 0, 0, False, 0, 4, 168, True), 8
-            case 3072, 2, 2, False:
-                fields = (4096, 4, 0, False, 0, 8, None, True)
-            case 4096, 1, 1, _:
-                fields, vector = (2048, 0, 0, False, 0, 4, 128, False), 8
-            case 4096, 2, 1, _:
-                fields, vector = (4096, 2, 0, True, 0, 8, 80, False), 8 if mxfp8 else 4
-            case 4096, 2, 2, False:
-                fields = (2048, 0, 0, True, 0, 4, 128, False)
-            case 10240, 1, 1, _:
-                fields, vector = (4096, 2, 0, False, 0, 8, 128, True), 8
-            case 10240, 2, 1, False:
-                fields = (4096, 1, 1, False, 0, 8, 128, False)
-            case (10240, 2, 1, True) | (10240, 2, 2, _):
-                fields = (2048, 2, 1, True, 0, 8, 128, False)
-                vector = 4 if mxfp8 and updates != 1 else 8
-    cfg = _ForwardConfig(*fields, LOADS_FIRST=True, VECTOR=vector)
-    return _replicated(cfg, replicas, readers, h)
-
-
-@lru_cache
-def _bf16_inference_rows(h, readers, updates, mxfp8):
-    """Cache one schedule per shape across the three-stream BF16 window (512–1024 rows)."""
-    return _inference_rows(512, h, 3, readers, mxfp8, updates, bf16_residual=True)
-
-
-def _prefill_config(h, streams, readers, bf16_residual, outputs):
-    """Prefill decision tree (inference rows > 1024, hidden 2048-16384, 1-6 streams).
-
-    Prefill writes no tape for the backward, so it gets its own tree, fit like
-    ``_training_config`` to a cold-L2 GB300 sweep of 584 inference cells (hidden 2048-16384,
-    1-6 streams, 1.5K-16K rows, both residual dtypes, one and two readers with and without a
-    shortcut add, every output format) over 32 schedules. Mean slowdown 1.3% against the per-cell
-    best (the tables it replaced: 6.8%).
+    Small batches can use multiple CTAs per row. Once the grid fills, row traffic and reader
+    formats determine the schedule. Above 1024 rows all tuned widths use the prefill rule.
     """
+    if m <= 128 or (m <= 1024 and h > 12288):
+        cfg = _ForwardConfig(4096, 4, 0, False, 0, 16, 128, True, LOADS_FIRST=True)
+        if m > 128:
+            if readers == 2 and any(fmt != "bf16" for fmt in outputs):
+                return cfg._replace(PIPELINE_DEPTH=2, PAIRED_REDUCE=True, MAXNREG=None)
+            return cfg
+        if readers == 2 and 32 <= m <= 64:
+            # Without a suitable cluster, dedicate a CTA to each reader of a short batch.
+            cfg = cfg._replace(PIPELINE_DEPTH=1, SPLIT=True)
+        if m * readers <= 192:
+            # Each cluster reduces one row per reader. Limit the total grid to 512 CTAs.
+            warps = 4 * readers
+            for width in (512, 1024, 2048) if h <= 4096 else (2048, 1024):
+                ctas, tail = divmod(h, width)
+                if not tail and 1 < ctas <= 8 and width >= 128 * warps:
+                    if m * readers * ctas > 512:
+                        return cfg
+                    return _ForwardConfig(
+                        width, 0, 0, False, 0, warps, None, True, 1, readers == 2, True, ctas
+                    )
+            if m <= 64 and not cfg.SPLIT:
+                # Replicate a row when the grid is small and its width cannot tile a cluster.
+                return _replicated(cfg, 4 if m <= 32 else 2, readers, h)
+        return cfg
     row_bytes = streams * h * (2 if bf16_residual else 4)
+    if m <= 1024 and 4096 < h <= 9216 and (m <= 256 or readers == 2 or row_bytes > 98304):
+        return _ForwardConfig(2048, 2, 1, readers == 2, 0, 8, 128, LOADS_FIRST=True)
+
     vector = 4
     if row_bytes <= 24576:
-        if bf16_residual:
+        if bf16_residual and m >= 512:
             fields, vector = (1024, 2, 0, False, 0, 4, None, False), 8
         else:
             fields = (4096, 1, 0, True, 0, 8, None, True)
@@ -247,27 +172,22 @@ def _training_config(h, streams, readers, bf16_residual):
 def choose_forward_config(
     m, h, streams, readers=1, *, outputs=None, inference=False, updates=None, bf16_residual=False
 ):
-    """Choose the row-kernel schedule; ``updates`` None means one per reader and ``outputs`` (the
-    readers' formats, ``OUTPUT_FORMATS``) None means BF16 readers."""
+    """Choose the row-kernel schedule. Readers default to BF16. The update count can be
+    supplied by callers benchmarking the seam and does not affect the schedule."""
     outputs = ("bf16",) * readers if outputs is None else tuple(outputs)
     if 2048 <= h <= 16384 and not inference and m >= 2048:
         cfg = _training_config(h, streams, readers, bf16_residual)
-    elif 2048 <= h <= 16384 and inference and m > 1024:
-        cfg = _prefill_config(h, streams, readers, bf16_residual, outputs)
+    elif 2048 <= h <= 16384 and inference:
+        cfg = _inference_config(m, h, streams, readers, bf16_residual, outputs)
     else:
-        # Otherwise schedules depend only on MXFP8 presence (reader zero's, where tuned).
-        mxfp8 = any(f != "bf16" for f in outputs)
-        cfg = _choose(m, h, streams, readers, mxfp8, inference, updates, bf16_residual)
+        cfg = _choose(m, h, streams, readers, inference)
     # Pairing the two readers' reductions needs two readers.
     return cfg._replace(PAIRED_REDUCE=False) if cfg.PAIRED_REDUCE and readers == 1 else cfg
 
 
-def _choose(m, h, streams, readers, mxfp8, inference, updates, bf16_residual):
-    """Decode, short training rows and untuned widths (training and prefill rows otherwise take
-    ``_training_config`` and ``_prefill_config``)."""
+def _choose(m, h, streams, readers, inference):
+    """Fallback for short training batches and untuned widths."""
     if inference and m <= 1024:
-        if 3072 <= h <= 16384:
-            return _inference_config(m, h, streams, readers, mxfp8, updates, bf16_residual)
         if h < 3072:
             profile = "row" if readers == 1 else "paired"
         else:
