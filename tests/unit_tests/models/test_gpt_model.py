@@ -17,10 +17,12 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.common.embeddings import rope_utils
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_mlp_module_spec,
@@ -785,6 +787,165 @@ class TestGPTDynamicInferencePaddingWithCudaGraphs:
         padding_logits = logits[0, active_token_count : context.padded_active_token_count, :]
         assert padding_logits.numel() > 0
         assert torch.all(padding_logits == 0.0), "Logits for padding tokens are not all zero."
+
+
+def _yarn_gpt_model(apply_rope_fusion, rotary_fraction):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        apply_rope_fusion=apply_rope_fusion,
+        # Peaked attention, so a wrong power of the YaRN factor in the logits shows in the output.
+        init_method_std=0.1,
+    )
+    # YaRN settings are attributes on the config, not TransformerConfig fields. Concentration
+    # factor 0.1 * ln(32) + 1, as in gpt-oss.
+    config.yarn_rotary_scaling_factor = 32.0
+    config.yarn_original_max_position_embeddings = 4096
+    config.yarn_beta_fast = 32.0
+    config.yarn_beta_slow = 1.0
+    config.yarn_mscale = 1.0
+    config.yarn_mscale_all_dim = 0.0
+    config.yarn_correction_range_round_to_int = True
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=128,
+        max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
+        position_embedding_type="yarn",
+        parallel_output=True,
+    )
+    if rotary_fraction < 1.0:
+        # YarnRotaryEmbedding covers the whole head whatever rotary_percent is. Narrow its table,
+        # as a model with its own partial RoPE table would pass it.
+        yarn_forward = model.rotary_pos_emb.forward
+
+        def partial_yarn_forward(*args, **kwargs):
+            emb, mscale = yarn_forward(*args, **kwargs)
+            freqs = emb[..., : emb.shape[-1] // 2]
+            freqs = freqs[..., : int(freqs.shape[-1] * rotary_fraction)]
+            return torch.cat((freqs, freqs), dim=-1), mscale
+
+        model.rotary_pos_emb.forward = partial_yarn_forward
+    return model
+
+
+def _yarn_dynamic_logits(model, prompt, next_token):
+    """Logits of a prefill step and one decode step with dynamic batching."""
+    config = model.config
+    context = DynamicInferenceContext(
+        model_config=TransformerConfig(
+            params_dtype=config.params_dtype,
+            num_layers=config.num_layers,
+            kv_channels=config.kv_channels,
+            num_attention_heads=config.num_attention_heads,
+        ),
+        inference_config=InferenceConfig(
+            max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER,
+            buffer_size_gb=1.0,
+            block_size_tokens=256,
+            materialize_only_last_token_logits=False,
+        ),
+    )
+    context.add_request(
+        DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=2),
+        )
+    )
+    logits = []
+    for step in range(2):
+        context.initialize_attention_state()
+        input_ids, position_ids = context.current_input_and_position_ids()
+        with InferenceMode.active():
+            out = model.forward(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                inference_context=context,
+                runtime_gather_output=True,
+            )
+        logits.append(out[0, : context.active_token_count].float())
+        if step == 0:
+            context.update_requests(
+                active_requests_mask=torch.ones(1, dtype=torch.int32, device="cuda"),
+                new_tokens=next_token,
+            )
+    return logits
+
+
+def _yarn_static_logits(model, prompt, next_token):
+    """Last-token logits of a prefill step and one decode step with static batching."""
+    context = StaticInferenceContext(
+        max_batch_size=1, max_sequence_length=DynamicInferenceContext.TOKEN_ROUNDER
+    )
+    logits = []
+    offset = 0
+    for tokens in (prompt, next_token):
+        if offset > 0:
+            context.enable_decode_mode()
+        context.sequence_len_offset = offset
+        position_ids = torch.arange(offset, offset + tokens.numel(), device="cuda")
+        with InferenceMode.active():
+            out = model.forward(
+                input_ids=tokens.unsqueeze(0),
+                position_ids=position_ids.unsqueeze(0),
+                attention_mask=None,
+                inference_context=context,
+                runtime_gather_output=True,
+            )
+        logits.append(out[0].float())
+        offset += tokens.numel()
+    return logits
+
+
+class TestYarnRopeFusionInference:
+    """YaRN with RoPE fusion puts the concentration factor squared in the softmax scale and takes
+    back out of q what a forward doesn't rotate. Inference must count the rotated sides before the
+    KV cache update rotates the key, and partial RoPE must keep the factor on the key that goes
+    into the cache. Both must give the logits of the path without RoPE fusion."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("rotary_fraction", [1.0, 0.5])
+    @pytest.mark.parametrize("batching", ["dynamic", "static"])
+    @torch.inference_mode()
+    def test_prefill_and_decode_match_unfused(self, batching, rotary_fraction):
+        if batching == "dynamic" and not is_fa_min_version("2.7.3"):
+            pytest.skip("need latest flash attn for dynamic batching")
+        unfused = _yarn_gpt_model(False, rotary_fraction)
+        fused = _yarn_gpt_model(True, rotary_fraction)
+        fused.load_state_dict(unfused.state_dict())
+        attention = fused.decoder.layers[0].self_attention
+        assert attention._yarn_factor_in_softmax_scale
+        unfused = Float16Module(unfused.config, unfused).cuda().eval()
+        fused = Float16Module(fused.config, fused).cuda().eval()
+
+        prompt = torch.arange(1, 11, dtype=torch.long, device="cuda")
+        next_token = torch.tensor([7], device="cuda")
+        run = _yarn_dynamic_logits if batching == "dynamic" else _yarn_static_logits
+        ref_steps = run(unfused, prompt, next_token)
+        with patch.object(
+            rope_utils, "fused_apply_rotary_pos_emb", wraps=rope_utils.fused_apply_rotary_pos_emb
+        ) as fused_rope:
+            got_steps = run(fused, prompt, next_token)
+        # The whole head uses TE's fused RoPE; partial RoPE keeps the factor in the unfused one.
+        assert (fused_rope.call_count > 0) == (rotary_fraction == 1.0)
+        for got, ref in zip(got_steps, ref_steps):
+            # The kernels round differently in BF16 (up to ~1.4e-2 of the max); one wrong power of
+            # the factor is off by 8e-2 or more.
+            torch.testing.assert_close(got, ref, rtol=0, atol=4e-2 * ref.abs().max().item())
 
 
 def test_get_transformer_layer_spec_forwards_use_te_activation_func():
