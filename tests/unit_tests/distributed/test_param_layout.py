@@ -209,6 +209,24 @@ class TestDefaultParamLayout:
         assert layout.param_index_map[params[0]] == (0, 256, 0)
         assert layout.bucket_indices == [(0, 256)]
 
+    @pytest.mark.parametrize("bucket_size", [None, 100])
+    @pytest.mark.parametrize("alignment", [4, 8])
+    def test_aligned_layout_preserves_parameter_counts(self, bucket_size, alignment):
+        params = _make_params((97,), (103,), (3,))
+        layout = _compute_default_per_buffer_param_layout(params, bucket_size, alignment=alignment)
+
+        assert all(
+            start % alignment == 0 and end % alignment == 0 for start, end in layout.bucket_indices
+        )
+        assert all(start % alignment == 0 for start, _, _ in layout.param_index_map.values())
+        assert all(
+            end - start == param.numel()
+            for param, (start, end, _) in layout.param_index_map.items()
+        )
+        for bucket_id, (start, _) in enumerate(layout.bucket_indices):
+            last_end = max(end for _, end, b in layout.param_index_map.values() if b == bucket_id)
+            assert layout.per_bucket_numel_unpadded[bucket_id] == last_end - start
+
 
 # ---------------------------------------------------------------------------
 # Tests for DistributedOptimizer._compute_per_buffer_param_layout
