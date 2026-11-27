@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.fusions.fused_moe_residual_add import (
     can_use_fused_moe_residual_add,
@@ -16,7 +17,6 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad
-from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_layer import TransformerLayer, make_viewless_tensor
 from megatron.core.typed_torch import apply_module, copy_signature
@@ -77,9 +77,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         """
 
         if (
-            isinstance(layer, GraphableMegatronModule)
-            and hasattr(layer, 'cuda_graphs')
-            and layer.cuda_graphs
+            getattr(layer.config, 'cuda_graph_impl', None) == "transformer_engine"
+            and isinstance(layer, TECudaGraphMixin)
+            and hasattr(layer, 'te_cuda_graphs')
+            and layer.te_cuda_graphs
         ):
             layer.set_te_cuda_graph_backward_dw_wrapper()
             forward_func = layer._te_cuda_graph_replay
@@ -246,8 +247,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         if fuse_residual_add and not should_fuse_residual_add:
             output = output + shared_expert_output
 
-        if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
-            layer.mlp.cudagraph_tensor_store.clear()
+        if (
+            getattr(layer.config, 'cuda_graph_impl', None) == "transformer_engine"
+            and layer.te_cuda_graphs
+        ):
+            layer.mlp.te_cuda_graph_tensor_store.clear()
         with layer.bias_dropout_add_exec_handler():
             if should_fuse_residual_add:
                 hidden_states = fused_moe_residual_add(output, shared_expert_output, residual)

@@ -74,11 +74,14 @@ def grouped_mlp_fusions(monkeypatch):
         register_forward_backward_fusion,
     )
 
-    checks = (
+    checks = [
         grouped_mlp._GroupedMLP_CuTeGEMMBase.is_supported,
         grouped_mlp.GroupedMLP_CuTeGEMMUnary.is_supported,
-        grouped_mlp._grouped_gemm_dsrelu_backward_supported,
-    )
+    ]
+    # TE 2.22 removed the separate dSReLU support cache.
+    legacy_check = getattr(grouped_mlp, "_grouped_gemm_dsrelu_backward_supported", None)
+    if legacy_check is not None:
+        checks.append(legacy_check)
     try:
         with monkeypatch.context() as patch:
             patch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")

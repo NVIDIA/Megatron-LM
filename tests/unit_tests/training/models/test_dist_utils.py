@@ -521,18 +521,25 @@ class TestDdpWrap:
         assert isinstance(result, list)
         assert len(result) == 2
 
+    @pytest.mark.parametrize("cuda_graph_impl", ["full_iteration", "local"])
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
     @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("megatron.training.models.dist_utils.get_shared_capture_stream")
-    def test_uses_full_iteration_capture_stream_for_ddp_initialization(
-        self, mock_shared_stream, mock_current_stream, mock_stream_context, mock_config, mock_ddp
+    def test_uses_capture_stream_for_ddp_initialization(
+        self,
+        mock_shared_stream,
+        mock_current_stream,
+        mock_stream_context,
+        mock_config,
+        mock_ddp,
+        cuda_graph_impl,
     ):
         mock_stream_context.return_value.__enter__ = Mock(return_value=None)
         mock_stream_context.return_value.__exit__ = Mock(return_value=False)
         shared_stream = mock_shared_stream.return_value
-        mock_config.return_value.cuda_graph_impl = "full_iteration"
+        mock_config.return_value.cuda_graph_impl = cuda_graph_impl
 
         _ddp_wrap(self.model, False, self.ddp_config, False, pg_collection=self.pg)
 
@@ -567,7 +574,7 @@ class TestDdpWrap:
         mock_stream_context.assert_called_once_with(current_stream)
         current_stream.wait_stream.assert_not_called()
 
-    @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
+    @pytest.mark.parametrize("cuda_graph_impl", ["transformer_engine"])
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
     @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
@@ -1204,3 +1211,58 @@ class TestUnimodalBuildDistributedModels:
             assert result is ddp_result
         finally:
             self._stop_patches()
+
+
+class TestExplicitExecutionDevice:
+    @pytest.mark.parametrize("device", ["cuda", "cpu"])
+    def test_cpu_initialization_does_not_override_execution_device(self, device):
+        from megatron.training.models.dist_utils import (
+            prepare_existing_model_chunks_for_distributed_training,
+        )
+
+        model = _make_model_module()
+        config = _make_transformer_config(use_cpu_initialization=True)
+        with (
+            patch(f"{_MODULE}._print_num_params"),
+            patch(f"{_MODULE}.correct_amax_history_if_needed"),
+        ):
+            prepare_existing_model_chunks_for_distributed_training(
+                [model], config, _make_pg(), wrap_with_ddp=False, device=device
+            )
+        model.to.assert_called_once_with(torch.device(device))
+
+    def test_cpu_export_materializes_only_meta_tensors(self):
+        from megatron.training.models.dist_utils import (
+            prepare_existing_model_chunks_for_distributed_training,
+        )
+
+        model = nn.Module()
+        model.register_parameter("weight", nn.Parameter(torch.empty(4, device="meta")))
+        model.register_buffer("scale", torch.tensor([7.0]))
+        config = _make_transformer_config(init_model_with_meta_device=True)
+        with (
+            patch(f"{_MODULE}._print_num_params"),
+            patch(f"{_MODULE}.correct_amax_history_if_needed"),
+        ):
+            result = prepare_existing_model_chunks_for_distributed_training(
+                [model], config, _make_pg(), wrap_with_ddp=False, device="cpu"
+            )
+        assert result[0].weight.device.type == "cpu"
+        assert result[0].scale.item() == 7.0
+
+    @pytest.mark.parametrize("fsdp", ["use_torch_fsdp2", "use_megatron_fsdp"])
+    def test_explicit_device_rejects_fsdp_owned_placement(self, fsdp):
+        from megatron.training.models.dist_utils import (
+            prepare_existing_model_chunks_for_distributed_training,
+        )
+
+        with patch(f"{_MODULE}._print_num_params"):
+            with pytest.raises(ValueError, match="FSDP-managed"):
+                prepare_existing_model_chunks_for_distributed_training(
+                    [_make_model_module()],
+                    _make_transformer_config(),
+                    _make_pg(),
+                    wrap_with_ddp=False,
+                    device="cpu",
+                    **{fsdp: True},
+                )

@@ -128,7 +128,9 @@ def sanitize_dataclass_config(config: dict[str, Any], _visited: set | None = Non
     target class specified in the config's _target_ field. This handles cases where
     older checkpoints serialized computed fields that should not be passed to __init__.
 
-    The function recursively processes nested dicts that may also be dataclass configs.
+    The function recursively processes nested dicts that may also be dataclass configs. A target
+    class may define a static ``upgrade_cfg_dict(config) -> config`` hook, applied first
+    (``DataConfig`` upgrades the sections of older SFT checkpoints).
 
     Args:
         config: A configuration dictionary, potentially with a _target_ field.
@@ -154,6 +156,9 @@ def sanitize_dataclass_config(config: dict[str, Any], _visited: set | None = Non
         target_class = _resolve_target_class(target)
         if target_class is not None:
             init_false_fields = _get_init_false_fields(target_class)
+            upgrade = getattr(target_class, "upgrade_cfg_dict", None)
+            if upgrade is not None:
+                config = upgrade(config)
 
     # Process all values, filtering init=False fields and recursing into nested dicts
     sanitized = {}
