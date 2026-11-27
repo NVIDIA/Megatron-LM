@@ -39,6 +39,41 @@ def reset_full_cuda_graph_state():
     StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
 
 
+def test_state_hooks_run_before_every_replay():
+    """Python-side state hooks run once per replay, before the captured graph.
+
+    Per-iteration bookkeeping such as the packed-sequence statistics flag is set
+    only while capturing, so a graph that produces such state must be able to
+    re-arm it on every replay.
+    """
+    calls = []
+    graph = Mock()
+    graph.replay.side_effect = lambda: calls.append('replay')
+    FullCudaGraphWrapper.cuda_graph['training'] = graph
+    on_capture = Mock(side_effect=lambda stage: calls.append(f'capture:{stage}'))
+    on_replay = Mock(side_effect=lambda stage: calls.append(f'replay-hook:{stage}'))
+    FullCudaGraphWrapper.register_state_hooks(on_capture=on_capture, on_replay=on_replay)
+    try:
+        wrapper = FullCudaGraphWrapper(lambda **_: None)
+        kwargs = dict(
+            model=[torch.nn.Identity()],
+            data_iterator=None,
+            num_microbatches=1,
+            seq_length=1,
+            forward_only=False,
+        )
+        wrapper(**kwargs)
+        wrapper(**kwargs)
+        assert calls == ['replay-hook:training', 'replay'] * 2
+        # Capture hooks fire only for a real capture, not for replays.
+        on_capture.assert_not_called()
+        # Registering the same hook twice must not run it twice.
+        FullCudaGraphWrapper.register_state_hooks(on_replay=on_replay)
+        assert FullCudaGraphWrapper.replay_hooks.count(on_replay) == 1
+    finally:
+        FullCudaGraphWrapper.capture_hooks.remove(on_capture)
+        FullCudaGraphWrapper.replay_hooks.remove(on_replay)
+
 def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
     """Retained DDP AccumulateGrad nodes must use the full-iteration capture stream."""
 
