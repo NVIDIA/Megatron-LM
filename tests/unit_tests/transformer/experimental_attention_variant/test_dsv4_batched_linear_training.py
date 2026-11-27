@@ -11,6 +11,7 @@ import torch
 from megatron.core import dist_checkpointing
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.extensions.te_batched_linear import TEBatchedLinear
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
@@ -18,6 +19,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     TensorParallelMuon,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -278,3 +280,89 @@ def test_matrix_optimizer_step_and_resume(backend, optimizer_name, tmp_path_dist
         )
     finally:
         Utils.destroy_model_parallel()
+
+
+def _mxfp8_train_bf16_eval_recipe(fp8_param):
+    """DSv4's per-module recipe: MXFP8 in training, BF16 in evaluation, for every TE linear."""
+    training_recipe = {"fp8_quantization_recipe": "mxfp8"}
+    if fp8_param:
+        training_recipe["fp8_param"] = True
+    return RecipeConfig.from_config_dict(
+        {
+            "configs": {
+                "mxfp8_evaluate_bf16": {
+                    "transformer_engine_config_type": "TEQuantizationParams",
+                    "training_recipe": training_recipe,
+                    "evaluation_recipe": {},
+                }
+            },
+            "matchers": {
+                "all_te_linears": {
+                    "config": "mxfp8_evaluate_bf16",
+                    "type": "glob",
+                    "pattern": "*",
+                    "enabled": True,
+                }
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("recipe_storage", [None, "bf16", "mxfp8"])
+def test_per_module_quant_recipe(recipe_storage):
+    """Built and run inside an MXFP8 layer's model-init and autocast contexts (fp8_param on),
+    the projection follows a per-module recipe like TELinear: the recipe's storage choice at
+    allocation, MXFP8 compute in training and BF16 in evaluation. Without a recipe it inherits
+    both contexts."""
+    if TEBatchedLinear is None:
+        pytest.skip("Transformer Engine BatchedLinear is unavailable")
+    import transformer_engine.pytorch as te
+
+    from megatron.core.extensions import te_batched_linear as adapter
+
+    available, reason = te.is_mxfp8_available(return_reason=True)
+    if not available:
+        pytest.skip(reason)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        quant_recipe=(
+            None
+            if recipe_storage is None
+            else _mxfp8_train_bf16_eval_recipe(fp8_param=recipe_storage == "mxfp8")
+        ),
+    )
+    with get_fp8_context(config, 0, is_init=True):
+        projection = TEBatchedLinear(
+            2,
+            64,
+            64,
+            input_batch_dim=-2,
+            bias=False,
+            dtype=torch.bfloat16,
+            device="cuda",
+            init_method=_initialize,
+            config=config,
+            name="decoder.layers.0.self_attention.linear_o_group_proj",
+        )
+    assert isinstance(projection.weight, adapter.MXFP8TensorStorage) == (recipe_storage != "bf16")
+    assert projection.weight.shape == (128, 64)
+
+    torch.manual_seed(7971)
+    inputs = torch.randn(32, 2, 64, device="cuda", dtype=torch.bfloat16)
+
+    def run(training, in_layer_context):
+        projection.train(training)
+        with torch.no_grad(), get_fp8_context(config, 0) if in_layer_context else nullcontext():
+            return projection(inputs)
+
+    # Training always computes in MXFP8 inside the layer's autocast.
+    assert not torch.equal(run(True, True), run(True, False))
+    # Evaluation inside the same autocast is BF16 exactly when a recipe asks for it.
+    assert torch.equal(run(False, True), run(False, False)) == (recipe_storage is not None)

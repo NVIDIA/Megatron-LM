@@ -12,7 +12,9 @@ import torch
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.dist_checkpointing.optimizer import get_param_id_to_sharded_param_map
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -1133,6 +1135,56 @@ class TestDSv4HybridGroupedOutput:
         expected = torch.full(weight.shape, 0.25, device=weight.device, dtype=torch.bfloat16)
         tolerances = {"rtol": 0.125, "atol": 0.0675} if quantized_weight else {}
         torch.testing.assert_close(weight, expected, **tolerances)
+
+    @pytest.mark.parametrize("per_module_recipe", [False, True])
+    def test_o_group_proj_follows_per_module_quant_recipe(self, per_module_recipe):
+        """The attention hands its config and module path to TE BatchedLinear, so a per-module
+        MXFP8 training recipe applies to it as to TE linears: BF16 storage even though the
+        layer's model-init context (fp8_param) would otherwise allocate MXFP8."""
+        if _get_te_batched_linear() is None:
+            pytest.skip("Transformer Engine BatchedLinear is not available")
+        available, reason = te_pytorch.is_mxfp8_available(return_reason=True)
+        if not available:
+            pytest.skip(reason)
+
+        quant_recipe = None
+        if per_module_recipe:
+            quant_recipe = RecipeConfig.from_config_dict(
+                {
+                    "configs": {
+                        "mxfp8_evaluate_bf16": {
+                            "transformer_engine_config_type": "TEQuantizationParams",
+                            "training_recipe": {"fp8_quantization_recipe": "mxfp8"},
+                            "evaluation_recipe": {},
+                        }
+                    },
+                    "matchers": {
+                        "all_te_linears": {
+                            "config": "mxfp8_evaluate_bf16",
+                            "type": "glob",
+                            "pattern": "*",
+                            "enabled": True,
+                        }
+                    },
+                }
+            )
+        config = _make_config(
+            output_projection_groups=8,
+            output_projection_lora_rank=64,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            quant_recipe=quant_recipe,
+        )
+        pg = ProcessGroupCollection.use_mpu_process_groups()
+        with get_fp8_context(config, 0, is_init=True):
+            attn = _build_attention(
+                config, layer_number=1, pg_collection=pg, name="decoder.layers.0.self_attention"
+            )
+
+        projection = attn.linear_o_group_proj
+        assert (projection.te_quant_params is not None) == per_module_recipe
+        assert isinstance(projection.weight, TEQuantizedTensor) != per_module_recipe
 
     @pytest.mark.parametrize("use_quantized_model_init", [False, True], ids=["bf16", "qmi"])
     def test_o_group_proj_falls_back_to_einsum(self, monkeypatch, use_quantized_model_init):

@@ -9,19 +9,26 @@ import pytest
 import torch
 
 from megatron.core.extensions.te_batched_linear import TEBatchedLinear
+from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
     DSv4HybridAttention,
 )
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
 
 
 @pytest.mark.skipif(
     TEBatchedLinear is None, reason="Transformer Engine BatchedLinear is unavailable"
 )
-@pytest.mark.parametrize("mode", ["bf16", "mxfp8", "primary_mxfp8"])
+@pytest.mark.parametrize("mode", ["bf16", "mxfp8", "primary_mxfp8", "per_module_recipe"])
 @pytest.mark.parametrize("fused", [False, True])
 def test_batched_linear_gradient_owner_replays(mode, fused):
-    """Replay outputs/dgrad/wgrad, including fresh buffers and two accumulated microbatches."""
+    """Replay outputs/dgrad/wgrad, including fresh buffers and two accumulated microbatches.
+
+    ``per_module_recipe`` builds and runs inside an MXFP8 layer's contexts (fp8_param on) with
+    a per-module MXFP8 training recipe: BF16 storage, MXFP8 compute via the module's autocast.
+    """
     import transformer_engine.common.recipe as recipes
     import transformer_engine.pytorch as te
 
@@ -31,12 +38,38 @@ def test_batched_linear_gradient_owner_replays(mode, fused):
         if not available:
             pytest.skip(reason)
         recipe = recipes.MXFP8BlockScaling(fp8_format=recipes.Format.E4M3)
+    config = None
+    if mode == "per_module_recipe":
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            quant_recipe=RecipeConfig.from_config_dict(
+                {
+                    "configs": {
+                        "mxfp8": {
+                            "transformer_engine_config_type": "TEQuantizationParams",
+                            "training_recipe": {"fp8_quantization_recipe": "mxfp8"},
+                        }
+                    },
+                    "matchers": {
+                        "all": {"config": "mxfp8", "type": "glob", "pattern": "*", "enabled": True}
+                    },
+                }
+            ),
+        )
     torch.manual_seed(7971)
-    init = (
-        te.quantized_model_init(enabled=True, recipe=recipe)
-        if mode == "primary_mxfp8"
-        else nullcontext()
-    )
+    if mode == "primary_mxfp8":
+        init = te.quantized_model_init(enabled=True, recipe=recipe)
+    elif config is not None:
+        init = get_fp8_context(config, 0, is_init=True)
+    else:
+        init = nullcontext()
     with init:
         module = TEBatchedLinear(
             2,
@@ -48,6 +81,8 @@ def test_batched_linear_gradient_owner_replays(mode, fused):
             device="cuda",
             accumulate_into_main_grad=fused,
             save_original_input=True,
+            config=config,
+            name="decoder.layers.0.self_attention.linear_o_group_proj",
         )
     weight = module.weight
     attention = SimpleNamespace(_uses_te_batched_linear=True, linear_o_group_proj=module)
@@ -66,7 +101,13 @@ def test_batched_linear_gradient_owner_replays(mode, fused):
         for microbatch, offset in enumerate((0.0, 0.125)):
             if fused:
                 weight.overwrite_main_grad = microbatch == 0
-            with te.autocast(enabled=True, recipe=recipe) if recipe is not None else nullcontext():
+            if config is not None:
+                autocast = get_fp8_context(config, 0)
+            elif recipe is not None:
+                autocast = te.autocast(enabled=True, recipe=recipe)
+            else:
+                autocast = nullcontext()
+            with autocast:
                 output = DSv4HybridAttention._apply_linear_o_group_proj(attention, value + offset)
             output.float().square().mean().backward()
             outputs.append(output.detach())

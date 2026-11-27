@@ -319,6 +319,7 @@ class DSv4HybridAttention(Attention):
                     if self.config.perform_initialization
                     else _skip_initialization
                 ),
+                config=self.config,
                 name=(name + ".linear_o_group_proj") if name is not None else None,
             )
             expected_weight_shape = (

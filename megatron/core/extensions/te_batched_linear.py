@@ -4,14 +4,24 @@
 
 import copy
 from types import MethodType
-from typing import Callable
+from typing import Callable, Optional
 
 import torch
+
+from megatron.core.quantization.quant_config import QuantizationConfig
+from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
     from transformer_engine.pytorch.ops import BatchedLinear
     from transformer_engine.pytorch.quantization import FP8GlobalStateManager
     from transformer_engine.pytorch.tensor.storage.mxfp8_tensor_storage import MXFP8TensorStorage
+
+    from megatron.core.extensions.transformer_engine import (
+        TEQuantizationParams,
+        _get_fp8_autocast_for_quant_params,
+        _get_fp8_model_init_for_quant_params,
+    )
 except ImportError:
     BatchedLinear = None
 
@@ -46,13 +56,38 @@ if BatchedLinear is not None:
         weight: torch.nn.Parameter
         _init_method: Callable[[torch.Tensor], object]
 
-        def __init__(self, *args, **kwargs) -> None:
+        def __init__(self, *args, config: Optional[TransformerConfig] = None, **kwargs) -> None:
             if kwargs.get("bias", False):
                 raise ValueError("DSv4 batched output projection does not support bias.")
             kwargs["bias"] = False
-            self._preserve_initial_value = FP8GlobalStateManager.with_high_precision_init_val()
-            super().__init__(*args, **kwargs)
+            # Like TELinear: resolve the per-module override from config.quant_recipe and
+            # allocate the weight under its storage choice. TE reads the model-init state in
+            # __init__, so a later finish_init() can only change the forward precision.
+            self.config = config
+            self.te_quant_params: Optional[TEQuantizationParams] = None
+            if config is not None:
+                self.finish_init(get_quant_config_or_none(kwargs.get("name"), config.quant_recipe))
+            init_quant_context = _get_fp8_model_init_for_quant_params(
+                self.te_quant_params, torch.is_grad_enabled()
+            )
+            with init_quant_context:
+                self._preserve_initial_value = FP8GlobalStateManager.with_high_precision_init_val()
+                super().__init__(*args, **kwargs)
             self._flatten_weight()
+
+        def finish_init(self, quantization_config: Optional[QuantizationConfig]) -> None:
+            """Post-init of quantization override"""
+            if quantization_config is None:
+                self.te_quant_params = None
+            else:
+                self.te_quant_params = TEQuantizationParams.parse_from_config(
+                    quantization_config, model_config=self.config
+                )
+
+        def forward(self, *args, **kwargs):
+            """Run under the per-module training or evaluation recipe, as TELinear does."""
+            with _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training):
+                return super().forward(*args, **kwargs)
 
         def _flatten_weight(self) -> None:
             # Initialization/materialization only, before optimizer/fuser ownership.
