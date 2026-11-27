@@ -2909,7 +2909,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Split the target buffer into two separate buffers.
             fp8_state_dict, non_fp8_state_dict = {}, {}
             for key in ('param',) + self.optimizer_state_keys:
-                tensor = state_dict[non_fp8_gbuf_idx][non_fp8_param_and_grad_dtype][key]
+                tensor = state_dict[non_fp8_gbuf_idx][non_fp8_dtype_key][key]
                 fp8_tensor = torch.empty([fp8_offsets[-1]], dtype=tensor.dtype)
                 non_fp8_tensor = torch.empty([non_fp8_offsets[-1]], dtype=tensor.dtype)
 
