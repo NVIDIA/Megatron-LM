@@ -6,7 +6,8 @@ This directory provides Hugging Face import/export examples backed by
 ## Supported models and scope
 
 The registered families are DeepSeek-V3 (including checkpoints that declare its architecture,
-such as Kimi-K2 and Moonlight), GPT-OSS, Llama (including Llama 3.1 RoPE scaling), Nemotron-H
+such as Kimi-K2 and Moonlight), GPT-OSS, Llama (including Llama 3.1 RoPE scaling), Mistral
+(including sliding-window attention), Nemotron-H
 (including Nemotron 3.5 Lightning), Nemotron 3.5 Super VL, and the Qwen 3.5 family's dense/MoE
 text and vision-language models, including Qwen 3.8 checkpoints such as the dense
 `Qwen/Qwen3.8-27B`. Other Bridge model families are not registered by this package.
