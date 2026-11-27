@@ -1455,3 +1455,95 @@ def test_vllm_tiled_sum_matches_original_bits(topk, hidden, apply_weights):
             backward=False,
             what=f"ordinary tiled MoE sum topk={topk} hidden={hidden}",
         )
+
+
+# --- DSA-over-GQA inference ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "query_lengths,kv_lengths,num_decode",
+    [
+        ([1, 1, 1, 1], [700, 4096, 33, 1], 4),
+        ([300, 45], [300, 900], 0),
+        ([1, 1, 300], [2600, 9, 900], 2),
+    ],
+    ids=["decode", "prefill", "mixed"],
+)
+def test_dsa_gqa_deterministic_rows_replay(query_lengths, kv_lengths, num_decode, monkeypatch):
+    """Deterministic DSA inference selects every row's keys, decode rows included, with
+    FlashInfer's deterministic ragged top-k over Triton scores instead of GVR2 top-k.
+
+    The indexer keys take four distinct values, so most scores tie at the top-k cutoff. Eager
+    calls and CUDA-graph replays at the static context bound, with the score buffer split into
+    windows, must be bit-exact.
+    """
+    from megatron.core.inference.contexts.attention_context.dsa_metadata import DSAMetadata
+    from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference
+    from megatron.core.tuning import policy as tuning_policy
+
+    monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
+    seeded()
+    heads, groups, head_dim, index_dim, topk = 16, 2, 128, 128, 512
+    page_size, bound = 256, 4096
+    # About 100 score rows per window at the graph bound, so prefill windows split requests.
+    monkeypatch.setattr(dsa_gqa_inference, "SCORE_BUFFER_BYTES", 100 * bound * 4)
+    requests, tokens = len(query_lengths) + 1, sum(query_lengths) + 3
+    max_pages = bound // page_size
+    num_pages = requests * max_pages
+    table = torch.randperm(num_pages, device="cuda").view(requests, max_pages).to(torch.int32)
+    keys = torch.randn(num_pages, page_size, groups, head_dim, device="cuda", dtype=torch.bfloat16)
+    values = torch.randn_like(keys)
+    distinct = torch.randn(4, index_dim, device="cuda", dtype=torch.bfloat16)
+    index_keys = distinct[torch.randint(0, 4, (num_pages, page_size), device="cuda")]
+    query = torch.randn(tokens, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    index_query = torch.randn(tokens, 1, 1, index_dim, device="cuda", dtype=torch.bfloat16)
+
+    metadata = DSAMetadata(max_requests=requests, max_tokens=tokens)
+    metadata.update(
+        query_lengths,
+        kv_lengths,
+        num_decode_requests=num_decode,
+        padded_tokens=tokens,
+        padded_requests=requests,
+        decode_only=num_decode == len(query_lengths),
+    )
+    metadata.transfer(table, non_blocking=False)
+    graphed = [False]
+    context = SimpleNamespace(
+        num_speculative_tokens=0,
+        dsa_metadata=metadata,
+        max_sequence_length=bound,
+        using_cuda_graph_this_step=lambda: graphed[0],
+    )
+
+    def attend():
+        return dsa_gqa_inference.dynamic_sparse_attention(
+            query=query,
+            key_cache=keys,
+            value_cache=values,
+            index_query=index_query,
+            index_key_cache=index_keys,
+            inference_context=context,
+            index_topk=topk,
+            softmax_scale=head_dim**-0.5,
+        )
+
+    assert_replays_bit_exact(attend, (), backward=False, contention=True, what="DSA rows eager")
+
+    graphed[0] = True
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        attend()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = attend()
+
+    def replay():
+        graph.replay()
+        return captured
+
+    assert_replays_bit_exact(replay, (), backward=False, what="DSA rows graph")
+    # Native decode's FlashInfer scratch is never allocated.
+    assert metadata.topk_workspace is None

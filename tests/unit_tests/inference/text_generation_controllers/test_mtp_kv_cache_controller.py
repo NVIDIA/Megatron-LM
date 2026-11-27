@@ -454,10 +454,11 @@ class TestMtpCommitPassPrefill:
     def test_a_carry_at_the_wrong_position_raises(self):
         """A carry only applies at the position it recorded, and a mismatch is a bug.
 
-        `_compute_prefix_match` gives up a carry-holding continuation chunk's entire prefix
-        match so its seam lands exactly at the carried position. Reaching the commit pass with a
-        mismatch means that back-off stopped holding, and skipping the seam would leave a
-        committed position unwritten -- a silent acceptance regression.
+        `_compute_prefix_match` takes no prefix skip for a carry-holding continuation chunk (it
+        may still inherit matched blocks contiguous with its inherited run; a match after a gap
+        is declined), so its seam lands exactly at the carried position. Reaching the commit
+        pass with a mismatch means that back-off stopped holding, and skipping the seam would
+        leave a committed position unwritten -- a silent acceptance regression.
         """
         context = _make_context(
             prefill_query_lengths=(3,), prefill_kv_offsets=(8,), request_ids=[42]

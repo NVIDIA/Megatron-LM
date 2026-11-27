@@ -15,6 +15,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     wide_residual_hybrid_inference_stack_spec,
     wide_residual_hybrid_stack_spec,
+    with_norm_backend,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
@@ -143,9 +144,16 @@ def _check_modelopt_spec_supported(use_wide_residual: bool) -> None:
 
 
 def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
-    """Return the configured stack spec, or the default one for the transformer config."""
+    """Return the configured stack spec, or the default one for the transformer config.
+
+    ``rmsnorm_impl`` chooses the norm backend of the returned spec (``with_norm_backend``).
+    """
+    norm_backend = model_config.transformer.rmsnorm_impl
     if model_config.hybrid_stack_spec is not None:
-        return model_config.hybrid_stack_spec
+        return with_norm_backend(model_config.hybrid_stack_spec, norm_backend)
+    modelopt = model_config.transformations is not None or model_config.restore_modelopt_state
+    if norm_backend != "te" and modelopt:
+        raise ValueError("rmsnorm_impl='liger' is not supported by ModelOpt Hybrid specs.")
     use_wide_residual = model_config.transformer.wide_residual is not None
     if model_config.transformations is not None:
         _check_modelopt_spec_supported(use_wide_residual)
@@ -166,7 +174,10 @@ def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
         # Keeps the unfused norm keys: Bridge loads without Megatron-LM's checkpoint key aliases.
         _check_modelopt_spec_supported(use_wide_residual)
         return get_hybrid_stack_modelopt_spec(local_core_attention=False, remap_te_layernorm=False)
-    return wide_residual_hybrid_stack_spec if use_wide_residual else default_hybrid_stack_spec
+    return with_norm_backend(
+        wide_residual_hybrid_stack_spec if use_wide_residual else default_hybrid_stack_spec,
+        norm_backend,
+    )
 
 
 class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
