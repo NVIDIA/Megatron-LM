@@ -88,24 +88,24 @@ def _prepare_kda_tail_kernel(
 
     raw_g = tl.load(
         raw_g_ptr
-        + s_offs[:, None] * raw_g_s_stride
-        + batch_id * raw_g_b_stride
+        + s_offs[:, None].to(tl.int64) * raw_g_s_stride
+        + batch_id.to(tl.int64) * raw_g_b_stride
         + channel[None, :] * raw_g_c_stride,
         mask=value_mask,
         other=0.0,
     )
     gate = tl.load(
         gate_ptr
-        + s_offs[:, None] * gate_s_stride
-        + batch_id * gate_b_stride
+        + s_offs[:, None].to(tl.int64) * gate_s_stride
+        + batch_id.to(tl.int64) * gate_b_stride
         + channel[None, :] * gate_c_stride,
         mask=value_mask,
         other=0.0,
     )
     tl.store(
         raw_g_out_ptr
-        + batch_id * raw_g_out_b_stride
-        + s_offs[:, None] * raw_g_out_s_stride
+        + batch_id.to(tl.int64) * raw_g_out_b_stride
+        + s_offs[:, None].to(tl.int64) * raw_g_out_s_stride
         + head_id * raw_g_out_h_stride
         + d_offs[None, :],
         raw_g,
@@ -113,8 +113,8 @@ def _prepare_kda_tail_kernel(
     )
     tl.store(
         gate_out_ptr
-        + batch_id * gate_out_b_stride
-        + s_offs[:, None] * gate_out_s_stride
+        + batch_id.to(tl.int64) * gate_out_b_stride
+        + s_offs[:, None].to(tl.int64) * gate_out_s_stride
         + head_id * gate_out_h_stride
         + d_offs[None, :],
         gate,
@@ -122,14 +122,17 @@ def _prepare_kda_tail_kernel(
     )
 
     beta = tl.load(
-        beta_ptr + s_offs * beta_s_stride + batch_id * beta_b_stride + head_id * beta_h_stride,
+        beta_ptr
+        + s_offs.to(tl.int64) * beta_s_stride
+        + batch_id.to(tl.int64) * beta_b_stride
+        + head_id * beta_h_stride,
         mask=s_mask,
         other=0.0,
     ).to(tl.float32)
     tl.store(
         beta_out_ptr
-        + batch_id * beta_out_b_stride
-        + s_offs * beta_out_s_stride
+        + batch_id.to(tl.int64) * beta_out_b_stride
+        + s_offs.to(tl.int64) * beta_out_s_stride
         + head_id * beta_out_h_stride,
         tl.sigmoid(beta),
         mask=s_mask,
@@ -187,8 +190,8 @@ def _prepare_kda_tail_backward_kernel(
 
     d_raw_g = tl.load(
         d_raw_g_out_ptr
-        + batch_id * d_raw_g_out_b_stride
-        + s_offs[:, None] * d_raw_g_out_s_stride
+        + batch_id.to(tl.int64) * d_raw_g_out_b_stride
+        + s_offs[:, None].to(tl.int64) * d_raw_g_out_s_stride
         + head_id * d_raw_g_out_h_stride
         + d_offs[None, :],
         mask=value_mask,
@@ -196,8 +199,8 @@ def _prepare_kda_tail_backward_kernel(
     )
     d_gate = tl.load(
         d_gate_out_ptr
-        + batch_id * d_gate_out_b_stride
-        + s_offs[:, None] * d_gate_out_s_stride
+        + batch_id.to(tl.int64) * d_gate_out_b_stride
+        + s_offs[:, None].to(tl.int64) * d_gate_out_s_stride
         + head_id * d_gate_out_h_stride
         + d_offs[None, :],
         mask=value_mask,
@@ -205,30 +208,33 @@ def _prepare_kda_tail_backward_kernel(
     )
     tl.store(
         d_raw_g_ptr
-        + s_offs[:, None] * d_raw_g_s_stride
-        + batch_id * d_raw_g_b_stride
+        + s_offs[:, None].to(tl.int64) * d_raw_g_s_stride
+        + batch_id.to(tl.int64) * d_raw_g_b_stride
         + channel[None, :] * d_raw_g_c_stride,
         d_raw_g,
         mask=value_mask,
     )
     tl.store(
         d_gate_ptr
-        + s_offs[:, None] * d_gate_s_stride
-        + batch_id * d_gate_b_stride
+        + s_offs[:, None].to(tl.int64) * d_gate_s_stride
+        + batch_id.to(tl.int64) * d_gate_b_stride
         + channel[None, :] * d_gate_c_stride,
         d_gate,
         mask=value_mask,
     )
 
     beta = tl.load(
-        beta_ptr + s_offs * beta_s_stride + batch_id * beta_b_stride + head_id * beta_h_stride,
+        beta_ptr
+        + s_offs.to(tl.int64) * beta_s_stride
+        + batch_id.to(tl.int64) * beta_b_stride
+        + head_id * beta_h_stride,
         mask=s_mask,
         other=0.0,
     ).to(tl.float32)
     d_beta_out = tl.load(
         d_beta_out_ptr
-        + batch_id * d_beta_out_b_stride
-        + s_offs * d_beta_out_s_stride
+        + batch_id.to(tl.int64) * d_beta_out_b_stride
+        + s_offs.to(tl.int64) * d_beta_out_s_stride
         + head_id * d_beta_out_h_stride,
         mask=s_mask,
         other=0.0,
@@ -237,8 +243,8 @@ def _prepare_kda_tail_backward_kernel(
     d_beta = d_beta_out * beta_sigmoid * (1.0 - beta_sigmoid)
     tl.store(
         d_beta_ptr
-        + s_offs * d_beta_s_stride
-        + batch_id * d_beta_b_stride
+        + s_offs.to(tl.int64) * d_beta_s_stride
+        + batch_id.to(tl.int64) * d_beta_b_stride
         + head_id * d_beta_h_stride,
         d_beta,
         mask=s_mask,
@@ -299,14 +305,14 @@ def _finalize_kda_backward_kernel(
         qkv_s = seq_len - boundary + boundary_s
         d_qkv_ptrs = (
             d_qkv_ptr
-            + qkv_s * d_qkv_s_stride
-            + batch_id * d_qkv_b_stride
+            + qkv_s.to(tl.int64) * d_qkv_s_stride
+            + batch_id.to(tl.int64) * d_qkv_b_stride
             + channel * d_qkv_c_stride
         )
         d_right_boundary_ptrs = (
             d_right_boundary_ptr
-            + boundary_s * d_right_boundary_s_stride
-            + batch_id * d_right_boundary_b_stride
+            + boundary_s.to(tl.int64) * d_right_boundary_s_stride
+            + batch_id.to(tl.int64) * d_right_boundary_b_stride
             + channel * d_right_boundary_c_stride
         )
         d_qkv_value = tl.load(d_qkv_ptrs, mask=boundary_mask, other=0.0).to(tl.float32)
