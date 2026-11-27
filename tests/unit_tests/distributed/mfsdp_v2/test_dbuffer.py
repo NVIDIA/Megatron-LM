@@ -73,10 +73,10 @@ def test_block_atomic_layout_keeps_bf16_blocks_on_one_rank(distributed_setup, sh
     assert all(block_atomic.get_tensor_view(index).shape[0] % 2 == 0 for index in range(2))
 
 
-def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
-    """LCM packing fills row-aligned padding gaps on a 5-rank mesh using RowAtomic."""
+def test_compute_minimum_padding_layout(distributed_setup):
+    """Optimal packing preserves whole-row ownership on a 5-rank RowAtomic mesh."""
     if distributed_setup.world_size < 5:
-        pytest.skip("LCM padding-gap layout test requires at least 5 ranks.")
+        pytest.skip("Minimum-padding layout test requires at least 5 ranks.")
 
     # P0-P4 are zero-based logical tensor names matching tensor indices.
     shapes = [
@@ -102,13 +102,13 @@ def test_compute_layout_fills_lcm_padding_gaps(distributed_setup):
     expected_local_shapes_by_rank = [
         [(2, 6), (0, 4), (0, 4), (0, 2), (0, 6)],
         [(0, 6), (3, 4), (0, 4), (0, 2), (0, 6)],
-        [(0, 6), (1, 4), (1, 4), (1, 2), (0, 6)],
-        [(0, 6), (0, 4), (3, 4), (0, 2), (0, 6)],
+        [(0, 6), (1, 4), (2, 4), (0, 2), (0, 6)],
+        [(0, 6), (0, 4), (2, 4), (1, 2), (0, 6)],
         [(0, 6), (0, 4), (0, 4), (0, 2), (1, 6)],
     ]
 
     assert layout.tensor_shapes == tuple(shapes)
-    assert layout.tensor_to_offset == (0, 12, 32, 28, 48)
+    assert layout.tensor_to_offset == (0, 12, 28, 44, 48)
     assert layout.size == 60
     expected_local_shapes = expected_local_shapes_by_rank[mesh.get_local_rank(0)]
     for index, expected_shape in enumerate(expected_local_shapes):
@@ -150,7 +150,8 @@ def test_constructor_allocates_local_buffer(distributed_setup):
         sharded_buffer.local_buffer.numel()
         == replicated_buffer.layout.size // distributed_setup.world_size
     )
-    assert sharded_buffer.layout.size % (15 * mesh_size) == 0
+    assert sharded_buffer.layout.size % mesh_size == 0
+    sharded_buffer.layout.validate_for_row_atomic()
     assert replicated_buffer.dtype == torch.float32
     assert sharded_buffer.local_buffer.device == distributed_setup.device
 

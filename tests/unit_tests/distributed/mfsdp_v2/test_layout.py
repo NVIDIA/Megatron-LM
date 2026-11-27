@@ -2,6 +2,9 @@
 
 """Unit tests for Megatron-FSDP global layout metadata."""
 
+import functools
+import itertools
+
 import pytest
 import torch
 from torch.distributed.device_mesh import init_device_mesh
@@ -16,14 +19,15 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement imp
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.range import Range
 
 
-def test_layout_pads_to_lcm_times_dp_size_and_fills_gaps():
-    """Layout offsets fill gaps and the total size is padded to LCM * DP size."""
+def test_layout_minimizes_padding_without_global_start_alignment():
+    """Relative row cuts permit smaller shards than the old LCM policy."""
     shapes = [torch.Size((5, 4)), torch.Size((2, 6)), torch.Size((3,))]
     layout = layout_builder.build_for_row_atomic(shapes, dp_size=2)
 
     assert layout.tensor_shapes == tuple(shapes)
-    assert layout.tensor_to_offset == (0, 24, 20)
-    assert layout.size == 48
+    assert layout.size == 38  # The previous greedy layout allocated 48 elements.
+    assert layout.rank_to_offset == (0, 19)
+    layout.validate_for_row_atomic()
 
 
 def test_layout_aligns_fragment_offsets_to_rows():
@@ -33,6 +37,143 @@ def test_layout_aligns_fragment_offsets_to_rows():
 
     assert layout.tensor_to_offset == (0, 18)
     assert layout.size == 24
+
+
+def test_layout_removes_greedy_gaps_for_mxfp8_shapes():
+    """B/A/C needs no padding and the rank cut falls on B's eighth 32-row block."""
+    shapes = [(160, 128), (320, 192), (64, 256)]
+    layout = layout_builder.build_for_row_atomic(shapes, dp_size=2, block_size=32)
+
+    assert layout.tensor_to_offset == (61440, 0, 81920)
+    assert layout.size == 98304  # Greedy: 147456. Useful data: 98304 (a tight lower bound).
+    assert layout.rank_to_offset == (0, 49152)
+    layout.validate_for_row_atomic(block_size=32)
+
+
+@pytest.mark.parametrize("shapes", [[], [(0, 8)], [(0, 3), (4, 4), (0, 7)]])
+@pytest.mark.parametrize("dp_size", [1, 4])
+def test_layout_ignores_empty_tensors_when_minimizing_padding(shapes, dp_size):
+    """Empty tensors do not impose block-size constraints or overlap nonempty tensors."""
+    layout = layout_builder.build_for_row_atomic(iter(shapes), dp_size=dp_size)
+    assert layout.tensor_shapes == tuple(torch.Size(shape) for shape in shapes)
+    assert layout.size == sum(shape.numel() for shape in layout.tensor_shapes)
+    assert layout.has_equal_shard_sizes
+    layout.validate_for_row_atomic()
+
+
+def test_layout_large_group_can_be_certified_without_subset_search():
+    """A zero-padding bound proves a 256-tensor expert-like group optimal without DP."""
+    layout = layout_builder.build_for_row_atomic(
+        [(128, 64)] * 256, dp_size=2, block_size=32, max_states=0, max_work=0
+    )
+    assert layout.size == 256 * 128 * 64
+    layout.validate_for_row_atomic(block_size=32)
+
+
+@pytest.mark.parametrize("budget", [{"max_states": 4}, {"max_work": 0}])
+def test_layout_falls_back_deterministically_when_search_is_limited(budget):
+    """Insufficient search resources still return a valid layout with no greedy regression."""
+    shapes = [(5, 4), (2, 6), (3,)]
+    layout = layout_builder.build_for_row_atomic(shapes, dp_size=2, **budget)
+    assert layout.size == 48  # Original greedy size; the proven optimum is 38.
+    assert layout.tensor_shapes == tuple(torch.Size(shape) for shape in shapes)
+    assert layout.has_equal_shard_sizes
+    layout.validate_for_row_atomic()
+    assert layout == layout_builder.build_for_row_atomic(shapes, dp_size=2, **budget)
+
+
+def test_layout_compresses_equivalent_tensors_and_preserves_their_shapes():
+    """Twenty interchangeable A tensors and one B require 42 count states, not 2**21."""
+    shapes = [(32, 128)] * 10 + [(32, 4, 32)] * 10 + [(32, 192)]
+    layout = layout_builder.build_for_row_atomic(shapes, dp_size=2, block_size=32, max_states=42)
+    # Volume lower bound rounded to the 2048-element GCD: optimal with 2048 padding.
+    assert layout.size == 90112
+    assert layout.tensor_shapes == tuple(torch.Size(shape) for shape in shapes)
+    layout.validate_for_row_atomic(block_size=32)
+    limited = layout_builder.build_for_row_atomic(shapes, dp_size=2, block_size=32, max_states=41)
+    assert limited.size == 98304
+    limited.validate_for_row_atomic(block_size=32)
+
+
+@pytest.mark.parametrize("max_work, expected_size", [(72, 24), (144, 20), (None, 20)])
+def test_layout_work_budget_is_shared_across_candidate_sizes(max_work, expected_size):
+    """S=9 is infeasible; S=10 is optimal. A budget for one candidate must not reset."""
+    shapes = [(1, 2), (1, 2), (2, 3), (2, 4)]
+    # 12 count states, 3 types: each candidate reserves 12 * (3 + 3) work units.
+    layout = layout_builder.build_for_row_atomic(shapes, dp_size=2, max_work=max_work)
+    assert layout.size == expected_size
+    layout.validate_for_row_atomic()
+
+
+def test_layout_fallback_keeps_original_greedy_when_it_beats_simple_orders():
+    """The five-order heuristic alone allocates 688128; old gap-filling needs 589824."""
+    shapes = [(32, 256), (704, 192), (416, 96), (640, 384), (64, 128), (160, 384), (704, 128)]
+    layout = layout_builder.build_for_row_atomic(shapes, dp_size=4, block_size=32, max_states=0)
+    assert layout.size == 589824
+    layout.validate_for_row_atomic(block_size=32)
+
+
+@pytest.mark.parametrize("budget", [{"max_states": -1}, {"max_work": -1}, {"max_work": 0.5}])
+def test_layout_rejects_invalid_search_budgets(budget):
+    """Invalid controls are errors; an exhausted valid budget is a fallback."""
+    with pytest.raises(ValueError, match="must be a nonnegative integer or None"):
+        layout_builder.build_for_row_atomic([(5, 4), (2, 6), (3,)], dp_size=2, **budget)
+
+
+def _brute_feasible(lengths, alignments, ranks, shard):
+    """Enumerate integer starts independently of the solver's placement formula and DP."""
+    capacity = ranks * shard
+    if sum(lengths) > capacity:
+        return False
+    domains = []
+    for length, alignment in zip(lengths, alignments):
+        domains.append(
+            tuple(
+                ((1 << length) - 1) << start
+                for start in range(capacity - length + 1)
+                if all(
+                    not start < rank * shard < start + length
+                    or (rank * shard - start) % alignment == 0
+                    for rank in range(1, ranks)
+                )
+            )
+        )
+
+    @functools.lru_cache(None)
+    def visit(index, occupied):
+        if index == len(domains):
+            return True
+        return any(
+            not span & occupied and visit(index + 1, occupied | span) for span in domains[index]
+        )
+
+    return visit(0, 0)
+
+
+def test_layout_optimum_matches_independent_small_grid_oracle():
+    """Exhaust smaller integer shard sizes, including values outside the GCD grid."""
+    # Equal lengths with different atomic sizes must not be compressed together.
+    types = [(1, 2), (2, 2), (1, 3), (2, 3), (3, 2)]
+    for shapes in itertools.combinations_with_replacement(types, 3):
+        for scale, ranks in itertools.product((1, 2), (2, 3)):
+            scaled = [(rows, cols * scale) for rows, cols in shapes]
+            lengths = tuple(rows * cols for rows, cols in scaled)
+            alignments = tuple(cols for _, cols in scaled)
+            layout = layout_builder.build_for_row_atomic(scaled, dp_size=ranks)
+            optimum = next(
+                shard
+                for shard in range(1, sum(lengths) + 1)
+                if _brute_feasible(lengths, alignments, ranks, shard)
+            )
+            assert layout.size == ranks * optimum
+            layout.validate_for_row_atomic()
+
+
+def test_layout_candidate_feasibility_is_not_monotone():
+    """A 12-element tensor with two-element rows fits S=4 and S=6, but not S=5."""
+    assert [_brute_feasible((12,), (2,), 3, shard) for shard in (4, 5, 6)] == [True, False, True]
+    layout = layout_builder.build_for_row_atomic([(6, 2)], dp_size=3)
+    assert layout.size == 12
 
 
 def test_uneven_layout_packs_without_padding_and_snaps_to_row_boundaries():
