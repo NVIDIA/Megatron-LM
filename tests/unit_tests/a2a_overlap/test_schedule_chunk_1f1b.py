@@ -116,6 +116,38 @@ def _make_b_grad(f_output, late_pp_recv_streams, late_pp_recv_events=None, sleep
     return b_grad, pre_backward
 
 
+def _all_ranks(flag):
+    """Whether ``flag`` holds on every rank, so all ranks take the same branch."""
+    t = torch.tensor([int(flag)], dtype=torch.int32, device="cuda")
+    torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN)
+    return bool(t.item())
+
+
+def _streams_run_concurrently():
+    """Whether a kernel can finish while an earlier-queued stream waits on a busy one.
+
+    With a single hardware queue (CUDA_DEVICE_MAX_CONNECTIONS=1) the wait blocks the probe.
+    """
+    busy, waiter, probe = torch.cuda.Stream(), torch.cuda.Stream(), torch.cuda.Stream()
+    for s in (busy, waiter, probe):
+        s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(busy):
+        torch.cuda._sleep(100_000_000)
+        busy_done = torch.cuda.Event()
+        busy_done.record()
+    waiter.wait_event(busy_done)
+    with torch.cuda.stream(waiter):
+        torch.cuda._sleep(1_000)
+    with torch.cuda.stream(probe):
+        torch.cuda._sleep(1_000)
+        probe_done = torch.cuda.Event()
+        probe_done.record()
+    probe_done.synchronize()
+    concurrent = not busy_done.query()
+    torch.cuda.synchronize()
+    return concurrent
+
+
 def run_two_chunk_parity(
     layers,
     extra_kwargs,
@@ -619,43 +651,52 @@ class TestA2AOverlap:
         Each chunk has one MoE layer, so the backward chunk starts with combine backward and
         nothing on the compute stream waits for the gradient before the paired forward
         pre-dispatch computation. Gradients must stay bitwise identical to the reference.
+
+        The check is timing-based, so a slow host can still be launching the forward when the
+        receive lands; the receive is then lengthened and the run repeated. A forward that is
+        ordered behind the receive finishes after it however long the receive takes.
         """
+        if not _all_ranks(_streams_run_concurrently()):
+            pytest.skip("streams serialize on this device (e.g. CUDA_DEVICE_MAX_CONNECTIONS=1)")
         extra_kwargs = {
             "moe_token_dispatcher_type": "alltoall",
             "overlap_moe_expert_parallel_comm": True,
         }
-        fwd_done = []
+        fwd_after_recv_ms = []
+        # ~50 ms, ~200 ms and ~800 ms at typical clocks, all much longer than the forward.
+        for sleep_cycles in (100_000_000, 400_000_000, 1_600_000_000):
+            fwd_done, streams, recv_done = [], [], []
 
-        def time_paired_forward(schedule_plans):
-            # Chunk 1's forward is the one paired with chunk 0's backward.
-            node = schedule_plans[1].get_layer(0).pre_dispatch_computation
-            forward = node.forward
+            def time_paired_forward(schedule_plans):
+                # Chunk 1's forward is the one paired with chunk 0's backward.
+                node = schedule_plans[1].get_layer(0).pre_dispatch_computation
+                forward = node.forward
 
-            def timed_forward(*args, **kwargs):
-                out = forward(*args, **kwargs)
-                event = torch.cuda.Event(enable_timing=True)
-                event.record(get_comp_stream())
-                fwd_done.append(event)
-                return out
+                def timed_forward(*args, **kwargs):
+                    out = forward(*args, **kwargs)
+                    event = torch.cuda.Event(enable_timing=True)
+                    event.record(get_comp_stream())
+                    fwd_done.append(event)
+                    return out
 
-            node.forward = timed_forward
+                node.forward = timed_forward
 
-        streams, recv_done = [], []
-        run_two_chunk_parity(
-            [1, 1],
-            extra_kwargs,
-            on_plans_built=time_paired_forward,
-            late_pp_recv_streams=streams,
-            late_pp_recv_events=recv_done,
-            # ~50 ms at typical clocks: much longer than one small layer's forward.
-            late_pp_recv_sleep_cycles=100_000_000,
-            post_process=False,
-        )
-        torch.cuda.synchronize()
-        assert len(fwd_done) == 1 and len(recv_done) == 2
-        # Negative: the paired forward pre-dispatch finished before the gradient arrived.
-        fwd_after_recv_ms = recv_done[0].elapsed_time(fwd_done[0])
-        assert fwd_after_recv_ms < 0, fwd_after_recv_ms
+            run_two_chunk_parity(
+                [1, 1],
+                extra_kwargs,
+                on_plans_built=time_paired_forward,
+                late_pp_recv_streams=streams,
+                late_pp_recv_events=recv_done,
+                late_pp_recv_sleep_cycles=sleep_cycles,
+                post_process=False,
+            )
+            torch.cuda.synchronize()
+            assert len(fwd_done) == 1 and len(recv_done) == 2
+            # Negative: the paired forward pre-dispatch finished before the gradient arrived.
+            fwd_after_recv_ms.append(recv_done[0].elapsed_time(fwd_done[0]))
+            if _all_ranks(fwd_after_recv_ms[-1] < 0):
+                break
+        assert fwd_after_recv_ms[-1] < 0, fwd_after_recv_ms
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
