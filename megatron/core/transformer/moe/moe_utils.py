@@ -298,30 +298,39 @@ def get_tokens_per_expert_and_token_count(
     with_padding_mask: bool = False,
 ) -> torch.Tensor:
     """
-    Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
+    Compute global_tokens_per_expert, local_num_tokens and total_num_tokens.
 
     ``reduce_group`` accepts one group or an ordered tuple of orthogonal groups
     (for example runtime CP followed by TP). The single-group positional API is preserved.
+
+    total_num_tokens is the exact token count over the reduce groups. Ranks may hold different
+    numbers of tokens (variable-length or compacted inputs, runtime CP), so it is reduced
+    together with the per-expert counts and is never derived from this rank's own length.
     """
     local_tokens_per_expert = routing_map.sum(dim=0)
     reduce_groups = reduce_group if isinstance(reduce_group, tuple) else (reduce_group,)
 
     # The reduction all-reduces contiguous tensors in place; reduce a copy so
     # local_tokens_per_expert keeps this rank's counts for local_num_tokens below.
-    global_tokens_per_expert = local_tokens_per_expert.clone()
-    reduce_world_size = 1
-    for group in reduce_groups:
-        global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
-            global_tokens_per_expert, group
+    if with_padding_mask:
+        reduced = local_tokens_per_expert.clone()
+    else:
+        # Without a padding mask every row is a token. Carry the row count in the same
+        # all-reduce as the per-expert counts; new_full is a device-side fill, so this stays
+        # valid inside CUDA graph capture.
+        local_num_tokens = routing_map.shape[0]
+        reduced = torch.cat(
+            [local_tokens_per_expert, local_tokens_per_expert.new_full((1,), local_num_tokens)]
         )
-        reduce_world_size *= group.size()
+    for group in reduce_groups:
+        reduced = reduce_from_tensor_model_parallel_region(reduced, group)
 
     if with_padding_mask:
+        global_tokens_per_expert = reduced
         local_num_tokens = local_tokens_per_expert.sum() // topk
         total_num_tokens = global_tokens_per_expert.sum() // topk
     else:
-        local_num_tokens = routing_map.shape[0]
-        total_num_tokens = local_num_tokens * reduce_world_size
+        global_tokens_per_expert, total_num_tokens = reduced[:-1], reduced[-1]
     return global_tokens_per_expert, local_num_tokens, total_num_tokens
 
 
