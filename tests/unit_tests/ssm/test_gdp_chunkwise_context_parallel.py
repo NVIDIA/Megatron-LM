@@ -24,7 +24,7 @@ from megatron.core.ssm.gated_delta_product import (
     GatedDeltaProductMixer,
 )
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 
 if HAVE_FLA_GDP_CP:

@@ -126,18 +126,20 @@ def test_platform_and_bucket_are_isolated(source_tree):
 
 
 def test_new_platform_uses_registry_without_hashing_its_recipe(source_tree, monkeypatch):
-    recipe = "tests/test_utils/recipes/gb300/unit-tests.yaml"
-    monkeypatch.setitem(cache.PLATFORMS, "dgx_gb300", {"cloud": "gb300-test", "recipe": recipe})
+    recipe = "tests/test_utils/recipes/future_gpu/unit-tests.yaml"
+    monkeypatch.setitem(
+        cache.PLATFORMS, "dgx_future_gpu", {"cloud": "future_gpu-test", "recipe": recipe}
+    )
     (source_tree / recipe).parent.mkdir(parents=True)
     (source_tree / recipe).write_text("original recipe")
 
-    before = cache.cache_identity(source_tree, BUCKET, "dgx_gb300", IMAGE_ID)
-    assert before["cache_prefix"].startswith("unit-testmon-v1-main-dgx_gb300-")
+    before = cache.cache_identity(source_tree, BUCKET, "dgx_future_gpu", IMAGE_ID)
+    assert before["cache_prefix"].startswith("unit-testmon-v1-main-dgx_future_gpu-")
     assert "tests/unit_tests/testmon_cache.py" not in before["compatibility"]["inputs"]
     assert recipe not in before["compatibility"]["inputs"]
 
     (source_tree / recipe).write_text("changed recipe")
-    after = cache.cache_identity(source_tree, BUCKET, "dgx_gb300", IMAGE_ID)
+    after = cache.cache_identity(source_tree, BUCKET, "dgx_future_gpu", IMAGE_ID)
     assert after == before
     with pytest.raises(ValueError, match="unsupported Testmon platform"):
         cache.cache_identity(source_tree, BUCKET, "dgx_unknown", IMAGE_ID)

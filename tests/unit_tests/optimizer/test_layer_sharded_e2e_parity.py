@@ -164,14 +164,14 @@ def _run_pair(extra, label):
         update_gtp_config(pad_for_alignment=16, calculate_per_token_loss=False)
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_dense_layer_sharded_matches_duplicated_end_to_end():
     """Dense GPT, TP2 x GTP2: layer_sharded (two-stage) through the training loop ==
     duplicated, bitwise."""
     _run_pair({}, "dense")
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_moe_layer_sharded_matches_duplicated_end_to_end():
     """GPT-MoE (EP1, ETP2 x EGTP2): layer_sharded (two-stage) == duplicated, bitwise."""
     _run_pair(_MOE, "moe")

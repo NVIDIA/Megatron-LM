@@ -109,7 +109,7 @@ The kernel bucket runs in the H100 unit-test recipe
 (`tests/test_utils/recipes/h100/unit-tests.yaml`). Hardware-specific
 scheduling is exactly what these tests are meant to catch, so running the
 bucket on GB200/GB300-class runners as well (GB200 unit tests are selected by
-the `launch_on_gb200` marker) is a tracked follow-up; until then, reproduce
+the `launch_on_gb300` marker) is a tracked follow-up; until then, reproduce
 findings on Blackwell hardware manually as described in
 [`status.md`](./status.md).
 

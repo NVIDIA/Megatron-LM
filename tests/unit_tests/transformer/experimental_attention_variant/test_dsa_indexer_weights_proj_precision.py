@@ -38,7 +38,7 @@ from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_pari
     run_absorbed_mla_dsa_parity,
 )
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 
 def _precision_config(

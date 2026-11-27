@@ -1078,7 +1078,7 @@ def test_zero_padding_rows_replays():
     assert_replays_bit_exact(fn, (activations,), backward=False, what="zero_padding_rows")
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_mxfp8_swiglu_moe_replays():
     """SwiGLU must select separate MXFP8 quantization without a caller override."""
     from megatron.core.inference.moe.fused_moe import (
@@ -1117,7 +1117,7 @@ def test_mxfp8_swiglu_moe_replays():
     assert_replays_bit_exact(run, (x,), replays=3, backward=False, what="MXFP8 SwiGLU MoE")
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_torch_mxfp8_moe_is_batch_invariant():
     """A routed token must be bitwise stable as its expert loads change."""
     from megatron.core.inference.moe.fused_moe import (

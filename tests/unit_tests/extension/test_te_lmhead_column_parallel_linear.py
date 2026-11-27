@@ -373,7 +373,7 @@ class TestCrossEntropyMxfp8GradConfig:
 
 
 @pytest.mark.internal
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.skipif(
     not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell (SM >= 10)"
 )
@@ -511,7 +511,7 @@ class TestCrossEntropyMxfp8GradBinding:
         )
 
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(
         not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell (SM >= 10)"
     )
@@ -527,7 +527,7 @@ class TestCrossEntropyMxfp8GradBinding:
         assert model.vocab_parallel_cross_entropy.keywords["grad_fp8_format"] == expected_format
 
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(
         not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell (SM >= 10)"
     )
@@ -548,7 +548,7 @@ class TestCrossEntropyMxfp8GradBinding:
         assert "grad_fp8_format" not in getattr(model.vocab_parallel_cross_entropy, "keywords", {})
 
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(
         not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell (SM >= 10)"
     )

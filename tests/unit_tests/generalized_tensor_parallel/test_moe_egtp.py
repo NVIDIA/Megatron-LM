@@ -642,7 +642,7 @@ class TestMoEEGTPCorrectness:
             pytest.skip("Requires at least 4 CUDA devices")
         _run_distributed(_worker_expert_bias_gtp_inclusive, 4)
 
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.parametrize("egtp_remat_size", (1, 2))
     def test_egtp_quantized_precision_override_backward(self, request, egtp_remat_size):
         """MXFP8 override under global NVFP4 keeps experts fused and survives backward with EGTP_remat."""

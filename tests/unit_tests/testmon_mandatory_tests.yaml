@@ -17,3 +17,5 @@ mappings:
         - tests/unit_tests/distributed/mfsdp_v2/**/*.py
       dgx_gb200:
         - tests/unit_tests/distributed/mfsdp_v2/**/*.py
+      dgx_gb300:
+        - tests/unit_tests/distributed/mfsdp_v2/**/*.py

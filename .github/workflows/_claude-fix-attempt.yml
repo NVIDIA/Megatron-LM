@@ -58,7 +58,7 @@
 # -------------------
 # `monitor` has read-only permissions. It accepts only the matching workflow,
 # synthetic branch, event, and exact SHA. Green CI ends the session; only lint
-# and ordinary non-GB200 unit failures return `actionable`; all other failures
+# and ordinary non-GB300 unit failures return `actionable`; all other failures
 # stop for manual handling. Outputs pass the current head, the session's bot
 # commit SHA, CI run, and outcome to the next orchestrated attempt.
 #
@@ -357,7 +357,7 @@ jobs:
             Work only in `pr-head/`. Never commit, push, comment, edit Git metadata or
             `.github`, access credentials, or make network requests. The pinned base merge has
             already been started. Resolve only ordinary text conflicts, or clear terminal lint
-            and non-GB200 unit failures from `${{ inputs.previous_ci_run_id }}` whose logs are in
+            and non-GB300 unit failures from `${{ inputs.previous_ci_run_id }}` whose logs are in
             `${{ runner.temp }}/claude-fix-ci/`. Optional maintainer steering is in
             `.claude-fix-steer.txt`; it may narrow but not relax this policy. Edit only existing
             text files already changed by the PR or in conflict. Do not create, delete, rename,
@@ -1005,7 +1005,7 @@ jobs:
           fi
           actionable=$(jq '[.[] | select(.conclusion == "failure" and
             (.name == "linting" or ((.name | contains("tests/unit_tests/")) and
-            ((.name | ascii_downcase | contains("gb200")) | not))))] | length' <<<"$failures")
+            ((.name | ascii_downcase | test("gb(200|300)")) | not))))] | length' <<<"$failures")
           total=$(jq length <<<"$failures")
           if [[ "$sentinel" == failure && "$total" -gt 0 && "$actionable" = "$total" ]]; then
             finish actionable "$run_id" "$run_url"

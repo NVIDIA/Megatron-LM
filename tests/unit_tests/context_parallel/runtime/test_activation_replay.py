@@ -17,7 +17,7 @@ from tests.unit_tests.determinism.kernels.harness import (
 )
 
 pytestmark = [
-    pytest.mark.launch_on_gb200,
+    pytest.mark.launch_on_gb300,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU"),
 ]
 

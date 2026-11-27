@@ -96,7 +96,7 @@ def _on_flashinfer_gpu(*fixtures):
     """Marks for a GPU test class: GB200 launch, SM100/SM103, and its fixtures."""
     marks = (
         pytest.mark.internal,
-        pytest.mark.launch_on_gb200,
+        pytest.mark.launch_on_gb300,
         pytest.mark.skipif(
             not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
             reason="FlashInfer routed MXFP8 and per-token NVFP4 MoE need SM100/SM103",

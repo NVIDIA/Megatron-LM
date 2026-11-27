@@ -269,7 +269,7 @@ def _check_mxfp8_mlp_matches_reference(
     )
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @requires_mxfp8
 @pytest.mark.parametrize("placements", _MXFP8_PLACEMENTS)
 @pytest.mark.parametrize(
@@ -289,7 +289,7 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements, sha
     )
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @requires_mxfp8
 @pytest.mark.parametrize("placements", _MXFP8_2D_PLACEMENTS)
 @pytest.mark.parametrize("num_microbatches", [1, 3])
@@ -309,7 +309,7 @@ def test_mxfp8_mlp_training_on_2d_mesh_matches_reference(
     _check_mxfp8_mlp_matches_reference(distributed_setup, mesh, placements, num_microbatches)
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @requires_mxfp8
 def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(distributed_setup):
     """Forward unshards and prefetches only rowwise planes; backward only columnwise ones.
@@ -369,7 +369,7 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
         assert not _is_columnwise_allocated(module)
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @requires_mxfp8
 @pytest.mark.parametrize("placements", _MXFP8_PLACEMENTS)
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
@@ -400,7 +400,7 @@ def test_mxfp8_activation_recompute_matches_no_recompute(
     _check_recompute_matches_no_recompute(distributed_setup, recipe, build, use_reentrant)
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @requires_mxfp8
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
 def test_mxfp8_recorded_order_prefetches_rowwise_for_recompute(distributed_setup, use_reentrant):
@@ -444,7 +444,7 @@ def test_mxfp8_recorded_order_prefetches_rowwise_for_recompute(distributed_setup
     train_step()
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @requires_mxfp8
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
 def test_mxfp8_recompute_inside_fsdp_module_matches_no_recompute(distributed_setup, use_reentrant):
@@ -470,7 +470,7 @@ def test_mxfp8_recompute_inside_fsdp_module_matches_no_recompute(distributed_set
     _check_recompute_matches_no_recompute(distributed_setup, recipe, build, use_reentrant)
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @requires_mxfp8
 @pytest.mark.parametrize("use_reentrant", [False, True], ids=["non_reentrant", "reentrant"])
 @pytest.mark.parametrize(

@@ -55,7 +55,7 @@ inputs:
     required: false
     default: "false"
   platform:
-    description: "Platform to run tests on (e.g. dgx_h100, dgx_gb200)"
+    description: "Platform to run tests on (e.g. dgx_h100, dgx_gb300)"
     required: false
     default: "dgx_h100"
   cadence:

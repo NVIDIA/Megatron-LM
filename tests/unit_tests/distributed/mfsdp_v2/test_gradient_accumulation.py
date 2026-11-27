@@ -99,7 +99,7 @@ def test_partial_grad_buffer_follows_grad_comm_dtype(
         assert parameter.grad.dtype == (main_grads_dtype or torch.bfloat16), name
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 10,
     reason="MXFP8 requires Blackwell-or-newer CUDA hardware.",

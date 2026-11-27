@@ -41,7 +41,7 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
 )
 from tests.unit_tests.test_utilities import te_reads_legacy_grouped_env
 
-pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb200]
+pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb300]
 
 
 def _bf16_mtp_recipe():

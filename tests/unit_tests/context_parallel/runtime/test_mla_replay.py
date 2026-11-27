@@ -18,7 +18,7 @@ from tests.unit_tests.determinism.kernels.harness import (
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = [
-    pytest.mark.launch_on_gb200,
+    pytest.mark.launch_on_gb300,
     pytest.mark.skipif(
         not (torch.cuda.is_available() and HAVE_TE), reason="needs a GPU and Transformer Engine"
     ),

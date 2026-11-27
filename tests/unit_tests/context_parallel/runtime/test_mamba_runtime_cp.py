@@ -7,7 +7,7 @@ import torch
 
 from megatron.core.ssm.mamba_context_parallel import MambaContextParallel
 
-pytestmark = [pytest.mark.launch_on_gb200, pytest.mark.internal]
+pytestmark = [pytest.mark.launch_on_gb300, pytest.mark.internal]
 
 
 def test_runtime_cp_views_do_not_mutate_base_helper():

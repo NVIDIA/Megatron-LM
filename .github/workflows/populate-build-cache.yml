@@ -97,15 +97,15 @@ jobs:
           SOURCE_SHA: ${{ github.sha }}
         run: |
           yq -o json '[.products[] | select(.testmon != false) | .test_case[]]' tests/test_utils/recipes/h100/unit-tests.yaml > h100.json
-          yq -o json '[.products[] | select(.testmon != false) | .test_case[]]' tests/test_utils/recipes/gb200/unit-tests.yaml > gb200.json
+          yq -o json '[.products[] | select(.testmon != false) | .test_case[]]' tests/test_utils/recipes/gb300/unit-tests.yaml > gb300.json
           # Testmon keys H100 data by recipe platform and bucket, not by cloud.
           # Publish one H100 baseline (AWS) to avoid concurrent writers for the
           # same cache key; the Singapore image build remains a separate matrix job.
           MATRIX=$(jq -cn --argjson builds "$BUILDS" --arg sha "$SOURCE_SHA" \
-            --slurpfile h100 h100.json --slurpfile gb200 gb200.json '
+            --slurpfile h100 h100.json --slurpfile gb300 gb300.json '
             [$builds.include[] | select(.cloud != "gcp-h100") as $build
               | (if $build.cloud == "aws-h100" then {platform: "dgx_h100", buckets: $h100[0]}
-                 elif $build.cloud == "gb-gpu" then {platform: "dgx_gb200", buckets: $gb200[0]}
+                 elif $build.cloud == "gb-gpu" then {platform: "dgx_gb300", buckets: $gb300[0]}
                  else error("Unsupported unit-test platform") end) as $suite
               | $suite.buckets[] as $bucket
               | {bucket: $bucket, platform: $suite.platform, runner: $build.runner,

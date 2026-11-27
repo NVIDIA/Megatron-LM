@@ -110,7 +110,7 @@ def test_split_comm_respects_user_setting(monkeypatch, value):
     assert os.environ["NCCL_RESHARD_SPLIT_COMM"] == value
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.parametrize("use_default_group", [False, True])
 @pytest.mark.parametrize("backend_name", ["gloo", "undefined"])
 def test_hybrid_group_uses_registered_nccl_cuda_backend(
@@ -377,7 +377,7 @@ def nccl_m2n_host_proxy(monkeypatch: pytest.MonkeyPatch):
     reason="install NVIDIA/nccl-extensions and NCCL4Py to run the M2N integration test",
 )
 @pytest.mark.usefixtures("nccl_m2n_host_proxy")
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_nccl_m2n_reshards_parameter_between_tensor_dimensions(monkeypatch: pytest.MonkeyPatch):
     """Exercise packed TP shard-to-shard M2N transfer on GPUs."""
     Utils.initialize_distributed()
@@ -459,7 +459,7 @@ def test_nccl_m2n_reshards_parameter_between_tensor_dimensions(monkeypatch: pyte
 )
 @pytest.mark.parametrize("grouped_gemm_backend", ["torch", "vllm", "flashinfer"])
 @pytest.mark.usefixtures("nccl_m2n_host_proxy")
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_nccl_m2n_refits_selective_mxfp8_from_te(
     grouped_gemm_backend: str, monkeypatch: pytest.MonkeyPatch
 ):
@@ -883,7 +883,7 @@ def test_stacked_experts_feed_receiver_side_transform(remove_parameters, convert
 )
 @pytest.mark.parametrize("source_count,convert_all", [(1, False), (2, False), (2, True)])
 @pytest.mark.usefixtures("nccl_m2n_host_proxy")
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_nccl_m2n_stacked_experts_match_per_expert_and_nccl_with_mxfp8(
     monkeypatch: pytest.MonkeyPatch, source_count: int, convert_all: bool
 ):
@@ -1006,7 +1006,7 @@ def test_nccl_m2n_stacked_experts_match_per_expert_and_nccl_with_mxfp8(
 )
 @pytest.mark.parametrize("source_count", [1, 3])
 @pytest.mark.usefixtures("nccl_m2n_host_proxy")
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 def test_nccl_m2n_refits_planner_built_strided_glu(
     source_count: int, monkeypatch: pytest.MonkeyPatch
 ):

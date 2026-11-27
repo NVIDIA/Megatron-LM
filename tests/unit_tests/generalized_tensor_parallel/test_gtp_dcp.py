@@ -129,7 +129,7 @@ def test_native_fp8_compatibility_preserves_class(monkeypatch, te_version, nativ
     assert type(weight) is GTPWeight
 
 
-@pytest.mark.launch_on_gb200
+@pytest.mark.launch_on_gb300
 @pytest.mark.parametrize("legacy", [False, True], ids=["native", "legacy"])
 def test_gtp_fp8_checkpoint_casts_replay(monkeypatch, legacy):
     """Replay checkpoint casts bit-exactly while preserving GTP identity and storage."""

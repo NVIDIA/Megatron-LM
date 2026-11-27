@@ -26,7 +26,7 @@ from tests.unit_tests.test_utilities import (
 from tests.unit_tests.transformer.moe import test_moe_single_grouped_weight_numerics as numerics
 
 # The GB200 CI selector scans this file's text before pytest resolves inherited marks.
-pytestmark = [pytest.mark.launch_on_gb200, *numerics.pytestmark]
+pytestmark = [pytest.mark.launch_on_gb300, *numerics.pytestmark]
 
 
 @pytest.fixture

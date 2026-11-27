@@ -1436,7 +1436,7 @@ _unique_buffer_counts = {}
 
 
 class TestTECudaGraphHelper:
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.parametrize(
         "pp_size,cp_size,chunks",
         [
@@ -2174,7 +2174,7 @@ class TestPartialCudaGraph:
             "deepep",
             "hybridep",
             "ncclep",
-            pytest.param("ncclep_fp8", marks=pytest.mark.launch_on_gb200),
+            pytest.param("ncclep_fp8", marks=pytest.mark.launch_on_gb300),
         ],
     )
     def test_moe_partial_cudagraph(self, ep_size, moe_dropless_dispatcher, moe_dispatcher_type):

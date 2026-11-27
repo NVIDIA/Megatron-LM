@@ -22,6 +22,7 @@ PHASES = ("prod", "experimental")
 PLATFORMS = {
     "dgx_h100": {"cloud": "aws-h100", "recipe": "tests/test_utils/recipes/h100/unit-tests.yaml"},
     "dgx_gb200": {"cloud": "gb-gpu", "recipe": "tests/test_utils/recipes/gb200/unit-tests.yaml"},
+    "dgx_gb300": {"cloud": "gb-gpu", "recipe": "tests/test_utils/recipes/gb300/unit-tests.yaml"},
 }
 TRACKED_ENVIRONMENT_PACKAGES = frozenset(
     {"numpy", "pytest", "torch", "transformer-engine", "triton"}

@@ -159,7 +159,7 @@ def _config(**overrides):
             True,
             marks=[
                 pytest.mark.internal,
-                pytest.mark.launch_on_gb200,
+                pytest.mark.launch_on_gb300,
                 pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 parameters need Blackwell"),
             ],
         ),
@@ -475,7 +475,7 @@ class TestTEWrappers:
             assert outputs["out"].dtype is torch.float32
 
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.parametrize("quantized", [False, True], ids=["bf16", "mxfp8"])
     @pytest.mark.parametrize(
         "k,n", [(256, 512), (2048, 1536), (768, 2048), (2688, 1856), (1856, 2688)]
@@ -764,7 +764,7 @@ class TestTEWrappers:
             module, (x, m_splits), replays=3, contention=True, what="TEGroupedLinear"
         )
 
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     def test_te_grouped_linear_bf16_override_replays_under_mxfp8(self):
         """The per-module autocast override also preserves deterministic gradients."""
         from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
@@ -810,7 +810,7 @@ class TestTEWrappers:
         assert not module.fp8
 
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 parameter storage needs Blackwell")
     @pytest.mark.parametrize(
         ("recipe_storage", "global_recipe", "transformer_impl", "middle_uses_mxfp8"),
@@ -944,7 +944,7 @@ class TestTEWrappers:
         )
 
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 needs Blackwell")
     @pytest.mark.parametrize("grad_fp8_format", ["e4m3", "e5m2"])
     def test_te_fused_cross_entropy_mxfp8_grad_replays(self, grad_fp8_format):

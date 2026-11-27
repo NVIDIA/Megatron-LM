@@ -64,7 +64,7 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
         "subprocess.run(['jq', sys.argv[3]], input=json.dumps(recipe), text=True, check=True)\n"
     )
     yq.chmod(0o755)
-    for platform in ("h100", "gb200"):
+    for platform in ("h100", "gb300"):
         relative = Path("tests/test_utils/recipes") / platform / "unit-tests.yaml"
         destination = tmp_path / relative
         destination.parent.mkdir(parents=True)
@@ -77,7 +77,7 @@ def shell_environment(tmp_path: Path) -> dict[str, str]:
     [
         ("true", "false", {"dgx_h100"}),
         ("false", "true", {"dgx_h100"}),
-        ("true", "true", {"dgx_h100", "dgx_gb200"}),
+        ("true", "true", {"dgx_h100", "dgx_gb300"}),
     ],
 )
 def test_producer_consumes_the_actual_build_matrix(
@@ -96,10 +96,10 @@ def test_producer_consumes_the_actual_build_matrix(
             "ENABLE_GB_TESTING": gb_enabled,
             "REGISTRY_AWS": "h100.example.test/team",
             "REGISTRY_GCP_H100": "gcp.example.test/team",
-            "REGISTRY_GB_GPU": "gb200.example.test/team",
+            "REGISTRY_GB_GPU": "gb300.example.test/team",
             "SELECTED_RUNNER": "h100-runner",
             "SELECTED_RUNNER_GCP_H100": "gcp-build-runner",
-            "SELECTED_RUNNER_GB_GPU": "gb200-runner",
+            "SELECTED_RUNNER_GB_GPU": "gb300-runner",
             "USE_GCP_H100": "false",
             "INCLUDE_GCP_H100": "false",
         },
@@ -117,7 +117,7 @@ def test_producer_consumes_the_actual_build_matrix(
     assert {entry["platform"] for entry in matrix} == expected_platforms
     for platform, cloud, registry, runner in (
         ("dgx_h100", "aws-h100", "h100.example.test/team", "h100-runner"),
-        ("dgx_gb200", "gb-gpu", "gb200.example.test/team", "gb200-runner"),
+        ("dgx_gb300", "gb-gpu", "gb300.example.test/team", "gb300-runner"),
     ):
         entries = [entry for entry in matrix if entry["platform"] == platform]
         if platform not in expected_platforms:
@@ -197,10 +197,10 @@ def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
             "ENABLE_GB_TESTING": "true",
             "REGISTRY_AWS": "h100.example.test/team",
             "REGISTRY_GCP_H100": "gcp.example.test/team",
-            "REGISTRY_GB_GPU": "gb200.example.test/team",
+            "REGISTRY_GB_GPU": "gb300.example.test/team",
             "SELECTED_RUNNER": "h100-runner",
             "SELECTED_RUNNER_GCP_H100": "gcp-build-runner",
-            "SELECTED_RUNNER_GB_GPU": "gb200-runner",
+            "SELECTED_RUNNER_GB_GPU": "gb300-runner",
             "USE_GCP_H100": "false",
             "INCLUDE_GCP_H100": "true",
         },
@@ -218,11 +218,11 @@ def test_producer_publishes_one_h100_testmon_baseline_for_aws_and_gcp_builds(
     )
     assert producer.returncode == 0, producer.stderr
     matrix = json.loads(outputs["matrix"])
-    assert {entry["platform"] for entry in matrix} == {"dgx_h100", "dgx_gb200"}
+    assert {entry["platform"] for entry in matrix} == {"dgx_h100", "dgx_gb300"}
 
     for platform, bucket_file, cloud, registry, runner in (
         ("dgx_h100", "h100", "aws-h100", "h100.example.test/team", "h100-runner"),
-        ("dgx_gb200", "gb200", "gb-gpu", "gb200.example.test/team", "gb200-runner"),
+        ("dgx_gb300", "gb300", "gb-gpu", "gb300.example.test/team", "gb300-runner"),
     ):
         recipe = yaml.safe_load(
             (ROOT / "tests/test_utils/recipes" / bucket_file / "unit-tests.yaml").read_text()
@@ -832,12 +832,12 @@ def test_nemo_cicd_validator_checks_h100_functional_result(
             "IS_CI_WORKLOAD": "false",
             "FORCE_RUN_ALL": "false",
             "RUN_H100_FUNCTIONAL": run_h100_functional,
-            "GB200_SHOULD_RUN": "false",
-            "ENABLE_GB200_TESTING": "false",
+            "GB300_SHOULD_RUN": "false",
+            "ENABLE_GB300_TESTING": "false",
             "UNIT_RESULT": "success",
-            "UNIT_GB200_RESULT": "skipped",
+            "UNIT_GB300_RESULT": "skipped",
             "H100_RESULT": h100_result,
-            "GB200_RESULT": "skipped",
+            "GB300_RESULT": "skipped",
         },
     )
     assert (result.returncode == 0) == expected_success, result.stdout + result.stderr
@@ -1002,7 +1002,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
         assert "unit_testmon_mode" not in step.get("if", "")
     for platform, parser_job, output in (
         ("h100", "cicd-parse-unit-tests", "unit-tests"),
-        ("gb200", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
+        ("gb300", "cicd-parse-unit-tests-gb300", "unit-tests-gb300"),
     ):
         parser = _step("cicd-main.yml", parser_job, "parse-unit-tests")
         result, parsed = _run(parser["run"], tmp_path, shell_environment)
@@ -1049,7 +1049,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     callers = yaml.safe_load((ROOT / ".github/workflows/cicd-main.yml").read_text())["jobs"]
     for caller, parser, output in (
         ("cicd-unit-tests-latest", "cicd-parse-unit-tests", "unit-tests"),
-        ("cicd-unit-tests-latest-gb200", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
+        ("cicd-unit-tests-latest-gb300", "cicd-parse-unit-tests-gb300", "unit-tests-gb300"),
     ):
         assert "strategy" not in callers[caller]
         assert parser in callers[caller]["needs"]
@@ -1059,14 +1059,14 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
     coverage = _step("cicd-main.yml", "Coverage", "coverage")
     for variable, job, output in (
         ("H100_BUCKETS", "cicd-parse-unit-tests", "unit-tests"),
-        ("GB200_BUCKETS", "cicd-parse-unit-tests-gb200", "unit-tests-gb200"),
+        ("GB300_BUCKETS", "cicd-parse-unit-tests-gb300", "unit-tests-gb300"),
     ):
         assert job in callers["Coverage"]["needs"]
         assert coverage["env"][variable] == (
             "${{ needs." + job + ".outputs." + output + " || '[]' }}"
         )
 
-    for platform in ("dgx_h100", "dgx_gb200"):
+    for platform in ("dgx_h100", "dgx_gb300"):
         directory = tmp_path / f"unit-test-plan-{platform}"
         directory.mkdir()
         (directory / "plan.json").write_text(
@@ -1087,7 +1087,7 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
         {
             "SELECTIVE": "true",
             "H100_BUCKETS": json.dumps([{"bucket": bucket}]),
-            "GB200_BUCKETS": json.dumps([{"bucket": bucket}]),
+            "GB300_BUCKETS": json.dumps([{"bucket": bucket}]),
             "SOURCE_SHA": "a" * 40,
         },
     )

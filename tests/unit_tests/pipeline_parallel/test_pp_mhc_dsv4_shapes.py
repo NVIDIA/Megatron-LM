@@ -22,7 +22,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb200]
+pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb300]
 
 _SEQUENCE_LENGTH = 128
 _NUM_STREAMS = 4

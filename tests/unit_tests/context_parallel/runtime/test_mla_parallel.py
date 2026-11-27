@@ -7,7 +7,7 @@ import pytest
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.transformer.mla_test_utils import check_mla_parallel_correctness
 
-pytestmark = [pytest.mark.launch_on_gb200, pytest.mark.experimental]
+pytestmark = [pytest.mark.launch_on_gb300, pytest.mark.experimental]
 
 
 @pytest.mark.parametrize(

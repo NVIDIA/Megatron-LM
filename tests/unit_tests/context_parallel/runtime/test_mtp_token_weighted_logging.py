@@ -7,7 +7,7 @@ import torch
 
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 
 @pytest.fixture(autouse=True)

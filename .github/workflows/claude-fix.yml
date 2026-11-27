@@ -42,7 +42,7 @@
 #    waits for the NVIDIA `pull-request/<PR>` CI run to finish.
 #
 # 3. Attempt 1 also tests an unchanged head when Claude has nothing to publish.
-#    A supported lint or non-GB200 unit-test failure enables the next attempt.
+#    A supported lint or non-GB300 unit-test failure enables the next attempt.
 #    Unsupported, stale, timed-out, green, and no-progress results stop early.
 #    Attempt 3 is the hard limit.
 #

@@ -15,7 +15,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
 )
 
-pytestmark = pytest.mark.launch_on_gb200
+pytestmark = pytest.mark.launch_on_gb300
 
 
 class _FakeCPGroup:

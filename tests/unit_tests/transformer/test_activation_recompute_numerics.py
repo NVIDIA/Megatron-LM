@@ -51,7 +51,7 @@ _TP = 2
 _ATOL = 1e-4
 _BLACKWELL_AVAILABLE = torch.cuda.is_available() and get_device_arch_version() >= 10
 
-pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb200]
+pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb300]
 
 _FULL = {"recompute_granularity": "full", "recompute_method": "uniform", "recompute_num_layers": 1}
 

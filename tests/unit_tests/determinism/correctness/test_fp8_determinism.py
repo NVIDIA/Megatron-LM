@@ -58,7 +58,7 @@ class TestQuantizationDeterminism:
         RUNNER.run(quant_overrides, {"TP": 2})
 
     @pytest.mark.internal
-    @pytest.mark.launch_on_gb200
+    @pytest.mark.launch_on_gb300
     @pytest.mark.skipif(not _IS_BLACKWELL, reason="grouped MXFP8 storage needs Blackwell")
     def test_grouped_mxfp8_parameter_updates_replay_bit_exact(self, monkeypatch):
         """Refit-style writes must update cached grouped members deterministically."""
