@@ -464,6 +464,9 @@ class OffloadTensorGroup:
         self._tensors = {}
         self._offload_event = torch.cuda.Event()
         self._reload_event = torch.cuda.Event()
+        self._prefetched_tags = set()
+        self._reload_allocation_stream = None
+        self._reload_waiters = set()
         self.offload = True
         # Margin groups stay resident to provide compute time for the first reloads.
         self.is_offload_margin = False
@@ -485,9 +488,37 @@ class OffloadTensorGroup:
         """Push a tensor to the group."""
         self._tensors[tag] = tensor
 
+    def push_prefetched_tensor(self, tag, tensor, allocation_stream):
+        """Store a reload destination and remember where it was allocated."""
+        self.push_tensor(tag, tensor)
+        self._prefetched_tags.add(tag)
+        self._reload_allocation_stream = allocation_stream
+
     def pop_tensor(self, tag):
         """Pop a tensor from the group."""
+        if tag in self._prefetched_tags:
+            # Recompute can unpack saved tensors before Commit backward runs.
+            if not (is_graph_capturing() or torch.cuda.is_current_stream_capturing()):
+                stream = torch.cuda.current_stream()
+                self.wait_reload_event(stream)
+                if stream != self._reload_allocation_stream:
+                    self._tensors[tag].record_stream(stream)
+            self._prefetched_tags.remove(tag)
         return self._tensors.pop(tag)
+
+    def finish_reload(self):
+        """Clear reload tracking once all prefetched tensors have been consumed."""
+        if not self._prefetched_tags:
+            self._reload_allocation_stream = None
+            self._reload_waiters.clear()
+
+    def reset_reload(self, h2d_stream):
+        """Discard unused reload destinations, which H2D may still be writing."""
+        for tag in self._prefetched_tags:
+            self._tensors[tag].record_stream(h2d_stream)
+            del self._tensors[tag]
+        self._prefetched_tags.clear()
+        self.finish_reload()
 
     def record_offload_event(self, stream):
         """Record the offload event."""
@@ -500,10 +531,13 @@ class OffloadTensorGroup:
     def record_reload_event(self, stream):
         """Record the reload event."""
         self._reload_event.record(stream)
+        self._reload_waiters.clear()
 
     def wait_reload_event(self, stream):
-        """Wait for the reload event."""
-        stream.wait_event(self._reload_event)
+        """Wait for the reload event once per consuming stream."""
+        if stream not in self._reload_waiters:
+            stream.wait_event(self._reload_event)
+            self._reload_waiters.add(stream)
 
     def update_offload_info(self, num_bytes: int):
         """Account for a candidate transfer without allocating a CPU backup."""
@@ -1089,6 +1123,8 @@ class ChunkOffloadHandler:
         self._groups_to_reload = []
         self._tensor_count_current_group = 0
         self._reloading_group = []
+        for group in self.offload_groups:
+            group.reset_reload(self.h2d_stream)
         # Clear the pending-event FIFO at iter boundary so we never wait on
         # an event recorded in a previous (non-captured) iteration.
         self._offload_pending_by_name.clear()
@@ -1310,7 +1346,9 @@ class ChunkOffloadHandler:
                     state, stream=self.h2d_stream, destination=gpu_tensor
                 )
                 debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
-                group_to_reload.push_tensor(tensor_tag, recovered_tensor)
+                group_to_reload.push_prefetched_tensor(
+                    tensor_tag, recovered_tensor, consumer_stream
+                )
             group_to_reload.record_reload_event(self.h2d_stream)
         self._groups_to_reload.pop()
         # Add the group to the reloading group to wait for the reload event.
@@ -1479,6 +1517,8 @@ class ChunkOffloadHandler:
         if not self.do_offload:
             return
         debug_rank(f"--on_group_start_backward {self}")
+        if current_group is not None and current_group not in self._reloading_group:
+            current_group.finish_reload()
         self.h2d_stream.wait_stream(torch.cuda.current_stream())
         # The forward-start marker runs after this group's internal backward.
         # At backward entry, a GPU-resident final group may still have its slot
