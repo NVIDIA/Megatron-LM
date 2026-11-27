@@ -66,6 +66,19 @@ from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 
+@pytest.mark.parametrize("sequence_major", [False, True])
+def test_full_sequence_log_probs_preserves_layout(sequence_major):
+    logits = torch.randn(5, 2, 64, device="cuda")
+    if sequence_major:
+        logits = logits.transpose(0, 1)
+    expected = torch.log_softmax(logits.contiguous(), dim=-1)
+
+    actual = TextGenerationController._full_sequence_log_probs(logits)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.is_contiguous() == logits.is_contiguous()
+
+
 def teardown_module(module):
     # Some tests build inference_optimized MoE models with the default 'vllm'
     # grouped-GEMM backend, which allocates class-level persistent intermediate
