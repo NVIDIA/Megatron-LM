@@ -3,7 +3,7 @@
 
 Every training seam records its write into a ``ReplayInterval`` (one write per interval without
 checkpoint replay). An interval keeps only its first input residual (the checkpoint) and the
-writes' tapes, which the seams save for their backward anyway. Its one replay launch rebuilds
+writes' tapes, which the seams save for their backward anyway. Replay rebuilds
 every seam's input residual bit-exactly and fills its readers' ``ColumnSlot``s with the
 columnwise MXFP8 operands their consumers' weight-gradient GEMMs unpack. It runs before any
 backward GEMM of the interval: in the backward of the next interval's first seam, or for a
@@ -52,7 +52,7 @@ class ReplayInterval:
 
     @torch.no_grad()
     def replay(self):
-        """Run the interval's replay launch, once; it then keeps only the input residuals."""
+        """Reconstruct the interval once and keep only the input residuals."""
         if self.predecessors is not None:
             return
         from .replay_kernel import replay_interval

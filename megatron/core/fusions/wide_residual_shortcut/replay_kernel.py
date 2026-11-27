@@ -25,7 +25,6 @@ from .kernel_utils import (
     _store_bf16x4,
     allocate_operand,
     cdiv,
-    operand_buffers,
 )
 
 
@@ -71,23 +70,14 @@ def bwd_wr_writeread_recompute_bf16(
 
 
 @g.jit
-def _tile_value(previous, update, write, retain, RETAIN: gl.constexpr):
-    """``_forward_value`` on a tile in packed f32x2 arithmetic. Bit-identical to it."""
-    return _fma2(write, update, _mul2(retain, previous) if RETAIN else previous)
-
-
-@g.jit
-def _emit_columns(y, data, scales, index, mask, EVEN: gl.constexpr):
+def _emit_columns(y, data, scales, index, mask):
     """Columnwise MXFP8 of a (32, C) FP32 tile that is one 32-row block: E8M0 scale per column
     (at ``index`` of the compact [row block, column] scales). Padded rows are zero in ``y``;
     tiles cover whole 128 x 128 scale tiles, so padded scales are written too."""
     exponent, bits = _e8m0_scale(gl.max(gl.abs(y), 0))
     q = _mul2(y, gl.expand_dims(bits.to(gl.float32, bitcast=True), 0))
     q = q.to(gl.float8e4nv).to(gl.uint8, bitcast=True)
-    if EVEN:
-        gl.store(data, q)
-    else:
-        gl.store(data, q, mask)
+    gl.store(data, q, mask)
     gl.store(scales + index, exponent.to(gl.uint8))
 
 
@@ -96,19 +86,16 @@ def bwd_wr_writeread_recompute_mxfp8(
     checkpoint,
     updates,
     cs,
-    rstd,
-    gamma,
+    statistics,
+    gammas,
     outputs,
     data,
     scales,
-    terminal,
     M: gl.constexpr,
     H: gl.constexpr,
     S: gl.constexpr,
     RETENTION: gl.constexpr,
-    TERMINAL: gl.constexpr,
     READERS: gl.constexpr,
-    FIRST: gl.constexpr,
     TABLE: gl.constexpr,
     VECTOR_COEFFICIENTS: gl.constexpr,
     VEC: gl.constexpr,
@@ -117,11 +104,9 @@ def bwd_wr_writeread_recompute_mxfp8(
     AHEAD: gl.constexpr,
 ):
     """Replay transitions on 32-row tiles, emitting the columns of every reader in READERS[j]
-    after transition j. ``rstd``, ``gamma`` and ``data`` hold one entry per emitted column
-    operand, in transition order; FIRST[j] is transition j's first. ``scales`` holds every
-    operand's compact [row block, padded column] scales, swizzled afterwards: one byte per
-    column of a row block lands in a different 32-byte sector of TE's layout, and such partial
-    sector writes cost far more than their bytes."""
+    after transition j. Each requested reader carries its saved rstd, gamma and destination.
+    ``scales`` holds compact [row block, padded column] scales. A later kernel swizzles them
+    in whole sectors. Direct stores here would touch a separate 32-byte sector per column."""
     BLOCK_COLS: gl.constexpr = VEC * THREADS_N
     # Training shapes cover whole 128 x 128 scale tiles: no masks.
     EVEN: gl.constexpr = (M % 128 == 0) and (H % 128 == 0)
@@ -132,11 +117,12 @@ def bwd_wr_writeread_recompute_mxfp8(
     lane = gl.arange(0, 32, layout=gl.constexpr(gl.SliceLayout(1, L)))
     rr = rowtile * 32 + lane
     cc = coltile * BLOCK_COLS + gl.arange(0, BLOCK_COLS, layout=gl.constexpr(gl.SliceLayout(0, L)))
-    mask = (rr[:, None] < M) & (cc[None, :] < H)
+    mask = None if EVEN else (rr[:, None] < M) & (cc[None, :] < H)
+    other = None if EVEN else 0
     values = ()
     for s in gl.static_range(S):
         ptr = checkpoint + rr[:, None] * (S * H) + s * H + cc[None, :]
-        values += ((gl.load(ptr) if EVEN else gl.load(ptr, mask, 0)).to(gl.float32),)
+        values += (gl.load(ptr, mask, other).to(gl.float32),)
     N: gl.constexpr = len(updates)
     # Per-thread offsets every transition shares: [M, H] tiles (updates, column data), the
     # residual's first stream, and each column's swizzled scale.
@@ -147,22 +133,16 @@ def bwd_wr_writeread_recompute_mxfp8(
     scale_index = rowtile * PADDED_H + cc
     # Updates load AHEAD transitions early, overlapping earlier transitions' stores.
     pending = ()
-    for k in gl.static_range(AHEAD):
-        if k < N:
-            uptr = updates[k] + offsets
-            pending += (gl.load(uptr) if EVEN else gl.load(uptr, mask, 0),)
+    for k in gl.static_range(min(AHEAD, N)):
+        pending += (gl.load(updates[k] + offsets, mask, other),)
+    operand = 0
     for j in gl.static_range(N):
         if AHEAD == 0:
-            uptr = updates[j] + offsets
-            pending = (gl.load(uptr) if EVEN else gl.load(uptr, mask, 0),)
+            pending = (gl.load(updates[j] + offsets, mask, other),)
         u = pending[0].to(gl.float32)
-        rest = ()
-        for k in gl.static_range(1, len(pending)):
-            rest += (pending[k],)
-        if j + AHEAD < N:
-            uptr = updates[j + AHEAD] + offsets
-            rest += (gl.load(uptr) if EVEN else gl.load(uptr, mask, 0),)
-        pending = rest
+        pending = pending[1:]
+        if AHEAD and j + AHEAD < N:
+            pending += (gl.load(updates[j + AHEAD] + offsets, mask, other),)
         # The transition's [write, retain, read...] x S coefficient rows, four per vector load.
         table = ()
         if VECTOR_COEFFICIENTS:
@@ -171,42 +151,29 @@ def bwd_wr_writeread_recompute_mxfp8(
         else:
             for k in gl.static_range(TABLE[j]):
                 table += (gl.load(cs[j] + k),)
-        writes, retains = (), ()
-        for s in gl.static_range(S):
-            writes += (table[s],)
-            retains += (table[S + s] if RETENTION[j] else 1.0,)
         for e in gl.static_range(len(READERS[j])):
             x = None
             q = 0.0
             for s in gl.static_range(S):
                 beta = table[(2 + READERS[j][e]) * S + s]
                 # Explicit rn multiply prevents contraction into neighboring recurrence.
-                alpha = _mul_rn(beta, retains[s])
+                alpha = _mul_rn(beta, (table[S + s] if RETENTION[j] else 1.0))
                 x = _mul2(alpha, values[s]) if x is None else _fma2(alpha, values[s], x)
-                q = gl.fma(beta, writes[s], q)
+                q = gl.fma(beta, table[s], q)
             x = _fma2(q, u, x)
-            if EVEN:
-                r = gl.load(rstd[FIRST[j] + e] + rr)
-                weight = gl.load(gamma[FIRST[j] + e] + cc).to(gl.float32)
-            else:
-                r = gl.load(rstd[FIRST[j] + e] + rr, rr < M, 0)
-                weight = gl.load(gamma[FIRST[j] + e] + cc, cc < H, 0).to(gl.float32)
+            r = gl.load(statistics[j][e] + rr, None if EVEN else rr < M, other)
+            weight = gl.load(gammas[j][e] + cc, None if EVEN else cc < H, other).to(gl.float32)
             y = _mul2(_mul2(x, r[:, None]), weight[None, :])
             if not EVEN:
                 y = gl.where(mask, y, 0.0)
-            _emit_columns(
-                y,
-                data[FIRST[j] + e] + offsets,
-                scales + (FIRST[j] + e) * OPERAND,
-                scale_index,
-                mask,
-                EVEN,
-            )
-        if j < len(updates) - 1 or TERMINAL:
+            _emit_columns(y, data[j][e] + offsets, scales + operand * OPERAND, scale_index, mask)
+            operand += 1
+        if j < len(outputs):
             next_values = ()
             for s in gl.static_range(S):
-                value = _tile_value(values[s], u, writes[s], retains[s], RETENTION[j])
-                target = outputs[j] if j < len(updates) - 1 else terminal
+                previous = _mul2(table[S + s], values[s]) if RETENTION[j] else values[s]
+                value = _fma2(table[s], u, previous)
+                target = outputs[j]
                 tptr = target + s * H + residual_offsets
                 if EVEN and VEC % 4 == 0 and target.dtype.element_ty == gl.bfloat16:
                     value = _store_bf16x4(tptr, value)
@@ -215,10 +182,7 @@ def bwd_wr_writeread_recompute_mxfp8(
                         value = _round_bf16(value)
                     else:
                         value = value.to(target.dtype.element_ty)
-                    if EVEN:
-                        gl.store(tptr, value)
-                    else:
-                        gl.store(tptr, value, mask)
+                    gl.store(tptr, value, mask)
                     value = value.to(gl.float32)
                 next_values += (value,)
             values = next_values
@@ -245,77 +209,88 @@ def bwd_wr_writeread_swizzle_scales(compact, scales, M, PADDED_H: tl.constexpr):
             tl.store(scales[k] + offset, value)
 
 
-def _column_inputs(checkpoint, tapes, requested, columns):
-    """Per tape, per reader: the columnwise operands (allocated unless supplied) and their data
-    and scale buffers (None where not requested)."""
+def _check_scratch(checkpoint, tapes, targets, columns):
+    """Check caller-owned buffers before handing their storage to the replay kernels."""
     m, h = tapes[0].update.shape
-    if columns is None:
-        shape, device = (m, h), checkpoint.device
-        columns = tuple(
-            tuple(
-                allocate_operand(shape, device, rowwise=False, columnwise=True) if need else None
-                for need in needs
-            )
-            for needs in requested
-        )
-    else:
-        columns = tuple(tuple(per_tape) for per_tape in columns)
-        if len(columns) != len(tapes) or any(
-            len(per_tape) != len(needs)
-            or any((column is not None) != need for need, column in zip(needs, per_tape))
-            for needs, per_tape in zip(requested, columns)
+    supplied = list(targets)
+    for out in targets:
+        if (
+            out.shape != checkpoint.shape
+            or out.dtype != checkpoint.dtype
+            or out.device != checkpoint.device
+            or not out.is_contiguous()
+            or out.storage_offset() != 0
+            or out.untyped_storage().nbytes() != out.numel() * out.element_size()
         ):
-            raise ValueError("column entries must match requested transitions and readers")
-    buffers = tuple(operand_buffers(per_tape, columnwise=True) for per_tape in columns)
-    data, scales = zip(*buffers)  # per tape, per reader
-    for needs, ds, qs in zip(requested, data, scales):
-        for need, d, q in zip(needs, ds, qs):
-            if need and (
-                d is None
-                or q is None
-                or d.shape != (m, h)
-                or q.numel() != cdiv(m, 128) * cdiv(h, 128) * 512
+            raise ValueError(
+                "predecessor buffers require full contiguous storage of the checkpoint dtype"
+            )
+    for per_tape in columns:
+        for column in per_tape:
+            if column is None:
+                continue
+            data = getattr(column, "_columnwise_data", None)
+            scale = getattr(column, "_columnwise_scale_inv", None)
+            if (
+                data is None
+                or scale is None
+                or data.shape != (m, h)
+                or scale.numel() != cdiv(m, 128) * cdiv(h, 128) * 512
                 or any(
                     t.dtype != torch.uint8 or t.device != checkpoint.device or not t.is_contiguous()
-                    for t in (d, q)
+                    for t in (data, scale)
                 )
             ):
                 raise ValueError("invalid MXFP8 column allocation")
-    return columns, data, scales
+            supplied.extend((data, scale))
+
+    def address(t):
+        return t.untyped_storage().data_ptr()
+
+    occupied = {address(checkpoint)}
+    for tape in tapes:
+        occupied.update(
+            address(t) for t in (tape.update, tape.coefficients, *tape.gammas, *tape.rstd)
+        )
+    for buffer in supplied:
+        ptr = address(buffer)
+        if ptr in occupied:
+            raise ValueError("replay, column and input buffers must not alias")
+        occupied.add(ptr)
 
 
-def _launch_columns(checkpoint, tapes, outputs, data, scales, requested, terminal):
+def _launch_columns(checkpoint, tapes, outputs, columns):
     m, h = tapes[0].update.shape
-    readers = tuple(tuple(r for r, need in enumerate(needs) if need) for needs in requested)
-    first, flat = [], []  # per tape its first emitted operand; (tape, reader) per operand
-    for index, emitted in enumerate(readers):
-        first.append(len(flat))
-        flat.extend((index, r) for r in emitted)
+    readers, stats, gammas, data, scales = [], [], [], [], []
+    for tape, cols in zip(tapes, columns):
+        selected = tuple(i for i, col in enumerate(cols) if col is not None)
+        readers.append(selected)
+        stats.append(tuple(tape.rstd[i] for i in selected))
+        gammas.append(tuple(tape.gammas[i] for i in selected))
+        data.append(tuple(cols[i]._columnwise_data for i in selected))
+        scales.extend(cols[i]._columnwise_scale_inv for i in selected)
+
     vector, threads, warps, maxnreg, ahead = _MX_SCHEDULES[checkpoint.dtype]
     block = vector * threads
     tiles = cdiv(m, 128) * 4 * cdiv(h, 128) * (128 // block)
     padded_h = cdiv(h, 128) * 128
     compact = torch.empty(
-        (len(flat), cdiv(m, 128) * 4, padded_h), dtype=torch.uint8, device=checkpoint.device
+        (len(scales), cdiv(m, 128) * 4, padded_h), dtype=torch.uint8, device=checkpoint.device
     )
     bwd_wr_writeread_recompute_mxfp8[(tiles,)](
         checkpoint,
         tuple(t.update for t in tapes),
         tuple(t.coefficients for t in tapes),
-        tuple(tapes[t].rstd[r] for t, r in flat),
-        tuple(tapes[t].gammas[r] for t, r in flat),
+        tuple(stats),
+        tuple(gammas),
         outputs,
-        tuple(data[t][r] for t, r in flat),
+        tuple(data),
         compact,
-        terminal,
         m,
         h,
         tapes[0].num_streams,
         tuple(t.has_retention for t in tapes),
-        terminal is not None,
-        readers,
-        tuple(first),
-        # Per transition, the coefficients it reads: write, retain and reads up to its last reader.
+        tuple(readers),
         tuple((3 + max(emitted, default=-1)) * tapes[0].num_streams for emitted in readers),
         all(t.coefficients.data_ptr() % 16 == 0 for t in tapes),
         vector,
@@ -325,8 +300,8 @@ def _launch_columns(checkpoint, tapes, outputs, data, scales, requested, termina
         maxnreg=maxnreg,
         num_warps=warps,
     )
-    bwd_wr_writeread_swizzle_scales[(cdiv(m, 128) * cdiv(h, 128), len(flat))](
-        compact, tuple(scales[t][r] for t, r in flat), m, padded_h, num_warps=1
+    bwd_wr_writeread_swizzle_scales[(cdiv(m, 128) * cdiv(h, 128), len(scales))](
+        compact, tuple(scales), m, padded_h, num_warps=1
     )
 
 
@@ -355,7 +330,7 @@ def replay_interval(
     checkpoint, tapes, outputs=None, columns=None, *, prepare_columns=False, terminal_output=None
 ):
     """Replay N tapes from ``checkpoint``: return N predecessors and, per tape, one columnwise
-    MXFP8 operand per reader (None unless requested), all emitted by one launch.
+    MXFP8 operand per requested reader. A second kernel swizzles the MXFP8 scales.
 
     The predecessors are the checkpoint itself plus N - 1 scratch buffers (``outputs``), and
     ``terminal_output`` optionally receives the last tape's result. ``prepare_columns`` is
@@ -365,6 +340,8 @@ def replay_interval(
     """
     tapes = tuple(tapes)
     # Forward validated each saved write; check only how the interval fits together.
+    if not tapes:
+        raise ValueError("replay requires at least one transition")
     m, h = tapes[0].update.shape
     streams = tapes[0].num_streams
     if (
@@ -374,44 +351,33 @@ def replay_interval(
     ):
         raise ValueError("inconsistent replay interval geometry")
     requested = column_requests(tapes, prepare_columns)
-    if outputs is None:
-        outputs = tuple(torch.empty_like(checkpoint) for _ in tapes[:-1])
-    outputs = tuple(outputs)
-    if len(outputs) != len(tapes) - 1:
+    scratch = () if outputs is None else tuple(outputs)
+    terminal = () if terminal_output is None else (terminal_output,)
+    if outputs is not None and len(scratch) != len(tapes) - 1:
         raise ValueError("need N-1 predecessor buffers")
-    addresses = {checkpoint.untyped_storage().data_ptr()}
-    for tape in tapes:
-        for tensor in (tape.update, tape.coefficients, *tape.gammas, *tape.rstd):
-            addresses.add(tensor.untyped_storage().data_ptr())
-
-    def claim(tensor):
-        address = tensor.untyped_storage().data_ptr()
-        if address in addresses:
-            raise ValueError("replay, column and input buffers must not alias")
-        addresses.add(address)
-
-    targets = outputs + (() if terminal_output is None else (terminal_output,))
-    for out in targets:
-        if (
-            out.shape != checkpoint.shape
-            or out.dtype != checkpoint.dtype
-            or out.device != checkpoint.device
-            or not out.is_contiguous()
-            or out.storage_offset() != 0
-            or out.untyped_storage().nbytes() != out.numel() * out.element_size()
-        ):
-            raise ValueError(
-                "predecessor buffers require full contiguous storage of the checkpoint dtype"
+    if columns is not None:
+        columns = tuple(tuple(per_tape) for per_tape in columns)
+        if tuple(tuple(col is not None for col in cols) for cols in columns) != requested:
+            raise ValueError("column entries must match requested transitions and readers")
+    if scratch or terminal or columns is not None:
+        _check_scratch(checkpoint, tapes, scratch + terminal, columns or ())
+    if outputs is None:
+        scratch = tuple(torch.empty_like(checkpoint) for _ in tapes[:-1])
+    if columns is None:
+        columns = tuple(
+            tuple(
+                (
+                    allocate_operand((m, h), checkpoint.device, rowwise=False, columnwise=True)
+                    if need
+                    else None
+                )
+                for need in needs
             )
-        claim(out)
-    supplied = columns is not None
-    columns, data, scales = _column_inputs(checkpoint, tapes, requested, columns)
-    if supplied:  # fresh allocations cannot alias
-        for tensor in (*sum(data, ()), *sum(scales, ())):
-            if tensor is not None:
-                claim(tensor)
+            for needs in requested
+        )
+    targets = scratch + terminal
     if any(any(needs) for needs in requested):
-        _launch_columns(checkpoint, tapes, outputs, data, scales, requested, terminal_output)
+        _launch_columns(checkpoint, tapes, targets, columns)
     elif transitions := (tapes if terminal_output is not None else tapes[:-1]):
         bwd_wr_writeread_recompute_bf16[(m * cdiv(h, 512),)](
             checkpoint,
@@ -425,4 +391,4 @@ def replay_interval(
             enable_fp_fusion=False,
             num_warps=4,
         )
-    return (checkpoint, *outputs), columns
+    return (checkpoint, *scratch), columns

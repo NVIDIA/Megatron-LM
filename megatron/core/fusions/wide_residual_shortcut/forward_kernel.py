@@ -5,6 +5,7 @@
 """
 
 from functools import lru_cache
+from itertools import product
 from typing import NamedTuple
 
 import torch
@@ -20,11 +21,11 @@ from .kernel_utils import (
     OUTPUT_FORMATS,
     SavedWrite,
     _coefficient,
-    _emit_mxfp8,
+    _e8m0_scale,
+    _swizzled_scale_index,
     _tensor,
     allocate_operand,
     named_jit,
-    operand_buffers,
     validate_num_streams,
 )
 
@@ -137,16 +138,17 @@ def forward(
     stats = tuple(
         None if inference else torch.empty(m, dtype=torch.float32, device=device) for _ in range(n)
     )
-    plain, quantized, qs = [], [], []
+    buffers, operands = [], []
     for fmt in outputs:
-        bf16 = None if fmt == "mxfp8" else allocate_operand((m, h), device, True)
+        bf16 = None if fmt == "mxfp8" else torch.empty_like(updates[0])
         mx = None if fmt == "bf16" else allocate_operand((m, h), device)
         # Inference pads rows in-kernel; partial scale columns still need clearing.
         if mx is not None and (h % 128 or (m % 128 and not inference)):
             mx._rowwise_scale_inv.zero_()
-        plain.append(bf16)
-        quantized.append(mx)
-        qs.append(bf16 if mx is None else mx if bf16 is None else (mx, bf16))
+        buffers.append(
+            (bf16, getattr(mx, "_rowwise_data", None), getattr(mx, "_rowwise_scale_inv", None))
+        )
+        operands.append(bf16 if mx is None else mx if bf16 is None else (mx, bf16))
 
     saved = None
     if not inference:
@@ -168,9 +170,7 @@ def forward(
         residual, updates[0], updates[1] if shortcut_add else None, current, summed
     )
     kwargs = dict(
-        read_tensors=_ReadArgs(
-            gammas, stats, tuple(plain), *operand_buffers(quantized, columnwise=False)
-        ),
+        read_tensors=_ReadArgs(gammas, stats, *zip(*buffers)),
         H=h,
         STREAMS=num_streams,
         # A runtime unit retention coefficient preserves Ultra register occupancy.
@@ -184,22 +184,21 @@ def forward(
         EXCHANGE=None,
         enable_fp_fusion=False,
         launch_pdl=dependent,
+        CONFIG=config,
+        num_warps=config.NUM_WARPS,
+        maxnreg=config.MAXNREG,
     )
     kernel = FORWARD_KERNELS[outputs]
     if config.CLUSTER > 1:
         kwargs["EXCHANGE"] = _exchange_asm(config.CLUSTER, 1 if config.SPLIT else n)
-        launch = dict(CONFIG=config, num_warps=config.NUM_WARPS, maxnreg=config.MAXNREG)
-        # The launch must repeat the warmup's keyword order to hit the patched kernel.
+        # Warmup and launch share the ordered kwargs so Triton reuses the patched metadata.
         if not (
             _programmatic_launch(device)
-            and _as_cluster(kernel, write_args, grid, config.CLUSTER, kwargs | launch)
+            and _as_cluster(kernel, write_args, grid, config.CLUSTER, kwargs)
         ):
-            # Same slices, one CTA per row.
-            config, kwargs["EXCHANGE"] = config._replace(CLUSTER=1), None
-    kernel[grid](
-        write_args, **kwargs, CONFIG=config, num_warps=config.NUM_WARPS, maxnreg=config.MAXNREG
-    )
-    return current, saved, tuple(qs)
+            kwargs.update(CONFIG=config._replace(CLUSTER=1), EXCHANGE=None)
+    kernel[grid](write_args, **kwargs)
+    return current, saved, tuple(operands)
 
 
 def _as_cluster(kernel, write_args, grid, ctas, kwargs):
@@ -216,6 +215,7 @@ def _as_cluster(kernel, write_args, grid, ctas, kwargs):
     return True
 
 
+@lru_cache
 def _exchange_asm(ctas, partials):
     """PTX ``(init, exchange, constraints)``: peers ``st.async`` reader k's partial into
     ``xbuf[k * ctas + rank]``; every CTA sums the partials in rank order, so all compute
@@ -225,35 +225,35 @@ def _exchange_asm(ctas, partials):
     ``st.async.shared::cluster``), which the cluster schedule's partial-norm exchange needs;
     exchanging through global memory instead would defeat the latency-bound decode schedule.
     """
-    init = [
-        ".shared .align 8 .b64 xbar;",
-        f".shared .align 16 .f32 xbuf[{ctas * partials}];",
-        "{",
-        ".reg .pred lead;",
-        ".reg .u32 tid, mbar;",
-        "mov.u32 tid, %tid.x;",
-        "setp.eq.u32 lead, tid, 0;",
-        "mov.u32 mbar, xbar;",
-        "@lead mbarrier.init.shared::cta.b64 [mbar], 1;",
-        f"@lead mbarrier.arrive.expect_tx.shared::cta.b64 _, [mbar], {(ctas - 1) * partials * 4};",
-        "fence.mbarrier_init.release.cluster;",
-        "barrier.cluster.arrive.relaxed.aligned;",
-        "mov.u32 $0, 0;",
-        "}",
-    ]
-    lines = [
-        "{",
-        ".reg .pred lead, send, own, done;",
-        ".reg .u32 tid, rank, buf, mbar, slot, peer_mbar, peer_slot;",
-        ".reg .f32 v;",
-        "mov.u32 tid, %tid.x;",
-        "mov.u32 rank, %cluster_ctarank;",
-        "setp.eq.u32 lead, tid, 0;",
-        "mov.u32 buf, xbuf;",
-        "mov.u32 mbar, xbar;",
-        "mad.lo.u32 slot, rank, 4, buf;",
-        "barrier.cluster.wait.aligned;",
-    ]
+    init = f"""
+        .shared .align 8 .b64 xbar;
+        .shared .align 16 .f32 xbuf[{ctas * partials}];
+        {{
+            .reg .pred lead;
+            .reg .u32 tid, mbar;
+            mov.u32 tid, %tid.x;
+            setp.eq.u32 lead, tid, 0;
+            mov.u32 mbar, xbar;
+            @lead mbarrier.init.shared::cta.b64 [mbar], 1;
+            @lead mbarrier.arrive.expect_tx.shared::cta.b64 _, [mbar], {(ctas - 1) * partials * 4};
+            fence.mbarrier_init.release.cluster;
+            barrier.cluster.arrive.relaxed.aligned;
+            mov.u32 $0, 0;
+        }}
+    """
+    lines = ["""
+        {
+            .reg .pred lead, send, own, done;
+            .reg .u32 tid, rank, buf, mbar, slot, peer_mbar, peer_slot;
+            .reg .f32 v;
+            mov.u32 tid, %tid.x;
+            mov.u32 rank, %cluster_ctarank;
+            setp.eq.u32 lead, tid, 0;
+            mov.u32 buf, xbuf;
+            mov.u32 mbar, xbar;
+            mad.lo.u32 slot, rank, 4, buf;
+            barrier.cluster.wait.aligned;
+    """]
     for peer in range(ctas):
         lines += [
             f"setp.ne.and.u32 send, rank, {peer}, lead;",
@@ -264,8 +264,7 @@ def _exchange_asm(ctas, partials):
             if k:
                 lines.append(f"@send add.u32 peer_slot, peer_slot, {ctas * 4};")
             lines.append(
-                "@send st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 "
-                f"[peer_slot], ${partials + k}, [peer_mbar];"
+                f"@send st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [peer_slot], ${partials + k}, [peer_mbar];"
             )
     lines += [
         "WAIT_${:uid}:",
@@ -278,11 +277,14 @@ def _exchange_asm(ctas, partials):
                 f"setp.eq.u32 own, rank, {peer};",
                 f"@own mov.f32 v, ${partials + k};",
                 f"@!own ld.shared.f32 v, [buf + {(k * ctas + peer) * 4}];",
-                f"add.rn.f32 ${k}, ${k}, v;" if peer else f"mov.f32 ${k}, v;",
             ]
+            if peer:
+                lines.append(f"add.rn.f32 ${k}, ${k}, v;")
+            else:
+                lines.append(f"mov.f32 ${k}, v;")
     lines.append("}")
     constraints = ",".join(["=f"] * partials + ["f"] * partials)
-    return "\n".join(init), "\n".join(lines), constraints
+    return init, "\n".join(lines), constraints
 
 
 @g.jit
@@ -423,14 +425,37 @@ def _owns_columns(cols, H: gl.constexpr, CONFIG: gl.constexpr):
 
 
 @g.jit
-def _emit(x, OPERANDS, indices, rstd, H: gl.constexpr, CONFIG: gl.constexpr, rows):
-    """Normalize one reader fragment; store it as BF16 and/or rowwise MXFP8 (each output None
-    when not emitted).
+def _emit_mxfp8(y, data, scale, coordinates, rows=None):
+    """Store MXFP8 data and TE-swizzled E8M0 scales of 32-value blocks per row.
 
-    ``rows`` pads the last 128-row tile's MXFP8 scales, or None.
+    ``rows`` zeroes padded-row scales.
     """
-    weight, output, quantized, scales = OPERANDS
-    row, cols = indices
+    exponent, bits = _e8m0_scale(gl.max(gl.abs(y), 1))
+    outer, inner, width = coordinates
+    index = _swizzled_scale_index(outer, inner, width)
+    scale_pointer, scale_mask = scale
+    data_pointer, data_mask = data
+    if rows is not None:
+        for offset in gl.static_range(32, 128, 32):
+            padding = (
+                (outer // 128 == (rows - 1) // 128) & (outer % 128 < 32) & (outer + offset >= rows)
+            )
+            gl.store(scale_pointer + index + offset // 32 * 4, 0, scale_mask & padding)
+    q = y * gl.expand_dims(bits.to(gl.float32, bitcast=True), 1)
+    q = q.to(gl.float8e4nv).to(gl.uint8, bitcast=True)
+    gl.store(data_pointer, gl.reshape(q, data_pointer.shape), data_mask)
+    gl.store(scale_pointer + index, exponent.to(gl.uint8), scale_mask)
+
+
+@g.jit
+def _emit(
+    fragment, reads, target: gl.constexpr, row, cols, H: gl.constexpr, CONFIG: gl.constexpr, rows
+):
+    """Normalize a queued fragment and emit its reader's requested formats.
+    When supplied, rows gives the true row count for padding the MXFP8 scales.
+    """
+    x, weight, rstd = fragment
+    output, quantized, scales = reads.outputs[target], reads.quantized[target], reads.scales[target]
     mask = (cols < H) & _owns_columns(cols, H, CONFIG)
     y = (x * rstd) * weight
     if output is not None:
@@ -541,6 +566,10 @@ def _forward_body(
         controllers[1] is not None,
     )
     width: gl.constexpr = CONFIG.WIDTH
+    warps: gl.constexpr = gl.num_warps()
+    lane_layout: gl.constexpr = BlockedLayout([1], [32], [warps], [0])
+    if CONFIG.REDUCE_VECTOR and K == 1:
+        vector_layout: gl.constexpr = BlockedLayout([CONFIG.REDUCE_VECTOR], [32], [warps], [0])
     paired: gl.constexpr = CONFIG.PAIRED_REDUCE and not CONFIG.SPLIT and K == 1
     NUM_SEGMENTS: gl.constexpr = triton.cdiv(H // K, width)
 
@@ -569,8 +598,7 @@ def _forward_body(
     if EXCHANGE is not None:
         # With the loads in flight, arm this CTA's exchange barrier and signal the cluster
         # (``_exchange_asm``'s PTX: Gluon cannot address peer shared memory).
-        one: gl.constexpr = BlockedLayout([1], [32], [gl.num_warps()], [0])
-        zero = gl.full([1], 0, gl.int32, layout=one)
+        zero = gl.full([1], 0, gl.int32, layout=lane_layout)
         gl.inline_asm_elementwise(
             EXCHANGE[0], "=r,r", [zero], dtype=gl.int32, is_pure=False, pack=1
         )
@@ -578,7 +606,7 @@ def _forward_body(
     for segment in gl.static_range(NUM_SEGMENTS):
         cc = cols + segment * width
         owner = _owns_columns(cc, H, CONFIG)
-        a, b = _mix_fragment(
+        fragments = _mix_fragment(
             write_tensors,
             coefficients,
             row,
@@ -593,7 +621,7 @@ def _forward_body(
         )
         next_totals = ()
         for reader in gl.static_range(len(gammas)):
-            x = a if reader == 0 else b
+            x = fragments[reader]
             fragment = x
             if segment < CONFIG.OFFLOAD_SEGMENTS:
                 fragment = gl.allocate_shared_memory(
@@ -609,7 +637,7 @@ def _forward_body(
         # Exchange the partial sums of squares across the cluster (``_exchange_asm``'s PTX).
         partials = ()
         for reader in gl.static_range(len(gammas)):
-            partials += (gl.zeros([1], gl.float32, layout=one) + gl.sum(totals[reader], 0),)
+            partials += (gl.zeros([1], gl.float32, layout=lane_layout) + gl.sum(totals[reader], 0),)
         totals = gl.inline_asm_elementwise(
             EXCHANGE[1],
             EXCHANGE[2],
@@ -620,83 +648,59 @@ def _forward_body(
         )
     queue = ()
     # The final reader also drains the queued stages.
-    for reader_index in gl.static_range(len(gammas)):
-        for segment_index in gl.static_range(
-            NUM_SEGMENTS + (CONFIG.PIPELINE_DEPTH if reader_index == len(gammas) - 1 else 0)
+    for reader in gl.static_range(len(gammas)):
+        for segment in gl.static_range(
+            NUM_SEGMENTS + (CONFIG.PIPELINE_DEPTH if reader == len(gammas) - 1 else 0)
         ):
-            if segment_index < NUM_SEGMENTS:
+            if segment < NUM_SEGMENTS:
+                cc = cols + segment * width
+                # Keep the segment as a load immediate after forming the base pointer.
                 weight = gl.load(
-                    gammas[reader_index] + cols + segment_index * width,
-                    (cols + segment_index * width < H)
-                    & _owns_columns(cols + segment_index * width, H, CONFIG),
+                    gammas[reader] + cols + segment * width,
+                    (cc < H) & _owns_columns(cc, H, CONFIG),
                     0,
                 ).to(gl.float32)
 
-                if paired and reader_index == 0 and segment_index == 0:
-                    if read_tensors.scales[0] is not None:
-                        norm_layout: gl.constexpr = BlockedLayout([1], [32], [gl.num_warps()], [0])
-                        totals = (
-                            gl.convert_layout(totals[0], norm_layout),
-                            gl.convert_layout(totals[1], norm_layout),
+                if segment == 0 and (not paired or reader == 0):
+                    if paired:
+                        if read_tensors.scales[0] is not None:
+                            totals = (
+                                gl.convert_layout(totals[0], lane_layout),
+                                gl.convert_layout(totals[1], lane_layout),
+                            )
+                        pair_layout: gl.constexpr = BlockedLayout(
+                            [1, 2], [32, 1], [warps, 1], [0, 1]
                         )
-                    norm_total = gl.convert_layout(
-                        gl.join(totals[0], totals[1]),
-                        gl.constexpr(BlockedLayout([1, 2], [32, 1], [gl.num_warps(), 1], [0, 1])),
-                    )
-                elif not paired and segment_index == 0:
-                    norm_total = totals[reader_index]
-                    if CONFIG.REDUCE_VECTOR and K == 1:
-                        norm_total = gl.convert_layout(
-                            norm_total,
-                            gl.constexpr(
-                                BlockedLayout([CONFIG.REDUCE_VECTOR], [32], [gl.num_warps()], [0])
-                            ),
-                        )
-                else:
-                    norm_total = None
-
-                if norm_total is not None:
+                        norm_total = gl.convert_layout(gl.join(totals[0], totals[1]), pair_layout)
+                    else:
+                        norm_total = totals[reader]
+                        if CONFIG.REDUCE_VECTOR and K == 1:
+                            norm_total = gl.convert_layout(norm_total, vector_layout)
                     rstd = gl.rsqrt(gl.sum(norm_total, 0) / H + EPSILON)
                     norms = gl.split(rstd) if paired else (rstd,)
                     if read_tensors.rstd[0] is not None:
-                        for reader in gl.static_range(len(norms)):
+                        for i in gl.static_range(len(norms)):
                             gl.store(
-                                read_tensors.rstd[reader if paired else reader_index] + row,
-                                norms[reader],
+                                read_tensors.rstd[i if paired else reader] + row,
+                                norms[i],
                                 mask=lead,
                             )
-                prefetch_rstd = norms[reader_index if paired else 0]
-                x = mixed[segment_index * len(gammas) + reader_index]
-                if segment_index < CONFIG.OFFLOAD_SEGMENTS:
+                prefetch_rstd = norms[reader if paired else 0]
+                x = mixed[segment * len(gammas) + reader]
+                if segment < CONFIG.OFFLOAD_SEGMENTS:
                     x = x.load(cols.type.layout)
                 queue += ((x, weight, prefetch_rstd),)
 
-            if reader_index * NUM_SEGMENTS + segment_index >= CONFIG.PIPELINE_DEPTH:
-                x, weight, rstd = queue[0]
-                output_stage = reader_index * NUM_SEGMENTS + segment_index - CONFIG.PIPELINE_DEPTH
+            if reader * NUM_SEGMENTS + segment >= CONFIG.PIPELINE_DEPTH:
+                stage = reader * NUM_SEGMENTS + segment - CONFIG.PIPELINE_DEPTH
                 for target in gl.static_range(len(read_tensors.gammas)):
-                    if target == (
-                        gl.program_id(1) if CONFIG.SPLIT else output_stage // NUM_SEGMENTS
-                    ):
-                        _emit(
-                            x,
-                            (
-                                weight,
-                                read_tensors.outputs[target],
-                                read_tensors.quantized[target],
-                                read_tensors.scales[target],
-                            ),
-                            (row, cols + (output_stage % NUM_SEGMENTS) * width),
-                            rstd,
-                            H,
-                            CONFIG,
-                            gl.num_programs(0) // K if PAD_ROWS else None,
-                        )
+                    if target == (gl.program_id(1) if CONFIG.SPLIT else stage // NUM_SEGMENTS):
+                        output_cols = cols + (stage % NUM_SEGMENTS) * width
+                        rows = gl.num_programs(0) // K if PAD_ROWS else None
+                        _emit(queue[0], read_tensors, target, row, output_cols, H, CONFIG, rows)
                 queue = queue[1:]
 
 
-# One kernel body; its profiler name gives the variant (reader count and output formats; reader
-# zero's format leads, a second reader's follows "_2reader" unless BF16).
 def _forward_kernel_name(outputs):
     """The profiler name of one variant: its readers, then each reader's output formats
     (``KERNEL_FORMAT_TAGS``)."""
@@ -706,6 +710,6 @@ def _forward_kernel_name(outputs):
 
 FORWARD_KERNELS = {
     formats: named_jit(_forward_body, _forward_kernel_name(formats))
-    for formats in [(a,) for a in OUTPUT_FORMATS]
-    + [(a, b) for a in OUTPUT_FORMATS for b in OUTPUT_FORMATS]
+    for readers in (1, 2)
+    for formats in product(OUTPUT_FORMATS, repeat=readers)
 }

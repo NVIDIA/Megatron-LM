@@ -6,7 +6,7 @@ gradients, and records it into a ReplayInterval; no-grad calls bypass autograd a
 for backward. The op knows tensors, formats and kernel limits, not the modules calling it.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from functools import lru_cache
 
 import torch
@@ -46,29 +46,16 @@ class _Boundary(torch.autograd.Function):
     """One seam; its tensors and MXFP8 handoff are call-local, never stored on a module."""
 
     @staticmethod
-    def forward(ctx, options, residual, *values):
+    def forward(ctx, options, residual, routed, shared, write, retain, *reader_params):
         """Run the seam; ``ctx`` None is an inference call without autograd state."""
-        (
-            streams,
-            replay,
-            uses,
-            slots,
-            epsilon,
-            update_count,
-            batch_invariant,
-            fuse,
-            update_formats,
-        ) = options
-        formats = tuple(_kernel_format(use) for use in uses)
+        streams, replay, uses, slots, epsilon, batch_invariant, fuse, update_formats = options
+        formats = tuple(use[0] if use[0] == use[-1] else "both" for use in uses)
         from .forward_kernel import forward
 
-        # values: updates, write, retain, then one read and one gamma per reader.
         count = len(uses)
-        updates = values[:update_count]
-        write, retain = values[update_count : update_count + 2]
-        reads = values[update_count + 2 : update_count + 2 + count]
-        gammas = values[update_count + 2 + count :]
-        hidden = updates[0].shape[-1]
+        reads, gammas = reader_params[:count], reader_params[count:]
+        updates = (routed,) if shared is None else (routed, shared)
+        hidden = routed.shape[-1]
         validate_input(residual, hidden, streams, inference=ctx is None)
         leading = residual.shape[:-1]
         if any(t.shape != (*leading, hidden) for t in updates):
@@ -86,43 +73,35 @@ class _Boundary(torch.autograd.Function):
             inference=ctx is None,
             batch_invariant=batch_invariant,
         )
-        outputs = tuple(
-            (
-                tuple(t.view(*leading, hidden) for t in q)
-                if isinstance(q, tuple)
-                else q.view(*leading, hidden)
-            )
-            for q in outputs
-        )
-        # One autograd output per consumer: its format's tensor, or a detached alias of it for a
-        # second consumer of the same format (each consumer's gradient arrives separately).
-        quantized = tuple(q[0] if isinstance(q, tuple) else q for q in outputs)
-        plain = tuple(q[1] if isinstance(q, tuple) else q for q in outputs)
-        flat = []
-        for use, mx, bf16 in zip(uses, quantized, plain):
-            handed = set()
-            for fmt in use:
-                tensor = mx if fmt == "mxfp8" else bf16
-                flat.append(tensor.detach() if fmt in handed else tensor)
-                handed.add(fmt)
-        result = (current.view(*leading, streams * hidden), *flat)
+        result = [current.view_as(residual)]
+        for use, output, slot in zip(uses, outputs, slots):
+            mx, plain = output if isinstance(output, tuple) else (output, output)
+            if ctx is not None and slot is not None:
+                # Detached views survive checkpointed GEMM recomputation. Pin the slot
+                # to the underlying rowwise data they all share.
+                data = mx._rowwise_data
+                (data if data._base is None else data._base)._shortcut_columns = slot
+            for index, fmt in enumerate(use):
+                if index and fmt == use[0]:
+                    # A distinct autograd output for a second consumer of the same tensor.
+                    result.append(result[-1].detach())
+                else:
+                    tensor = mx if fmt == "mxfp8" else plain
+                    result.append(tensor.view(*leading, hidden))
+        result = tuple(result)
         if ctx is None:
             return result
         # The interval keeps or replays this seam's input residual (and fills its MXFP8 readers'
         # column slots): the backward never reconstructs it from a rounded successor.
         ctx.replay, ctx.index = replay, replay.record(residual, current, saved, slots)
         ctx.save_for_backward(saved.update, saved.coefficients, *saved.gammas, *saved.rstd)
-        ctx.spec = replace(saved, update=None, coefficients=None, gammas=(), rstd=())
+        # Autograd owns the saved tensors. Keep only the other SavedWrite fields here.
+        ctx.write_metadata = (saved.controller_sizes, streams, saved.has_retention, len(updates))
         ctx.leading, ctx.uses, ctx.update_formats = leading, uses, update_formats
         # Controller and norm weight parameters whose gradients may accumulate in the kernel.
-        ctx.parameters = values[update_count:] if fuse else (None,) * (len(values) - update_count)
-        for slot, operand in zip(slots, quantized):
-            if slot is not None:
-                # Pinned on the rowwise data's base, which every view and detached alias keeps: a
-                # checkpointed consumer (GatedDeltaProduct's gdp_in_proj recompute) re-runs in
-                # backward, after the interval's replay dropped its slots.
-                data = operand._rowwise_data
-                (data if data._base is None else data._base)._shortcut_columns = slot
+        ctx.parameters = (
+            (write, retain, *reader_params) if fuse else (None,) * (2 + len(reader_params))
+        )
         ctx.set_materialize_grads(False)
         return result
 
@@ -131,38 +110,31 @@ class _Boundary(torch.autograd.Function):
     def backward(ctx, carry, *flat):
         """Fused seam backward; the replay interval supplies the predecessor."""
         from .backward_kernel import backward
+        from .kernel_utils import SavedWrite
 
-        # Per reader, its consumers' gradients: one, or a pair the kernel sums.
-        dys, position = [], 0
-        for use in ctx.uses:
-            grads = [g for g in flat[position : position + len(use)] if g is not None]
-            position += len(use)
-            dys.append(tuple(grads) if len(grads) == 2 else grads[0] if grads else None)
-
-        streams, update_count, leading = ctx.spec.num_streams, ctx.spec.update_count, ctx.leading
         update, coefficients, *readers = ctx.saved_tensors
-        previous = ctx.replay.take(ctx.index)
-        count = len(dys)
-        saved = replace(
-            ctx.spec,
-            update=update,
-            coefficients=coefficients,
-            gammas=tuple(readers[:count]),
-            rstd=tuple(readers[count:]),
+        count = len(ctx.uses)
+        saved = SavedWrite(
+            update,
+            coefficients,
+            tuple(readers[:count]),
+            tuple(readers[count:]),
+            *ctx.write_metadata,
         )
         hidden = update.shape[1]
-        previous = previous.view(-1, streams * hidden)
-        flat2d = lambda t: t.contiguous().view(-1, hidden)
-        dy = tuple(
-            None if t is None else tuple(map(flat2d, t)) if isinstance(t, tuple) else flat2d(t)
-            for t in dys
-        )
+        streams, update_count, leading = saved.num_streams, saved.update_count, ctx.leading
+        previous = ctx.replay.take(ctx.index).view(-1, streams * hidden)
+        # Each reader contributes zero, one or two gradients; the kernel adds a pair in FP32.
+        dy = []
+        for group in _reader_groups(ctx.uses, flat):
+            live = tuple(g.contiguous().view(-1, hidden) for g in group if g is not None)
+            dy.append(live[0] if len(live) == 1 else live or None)
         dc = None if carry is None else carry.contiguous().view_as(previous)
         # A missing reader gets no read or norm weight gradient (its parameters' main_grad stays
         # untouched), although the kernel materializes a zero dy for it.
-        missing = {j for i, grad in enumerate(dys) if grad is None for j in (2 + i, 2 + count + i)}
+        active = (True, True) + tuple(g is not None for g in dy) * 2
         targets = tuple(
-            None if j in missing else _main_grad_target(p) for j, p in enumerate(ctx.parameters)
+            _main_grad_target(p) if used else None for p, used in zip(ctx.parameters, active)
         )
         grads, _ = backward(
             saved, previous, dy, dc, main_grads=targets, update_formats=ctx.update_formats
@@ -173,8 +145,8 @@ class _Boundary(torch.autograd.Function):
             ctx.replay.previous.replay()
             ctx.replay.previous = None
         grads = list(grads)
-        for j, (parameter, target) in enumerate(zip(ctx.parameters, targets)):
-            if j in missing:
+        for j, (parameter, target, used) in enumerate(zip(ctx.parameters, targets, active)):
+            if not used:
                 grads[update_count + 1 + j] = None
             elif target is not None:
                 grads[update_count + 1 + j] = _accumulated(parameter)
@@ -185,6 +157,8 @@ class _Boundary(torch.autograd.Function):
                 if id(grad) not in views:
                     views[id(grad)] = grad.view(*leading, streams * hidden if i == 0 else hidden)
                 grads[i] = views[id(grad)]
+        if update_count == 1:
+            grads.insert(2, None)  # shared is an explicit autograd input even for a single update.
         return (None,) + tuple(
             g if needed else None for g, needed in zip(grads, ctx.needs_input_grad[1:])
         )
@@ -272,8 +246,7 @@ def fused_seam(
     if not 1 <= len(reads) == len(gammas) <= 2:
         raise ValueError("a seam has one or two readers, each with read logits and a norm weight")
     p = pending
-    updates = (p.routed,) if p.shared is None else (p.routed, p.shared)
-    inputs = (p.residual, *updates, p.write, p.retain, *reads, *gammas)
+    inputs = (p.residual, p.routed, p.shared, p.write, p.retain, *reads, *gammas)
     uses = tuple(
         _consumer_formats(fmt) for fmt in (("bf16",) * len(reads) if outputs is None else outputs)
     )
@@ -286,7 +259,6 @@ def fused_seam(
         uses,
         slots,
         epsilon,
-        len(updates),
         batch_invariant,
         fuse_wgrad_accumulation,
         p.update_formats,
@@ -321,21 +293,18 @@ def _consumer_formats(fmt):
     return use
 
 
-def _kernel_format(use):
-    """The forward kernel's format for a reader's consumers: MXFP8, BF16 or both."""
-    if all(f == "mxfp8" for f in use):
-        return "mxfp8"
-    return "bf16" if all(f == "bf16" for f in use) else "both"
+def _reader_groups(uses, tensors):
+    """Partition flat autograd inputs or outputs in consumer order."""
+    begin = 0
+    for use in uses:
+        end = begin + len(use)
+        yield tensors[begin:end]
+        begin = end
 
 
 def _regroup(uses, flat):
-    """``(residual, *readers)``: a reader with two consumers as a pair, in consumer order."""
-    result, position = [flat[0]], 1
-    for use in uses:
-        width = len(use)
-        result.append(flat[position] if width == 1 else tuple(flat[position : position + width]))
-        position += width
-    return tuple(result)
+    readers = (g[0] if len(g) == 1 else g for g in _reader_groups(uses, flat[1:]))
+    return (flat[0], *readers)
 
 
 @dataclass(frozen=True)

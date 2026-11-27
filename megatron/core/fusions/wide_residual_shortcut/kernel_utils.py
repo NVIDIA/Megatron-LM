@@ -3,6 +3,7 @@
 
 import types
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 import triton
@@ -57,11 +58,9 @@ def _tensor(t, shape, dtype, device, name):
         raise ValueError(f"{name} must be contiguous {dtype} {tuple(shape)} on {device}")
 
 
-def allocate_operand(shape, device, bf16=False, *, rowwise=True, columnwise=False):
-    """Allocate a BF16 operand or an MXFP8 one with the requested TE orientations (its own
+def allocate_operand(shape, device, *, rowwise=True, columnwise=False):
+    """Allocate an MXFP8 operand with the requested TE orientations (its own
     quantizer: TE may change a tensor's quantizer usage)."""
-    if bf16:
-        return torch.empty(shape, dtype=torch.bfloat16, device=device)
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
     from transformer_engine_torch import DType  # constants does not re-export it in every TE
 
@@ -70,24 +69,19 @@ def allocate_operand(shape, device, bf16=False, *, rowwise=True, columnwise=Fals
     return quantizer.make_empty(shape, dtype=torch.bfloat16, device=device)
 
 
-def operand_buffers(operands, *, columnwise=True):
-    """``(data, scales)`` of BF16 (scales None), MXFP8 and absent operands."""
-    axis = "columnwise" if columnwise else "rowwise"
-    pairs = []
-    for operand in operands:
-        pair = (operand, None)
-        if operand is not None and type(operand) is not torch.Tensor:
-            pair = (getattr(operand, f"_{axis}_data"), getattr(operand, f"_{axis}_scale_inv"))
-        pairs.append(pair)
-    return tuple(zip(*pairs)) if pairs else ((), ())
-
-
-def _descriptor(tensor, tile_shape):
+def _descriptor(tensor, tile_shape=(16, 128)):
+    """Describe a backward TMA copy, normally one column half of a 16-row tile."""
     if tensor is None:
         return None
     bits = tensor.element_size() * 8
     layout = NVMMASharedLayout(swizzle_byte_width=bits * 4, element_bitwidth=bits, rank=2)
     return TensorDescriptor.from_tensor(tensor, list(tile_shape), layout)
+
+
+@g.jit
+def _volatile_asm(asm: gl.constexpr, constraints: gl.constexpr, args):
+    """One volatile PTX invocation per element, including side-effect-only instructions."""
+    return gl.inline_asm_elementwise(asm, constraints, args, dtype=gl.int32, is_pure=False, pack=1)
 
 
 @g.jit
@@ -131,29 +125,6 @@ def _swizzled_scale_index(outer, inner, width):
     # Left-associated, so constant per-thread offsets fold into store immediates.
     index = ((outer // 128) * gl.cdiv(width, 128) + inner // 4) * 512 + (outer % 32) * 16
     return index + (outer % 128 // 32) * 4 + inner % 4
-
-
-@g.jit
-def _emit_mxfp8(y, data, scale, coordinates, rows=None, AXIS: gl.constexpr = 1):
-    """Store MXFP8 data and TE-swizzled E8M0 scales of 32-value blocks along ``AXIS``.
-
-    ``rows`` zeroes padded-row scales.
-    """
-    exponent, bits = _e8m0_scale(gl.max(gl.abs(y), AXIS))
-    outer, inner, width = coordinates
-    index = _swizzled_scale_index(outer, inner, width)
-    scale_pointer, scale_mask = scale
-    data_pointer, data_mask = data
-    if rows is not None:
-        for offset in gl.static_range(32, 128, 32):
-            padding = (
-                (outer // 128 == (rows - 1) // 128) & (outer % 128 < 32) & (outer + offset >= rows)
-            )
-            gl.store(scale_pointer + index + offset // 32 * 4, 0, scale_mask & padding)
-    q = y * gl.expand_dims(bits.to(gl.float32, bitcast=True), AXIS)
-    q = q.to(gl.float8e4nv).to(gl.uint8, bitcast=True)
-    gl.store(data_pointer, gl.reshape(q, data_pointer.shape) if AXIS == 1 else q, data_mask)
-    gl.store(scale_pointer + index, exponent.to(gl.uint8), scale_mask)
 
 
 # Packed FP32 (f32x2) arithmetic for the backward kernel. Inline PTX: Blackwell's
@@ -203,12 +174,6 @@ def _mul2(a, b):
         is_pure=True,
         pack=2,
     )
-
-
-# Uncontracted IEEE FP32 multiply for replay. Inline PTX: replay must reproduce the forward's
-# FP32 rounding exactly, but the compiler still contracts a plain ``*`` into a neighboring FMA
-# even with enable_fp_fusion=False (measured: replay no longer bit-identical), and
-# libdevice.mul_rn flushes subnormals under reflect-FTZ.
 
 
 @g.jit
@@ -266,7 +231,10 @@ def _widen_bf16(x):
     the packed pair: one shift or mask per value, without unpacking the halves first."""
     if x.dtype == gl.bfloat16:
         return gl.inline_asm_elementwise(
-            "shl.b32 $0, $2, 16;\n and.b32 $1, $2, 0xffff0000;",
+            """
+            shl.b32 $0, $2, 16;
+            and.b32 $1, $2, 0xffff0000;
+            """,
             "=f,=f,r",
             [x],
             dtype=gl.float32,
@@ -274,6 +242,12 @@ def _widen_bf16(x):
             pack=2,
         )
     return x.to(gl.float32)
+
+
+# Uncontracted IEEE FP32 multiply for replay. Inline PTX: replay must reproduce the forward's
+# FP32 rounding exactly, but the compiler still contracts a plain ``*`` into a neighboring FMA
+# even with enable_fp_fusion=False (measured: replay no longer bit-identical), and
+# libdevice.mul_rn flushes subnormals under reflect-FTZ.
 
 
 @g.jit
@@ -299,61 +273,63 @@ def named_jit(fn, name):
     return g.jit(copy)
 
 
+class _Reduction(NamedTuple):
+    width: int
+    height: int
+    tile: int
+    chunk: int
+    axis: int
+    output_size: int
+    begin: int
+    end: int
+    term_ranks: tuple
+    accumulate: int  # 0 store, 1 add, 2 round to BF16 then add
+
+
+@triton.jit
+def _reduce_tile(source, output, factor, spec: tl.constexpr, terms, base_weight):
+    if tl.program_id(0) >= spec.begin and tl.program_id(0) < spec.end:
+        width: tl.constexpr = spec.width
+        height: tl.constexpr = spec.height
+        chunks: tl.constexpr = tl.cdiv(height, spec.chunk)
+        tiles: tl.constexpr = tl.cdiv(width, spec.tile)
+        bid = tl.program_id(0) - spec.begin
+        rows = bid % tiles * spec.tile + tl.arange(0, spec.tile)
+        cols = bid // tiles * spec.chunk + tl.arange(0, spec.chunk)
+        i, j = (cols[:, None], rows[None, :]) if spec.axis == 0 else (rows[:, None], cols[None, :])
+        h, w = (height, width) if spec.axis == 0 else (width, height)
+        total = tl.sum(tl.load(source + i * w + j, (i < h) & (j < w), 0), spec.axis)
+        # A reader contributes one shared B row to the write/read derivative and
+        # one A row per stream to retention. Keep each reduction's original sum tree.
+        for k in tl.static_range(len(terms)):
+            partial, weight = terms[k]
+            if spec.term_ranks[k] == 2:
+                part = tl.sum(tl.load(partial + i * w + j, (i < h) & (j < w), 0), spec.axis)
+            else:
+                part = tl.sum(tl.load(partial + cols, cols < height, 0), 0)
+            w_k = tl.load(weight + rows, rows < width, 0)
+            if k == 0 and base_weight is not None:
+                total *= tl.load(base_weight + rows, rows < width, 0)
+            total += w_k * part
+        if factor is not None:
+            total *= tl.load(factor + rows, rows < width, 0)
+        if spec.accumulate:
+            if spec.accumulate == 2:
+                total = total.to(tl.bfloat16).to(tl.float32)
+            total += tl.load(output + rows, rows < width, 0).to(tl.float32)
+        tl.store(output + rows * chunks + bid // tiles, total, rows < width)
+        if spec.output_size > width and bid == 0 and not spec.accumulate:
+            padding = tl.arange(0, triton.next_power_of_2(spec.output_size))
+            tl.store(output + padding, 0, (padding >= width) & (padding < spec.output_size))
+
+
 @triton.jit
 def bwd_wr_writeread_reduce(JOBS):
     """Reduce disjoint matrix tiles in one launch, preserving each axis's sum tree. An
     accumulating job adds its result, rounded to the parameter dtype first, into the output (a
     parameter's main_grad): autograd's cast of the returned gradient, then the DDP hook's add."""
     for job in tl.static_range(len(JOBS)):
-        if tl.program_id(0) >= JOBS[job][3][6] and tl.program_id(0) < JOBS[job][3][7]:
-            source, output, factor = JOBS[job][:3]
-            spec: tl.constexpr = JOBS[job][3]
-            width: tl.constexpr = spec[0]
-            height: tl.constexpr = spec[1]
-            tile: tl.constexpr = spec[2]
-            chunk: tl.constexpr = spec[3]
-            axis: tl.constexpr = spec[4]
-            size: tl.constexpr = spec[5]
-            accumulate: tl.constexpr = spec[8]  # 0 store, 1 add, 2 round to BF16 then add
-            chunks: tl.constexpr = (height + chunk - 1) // chunk
-            tiles: tl.constexpr = (width + tile - 1) // tile
-            bid = tl.program_id(0) - spec[6]
-            rows = bid % tiles * tile + tl.arange(0, tile)
-            cols = bid // tiles * chunk + tl.arange(0, chunk)
-            i, j = (cols[:, None], rows[None, :]) if axis == 0 else (rows[:, None], cols[None, :])
-            h, w = (height, width) if axis == 0 else (width, height)
-            total = tl.sum(tl.load(source + i * w + j, (i < h) & (j < w), 0), axis)
-            if JOBS[job][4] is not None:
-                if len(JOBS[job][4]) == 3:
-                    # Read controller: t * a + w * b.
-                    b_source, writes, retains = JOBS[job][4]
-                    b_total = tl.sum(tl.load(b_source + cols, cols < height, 0), 0)
-                    w = tl.load(writes + rows, rows < width, 0)
-                    t = tl.load(retains + rows, rows < width, 0) if retains is not None else 1.0
-                    total = t * total + w * b_total
-                else:
-                    # Write (raw b rows, 5 entries) or retention (a planes) controller: plus
-                    # each reader's beta * (its b or a).
-                    for k in tl.static_range(2):
-                        extra = JOBS[job][4][2 * k]
-                        if extra is not None:
-                            if len(JOBS[job][4]) == 5:
-                                part = tl.sum(tl.load(extra + cols, cols < height, 0), 0)
-                            else:
-                                part = tl.sum(
-                                    tl.load(extra + i * w + j, (i < h) & (j < w), 0), axis
-                                )
-                            total += tl.load(JOBS[job][4][2 * k + 1] + rows, rows < width, 0) * part
-            if factor is not None:
-                total *= tl.load(factor + rows, rows < width, 0)
-            if accumulate:
-                if accumulate == 2:
-                    total = total.to(tl.bfloat16).to(tl.float32)
-                total += tl.load(output + rows, rows < width, 0).to(tl.float32)
-            tl.store(output + rows * chunks + bid // tiles, total, rows < width)
-            if size > width and bid == 0 and not accumulate:
-                padding = tl.arange(0, triton.next_power_of_2(size))
-                tl.store(output + padding, 0, (padding >= width) & (padding < size))
+        _reduce_tile(*JOBS[job])
 
 
 def reduce_jobs(jobs):
@@ -366,8 +342,10 @@ def reduce_jobs(jobs):
         chunk = chunk or next_power_of_2(height)
         size = output.numel() if output.ndim == 1 else width
         end = grid + cdiv(width, tile) * cdiv(height, chunk)
-        spec = (width, height, tile, chunk, axis, size, grid, end, accumulate)
-        packed.append((source, output, factor, tl.constexpr(spec), combo))
+        terms, base_weight = combo or ((), None)
+        ranks = tuple(partial.ndim for partial, _ in terms)
+        spec = _Reduction(width, height, tile, chunk, axis, size, grid, end, ranks, accumulate)
+        packed.append((source, output, factor, tl.constexpr(spec), terms, base_weight))
         grid = end
     if packed:
         bwd_wr_writeread_reduce[(grid,)](tuple(packed), num_warps=4, enable_fp_fusion=False)

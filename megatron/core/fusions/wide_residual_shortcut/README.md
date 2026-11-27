@@ -28,12 +28,12 @@ and dispatcher, whose gradients autograd sums. Under MXFP8 its Linears quantize 
 themselves, unlike a block's MoE read, which goes to the shared expert's first Linear as MXFP8.
 
 During training, `--residual-stream-recompute-num-layers` sets the replay interval length
-(default one write). The interval retains
-its first input residual and each write's tape. Before the interval's backward GEMMs run,
-one replay kernel reconstructs the residuals and the columnwise MXFP8 activations needed
-for weight gradients. The next interval triggers replay for its predecessor. A stack output
-hook handles the final interval when its consumers need columns. Reusing a retained graph
-for a second backward is unsupported.
+(default one write). Each interval retains its first input residual and each write's tape.
+Before its backward GEMMs run, a replay kernel reconstructs the predecessor residuals and
+any columnwise MXFP8 operands needed for weight gradients. A second kernel arranges the
+MXFP8 scales in Transformer Engine's GEMM layout. Each interval triggers replay for its
+predecessor. A stack output hook handles the final interval when its consumers need columns.
+Replay hands out each predecessor once, so a second backward on a retained graph raises.
 
 Residual writes are bit-identical across schedules and to replay; reader outputs differ by at
 most one BF16 ulp between schedules. Tests: `tests/unit_tests/fusions/test_wide_residual_shortcut.py`

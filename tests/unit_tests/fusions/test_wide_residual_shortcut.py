@@ -293,9 +293,9 @@ def spy(monkeypatch, owner, name, record):
 # ---------------------------------------------------------------- the FP64 reference
 
 
-def reference(raw, streams, epsilon=1e-5, coefficients=None):
-    """The seam in FP64: ``(current, *readers)`` rounded like the kernel (the residual once to
-    its dtype, BF16 readers of unrounded folds) and the FP64 ``(mix, update, current, folds)``.
+def reference(raw, streams, epsilon=1e-5, coefficients=None, *, reader_dtype=BF16):
+    """Compute the seam in FP64 and return its outputs and intermediate values.
+    The residual is rounded to its dtype and the readers to ``reader_dtype`` (BF16 by default).
 
     ``mix`` is (write, retain, reads...) per stream from the logits (retain None is the static
     identity) or, as FP64 leaves, from a saved tape's ``coefficients`` table.
@@ -315,7 +315,7 @@ def reference(raw, streams, epsilon=1e-5, coefficients=None):
     current = (r if mix[1] is None else mix[1][:, None] * r) + mix[0][:, None] * u[:, None]
     xs = [(read[:, None] * current).sum(1) for read in mix[2:]]
     readers = [
-        ((x * (x.square().mean(-1, keepdim=True) + epsilon).rsqrt()) * g.double()).bfloat16()
+        ((x * (x.square().mean(-1, keepdim=True) + epsilon).rsqrt()) * g.double()).to(reader_dtype)
         for x, g in zip(xs, gammas)
     ]
     return (current.flatten(1).to(residual.dtype), *readers), (mix, u, current, xs)
@@ -328,7 +328,11 @@ def fp64_backward(raw, streams, dys, carry, *, epsilon=1e-5, tape=None):
     leaf = lambda t: None if t is None else t.detach().double().requires_grad_()
     r, us, cs, gs = leaf(raw[0]), [*map(leaf, raw[1])], [*map(leaf, raw[2])], [*map(leaf, raw[3])]
     coefficients = None if tape is None else tape.coefficients
-    outputs, (mix, u, current, xs) = reference((r, us, cs, gs), streams, epsilon, coefficients)
+    # Low-level callers can supply FP32 dy directly. Differentiate the normalization
+    # with that incoming precision, including when the public reader would be stored as BF16.
+    outputs, (mix, u, current, xs) = reference(
+        (r, us, cs, gs), streams, epsilon, coefficients, reader_dtype=torch.float64
+    )
     upstream = [
         torch.zeros_like(o) if g is None else g.to(o.dtype) for o, g in zip(outputs, (carry, *dys))
     ]
@@ -567,6 +571,23 @@ def test_backward_kernel_matches_fp64(
     assert_matches_fp64(actual, expected, bounds, streams, (5e-4, 2e-4) if pruned else (2e-5, 2e-5))
     reference = (reference_columns(saved, r) if columns else None,) + (None,) * (readers - 1)
     assert_columns_equal(operands, reference)
+
+
+@REQUIRES_FUSED_BACKWARD
+@pytest.mark.parametrize("reader_dtypes", [(BF16,), (None,), (F32,), (BF16, F32)])
+def test_native_backward_input_dtypes(reader_dtypes):
+    """A native FP32 update or reader gradient must not reuse a BF16 TMA landing slot."""
+    raw = inputs(3, len(reader_dtypes), 352, 96, residual_dtype=BF16)
+    with torch.no_grad():
+        _, (saved, previous, dys, carry) = backward_args(raw)
+        saved = replace(saved, update=saved.update.float())
+        dys = tuple(
+            None if dtype is None else torch.randn_like(dy, dtype=dtype)
+            for dy, dtype in zip(dys, reader_dtypes)
+        )
+        grads, _ = backward_kernel.backward(saved, previous, dys, carry)
+    expected, bounds = fp64_backward(raw, 3, dys, carry)
+    assert_matches_fp64(grads, expected, bounds, 3)
 
 
 # ---------------------------------------------------------------- schedules

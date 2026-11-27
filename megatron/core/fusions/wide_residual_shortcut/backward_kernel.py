@@ -5,6 +5,7 @@ Groups of CTAs span the width (256 columns each) and walk 16-row tiles, pipelini
 projections, predecessor/carry TMA transfers and the residual/update/controller gradients.
 """
 
+from itertools import product
 from typing import NamedTuple
 
 import torch
@@ -25,6 +26,7 @@ from .kernel_utils import (
     _fma2,
     _mul2,
     _round_bf16,
+    _volatile_asm,
     _widen_bf16,
     allocate_operand,
     cdiv,
@@ -37,7 +39,6 @@ from .kernel_utils import (
 _tma_load = tma.async_load if hasattr(tma, "async_load") else tma.async_copy_global_to_shared
 
 _GRADIENT_LAYOUT = gl.constexpr(BlockedLayout([1, 4], [4, 8], [1, 4], [1, 0]))
-_SLICE = (16, 128)  # rows x columns of one TMA copy: a column half of a row tile
 _ROWS = gl.constexpr(SliceLayout(1, _GRADIENT_LAYOUT))  # one value per slice row
 _COLUMNS = gl.constexpr(SliceLayout(0, _GRADIENT_LAYOUT))  # one value per slice column
 
@@ -47,9 +48,7 @@ class _BackwardInputs(NamedTuple):
     rstd: tuple
     gammas: tuple
     carry: object
-    reader_grads: tuple
-    # Per reader, a second consumer's gradient summed into its dy (None: one consumer).
-    second_grads: tuple
+    reader_grads: tuple  # per reader, one or two consumer gradients
 
 
 class _BackwardOutputs(NamedTuple):
@@ -119,18 +118,26 @@ def backward(
         carry = torch.zeros_like(previous)
     if carry.dtype != previous.dtype:
         raise ValueError("the residual gradient must have the residual's dtype")
-    pairs = tuple(dy if isinstance(dy, tuple) else (dy, None) for dy in dys)
-    if any(len(pair) != 2 or (pair[0] is None and pair[1] is not None) for pair in pairs):
-        raise ValueError("a reader takes one gradient or a pair (first not None)")
-    dys = tuple(torch.zeros_like(saved.update) if dy is None else dy for dy, _ in pairs)
-    seconds = tuple(second for _, second in pairs)
-    if any(second is not None for second in seconds[:-1]):
-        raise ValueError("only the last reader may take a second gradient")
-    for first, second in zip(dys, seconds):
-        if second is not None and (
-            second.shape != first.shape or second.dtype != first.dtype or not second.is_contiguous()
-        ):
-            raise ValueError("a reader's second gradient must match its first, contiguous")
+    gradients = []
+    extra = None
+    for index, dy in enumerate(dys):
+        if isinstance(dy, tuple) and len(dy) != 2:
+            raise ValueError("a reader takes one gradient or a pair")
+        first, second = dy if isinstance(dy, tuple) else (dy, None)
+        if second is not None:
+            if index != n - 1 or first is None:
+                raise ValueError("only the last reader may take a second gradient, after its first")
+            if (
+                second.shape != first.shape
+                or second.dtype != first.dtype
+                or not second.is_contiguous()
+            ):
+                raise ValueError("a reader's second gradient must match its first, contiguous")
+            extra = second
+        if first is None:
+            first = torch.zeros_like(saved.update, dtype=torch.bfloat16)
+        gradients.append((first,) if second is None else (first, second))
+    gradients = tuple(gradients)
     if not qualified_device(torch.cuda.get_device_properties(previous.device)):
         raise ValueError("shortcut backward requires a qualified GB300")
     formats = ("bf16",) * updates if update_formats is None else tuple(update_formats)
@@ -158,14 +165,14 @@ def backward(
     if any(missing):
         from .replay_kernel import replay_interval
 
-        # One launch emits every missing reader's columns.
+        # Replay materializes every missing reader together.
         generated = replay_interval(previous, (saved,), prepare_columns=(missing,))[1][0]
         columns = tuple(old if old is not None else new for old, new in zip(columns, generated))
     if on_columns_ready is not None:
         on_columns_ready(columns)
     bf16 = previous.dtype == torch.bfloat16
     grid, maxnreg, spare = get_backward_knobs(
-        m, h, streams, n, grid=config, bf16=bf16, second=seconds[-1] is not None
+        m, h, streams, n, grid=config, bf16=bf16, second=extra is not None
     )
     planes = (1 + n + saved.has_retention) * streams
     shares = sum(_share_planes.fn(planes + n, k) for k in (0, 1)) * 512  # paired shares' bytes
@@ -188,19 +195,16 @@ def backward(
         if m % 128 or h % 128:
             for scale in mx[1::2]:  # padded scales stay zero, as the forward's
                 scale.zero_()
-    grads = (
-        empty((m, streams * h), dtype=previous.dtype),
-        *(du if f == "bf16" else du_mx for f in formats),
-        *(
-            (empty((size,)) if t is None else t[0]) if size else None
-            for size, t in zip(saved.controller_sizes, targets)
-        ),
-        *(empty((h,)) if t is None else t[0] for t in targets[2 + n :]),
+    residual_grad = empty((m, streams * h), dtype=previous.dtype)
+    sizes = saved.controller_sizes + (h,) * n
+    parameters = tuple(
+        (empty((size,)) if target is None else target[0]) if size else None
+        for size, target in zip(sizes, targets)
     )
     # Eight partials per controller plane and (row tile, column tile or half).
     p = cdiv(m, 16) * cdiv(h, 256 if paired else 128) * 8
     gp = tuple(empty((cdiv(m, 16), h)) for _ in range(n))
-    controllers = empty((planes + n, p))
+    controllers_scratch = empty((planes + n, p))
     chunks = empty((planes + n, cdiv(p, 1024)))
 
     # Per row tile: a 16-word header (arrival hint, next row tile) and one projection word per
@@ -213,69 +217,68 @@ def backward(
     workspace = empty((tiles * block + 1,), dtype=torch.int64)
     pp, epochs = workspace[: tiles * block], workspace[tiles * block :].view(torch.int32)
 
-    staged = streams < 6  # six streams read dy from global memory
+    # The packed TMA tile stages BF16 reader gradients. Six streams or FP32 dy use global loads.
+    staged = streams < 6 and all(group[0].dtype == torch.bfloat16 for group in gradients)
     # Reset on every invocation (also under graph replay) so every handoff word starts at tag 0.
     workspace.zero_()
     du_formats = "both" if len(set(formats)) == 2 else formats[0]
-    BACKWARD_KERNELS[n, seconds[-1] is not None, du_formats][(grid,)](
-        inputs=_BackwardInputs(saved.coefficients, saved.rstd, saved.gammas, carry, dys, seconds),
+    BACKWARD_KERNELS[n, extra is not None, du_formats][(grid,)](
+        inputs=_BackwardInputs(saved.coefficients, saved.rstd, saved.gammas, carry, gradients),
         GEOMETRY=_Geometry(m, h, streams, saved.has_retention),
         GRID=grid,
         PAIRED=paired,
         outputs=_BackwardOutputs(
-            grads[0],
+            residual_grad,
             du,
             mx,
             None if stash_shared or mx is None else empty((grid * 4096,), dtype=torch.bfloat16),
-            controllers,
+            controllers_scratch,
             pp,
             gp,
             epochs,
         ),
-        CARRY_DESC=_descriptor(carry, _SLICE),
-        R_DESC=_descriptor(previous, _SLICE),
-        DY0_DESC=_descriptor(dys[0] if staged else None, _SLICE),
-        DY1_DESC=_descriptor(dys[-1] if staged and n == 2 else None, _SLICE),
-        # The last reader's second consumer gradient, staged with the others.
-        DY2_DESC=_descriptor(seconds[-1] if staged else None, _SLICE),
-        U_DESC=_descriptor(saved.update, _SLICE),
-        DR_DESC=_descriptor(grads[0] if tma_store else None, _SLICE),
-        DU_DESC=_descriptor(du if tma_store else None, _SLICE),
+        CARRY_DESC=_descriptor(carry),
+        R_DESC=_descriptor(previous),
+        # Triton's launcher requires tensor descriptors as top-level arguments.
+        DY0_DESC=_descriptor(gradients[0][0] if staged else None),
+        DY1_DESC=_descriptor(gradients[1][0] if staged and n == 2 else None),
+        DY2_DESC=_descriptor(extra if staged else None),
+        U_DESC=_descriptor(saved.update),
+        DR_DESC=_descriptor(residual_grad if tma_store else None),
+        DU_DESC=_descriptor(du if tma_store else None),
         maxnreg=maxnreg,
         num_warps=4,
         enable_fp_fusion=True,
     )
 
-    # Reduce controller chunks, then all gamma and controller gradients.
-    retention, two = saved.has_retention, n == 2
-
-    def plane(index):
-        return chunks[index * streams : (index + 1) * streams]
-
-    def coefficients(index):
-        return saved.coefficients[index * streams : (index + 1) * streams]
-
-    raw_b = planes  # Each reader's raw b row follows every controller plane.
-    beta0, beta1 = coefficients(2), coefficients(3) if two else None
-    write, retain = coefficients(0), coefficients(1) if retention else None
-    # Per controller (write, retention, then each reader's read): its partial plane and the
-    # raw rows/coefficients its final reduction combines (see bwd_wr_writeread_reduce).
-    kinds = (
-        (0, (chunks[raw_b], beta0, chunks[raw_b + 1] if two else None, beta1, True)),
-        (1, (plane(2), beta0, plane(3) if two else None, beta1) if retention else None),
-        *((1 + retention + r, (chunks[raw_b + r], write, retain)) for r in range(n)),
+    # Per stream, A[r] = sum(previous * dx[r]). B[r] = sum(update * dx[r]) is shared.
+    # The primary partials occupy one [streams, chunks] plane per controller.
+    retention = saved.has_retention
+    primary = chunks[:planes].view(1 + retention + n, streams, -1)
+    a, b = primary[1 + retention :].unbind(), chunks[planes:].unbind()
+    coefficients = saved.coefficients.view(8, streams)
+    write, retain = coefficients[0], coefficients[1] if retention else None
+    betas = coefficients[2 : 2 + n].unbind()
+    # Write adds sum(beta * B), retention adds sum(beta * A), read forms t * A + w * B.
+    controllers = (
+        (primary[0], tuple(zip(b, betas)), None),
+        (primary[1], tuple(zip(a, betas)), None),
+        *((ar, ((br, write),), retain) for ar, br in zip(a, b)),
     )
-    final = [(p, g, 0, 8, 0, None, None, a) for p, g, a in zip(gp, grads[-n:], accumulate[2 + n :])]
-    for kind, (output, (index, combo)) in enumerate(
-        zip(grads[1 + updates : 3 + updates + n], kinds)
-    ):
-        if output is not None:
-            args = (plane(index), output, 1, 1, 0, coefficients(4 + kind), combo, accumulate[kind])
-            final.append(args)
-    reduce_jobs([(controllers, chunks, 1, 1, 1024, None, None, 0)])
+    final = [
+        (partial, out, 0, 8, 0, None, None, mode)
+        for partial, out, mode in zip(gp, parameters[-n:], accumulate[-n:])
+    ]
+    for index, (source, terms, weight) in enumerate(controllers):
+        if (out := parameters[index]) is not None:
+            final.append(
+                (source, out, 1, 1, 0, coefficients[4 + index], (terms, weight), accumulate[index])
+            )
+    reduce_jobs([(controllers_scratch, chunks, 1, 1, 1024, None, None, 0)])
     reduce_jobs(final)
-    parameters = (g if t is None else None for g, t in zip(grads[1 + updates :], targets))
-    return (*grads[: 1 + updates], *parameters), columns
+    updates_out = (du if fmt == "bf16" else du_mx for fmt in formats)
+    returned = (out if target is None else None for out, target in zip(parameters, targets))
+    return (residual_grad, *updates_out, *returned), columns
 
 
 # Fence-free cross-CTA handoff (projection partials, next row tile): each value travels in one
@@ -298,7 +301,7 @@ def backward(
 def _publish_word(pointer, value, tag, OWNER_MASK: gl.constexpr):
     """Store value|tag<<32 (st.relaxed.gpu, morally strong) once, from the threads whose
     (tid & OWNER_MASK) == 0: one replica of each word in the layout."""
-    return gl.inline_asm_elementwise(
+    return _volatile_asm(
         """
         {
             .reg .pred owner;
@@ -314,16 +317,13 @@ def _publish_word(pointer, value, tag, OWNER_MASK: gl.constexpr):
         """,
         "=r,l,r,r,n",
         [pointer, value, tag, OWNER_MASK],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
     )
 
 
 @g.jit
 def _arrive_hint(pointer):
     """Count this CTA's publication with one relaxed reduction from thread 0 (no fence)."""
-    return gl.inline_asm_elementwise(
+    return _volatile_asm(
         """
         {
             .reg .pred leader;
@@ -336,9 +336,6 @@ def _arrive_hint(pointer):
         """,
         "=r,l",
         [pointer],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
     )
 
 
@@ -346,7 +343,7 @@ def _arrive_hint(pointer):
 def _await_hint(pointer, expected):
     """Spin on relaxed loads until the arrival hint reaches ``expected`` (pacing only; the
     words themselves are verified by ``_verify_word``)."""
-    return gl.inline_asm_elementwise(
+    return _volatile_asm(
         """
         {
             .reg .pred ready;
@@ -360,9 +357,6 @@ def _await_hint(pointer, expected):
         """,
         "=r,l,n",
         [pointer, expected],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
     )
 
 
@@ -396,18 +390,21 @@ def _verify_word(word, pointer, tag):
 
 
 @g.jit
-def _load_dy(inputs, ds, ds2, reader: gl.constexpr, part: gl.constexpr, offset, mask):
-    """A reader's FP32 dy slice from global memory or staged BF16, plus a second consumer's
-    gradient when the reader has one (staged after the readers' slices)."""
-    second = inputs.second_grads[reader]
-    if ds is None:
-        dy = gl.load(inputs.reader_grads[reader] + offset, mask, 0).to(gl.float32)
-        if second is not None:
-            dy += gl.load(second + offset, mask, 0).to(gl.float32)
+def _gradient_slice(pointer, tile, start: gl.constexpr, offset, mask):
+    if tile is None:
+        value = gl.load(pointer + offset, mask, 0).to(gl.float32)
     else:
-        dy = _widen_bf16(ds.slice(reader * 32 + part * 16, 16).load(_GRADIENT_LAYOUT))
-        if second is not None:
-            dy += _widen_bf16(ds2.slice(part * 16, 16).load(_GRADIENT_LAYOUT))
+        value = _widen_bf16(tile.slice(start, 16).load(_GRADIENT_LAYOUT))
+    return value
+
+
+@g.jit
+def _load_dy(inputs, ds, ds2, reader: gl.constexpr, part: gl.constexpr, offset, mask):
+    """Sum the reader's consumer gradients in FP32."""
+    grads = inputs.reader_grads[reader]
+    dy = _gradient_slice(grads[0], ds, reader * 32 + part * 16, offset, mask)
+    if len(grads) == 2:
+        dy += _gradient_slice(grads[1], ds2, part * 16, offset, mask)
     return dy
 
 
@@ -481,11 +478,7 @@ def _defer(queued, a, b, PLANE: gl.constexpr, at, PART: gl.constexpr):
 @g.jit
 def _pick(cs, scalars, INDEX: gl.constexpr):
     """Coefficient INDEX: a uniform scalar when loaded once (one reader), else the shared table."""
-    if len(scalars):
-        value = scalars[INDEX]
-    else:
-        value = _coefficient(cs, INDEX)
-    return value
+    return scalars[INDEX] if len(scalars) else _coefficient(cs, INDEX)
 
 
 @g.jit
@@ -503,7 +496,7 @@ def _prefetch_warp_rows(base, rows, ROW: gl.constexpr, STRIDE: gl.constexpr, BYT
     Inline PTX: Gluon has no bulk L2 prefetch (``cp.async.bulk.prefetch.L2``). Warming the next
     claimed tile measured 4-13% of the backward (e.g. hidden 10240: 512 -> 580 us without it).
     """
-    return gl.inline_asm_elementwise(
+    return _volatile_asm(
         """
         {
             .reg .pred p, q;
@@ -523,9 +516,6 @@ def _prefetch_warp_rows(base, rows, ROW: gl.constexpr, STRIDE: gl.constexpr, BYT
         """,
         "=r,l,r,n,n,n",
         [base, rows, ROW, STRIDE, BYTES],
-        dtype=gl.int32,
-        is_pure=False,
-        pack=1,
     )
 
 
@@ -659,6 +649,15 @@ def _sync():
     fence_async_shared()
 
 
+@triton.constexpr_function
+def _half_bytes(tile_types):
+    """Bytes expected at a column half's TMA barrier across all copy descriptors."""
+    return sum(
+        tile.shape[0] // 2 * tile.shape[1] * tile.element_ty.primitive_bitwidth // 8
+        for tile in tile_types
+    )
+
+
 @g.jit
 def _copy_tiles(plan, row_tile, barrier, part: gl.constexpr):
     """Copy column half ``part`` of each planned slice into its rows of the [32, 128] tile."""
@@ -669,15 +668,24 @@ def _copy_tiles(plan, row_tile, barrier, part: gl.constexpr):
 
 
 @g.jit
-def _refill_slice(s: gl.constexpr, plan, next_rp, part: gl.constexpr):
-    """Refill consumed predecessor slice s with carry s + 1, or the next tile's last stream."""
-    carry_copies, residual_copies, barriers, copy_barrier, row_tile = plan
-    if s + 1 < len(residual_copies):
-        bits: gl.constexpr = carry_copies[s][0].dtype.primitive_bitwidth
-        mbarrier.expect(barriers[s], 16 * 128 * bits // 8)
-        _copy_tiles((carry_copies[s],), row_tile, barriers[s], part)
-    else:
-        _copy_tiles((residual_copies[s],), next_rp, copy_barrier, part)
+def _copy_carry(load, row, part: gl.constexpr):
+    copy, barrier = load
+    mbarrier.expect(barrier, 16 * 128 * copy[0].dtype.primitive_bitwidth // 8)
+    _copy_tiles((copy,), row, barrier, part)
+
+
+@g.jit
+def _refill(carries, next_inputs, tile, part: gl.constexpr):
+    """After a slice's last use, load the current carry and/or the next row's inputs.
+    Each carry has a private barrier. All next-row inputs share the column half's barrier.
+    """
+    row, next_row, has_next, next_barrier = tile
+    if len(carries) or (len(next_inputs) and has_next):
+        _sync()
+        for i in gl.static_range(len(carries)):
+            _copy_carry(carries[i], row, part)
+        if len(next_inputs) and has_next:
+            _copy_tiles(next_inputs, next_row, next_barrier, part)
 
 
 @g.jit
@@ -737,10 +745,9 @@ def _backward_body(
         out_shared = gl.allocate_shared_memory(DR_DESC.dtype, [32, 128], DR_DESC.layout)
 
     # One column half of a tile's TMA copies: every predecessor stream, the staged BF16 dys, U.
-    BITS: gl.constexpr = R_DESC.dtype.primitive_bitwidth * streams + U_DESC.dtype.primitive_bitwidth
-    HALF_BYTES: gl.constexpr = 16 * 128 * (BITS // 8 + 2 * (NREADERS + SECOND) * STAGE_DY)
     copy_deps = ((ds,) if STAGE_DY else ()) + ((ds2,) if SECOND else ()) + (update_shared,)
     copy_deps += residuals
+    HALF_BYTES: gl.constexpr = _half_bytes(copy_deps.type)
     # Carry s > 0 lands on barrier s - 1; the last two complete each half's copy phase.
     storage = gl.allocate_shared_memory(gl.int64, [streams + 1, 1], mbarrier.MBarrierLayout())
     barriers = ()
@@ -765,13 +772,9 @@ def _backward_body(
 
     rr0 = gl.arange(0, 16, layout=_ROWS)
     cc = column_tile * 256 + gl.arange(0, 128, layout=_COLUMNS)
-    residual_copies, reader_copies, carry_copies = (), (), ()
+    residual_copies, reader_copies = (), ()
     for stream in gl.static_range(streams):
-        column = stream * h + column_tile * 256
-        residual_copies += ((R_DESC, residuals[stream], column),)
-        if stream > 0:
-            # carry_copies[s - 1] lands carry stream s in consumed predecessor slice s - 1.
-            carry_copies += ((CARRY_DESC, residuals[stream - 1], column),)
+        residual_copies += ((R_DESC, residuals[stream], stream * h + column_tile * 256),)
     if STAGE_DY:
         for reader in gl.static_range(NREADERS):
             reader_copies += (
@@ -782,12 +785,18 @@ def _backward_body(
     reader_copies += ((U_DESC, update_shared, column_tile * 256),)
     # One reader with a BF16 residual lands carries s > 0 in the dy and U slices, free once a
     # column half's gradient phase holds dy and U, so they are requested a whole half early.
-    EARLY_CARRY: gl.constexpr = not TWO and R_DESC.dtype.primitive_bitwidth == 16 and streams <= 3
-    if EARLY_CARRY:
-        landed = ()
-        for c in gl.static_range(streams - 1):
-            landed += ((CARRY_DESC, reader_copies[c][1], carry_copies[c][2]),)
-        carry_copies = landed
+    EARLY_CARRY: gl.constexpr = (
+        not TWO
+        and streams <= 3
+        and STAGE_DY
+        and R_DESC.dtype == gl.bfloat16
+        and U_DESC.dtype == gl.bfloat16
+    )
+    carry_loads = ()
+    for s in gl.static_range(streams - 1):
+        target = reader_copies[s][1] if EARLY_CARRY else residuals[s]
+        copy = (CARRY_DESC, target, (s + 1) * h + column_tile * 256)
+        carry_loads += ((copy, barriers[s]),)
     gs = gl.allocate_shared_memory(gl.float32, [NREADERS * 256], LINEAR_SHARED)
     # Half zero's controller shares, one word per thread and plane (write, retention and read
     # per stream, then raw b); only the owning thread touches a word.
@@ -968,7 +977,7 @@ def _backward_body(
             store_valid = (row_tile * 16 < m) if PAIRED else valid
             at = (controller_row, stride, valid if h % 256 else True)
             at += (shares,) if PAIRED else ()
-            refill = (carry_copies, residual_copies, barriers, copy_barriers[part], row_tile)
+            refill = (row_tile, next_rp, prefetch_active, copy_barriers[part])
             # One dR row pointer per slice; stream offsets become store immediates.
             residual_grad_rows = outputs.residual_grad + (rows * (streams * h) + cols)
 
@@ -1000,11 +1009,8 @@ def _backward_body(
                 dxs += (_mul2(_fma2(_mul2(x, -r), p, dz), r),)
                 update_mixes += (update_mix,)
 
-            if EARLY_CARRY and streams > 1:
-                _sync()
-                for c in gl.static_range(streams - 1):
-                    mbarrier.expect(barriers[c], 16 * 128 * 2)
-                    _copy_tiles((carry_copies[c],), row_tile, barriers[c], part)
+            if EARLY_CARRY:
+                _refill(carry_loads, (), refill, part)
             if not TWO:
                 for reader in gl.static_range(NREADERS):
                     queued = _defer(queued, u, dxs[reader], U_PLANE + reader, at, part)
@@ -1015,13 +1021,8 @@ def _backward_body(
                 held = ()
                 for first in gl.static_range(HELD):
                     held += (_load_residual(residuals, cols, part, first, h),)
-                if streams > 1 or prefetch_active:
-                    _sync()
-                    for first in gl.static_range(HELD):
-                        if first + 1 < streams or prefetch_active:
-                            _refill_slice(first, refill, next_rp, part)
-                    if prefetch_active:
-                        _copy_tiles(reader_copies, next_rp, copy_barriers[part], part)
+                released = residual_copies[-1:] if HELD == streams else ()
+                _refill(carry_loads[:HELD], released + reader_copies, refill, part)
 
             for s in gl.static_range(streams):
                 if TWO and s < HELD:
@@ -1030,9 +1031,10 @@ def _backward_body(
                     R_prev_s = _load_residual(residuals, cols, part, s, h)
                 # Stream s's own release: before its controller reductions for two readers past
                 # HELD, after them for one reader.
-                if TWO and s >= HELD and (s + 1 < streams or prefetch_active):
-                    _sync()
-                    _refill_slice(s, refill, next_rp, part)
+                carry = carry_loads[s : s + 1]
+                last_slice = residual_copies[s : s + 1] if s + 1 == streams else ()
+                if TWO and s >= HELD:
+                    _refill(carry, last_slice, refill, part)
                 w = joint_coefficients[s]
                 t = joint_coefficients[streams + s] if retention else 1.0
                 if TWO and s == 0:
@@ -1052,7 +1054,10 @@ def _backward_body(
                         _copy_tiles((reader_copies[s - 2],), next_rp, copy_barriers[part], part)
                 if not TWO and not EARLY_CARRY and (s + 1 < streams or prefetch_active):
                     _sync()
-                    _refill_slice(s, refill, next_rp, part)
+                    if s + 1 < streams:
+                        _copy_carry(carry_loads[s], row_tile, part)
+                    else:
+                        _copy_tiles(last_slice, next_rp, copy_barriers[part], part)
                     if s > 0 and prefetch_active:
                         # The previous stream's consumed carry slice (or dy/U) for the next tile.
                         deferred = reader_copies if s == 1 else (residual_copies[s - 2],)
@@ -1061,8 +1066,9 @@ def _backward_body(
                 if s == 0:
                     incoming_dR_s = incoming_zero
                 else:
-                    tile = carry_copies[s - 1][1]
-                    mbarrier.wait(barriers[s - 1], part & 1, deps=(tile,))
+                    copy, barrier = carry_loads[s - 1]
+                    tile = copy[1]
+                    mbarrier.wait(barrier, part & 1, deps=(tile,))
                     incoming_dR_s = _widen_bf16(tile.slice(part * 16, 16).load(L))
                 if TWO and s > 0 and prefetch_active:
                     # Release the consumed carry slice to the next tile's predecessor s - 1.
@@ -1100,11 +1106,8 @@ def _backward_body(
                     _store_partial(queued[k][0], queued[k][1], store_valid)
                 queued = ()
 
-            if EARLY_CARRY and prefetch_active:
-                # The reader slices not yet handed back: the last carry's and every unused one.
-                _sync()
-                for c in gl.static_range(max(0, streams - 2), len(reader_copies)):
-                    _copy_tiles((reader_copies[c],), next_rp, copy_barriers[part], part)
+            if EARLY_CARRY:
+                _refill((), reader_copies[max(0, streams - 2) :], refill, part)
             for reader in gl.static_range(NREADERS):
                 du = _fma2(update_mixes[reader], dxs[reader], du)
 
@@ -1131,10 +1134,7 @@ def _backward_kernel_name(readers, second, du):
     return f"bwd_wr_writeread_{readers}reader_{readers + second}grad_{KERNEL_FORMAT_TAGS[du]}"
 
 
-# One kernel body; each variant compiles under its own name, keyed (readers, second, du).
 BACKWARD_KERNELS = {
     key: named_jit(_backward_body, _backward_kernel_name(*key))
-    for key in [
-        (n, second, du) for n in (1, 2) for second in (False, True) for du in OUTPUT_FORMATS
-    ]
+    for key in product((1, 2), (False, True), OUTPUT_FORMATS)
 }
