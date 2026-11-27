@@ -70,6 +70,111 @@ def _assert_same_replay(reference, actual):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")
+@pytest.mark.parametrize("cache_batch,batch_offset", [(2, 0), (4, 1)])
+def test_static_cached_qkv_layout_replays(cache_batch, batch_offset, monkeypatch):
+    """Repack cached Q/K/V without changing values and replay prefill/decode exactly."""
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+
+    if not HAVE_TE:
+        pytest.skip("requires Transformer Engine")
+
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        dot_product_attention as te_dpa,
+    )
+
+    from megatron.core.inference.contexts.static_context import StaticInferenceContext
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_submodules,
+    )
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.enums import AttnBackend, AttnMaskType
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    monkeypatch.setenv("NVTE_FUSED_ATTN", "1")
+    monkeypatch.setenv("NVTE_FLASH_ATTN", "0")
+    monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
+    monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+    monkeypatch.setattr(
+        te_dpa, "_attention_backends", dict(te_dpa._attention_backends, attention_params=None)
+    )
+    Utils.initialize_model_parallel()
+    try:
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=1024,
+            num_attention_heads=16,
+            num_query_groups=1,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_backend=AttnBackend.fused,
+            attention_dropout=0.0,
+            deterministic_mode=True,
+            flash_decode=False,
+        )
+        module = (
+            SelfAttention(
+                config,
+                get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=['tp', 'cp', 'dp']
+                ),
+            )
+            .cuda()
+            .eval()
+        )
+        hidden = torch.randn(4, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+
+        @torch.no_grad()
+        def prefill_then_decode(states):
+            context = StaticInferenceContext(cache_batch, max_sequence_length=4)
+            context.batch_size_offset = batch_offset
+            keys, values, outputs = [], [], []
+            for chunk in states.split((3, 1)):
+                query, key, value = module.get_query_key_value_tensors(chunk)
+                # Sixteen logical Q heads still occupy an eighteen-head QKV pitch.
+                assert query.stride(1) == 18 * config.kv_channels
+                assert not query.is_contiguous()
+                keys.append(key)
+                values.append(value)
+                expected = (query, torch.cat(keys), torch.cat(values))
+
+                def check_layout(_module, args):
+                    for observed, reference in zip(args[:3], expected):
+                        assert observed.is_contiguous()
+                        assert bytes_equal(observed, reference)
+
+                hook = module.core_attention.register_forward_pre_hook(check_layout)
+                try:
+                    output, _ = module(chunk, None, inference_context=context)
+                finally:
+                    hook.remove()
+                assert torch.isfinite(output).all()
+                outputs.append(output)
+                context.sequence_len_offset += chunk.shape[0]
+                context.enable_decode_mode()
+            return torch.cat(outputs)
+
+        assert_replays_bit_exact(
+            prefill_then_decode,
+            (hidden,),
+            replays=2,
+            backward=False,
+            contention=True,
+            what="static cached QKV layout",
+        )
+        assert te_dpa._attention_backends["use_fused_attention"]
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA and Transformer Engine")
 @pytest.mark.parametrize("fraction", [0.5, 1.0])
 @pytest.mark.parametrize("input_layout", ["qk_norm", "rope"])
 def test_core_attention_offload_replays_bit_exact(input_layout, fraction, monkeypatch):
