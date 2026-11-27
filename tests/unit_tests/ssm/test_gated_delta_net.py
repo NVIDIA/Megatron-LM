@@ -241,6 +241,7 @@ class TestFusedPreGatedDeltaRule:
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
         )
+        torch.manual_seed(123)
         model_parallel_cuda_manual_seed(123)
 
         tp_group = parallel_state.get_tensor_model_parallel_group()

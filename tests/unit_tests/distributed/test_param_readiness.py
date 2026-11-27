@@ -9,9 +9,12 @@ CUDA-graph capture deferral, and out-of-order bucket dedup -- which would be con
 on real GPUs.
 """
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
+import pytest
 import torch
+from torch.utils.checkpoint import checkpoint
 
 import megatron.core.distributed.distributed_data_parallel as ddp_module
 from megatron.core.distributed.distributed_data_parallel import (
@@ -23,6 +26,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataPa
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import PARAM_READY_CALLBACK_ATTR, ensure_params_ready
+from tests.unit_tests.test_utilities import defer_parameter_gathers
 
 
 class _FakeBucketGroup:
@@ -46,27 +50,66 @@ def _fake_ddp(align_param_gather=False, hooks_enabled=True):
 
 
 class TestParamReadinessProtocol:
+    @pytest.mark.parametrize("bypass_owner", [False, True])
+    def test_deferred_gathers_detect_unregistered_reads(self, bypass_owner):
+        model = torch.nn.Module()
+        model.projection = torch.nn.Linear(2, 2)
+        model.tied_projection = model.projection
+        model.unused = torch.nn.Linear(2, 2)
+        model.frozen = torch.nn.Parameter(torch.ones(2), requires_grad=False)
+        original = {name: value.clone() for name, value in model.state_dict().items()}
+        previous_callback = lambda: None  # noqa: E731
+        setattr(model.projection.weight, PARAM_READY_CALLBACK_ATTR, previous_callback)
+        x = torch.ones(1, 2)
+        expected = model.projection(x) + model.frozen
+
+        # This is an ordinary Linear with no entry in the dependency map. A new direct
+        # read must be detected by numerical comparison, even with unused/tied parameters.
+        with pytest.raises(AssertionError) if bypass_owner else nullcontext():
+            with defer_parameter_gathers(model):
+                if bypass_owner:
+                    actual = torch.nn.functional.linear(
+                        x, model.projection.weight, model.projection.bias
+                    )
+                else:
+                    actual = model.tied_projection(x)
+                torch.testing.assert_close(actual + model.frozen, expected)
+
+        torch.testing.assert_close(model.state_dict(), original)
+        assert getattr(model.projection.weight, PARAM_READY_CALLBACK_ATTR) is previous_callback
+        assert all(not module._forward_pre_hooks for module in model.modules())
+
     def test_no_marker_is_a_noop(self):
         """A parameter no backend owns must be readable without any callback."""
         param = torch.nn.Parameter(torch.zeros(2))
         assert not hasattr(param, PARAM_READY_CALLBACK_ATTR)
         ensure_params_ready([param])  # must not raise
 
-    def test_callbacks_are_deduplicated_per_bucket(self):
+    @pytest.mark.parametrize("use_ddp_hook", [False, True])
+    def test_callbacks_are_deduplicated_per_bucket(self, use_ddp_hook):
         """Backends share one callback per bucket, so it must fire once per call, in order."""
         calls = []
-        shared = lambda: calls.append("shared")  # noqa: E731
         other = lambda: calls.append("other")  # noqa: E731
 
         first, second, third = (torch.nn.Parameter(torch.zeros(1)) for _ in range(3))
-        setattr(first, PARAM_READY_CALLBACK_ATTR, shared)
-        setattr(second, PARAM_READY_CALLBACK_ATTR, shared)
         setattr(third, PARAM_READY_CALLBACK_ATTR, other)
         plain = torch.nn.Parameter(torch.zeros(1))
 
-        ensure_params_ready([first, second, plain, first, third])
-
-        assert calls == ["shared", "other"]
+        params = [first, second, plain, first, third]
+        ddp = _fake_ddp()
+        ddp.use_forward_hook = True
+        ddp.param_to_bucket_group = {}
+        for label in ("shared", "rebound"):
+            # A new hook registration must bind the current callbacks after a re-wrap.
+            shared = lambda label=label: calls.append(label)  # noqa: E731
+            setattr(first, PARAM_READY_CALLBACK_ATTR, shared)
+            setattr(second, PARAM_READY_CALLBACK_ATTR, shared)
+            calls.clear()
+            if use_ddp_hook:
+                ddp._make_forward_pre_hook(params)(torch.nn.Identity())
+            else:
+                ensure_params_ready(params)
+            assert calls == [label, "other"]
 
 
 class TestBucketParamReadiness:
@@ -75,6 +118,26 @@ class TestBucketParamReadiness:
     The callback stores DDP weakly, so letting ``_fake_ddp()`` stay a temporary would collect it
     immediately and make every callback early-return -- turning these into vacuous passes.
     """
+
+    def test_dependency_wait_is_not_repeated_during_recompute(self):
+        ddp = _fake_ddp()
+        ddp.use_forward_hook = True
+        bucket_group = _FakeBucketGroup()
+        dependency = torch.nn.Parameter(torch.ones(1))
+        ddp.param_to_bucket_group = {dependency: bucket_group}
+        setattr(dependency, PARAM_READY_CALLBACK_ATTR, _BucketParamReadyCallback(ddp, bucket_group))
+        projection = torch.nn.Linear(1, 1, bias=False)
+        projection.register_forward_pre_hook(ddp._make_forward_pre_hook((dependency,)))
+
+        x = torch.ones(1, 1, requires_grad=True)
+        output = checkpoint(projection, x, use_reentrant=True)
+        # Simulate a dependency bucket whose backward has already completed/reset.
+        bucket_group.param_gather_dispatched = False
+        (output * dependency).sum().backward()
+
+        # This dependency is consumed after the projection; its backward can finish before
+        # the projection is recomputed. Only the original forward may request its gather.
+        assert bucket_group.finished == [False]
 
     def test_cuda_graph_capture_defers_publication_until_replay(self, monkeypatch):
         ddp = _fake_ddp()

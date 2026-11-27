@@ -22,7 +22,7 @@ from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import Float16Module
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, defer_parameter_gathers
 from tests.unit_tests.transformer.test_attention import _test_parallel_attention_correctness
 from tests.unit_tests.transformer.test_multi_latent_attention import (
     make_test_packed_seq_params,
@@ -333,9 +333,10 @@ def test_kda_selective_recompute(recompute_module, two_stage_gates):
         recompute_input = hidden_states.detach().clone().requires_grad_(True)
 
         base_output, base_input_grad, base_grads = run(base_kda, base_input)
-        recompute_output, recompute_input_grad, recompute_grads = run(
-            recompute_kda, recompute_input
-        )
+        with defer_parameter_gathers(recompute_kda, enabled=not two_stage_gates):
+            recompute_output, recompute_input_grad, recompute_grads = run(
+                recompute_kda, recompute_input
+            )
 
         assert base_kda.recompute_norm_out is False
         assert base_kda.recompute_gdn is False

@@ -4,7 +4,7 @@ import logging
 import math
 import weakref
 from contextlib import contextmanager
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -23,6 +23,7 @@ except ImportError:
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
+from .param_readiness import collect_param_readiness_dependencies
 
 logger = logging.getLogger(__name__)
 
@@ -551,10 +552,13 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         assert self.use_forward_hook
         assert len(self.remove_forward_pre_hook_handles) == 0
+
+        extra_params = collect_param_readiness_dependencies(self.module)
+
         # Register forward pre-hook for all sub-modules.
         for module in self.module.modules():
             self.remove_forward_pre_hook_handles[module] = module.register_forward_pre_hook(
-                self._make_forward_pre_hook()
+                self._make_forward_pre_hook(extra_params.get(module, ()))
             )
 
     def disable_forward_pre_hook(self, param_sync: bool = True):
@@ -577,11 +581,18 @@ class DistributedDataParallel(_BaseDataParallel):
             with torch.no_grad():
                 self.start_param_sync(force_sync=True)
 
-    def _make_forward_pre_hook(self):
+    def _make_forward_pre_hook(self, extra_params=()):
         """
         Create a forward pre-hook to wait on all-gather handles when necessary (i.e.,
         when a module uses a parameter in a bucket with a still incomplete all-gather).
         """
+        # Bind once per hook registration, preserving the first occurrence of each bucket.
+        callbacks: dict[int, Callable[[], None]] = {}
+        for param in extra_params:
+            callback = getattr(param, PARAM_READY_CALLBACK_ATTR, None)
+            if callback is not None:
+                callbacks[id(callback)] = callback
+        ready_callbacks = tuple(callbacks.values())
 
         def hook(module, *unused):
             assert (
@@ -599,6 +610,12 @@ class DistributedDataParallel(_BaseDataParallel):
                     continue
                 assert param.requires_grad
                 self._finish_param_sync_for_bucket_group(self.param_to_bucket_group[param])
+
+            # Recompute reuses published weights; dependency buckets may have finished
+            # grad sync already, so requesting their param sync again would start a new gather.
+            if ready_callbacks and torch._C._current_graph_task_id() == -1:
+                for callback in ready_callbacks:
+                    callback()
 
         return hook
 

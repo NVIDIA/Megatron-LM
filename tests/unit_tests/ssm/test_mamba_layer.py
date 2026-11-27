@@ -15,7 +15,7 @@ from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, defer_parameter_gathers
 
 
 @pytest.mark.internal
@@ -163,10 +163,11 @@ class TestMambaLayer:
 
         layer.zero_grad(set_to_none=True)
         split_input = hidden_states.detach().clone().requires_grad_(True)
-        stage_state = layer.forward_pre_attn_and_core_attn(split_input)
-        assert len(stage_state) == 3
-        split_output = layer.forward_post_core_attn(*stage_state)
-        split_output.float().square().mean().backward()
+        with defer_parameter_gathers(layer, enabled=not fp32_residual):
+            stage_state = layer.forward_pre_attn_and_core_attn(split_input)
+            assert len(stage_state) == 3
+            split_output = layer.forward_post_core_attn(*stage_state)
+            split_output.float().square().mean().backward()
         split_grads = {
             name: param.grad for name, param in layer.named_parameters() if param.grad is not None
         }
