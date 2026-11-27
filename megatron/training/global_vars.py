@@ -407,13 +407,15 @@ def _set_wandb_writer(args):
         else:
             # Defaults to the save dir.
             save_dir = os.path.join(cfg.checkpoint.save, 'wandb')
-        # Private attributes are runtime state rather than configuration and can be large; keep
-        # them out of the wandb config. Copy so the kitchen contents added below stay off args.
-        wandb_config = {k: v for k, v in vars(args).items() if not k.startswith('_')}
-        if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
+        # Private attributes are runtime state rather than configuration and can be large. The
+        # config container is the source of truth for values consumed by training.
+        wandb_config = cfg.to_dict()
+        kitchen_config_file = getattr(args, 'kitchen_config_file', None)
+        if kitchen_config_file is not None:
             # Log the contents of the config for discovery of what the quantization
             # settings were.
-            with open(wandb_config['kitchen_config_file'], "r") as f:
+            wandb_config['kitchen_config_file'] = kitchen_config_file
+            with open(kitchen_config_file, "r") as f:
                 wandb_config['kitchen_config_file_contents'] = f.read()
         # wandb.init() creates a new run unless it is given an id to resume, and this
         # runs on every process start. A long job restarts many times -- a requeue, a

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron initialization."""
+import json
 import logging
 import os
 import random
@@ -590,12 +591,15 @@ def _set_random_seed(
 
 
 def write_args_to_tensorboard():
-    """Write arguments to tensorboard."""
-    args = get_args()
+    """Write the run configuration to tensorboard."""
     writer = get_tensorboard_writer()
     if writer:
-        for arg in vars(args):
-            writer.add_text(arg, str(getattr(args, arg)), global_step=get_train_state().iteration)
+        for section, value in get_run_config().to_dict().items():
+            writer.add_text(
+                section,
+                json.dumps(value, indent=2, sort_keys=True, default=str),
+                global_step=get_train_state().iteration,
+            )
 
 
 def set_jit_fusion_options(
