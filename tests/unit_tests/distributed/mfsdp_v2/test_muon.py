@@ -154,3 +154,48 @@ def test_muon_matches_reference(
     reference_losses = _train(reference, (reference_optimizer, reference_other), inputs)
     losses = _train(model, (optimizer, other_optimizer), inputs)
     torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
+@pytest.mark.parametrize("nesterov", [False, True], ids=["momentum", "nesterov"])
+def test_muon_batches_each_optimizer_group(distributed_setup, weight_decay_method, nesterov):
+    """One FSDP group holds two optimizer groups of two matrices each.
+
+    Each optimizer group is updated as one batch with its own learning rate and weight decay.
+    """
+    mesh = init_device_mesh("cuda", (distributed_setup.world_size,))
+    placements = Placements(
+        dp_axes=[0], parameter=[RowAtomic()], gradient=[RowAtomic()], optimizer=[RowAtomic()]
+    )
+    torch.manual_seed(1234)
+    model = nn.Sequential(*(nn.Linear(8, 8, bias=False) for _ in range(4)))
+    model = model.to(distributed_setup.device)
+    reference = copy.deepcopy(model)
+    with fully_shard_context(FsdpContext(device=distributed_setup.device)):
+        fully_shard(model, mesh=mesh, placements=placements)
+    kwargs = dict(
+        lr=0.05,
+        momentum=0.9,
+        nesterov=nesterov,
+        weight_decay=0.1,
+        weight_decay_method=weight_decay_method,
+    )
+    optimizer = muon.FsdpMuon(
+        [
+            {"params": [model[0].weight, model[2].weight]},
+            {"params": [model[1].weight, model[3].weight], "lr": 0.02, "weight_decay": 0.3},
+        ],
+        **kwargs,
+    )
+    fully_shard_optimizer(optimizer, precision_aware=True)
+    reference_optimizer = Muon(
+        [
+            {"params": [reference[0].weight, reference[2].weight]},
+            {"params": [reference[1].weight, reference[3].weight], "lr": 0.02, "weight_decay": 0.3},
+        ],
+        **kwargs,
+    )
+    inputs = torch.randn(5, 4, 8, device=distributed_setup.device)
+    reference_losses = _train(reference, (reference_optimizer,), inputs)
+    losses = _train(model, (optimizer,), inputs)
+    torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)
