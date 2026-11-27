@@ -1233,6 +1233,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if self.ddp_config.use_megatron_fsdp:
             # When using Megatron-FSDP, directly load the optimizer state
             # into the wrapped optimizer.
+            missing_master_params = set(state_dict.pop('_fsdp_missing_master_params', ()))
+            if missing_master_params:
+                # Legacy checkpoints did not save masters, so rebuild them from
+                # the restored model weights.
+                for group in self.optimizer.param_groups:
+                    for param in group['params']:
+                        name = self._param_name(param)
+                        if name in missing_master_params:
+                            use_remainders = (
+                                getattr(self.optimizer, 'store_param_remainders', False)
+                                and param.dtype == torch.bfloat16
+                            )
+                            state_dict['state'][name]['master_param'] = (
+                                torch.zeros_like(param, dtype=torch.int16)
+                                if use_remainders
+                                else param.detach().float().clone()
+                            )
             if "param_to_group_meta" in state_dict:
                 state_dict["param_groups"] = self._param2group_meta_to_param_groups(
                     state_dict["param_to_group_meta"], self.optimizer.param_groups

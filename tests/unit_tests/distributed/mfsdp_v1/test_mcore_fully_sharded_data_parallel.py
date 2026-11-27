@@ -834,10 +834,12 @@ class TestMegatronFSDPE2E:
         megatron_fsdp_te_fused_adam = kwargs.get("use_megatron_fsdp", False) and kwargs.get(
             "use_precision_aware_optimizer", False
         )
+        optimizer_owns_master_weights = False
         if megatron_fsdp_te_fused_adam:
-            assert (
-                not optim.optimizer.master_weights
-            ), "Megatron-FSDP should not use FusedAdam master weights."
+            optimizer_owns_master_weights = (
+                kwargs.get("megatron_fsdp_main_params_dtype", torch.float32) is None
+            )
+            assert optim.optimizer.master_weights == optimizer_owns_master_weights
             assert (
                 optim.optimizer.use_decoupled_grad
             ), "Megatron-FSDP should be using a decoupled gradient with FusedAdam."
@@ -881,12 +883,53 @@ class TestMegatronFSDPE2E:
                 ), f"[Megatron-FSDP] Missing gradient in Parameter.{grad_attr}..."
             optim.step()
 
+            if optimizer_owns_master_weights:
+                assert optim.state
+                expected_dtype = (
+                    torch.int16 if kwargs.get("store_param_remainders", True) else torch.float32
+                )
+                assert all(
+                    state["master_param"].dtype == expected_dtype for state in optim.state.values()
+                )
+
             # Collect loss
             outputs.append(output[-1])
 
         Utils.destroy_model_parallel()
 
         return outputs
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron FSDP requires torch >= 2.4.0"
+    )
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.1.0")), reason="Remainders require TE >= 2.1"
+    )
+    def test_param_remainders_match_fp32_master_weights(self):
+        config = dict(
+            bf16=True,
+            use_megatron_fsdp=True,
+            ckpt_format="fsdp_dtensor",
+            gradient_accumulation_fusion=False,
+            megatron_fsdp_main_grads_dtype=torch.float32,
+            use_precision_aware_optimizer=True,
+        )
+        reference = self._training_loop(
+            **config, megatron_fsdp_main_params_dtype=torch.float32, store_param_remainders=False
+        )
+        outputs = self._training_loop(
+            **config, megatron_fsdp_main_params_dtype=None, store_param_remainders=True
+        )
+
+        assert len(outputs) == len(reference)
+        for step, (output, ref_output) in enumerate(zip(outputs, reference)):
+            assert_close(
+                output["lm loss"],
+                ref_output["lm loss"],
+                rtol=1e-3,
+                atol=0,
+                msg=lambda msg: f"Remainder loss mismatch at step {step}: {msg}",
+            )
 
     @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(

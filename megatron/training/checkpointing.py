@@ -2561,6 +2561,20 @@ def _load_base_checkpoint(
 
         if raw_optimizer_state_dict is not None:
             state_dict['optimizer'] = raw_optimizer_state_dict
+            checkpoint_has_no_master_params = not any(
+                key.startswith('optimizer.state.') and '.master_param' in key
+                for key in state_dict_metadata
+            )
+            if checkpoint_has_no_master_params and 'state' in raw_optimizer_state_dict:
+                # FSDP v1 previously disabled TE masters even when FSDP had no main
+                # buffer. Record which masters must be rebuilt after model restoration.
+                missing_master_params = [
+                    name
+                    for name, slots in raw_optimizer_state_dict['state'].items()
+                    if 'master_param' in slots
+                ]
+                # This marker is local load bookkeeping, never a DCP template key.
+                state_dict['optimizer']['_fsdp_missing_master_params'] = missing_master_params
 
         if raw_model_state_dict is not None:
             state_dict['model'] = raw_model_state_dict
