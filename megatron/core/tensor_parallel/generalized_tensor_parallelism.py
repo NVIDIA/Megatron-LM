@@ -1092,7 +1092,8 @@ def _gtp_native_fp8_subclass(base_cls: type) -> type:
     """Cached ``base_cls`` subclass + GTPShardedParam's methods (isinstance(base_cls) kept True).
 
     CRITICAL: skip names already in the FP8 MRO — a GTPShardedParam method shadowing one TE needs
-    (e.g. get_data_tensors) silently freezes optimizer updates.
+    (e.g. get_data_tensors) silently freezes optimizer updates. The explicit detach
+    adapter below retains TE's storage behavior and adds only a GTP owner reference.
     """
     sub = _GTP_NATIVE_FP8_SUBCLASSES.get(base_cls)
     if sub is None:
@@ -1104,6 +1105,16 @@ def _gtp_native_fp8_subclass(base_cls: type) -> type:
             for k, v in vars(GTPShardedParam).items()
             if k not in _GTP_SUBCLASS_SKIP and k not in base_mro_names
         }
+
+        def detach(self):
+            # Autograd detaches tensors returned by saved-tensor hooks. TE's detach keeps
+            # the FP8 storage and this subclass, but not GTP's mutable runtime state.
+            # Point the copy at the live weight instead of copying handles/chain links.
+            alias = base_cls.detach(self)
+            alias._gtp_saved_weight_owner = getattr(self, "_gtp_saved_weight_owner", self)
+            return alias
+
+        ns["detach"] = detach
         # Share the (class-level) prefetch chain-state dicts with GTPShardedParam.
         ns["_chain_state"] = GTPShardedParam._chain_state
         ns["_recompute_chain_state"] = GTPShardedParam._recompute_chain_state
@@ -2749,11 +2760,13 @@ class GTPShardedParam(torch.nn.Parameter):
     # ------------------------------------------------------------------
     def materialize_group_for_forward(self):
         """Protocol: all-gather the group's shard(s) for the forward GEMM."""
-        return self.all_gather_and_prefetch(fwd=True)
+        owner = getattr(self, "_gtp_saved_weight_owner", self)
+        return owner.all_gather_and_prefetch(fwd=True)
 
     def materialize_group_for_backward(self, nvtx_label=None):
         """Protocol: re-materialize the group's weight(s) for the backward GEMMs."""
-        return self.all_gather_and_prefetch_bwd(nvtx_label=nvtx_label)
+        owner = getattr(self, "_gtp_saved_weight_owner", self)
+        return owner.all_gather_and_prefetch_bwd(nvtx_label=nvtx_label)
 
     def peek_group_for_forward(self):
         """Read the group's gathered forward weight(s) without consuming them in the chain.
@@ -2770,7 +2783,8 @@ class GTPShardedParam(torch.nn.Parameter):
 
     def finalize_group_grads(self, wgrads, nvtx_label=None):
         """Protocol: reduce-scatter the group's freshly computed weight grad(s)."""
-        return self.wgrad_reduce_scatter(wgrads, nvtx_label=nvtx_label)
+        owner = getattr(self, "_gtp_saved_weight_owner", self)
+        return owner.wgrad_reduce_scatter(wgrads, nvtx_label=nvtx_label)
 
     def _can_accumulate_wgrad(self) -> bool:
         """Eligibility, not state: opted in, and not on a graphed or ring-slot path.
@@ -2820,7 +2834,8 @@ class GTPShardedParam(torch.nn.Parameter):
 
     def grad_buffer(self):
         """Protocol: the wgrad accumulation scratch buffer for this weight."""
-        return self.get_wgrad_tensor()
+        owner = getattr(self, "_gtp_saved_weight_owner", self)
+        return owner.get_wgrad_tensor()
 
     def get_data_tensors(self):
         """Expose self as the lone data tensor for TE's offload-marking interface.
