@@ -19,10 +19,15 @@ Sizing matters more than replay count: a reduction with two contending blocks ca
 from __future__ import annotations
 
 import contextlib
+import functools
+import inspect
+import os
 from typing import Any, Callable, Dict, Optional, Tuple
 
+import pytest
 import torch
 
+from megatron.core import utils as core_utils
 from tests.unit_tests.determinism.utils import (
     RacingStreams,
     capture_rng_state,
@@ -128,6 +133,104 @@ def _describe_mismatch(name: str, a: torch.Tensor, b: torch.Tensor) -> str:
     return msg
 
 
+# Perf breakdown (tests/performance_tests/shell_test_utils/determinism/kernel_breakdown.sh).
+# Everything below is inert unless DETERMINISM_PERF_MODE is set ("det" or "nondet").
+_PERF_MODE = os.environ.get("DETERMINISM_PERF_MODE")
+# Calls 1-2 of a workload warm up (compilation, plan selection, allocator); calls 3-6 are traced.
+_PERF_WARMUP = 2
+_PERF_REPLAYS = 6
+_perf_calls: Dict[str, int] = {}
+_perf_invocations: Dict[str, int] = {}
+_perf_workload = ""  # range prefix of the replay assertion now running; "" = not traced
+
+
+def perf_scaled(test):
+    """Run ``test(..., perf_scale=s)`` at several input scales in the perf breakdown.
+
+    The test multiplies its own sequence length (or token count) by ``perf_scale``, so every
+    tensor it builds stays consistent. Normal runs call it once with ``perf_scale=1`` and keep
+    their test ids; perf runs add the cases ``x1`` and ``DETERMINISM_PERF_SCALES`` (default
+    4 and 16), which shows whether a row is bound by launch cost or by computation.
+    """
+    if _PERF_MODE:
+        extra = os.environ.get("DETERMINISM_PERF_SCALES", "4,16")
+        scales = [1] + [int(s) for s in extra.split(",") if s]
+        return pytest.mark.parametrize("perf_scale", scales, ids=[f"x{s}" for s in scales])(test)
+
+    @functools.wraps(test)
+    def at_scale_1(*args, **kwargs):
+        return test(*args, perf_scale=1, **kwargs)
+
+    sig = inspect.signature(test)
+    at_scale_1.__signature__ = sig.replace(
+        parameters=[p for name, p in sig.parameters.items() if name != "perf_scale"]
+    )
+    return at_scale_1
+
+
+def effective_replays(replays: int) -> int:
+    """How many times the replay assertions run ``fn``: ``replays``, or at least
+    ``_PERF_REPLAYS`` in the perf breakdown. Tests that count calls compare against this."""
+    return max(replays, _PERF_REPLAYS) if _PERF_MODE else replays
+
+
+def _perf_test_id() -> str:
+    test = os.environ.get("PYTEST_CURRENT_TEST", "kernel").split(" (")[0].rpartition("/")[2]
+    return test.replace("::", ".")
+
+
+@contextlib.contextmanager
+def _perf_workload_scope():
+    """Name the replay assertion now running: the test id, plus ``#k`` for its k-th call."""
+    global _perf_workload
+    if not _PERF_MODE:
+        yield
+        return
+    test = _perf_test_id()
+    k = _perf_invocations[test] = _perf_invocations.get(test, 0) + 1
+    _perf_workload = test if k == 1 else f"{test}#{k}"
+    try:
+        yield
+    finally:
+        _perf_workload = ""
+
+
+def _perf_workload_scoped(assert_fn):
+    @functools.wraps(assert_fn)
+    def wrapper(*args, **kwargs):
+        with _perf_workload_scope():
+            return assert_fn(*args, **kwargs)
+
+    return wrapper
+
+
+@contextlib.contextmanager
+def _perf_range(phase: str):
+    """One NVTX range per replay assertion and phase, for the det-vs-nondet perf breakdown.
+
+    Only calls 3-6 of each workload are tagged (see ``_PERF_WARMUP``). The device is
+    synchronised at both ends so the range holds the kernel, not only its launch. In perf
+    mode this also drains ``RacingStreams`` before each traced call, so contention is weaker
+    there than in a normal run. Calls outside a replay assertion are not traced. "forward" is
+    the whole callable: a callable that runs backward itself has that time in "forward".
+    """
+    if not (_PERF_MODE and _perf_workload):
+        yield
+        return
+    name = f"{_perf_workload} {phase}"
+    call = _perf_calls[name] = _perf_calls.get(name, 0) + 1
+    if not _PERF_WARMUP < call <= _PERF_REPLAYS:
+        yield
+        return
+    torch.cuda.synchronize()
+    core_utils.nvtx_range_push(name)
+    try:
+        yield
+        torch.cuda.synchronize()
+    finally:
+        core_utils.nvtx_range_pop(name)
+
+
 def run_once(
     fn: Callable[..., Any],
     inputs: Any,
@@ -141,7 +244,8 @@ def run_once(
     alias them.
     """
     local = clone_inputs(inputs)
-    result = fn(**local) if isinstance(local, dict) else fn(*local)
+    with _perf_range("forward"):
+        result = fn(**local) if isinstance(local, dict) else fn(*local)
     outputs = {k: v for k, v in flatten_tensors(result).items()}
     grads: Dict[str, torch.Tensor] = {}
     if backward:
@@ -151,12 +255,13 @@ def run_once(
         ]
         if leaves and diff_outputs:
             gos = [(grad_outputs or {}).get(name, torch.ones_like(t)) for name, t in diff_outputs]
-            computed = torch.autograd.grad(
-                [t for _, t in diff_outputs],
-                list(leaves.values()),
-                grad_outputs=gos,
-                allow_unused=True,
-            )
+            with _perf_range("Backward"):
+                computed = torch.autograd.grad(
+                    [t for _, t in diff_outputs],
+                    list(leaves.values()),
+                    grad_outputs=gos,
+                    allow_unused=True,
+                )
             for name, g in zip(leaves, computed):
                 if g is not None:
                     grads[name] = g.detach().clone()
@@ -164,6 +269,7 @@ def run_once(
     return {k: v.detach().clone() for k, v in outputs.items()}, grads
 
 
+@_perf_workload_scoped
 def assert_replays_bit_exact(
     fn: Callable[..., Any],
     inputs: Any,
@@ -198,6 +304,7 @@ def assert_replays_bit_exact(
     """
     if replays < 2:
         raise ValueError("replays must be >= 2")
+    replays = effective_replays(replays)
     rng = capture_rng_state() if restore_rng else None
     ref_out, ref_grad = run_once(fn, inputs, grad_outputs, backward)
     if not ref_out:
@@ -291,7 +398,8 @@ def _zero_module_grads(module: torch.nn.Module) -> None:
 
 def _module_fwd_bwd(module, inputs, grad_output, backward):
     local = clone_inputs(inputs)
-    result = module(**local) if isinstance(local, dict) else module(*local)
+    with _perf_range("forward"):
+        result = module(**local) if isinstance(local, dict) else module(*local)
     outputs = flatten_tensors(result)
     grads: Dict[str, torch.Tensor] = {}
     if backward:
@@ -300,7 +408,8 @@ def _module_fwd_bwd(module, inputs, grad_output, backward):
             raise AssertionError("module produced no differentiable output")
         name, tensor = diff[0]
         g = grad_output if grad_output is not None else torch.ones_like(tensor)
-        tensor.backward(g)
+        with _perf_range("Backward"):
+            tensor.backward(g)
         grads = collect_grads([module])
         for n, t in _leaf_inputs(local).items():
             if t.grad is not None:
@@ -309,6 +418,7 @@ def _module_fwd_bwd(module, inputs, grad_output, backward):
     return {k: v.detach().clone() for k, v in outputs.items()}, grads
 
 
+@_perf_workload_scoped
 def assert_module_replays_bit_exact(
     module: torch.nn.Module,
     inputs: Any,
@@ -331,6 +441,7 @@ def assert_module_replays_bit_exact(
     """
     if replays < 2:
         raise ValueError("replays must be >= 2")
+    replays = effective_replays(replays)
     rng = capture_rng_state() if restore_rng else None
     _zero_module_grads(module)
     ref_out, ref_grad = _module_fwd_bwd(module, inputs, grad_output, backward)

@@ -65,6 +65,7 @@ from tests.unit_tests.determinism.kernels.harness import (
     bytes_equal,
     count_differing_replays,
     deterministic_algorithms,
+    effective_replays,
     run_once,
     seeded,
 )
@@ -1685,7 +1686,7 @@ class TestMoEModules:
             what="TE op fuser[BF16 override under MXFP8]",
         )
         assert experts._fused_ops is not None
-        assert contexts == [False] * 3
+        assert contexts == [False] * effective_replays(3)
 
     @pytest.mark.skipif(
         not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,

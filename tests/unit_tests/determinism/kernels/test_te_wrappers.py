@@ -50,6 +50,7 @@ from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     bytes_equal,
+    effective_replays,
     seeded,
 )
 from tests.unit_tests.determinism.kernels.softmax_offset import (
@@ -1180,7 +1181,7 @@ def test_te_fused_rope_replays_fwd_bwd(layout, rotary_interleaved, monkeypatch):
             what=f"TE fused RoPE[{layout}, interleaved={rotary_interleaved}]",
         )
         expected_shape = (s, 1, h, d) if layout == "thd_per_token" else t.shape
-        assert calls == [expected_shape] * 3
+        assert calls == [expected_shape] * effective_replays(3)
         assert outputs["out"].shape == t.shape
         assert gradients["in[0]"].shape == t.shape
     finally:
