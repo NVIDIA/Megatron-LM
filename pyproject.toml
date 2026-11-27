@@ -122,6 +122,8 @@ dev = [
     "flashinfer-python>=0.7.2,<0.8.0",
     "flash-attn-4[cu13]==4.0.0b27",
     "nvidia-cudnn-frontend[cutedsl]==1.33.0",
+    # Optional Liger backends; its Triton dependency only ships Linux wheels.
+    "liger-kernel==0.8.5; sys_platform == 'linux'",
     "wget",
     "onnxscript",
     "fastapi~=0.50",                                    # Forcing a little bit more recent version of fastapi to be compatible with pydantic 2.0
