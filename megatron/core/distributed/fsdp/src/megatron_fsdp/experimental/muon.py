@@ -31,6 +31,18 @@ from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .range import Range, intersect_ranges
 
 
+def _add_scaled_(tensor: torch.Tensor, other: torch.Tensor, scale: float | torch.Tensor) -> None:
+    """Add ``scale * other`` to ``tensor`` in place.
+
+    The learning rate is a Python number, or a 0-d CUDA tensor when the optimizer step is captured
+    in a CUDA graph, so that a replay reads its current value instead of the captured one.
+    """
+    if isinstance(scale, torch.Tensor):
+        tensor.addcmul_(other, scale)
+    else:
+        tensor.add_(other, alpha=scale)
+
+
 @dataclass(frozen=True)
 class _FsdpGroupAssignment:
     """An FSDP group and its cached optimizer-group and owner-rank assignments and rank ranges."""
@@ -365,16 +377,16 @@ class FsdpMuon(Muon):
             weight_decay: float = group["weight_decay"]
             if weight_decay != 0:
                 weight: torch.Tensor = param.to_local()
-                lr: float = group["lr"]
+                lr: float | torch.Tensor = group["lr"]
                 match self.weight_decay_method:
                     case "decoupled":
-                        weight.add_(weight, alpha=-(weight_decay * lr))
+                        _add_scaled_(weight, weight, -(weight_decay * lr))
                     case "independent":
                         weight.add_(weight, alpha=-weight_decay)
                     case "l2":
                         grad.add_(weight, alpha=weight_decay)
                     case "palm":
-                        weight.add_(weight, alpha=-(weight_decay * lr * lr))
+                        _add_scaled_(weight, weight, -(weight_decay * lr * lr))
                     case _:
                         raise ValueError(f"Invalid weight decay method: {self.weight_decay_method}")
             # EO's OrthogonalizedOptimizer.step implements momentum inline, without a helper.
@@ -428,5 +440,5 @@ class FsdpMuon(Muon):
             update = update.reshape(weight.shape).to(weight.dtype)
             # These hooks are inherited from EO's OrthogonalizedOptimizer, via Muon.
             self.pre_weight_update_fn_inplace(weight, update)
-            weight.add_(update, alpha=-self.param_groups[group_index]["lr"])
+            _add_scaled_(weight, update, -self.param_groups[group_index]["lr"])
             self.post_weight_update_fn_inplace(weight)
