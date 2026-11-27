@@ -10,7 +10,12 @@
 # Both are licensed under the Apache License, Version 2.0
 # (http://www.apache.org/licenses/LICENSE-2.0).
 
-"""Faithful standard-residual and native-mHC Engram module."""
+"""Faithful standard-residual and native-mHC Engram module.
+
+The gated fusion of the ``deepseek_v41`` variant (:meth:`Engram._gated_fusion_residual`)
+follows the DeepSeek-V4.1 Engram module of NVIDIA/Megatron-LM#7224 by Deyu Fu and Hongxiao Bai,
+megatron/core/models/deepseek_v41/engram.py at commit 1bb21c69c.
+"""
 
 from __future__ import annotations
 
@@ -37,6 +42,7 @@ from .cp_layout import (
 )
 from .distributed_embedding import EPShardedMultiTableEmbedding
 from .hashing import build_ngram_hashes, slice_hashes_for_sequence_parallel
+from .variants import GATED_FUSION
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +143,11 @@ class EngramGroupRMSNorm(torch.nn.Module):
         if self.zero_centered:
             gamma = 1.0 + gamma
         return (normed * gamma).type_as(hidden)
+
+
+def _at_least_fp32(tensor: Tensor) -> Tensor:
+    """Return ``tensor`` in FP32 when it is half precision, and unchanged otherwise."""
+    return tensor.float() if tensor.dtype in (torch.float16, torch.bfloat16) else tensor
 
 
 def _gather_tokens_across_cp(input_ids: Tensor, cp_group, cu_seqlens: Tensor | None) -> Tensor:
@@ -344,6 +355,17 @@ class Engram(MegatronModule):
             for table in self.embedding.tables:
                 table.weight.requires_grad_(False)
         factory_kwargs = {"device": device, "dtype": config.params_dtype}
+        self._gated_fusion = engram_config.variant_spec.fusion == GATED_FUSION
+        if self._gated_fusion:
+            self._build_gated_fusion(factory_kwargs)
+        else:
+            self._build_gated_conv_fusion(factory_kwargs)
+        self._initialize_dense_parameters()
+        self._log_allocation()
+
+    def _build_gated_conv_fusion(self, factory_kwargs: dict) -> None:
+        """Build the projections, group norms and short convolution of Engram and PLE."""
+        config, engram_config = self.config, self.engram_config
         # Official Qwen PLE layout: one fused key projection over all residual streams, one
         # shared value projection, and one group RMSNorm per role. This is mathematically
         # identical to per-stream projections/norms and maps 1:1 onto the HF weights. The
@@ -381,8 +403,23 @@ class Engram(MegatronModule):
             dilation=dilation,
             **factory_kwargs,
         )
-        self._initialize_dense_parameters()
-        self._log_allocation()
+
+    def _build_gated_fusion(self, factory_kwargs: dict) -> None:
+        """Build the DeepSeek-V4.1 fusion: one projection and two per-channel gate weights.
+
+        ``wkv`` maps the memory to one key per residual stream followed by the shared value,
+        without a bias. ``q_weight`` and ``k_weight`` scale the normalized streams and keys
+        in the gate. The names are those of the DeepSeek-V4.1 module.
+        """
+        stream_width = self.num_streams * self.hidden_size
+        self.wkv = nn.Linear(
+            self.engram_config.total_memory_dim,
+            stream_width + self.hidden_size,
+            bias=False,
+            **factory_kwargs,
+        )
+        self.q_weight = nn.Parameter(torch.ones(stream_width, **factory_kwargs))
+        self.k_weight = nn.Parameter(torch.ones(stream_width, **factory_kwargs))
 
     @property
     def local_sparse_parameter_count(self) -> int:
@@ -395,15 +432,19 @@ class Engram(MegatronModule):
         return self.embedding.global_parameter_count
 
     def _initialize_dense_parameters(self) -> None:
-        if self.config.perform_initialization:
-            self.config.init_method(self.value_projection.weight)
-            self.config.init_method(self.key_projection.weight)
-        with torch.no_grad():
-            if self.value_projection.bias is not None:
-                self.value_projection.bias.zero_()
-            if self.key_projection.bias is not None:
-                self.key_projection.bias.zero_()
-            self.short_conv.weight.zero_()
+        if self._gated_fusion:
+            if self.config.perform_initialization:
+                self.config.init_method(self.wkv.weight)
+        else:
+            if self.config.perform_initialization:
+                self.config.init_method(self.value_projection.weight)
+                self.config.init_method(self.key_projection.weight)
+            with torch.no_grad():
+                if self.value_projection.bias is not None:
+                    self.value_projection.bias.zero_()
+                if self.key_projection.bias is not None:
+                    self.key_projection.bias.zero_()
+                self.short_conv.weight.zero_()
 
         if self.config.sequence_parallel:
             # Under SP every TP rank sees a distinct sequence slice, so all Engram gradients
@@ -555,13 +596,21 @@ class Engram(MegatronModule):
         hidden_states: Tensor,
         input_ids: Tensor,
         packed_seq_params: PackedSeqParams | None = None,
+        add_to_hidden_states: bool = False,
     ) -> Tensor:
         """Return an Engram residual with the same standard or mHC layout as input.
 
-        ``packed_seq_params`` carries the packed (THD) document boundaries. It is only used to
-        stop an n-gram window from reaching back into the previous document of the same row;
-        the causal convolution deliberately still mixes across the boundary, matching both
-        published reference implementations.
+        ``packed_seq_params`` carries the packed (THD) document boundaries, as positions of
+        the row. They stop an n-gram window from reaching back into the previous document of the
+        same row; the causal convolution deliberately still mixes across the boundary, matching
+        both published reference implementations. The ``gated`` fusion also closes its gate on
+        the positions after the last boundary. The ``--sft`` rows have none: their last document
+        ends at the end of the row and holds the padding.
+
+        With ``add_to_hidden_states`` the hidden states are returned with the residual added,
+        which is what the layers ask for. The ``gated`` fusion then adds half-precision hidden
+        states in FP32 and rounds once, as DeepSeek-V4.1 does; the ``gated_conv`` fusion adds in
+        the hidden dtype.
         """
         if hidden_states.ndim != 3:
             raise ValueError(f"Engram hidden_states must be [S,B,H], got {hidden_states.shape}.")
@@ -597,17 +646,17 @@ class Engram(MegatronModule):
                 reset_at_boundary=self.engram_config.variant_spec.resets_windows_at_boundary_token,
                 cu_seqlens=row_cu_seqlens,
             )
-            if cp_size > 1:
-                if row_cu_seqlens is not None:
-                    index = thd_partition_index(row_cu_seqlens, cp_size, get_pg_rank(self.cp_group))
-                    hash_ids = hash_ids.index_select(1, index)
-                else:
-                    hash_ids = select_zigzag(
-                        hash_ids, cp_size, get_pg_rank(self.cp_group), sequence_dim=1
-                    )
-            hash_ids = slice_hashes_for_sequence_parallel(
-                hash_ids, hidden_states.shape[0], self.tp_group
-            )
+            local_sequence_length = hidden_states.shape[0]
+            hash_ids = self._select_local_positions(hash_ids, row_cu_seqlens, local_sequence_length)
+            valid = None
+            if self._gated_fusion and row_cu_seqlens is not None:
+                # Positions after the last document boundary belong to no document.
+                positions = torch.arange(global_input_ids.shape[1], device=row_cu_seqlens.device)
+                valid = self._select_local_positions(
+                    (positions < row_cu_seqlens[-1]).view(1, -1, 1),
+                    row_cu_seqlens,
+                    local_sequence_length,
+                )
         finally:
             nvtx_range_pop(message)
 
@@ -617,6 +666,16 @@ class Engram(MegatronModule):
             memory = self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
         finally:
             nvtx_range_pop(message)
+        if self._gated_fusion:
+            message = "engram.gate-projection"
+            nvtx_range_push(message)
+            try:
+                streams, residual = self._gated_fusion_residual(memory, hidden_states, valid)
+                output = streams + residual if add_to_hidden_states else residual
+                return output.flatten(start_dim=-2).to(hidden_states.dtype)
+            finally:
+                nvtx_range_pop(message)
+
         streams = hidden_states.view(
             hidden_states.shape[0], hidden_states.shape[1], self.num_streams, self.hidden_size
         )
@@ -640,4 +699,46 @@ class Engram(MegatronModule):
             output = value + self._short_convolution(value, row_cu_seqlens)
         finally:
             nvtx_range_pop(message)
-        return output.reshape(hidden_states.shape)
+        output = output.reshape(hidden_states.shape)
+        return hidden_states + output if add_to_hidden_states else output
+
+    def _select_local_positions(
+        self, tensor: Tensor, cu_seqlens: Tensor | None, local_sequence_length: int
+    ) -> Tensor:
+        """Select this rank's positions of a ``[B, S_global, ...]`` tensor.
+
+        The context-parallel step inverts :func:`_gather_tokens_across_cp`; the
+        sequence-parallel slice follows it.
+        """
+        cp_size = get_pg_size(self.cp_group)
+        if cp_size > 1:
+            cp_rank = get_pg_rank(self.cp_group)
+            if cu_seqlens is not None:
+                tensor = tensor.index_select(1, thd_partition_index(cu_seqlens, cp_size, cp_rank))
+            else:
+                tensor = select_zigzag(tensor, cp_size, cp_rank, sequence_dim=1)
+        return slice_hashes_for_sequence_parallel(tensor, local_sequence_length, self.tp_group)
+
+    def _gated_fusion_residual(
+        self, memory: Tensor, hidden_states: Tensor, valid: Tensor | None
+    ) -> tuple[Tensor, Tensor]:
+        """Return the residual streams and the gated value added to each of them.
+
+        ``wkv`` yields one key per residual stream and one shared value. The gate is the
+        sigmoid of the signed square root of the normalized stream-key product. Half-precision
+        inputs are widened first, so both RMS factors, the product, the gate and the returned
+        tensors are FP32. Positions outside ``valid`` (``[1, S, 1]``) keep a closed gate.
+        """
+        num_streams, hidden_size = self.num_streams, self.hidden_size
+        key, value = self.wkv(memory).split([num_streams * hidden_size, hidden_size], dim=-1)
+        key = _at_least_fp32(key).unflatten(-1, (num_streams, hidden_size))
+        streams = _at_least_fp32(hidden_states).unflatten(-1, (num_streams, hidden_size))
+        eps = self.config.layernorm_epsilon
+        scale = (streams.square().mean(-1) + eps).rsqrt() * (key.square().mean(-1) + eps).rsqrt()
+        gamma = _at_least_fp32(self.q_weight) * _at_least_fp32(self.k_weight)
+        score = (streams * gamma.view(num_streams, hidden_size) * key).sum(-1)
+        score = score * scale * hidden_size**-0.5
+        gate = torch.sigmoid(torch.copysign(score.abs().clamp_min(1e-6).sqrt(), score))
+        if valid is not None:
+            gate = gate.masked_fill(~valid.transpose(0, 1).to(gate.device), 0)
+        return streams, gate.unsqueeze(-1) * _at_least_fp32(value).unsqueeze(-2)

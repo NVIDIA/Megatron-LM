@@ -273,7 +273,8 @@ class EngramConfig:
     """Retrieved-memory width per n-gram order, split evenly over its hash heads."""
 
     kernel_size: int
-    """Kernel size of the depthwise causal short convolution, dilated by max_ngram_order."""
+    """Kernel size of the depthwise causal short convolution, dilated by max_ngram_order.
+    Unused by a variant without the convolution."""
 
     hash_seed: int
     """Seed of the hash multipliers: checked against the tokenizer-map artifact by
@@ -446,7 +447,7 @@ class EngramConfig:
                 "engram_memory_dim must be divisible by engram_num_hash_heads; "
                 f"got {self.memory_dim} and {self.num_hash_heads}."
             )
-        if self.kernel_size <= 0:
+        if self.variant_spec.has_short_convolution and self.kernel_size <= 0:
             raise ValueError("engram_kernel_size must be positive.")
         if self.boundary_token_id < 0:
             raise ValueError(f"{self.variant_spec.boundary_token_flag} must be nonnegative.")
@@ -618,7 +619,12 @@ class EngramConfig:
 
     @property
     def conv_history_length(self) -> int:
-        """Positions of causal left context the short convolution needs."""
+        """Positions of causal left context the short convolution needs.
+
+        Zero for a variant without the convolution, whose fusion reads no other position.
+        """
+        if not self.variant_spec.has_short_convolution:
+            return 0
         return (self.kernel_size - 1) * self.max_ngram_order
 
     def _validate_parallelism(
