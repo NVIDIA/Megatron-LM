@@ -277,6 +277,7 @@ class PrefixMatch:
     effective_prefill_chunk_length: int
     backed_off_blocks: int = 0
     speculative_reserve_blocks: int = 0
+    mtp_declined_block_id: Optional[int] = None
 
 
 @dataclass
@@ -997,9 +998,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             ), "Router recording/replay requested but no MoE experts specified!"
             self.moe_routing_metadata = RoutingMetadata(self, model_config.moe_router_topk)
 
+        # MoE layers cannot be built without num_moe_experts, so a model without it is dense
+        # and must not set up dispatcher state: the NVLS buffers need a symmetric-memory
+        # rendezvous over the tp_ep group, which equals the TP group for a dense model.
+        has_moe_layers = model_config.num_moe_experts is not None
+
         # are we using the inference_optimized nccl ep dispatcher for MoEs?
         self._nccl_ep_dispatcher = (
-            get_pg_size(self.expert_model_parallel_group) > 1
+            has_moe_layers
+            and get_pg_size(self.expert_model_parallel_group) > 1
             and model_config.inference_moe_token_dispatcher_type == 'nccl'
         )
 
@@ -1007,7 +1014,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # The NVLS dispatcher gathers over the tp_ep group, so it is also active
         # for EP == 1 with expert tensor parallelism (ETP > 1).
         self._nvls_dispatcher = (
-            get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
+            has_moe_layers
+            and get_pg_size(self.expert_tensor_and_model_parallel_group) > 1
             and model_config.inference_moe_token_dispatcher_type == 'nvls'
         )
 
@@ -3707,8 +3715,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             req, already_allocated_blocks, overall_required_blocks
         )
 
-        matched_block_ids, mtp_backed_off_blocks = self._mtp_trim_prefix_match(
-            req, matched_block_ids, already_allocated_blocks
+        matched_block_ids, mtp_backed_off_blocks, mtp_declined_block_id = (
+            self._mtp_trim_prefix_match(req, matched_block_ids, already_allocated_blocks)
         )
 
         num_matched = len(matched_block_ids)
@@ -3771,6 +3779,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 req._mamba_num_matched_blocks = 0
             prefix_skip_tokens = 0
 
+        # A continuation chunk holding the MTP boundary carry must start at `finished`, where
+        # the carry is consumable, so it inherits its matched blocks without skipping them.
+        if self.enable_mtp_kv_cache and self.mtp_metadata.chunk_boundary_req_id == req.request_id:
+            prefix_skip_tokens = 0
+
         # A one-token chunk is fine: `initialize_attention_state` keeps max_seqlen_q >= 2
         # for any batch containing prefill.
 
@@ -3792,6 +3805,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             effective_prefill_chunk_length=effective_prefill_chunk_length,
             backed_off_blocks=mtp_backed_off_blocks,
             speculative_reserve_blocks=speculative_reserve_blocks,
+            mtp_declined_block_id=mtp_declined_block_id,
         )
 
     def check_availability(
@@ -3951,6 +3965,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if num_matched_blocks > 0:
             matched_tensor = torch.tensor(matched_block_ids, dtype=torch.int32, device='cpu')
             self.kv_block_allocator.pc_state.retain(matched_tensor, self.prefix_cache_lru_clock)
+
+        # Before drawing from the pool, so an evicted declined block is reusable right away.
+        mtp_replaced_declined_block = self._mtp_try_replace_declined_block(match)
 
         new_block_ids = None
         if num_blocks_from_pool > 0:
@@ -4145,7 +4162,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             total_tokens_after = req.finished_chunk_token_count + prefill_chunk_length
             num_complete_blocks = total_tokens_after // self.block_size_tokens
             previously_complete = req.finished_chunk_token_count // self.block_size_tokens
-            if match.backed_off_blocks and req.mtp_private_suffix_start is None:
+            if (
+                match.backed_off_blocks
+                and not mtp_replaced_declined_block
+                and req.mtp_private_suffix_start is None
+            ):
                 req.mtp_private_suffix_start = already_allocated_blocks + num_matched_blocks
 
             def _register_range(start: int, end: int):
