@@ -64,6 +64,13 @@ except (ImportError, ModuleNotFoundError):
     HAVE_TE_MXFP8TENSOR = False
 
 try:
+    from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockwiseQTensor
+
+    HAVE_TE_BLOCKWISE_FP8TENSOR = True
+except (ImportError, ModuleNotFoundError):
+    HAVE_TE_BLOCKWISE_FP8TENSOR = False
+
+try:
     from transformer_engine.pytorch.tensor.grouped_tensor import GroupedTensor
 
     HAVE_TE_GROUPED_TENSOR_CLASS = True
@@ -77,6 +84,8 @@ if HAVE_TE:
         TELayerNormColumnParallelLinear,
         TELinear,
         TERowParallelLinear,
+        check_te_group_quantize_support,
+        te_group_quantize_,
     )
 
     TE_LINEAR_TYPES = (
@@ -135,6 +144,62 @@ def is_float8tensor(tensor: torch.Tensor) -> bool:
 def is_mxfp8tensor(tensor: torch.Tensor) -> bool:
     """Check if a tensor is a Transformer Engine MXFP8Tensor"""
     return HAVE_TE_MXFP8TENSOR and _is_instance_or_param_data(tensor, MXFP8Tensor)
+
+
+def is_blockwise_float8tensor(tensor: torch.Tensor) -> bool:
+    """Check if a tensor is a Transformer Engine Float8BlockwiseQTensor."""
+    return HAVE_TE_BLOCKWISE_FP8TENSOR and _is_instance_or_param_data(
+        tensor, Float8BlockwiseQTensor
+    )
+
+
+def requantize_whole_params_from_high_precision(
+    params: List[torch.Tensor], srcs: List[torch.Tensor]
+) -> None:
+    """Requantize whole values into MXFP8 (including grouped) or blockwise FP8 params.
+
+    Used by compact LayerWise gathers and local master-to-model copies that stage
+    whole BF16 parameters from FP32 masters. Every rank, owner included, requantizes
+    the same values, so all replicas hold identical quantized data.
+    Blockwise FP8 columnwise data is recreated after the copy.
+
+    Raises:
+        TypeError: For storage outside this BF16 publication path's supported recipes
+            (MXFP8 and plain blockwise FP8).
+    """
+    for param in params:
+        if not (
+            is_mxfp8tensor(param)
+            or is_grouped_mxfp8tensor(param)
+            or is_blockwise_float8tensor(param)
+        ):
+            raise TypeError(
+                "Whole-parameter requantization supports MXFP8 and plain blockwise FP8 "
+                f"parameters only, got {type(_unwrap_parameter_data(param)).__name__}."
+            )
+    copy_tensors_to_quantized_params(params, srcs)
+    post_all_gather_processing(params)
+
+
+def get_high_precision_storage_view(tensor: torch.Tensor) -> torch.Tensor:
+    """Return live high-precision storage without detaching a GroupedTensor wrapper.
+
+    Quantized parameters require their recipe's publication path instead of a raw copy.
+    """
+    if is_grouped_tensor(tensor):
+        if is_grouped_tensor_with_quantized_storage(tensor):
+            raise ValueError("Quantized grouped parameters have no high-precision storage view.")
+        storage = _unwrap_parameter_data(tensor).rowwise_data
+        if storage.device != tensor.device:
+            raise RuntimeError(
+                "GroupedTensor backing storage and parameter are on different devices. "
+                "Initialize grouped weights directly on CUDA (use_cpu_initialization=False); "
+                "this Transformer Engine build does not migrate grouped storage with .cuda()."
+            )
+        return storage.view(tensor.shape)
+    if is_float8tensor(tensor):
+        raise ValueError("Quantized parameters have no high-precision storage view.")
+    return tensor.data
 
 
 def is_grouped_tensor(tensor: torch.Tensor) -> bool:
@@ -208,9 +273,98 @@ def get_grouped_tensor_members(
     return members
 
 
+def validate_grouped_mxfp8_weight_shape(shape, *, param_name: str = "weight") -> None:
+    """Reject unsupported grouped MXFP8 shapes before allocating TE storage."""
+    shape = tuple(shape)
+    if (
+        len(shape) != 3
+        or not 1 <= shape[0] <= 64
+        or shape[1] <= 0
+        or shape[2] <= 0
+        or shape[1] % 128
+        or shape[2] % 128
+    ):
+        raise ValueError(
+            f"{param_name}: grouped MXFP8 updates require uniform [E, N, K] weights "
+            f"with 1 <= E <= 64 and positive N and K divisible by 128; got {shape}."
+        )
+
+
+def prepare_grouped_mxfp8_weight_(param: torch.Tensor, *, param_name: str = "weight") -> None:
+    """Validate unswizzled grouped MXFP8 storage and cache its member views.
+
+    Call during model/optimizer initialization, before CUDA graph capture. Both
+    payloads and their scales must already exist. Persistent scales stay unswizzled
+    for direct dequantization; TE prepares temporary swizzled scales at GEMM time.
+    Preparation does not transform data or replace any backing storage.
+    """
+    dst = _unwrap_parameter_data(param)
+    if not is_grouped_mxfp8tensor(dst):
+        raise TypeError(f"{param_name}: expected a grouped MXFP8 weight.")
+    check_te_group_quantize_support()
+    validate_grouped_mxfp8_weight_shape(dst.shape, param_name=param_name)
+    if not dst.all_same_shape():
+        raise ValueError(f"{param_name}: grouped MXFP8 updates require uniform member shapes.")
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            f"{param_name}: prepare grouped MXFP8 storage before CUDA graph capture."
+        )
+    if dst._with_gemm_swizzled_scales:
+        raise ValueError(f"{param_name}: grouped MXFP8 primary weights require unswizzled scales.")
+    fields = ("rowwise_data", "columnwise_data", "scale_inv", "columnwise_scale_inv")
+    expected_sizes = (dst.numel(), dst.numel(), dst.numel() // 32, dst.numel() // 32)
+    for field, expected_size in zip(fields, expected_sizes):
+        value = getattr(dst, field, None)
+        if (
+            value is None
+            or value.dtype != torch.uint8
+            or not value.is_cuda
+            or value.device != dst.device
+            or not value.is_contiguous()
+            or value.numel() != expected_size
+        ):
+            raise RuntimeError(
+                f"{param_name}: grouped MXFP8 {field} must be allocated on the weight's CUDA "
+                f"device with {expected_size} contiguous bytes. Initialize weights on CUDA "
+                "with both rowwise and columnwise storage."
+            )
+    get_grouped_quantized_members(dst, create_if_missing=True)
+    dst._mcore_grouped_mxfp8_weight_prepared = True
+
+
+def update_grouped_mxfp8_weight_(param: torch.Tensor, src_bf16: torch.Tensor) -> None:
+    """Publish whole BF16 values with one TE grouped quantization dispatch.
+
+    The prepared destination owns both rowwise and columnwise storage with
+    unswizzled scales. TE's ``output=`` path writes into these existing buffers,
+    even when forward has changed the shared quantizer to rowwise-only usage.
+    """
+    dst = _unwrap_parameter_data(param)
+    if not getattr(dst, "_mcore_grouped_mxfp8_weight_prepared", False):
+        raise RuntimeError(
+            "Grouped MXFP8 weight is not prepared; call prepare_grouped_mxfp8_weight_ "
+            "during initialization, before parameter publication or CUDA graph capture."
+        )
+    if (
+        src_bf16.dtype != torch.bfloat16
+        or src_bf16.device != dst.device
+        or not src_bf16.is_contiguous()
+        or src_bf16.numel() != dst.numel()
+    ):
+        raise ValueError(
+            "Grouped MXFP8 publication requires a contiguous BF16 source on the weight's "
+            "device containing the complete parameter."
+        )
+    te_group_quantize_(src_bf16.view(-1, dst.shape[-1]), dst)
+
+
 def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> None:
     """Copy high-precision values into TE quantized parameter storage."""
     dst = _unwrap_parameter_data(param)
+
+    if is_grouped_mxfp8tensor(dst):
+        update_grouped_mxfp8_weight_(dst, src)
+        return
 
     if is_grouped_tensor_with_quantized_storage(dst):
         if src.numel() != dst.numel():
@@ -236,7 +390,9 @@ def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> No
             )
 
         for src_member, dst_member in zip(src_members, quantized_members):
-            dst.quantizer.update_quantized(src_member, dst_member)
+            # The member owns its in-place quantizer and allocated layouts. The parent's
+            # quantizer can be reconfigured by forward (e.g. rowwise-only during eval).
+            dst_member.quantize_(src_member)
         return
 
     # Plain TE quantized tensors override copy_ to requantize into their
@@ -247,10 +403,9 @@ def copy_tensor_to_quantized_param(param: torch.Tensor, src: torch.Tensor) -> No
 def copy_tensors_to_quantized_params(params: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
     """List form of :func:`copy_tensor_to_quantized_param`, for a whole bucket of params.
 
-    Same values, minus the per-param ``copy_`` and tensor-subclass dispatch: the quantizer is
-    resolved up front and called directly. Cast kernels are unchanged, one per param. Worth it
-    because those casts are small and issuing them is expensive, and under
-    --reuse-grad-buf-for-mxfp8-param-ag they run inside the forward pass.
+    Plain parameters call their quantizer directly, avoiding ``copy_`` tensor-subclass
+    dispatch. Each grouped MXFP8 parent uses one in-place grouped cast. These updates also
+    run inside the forward pass when all-gather reuses the gradient buffer.
 
     Args:
         params: quantized model params to write into.
@@ -270,8 +425,8 @@ def copy_tensors_to_quantized_params(params: List[torch.Tensor], srcs: List[torc
             else getattr(dst, "_quantizer", None)
         )
         if quantizer is None:
-            # Grouped storage quantizes per member; a missing quantizer has to be built. Both
-            # cases are handled by the single-param path.
+            # Grouped storage uses its dedicated whole-weight dispatch. A missing
+            # plain-tensor quantizer is also handled by the single-param path.
             copy_tensor_to_quantized_param(param, src)
             continue
         srcs_to_cast.append(src.view(dst.shape))

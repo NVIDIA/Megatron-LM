@@ -9,6 +9,7 @@ from typing import Optional
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
+from ..fp8_utils import is_grouped_mxfp8tensor, prepare_grouped_mxfp8_weight_
 from ..optimizer.param_layout import FullParamLayout
 from ..process_groups_config import ProcessGroupCollection
 from ..transformer.cuda_graphs import is_graph_capturing
@@ -129,8 +130,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 )
             if not ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
                 raise ValueError(
-                    "MoonEP with MXFP8 requires reuse_grad_buf_for_mxfp8_param_ag=True "
-                    "(--reuse-grad-buf-for-mxfp8-param-ag)."
+                    "MoonEP with MXFP8 requires reuse_grad_buf_for_mxfp8_param_ag=True, which "
+                    "the training CLI sets for --fp8-recipe mxfp8 with --fp8-param-gather."
                 )
 
     def __init__(
@@ -213,6 +214,8 @@ class DistributedDataParallel(_BaseDataParallel):
         self.params_with_grad = []
         all_params = []
         for name, param in self.module.named_parameters():
+            if is_grouped_mxfp8tensor(param):
+                prepare_grouped_mxfp8_weight_(param, param_name=name)
             if not param.requires_grad:
                 continue
 
@@ -671,7 +674,13 @@ class DistributedDataParallel(_BaseDataParallel):
         of bucket groups (e.g. a chained ``LayerWiseDistributedOptimizer`` +
         ``DistributedOptimizer`` pair) can sync only their own buckets without
         losing the post-processing that follows the collective.
+
+        Bucket groups that do not dispatch parameter sync through DDP are skipped:
+        their parameters are published by the owning optimizer (the compact LayerWise layout
+        without overlap or grad-buffer reuse gathers in ``allgather_params()``).
         """
+        if not bucket_group.param_sync_via_bucket_group:
+            return
         bucket_group.start_param_sync(force_sync=force_sync)
 
         if self.ddp_config.overlap_param_gather:

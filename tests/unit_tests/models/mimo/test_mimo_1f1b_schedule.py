@@ -679,7 +679,6 @@ def get_mimo_model(
             ),
             ddp_config,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-            use_layer_wise_param_layout=True,
         )
     else:
         if mimo_model.language_model is not None:

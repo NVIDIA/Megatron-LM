@@ -60,7 +60,7 @@ def get_grad_norm_fp32(
     grads_for_norm: Union[List[torch.Tensor], torch.Tensor],
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> float:
+) -> Union[float, torch.Tensor]:
     """Calculate the p-norm of gradients in FP32 precision.
 
     This function is adapted from `torch.nn.utils.clip_grad.clip_grad_norm_`
@@ -78,7 +78,7 @@ def get_grad_norm_fp32(
             used for reducing gradient statistics (e.g., norms and zero counts).
 
     Returns:
-        float: The total norm of the parameters, treated as a single vector.
+        The total norm as a Python float or a single-element device tensor.
     """
 
     if isinstance(grads_for_norm, torch.Tensor):
@@ -147,7 +147,7 @@ def get_grad_norm_fp32(
 def clip_grad_by_total_norm_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
     max_norm: Union[int, float],
-    total_norm: float,
+    total_norm: Union[float, torch.Tensor],
     use_decoupled_grad: bool = False,
 ):
     """Clips the gradients of an iterable of parameters in FP32 by total norm.
@@ -159,7 +159,7 @@ def clip_grad_by_total_norm_fp32(
             Tensors or a single Tensor that will have gradients normalized.
         max_norm (Union[int, float]): The maximum permissible total norm
             of the gradients.
-        total_norm (float): The current total norm of the gradients.
+        total_norm: The current gradient norm as a float or a single-element tensor.
         use_decoupled_grad (bool, optional): Whether to read from the
             '.decoupled_grad' attribute instead of the standard '.grad'.
             Defaults to False.
@@ -180,15 +180,27 @@ def clip_grad_by_total_norm_fp32(
                 grads.append(to_local_if_dtensor(param.grad).detach())
 
     # Scale.
-    clip_coeff = max_norm / (total_norm + 1.0e-6)
+    if isinstance(total_norm, torch.Tensor) and total_norm.dtype == torch.float64:
+        # ChainedOptimizer combines its optimizers' norms in float64 on the device. A true
+        # division (``scalar / tensor`` would be a reciprocal followed by a multiply, two
+        # roundings) keeps this coefficient bit-equal to the Python-float path's for any
+        # ``max_norm``. The fp32 tensor path below is unchanged.
+        clip_coeff = torch.full_like(total_norm, max_norm) / (total_norm + 1.0e-6)
+    else:
+        clip_coeff = max_norm / (total_norm + 1.0e-6)
     dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
     if isinstance(clip_coeff, torch.Tensor):
         clip_coeff.clamp_max_(1.0)
         assert (
             multi_tensor_scale_tensor_impl is not None
         ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
+        # The kernel reads a float32 scale. A float64 coefficient is rounded here, once, as a
+        # Python float is when it is passed to the float-scalar kernel below.
         multi_tensor_applier(
-            multi_tensor_scale_tensor_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+            multi_tensor_scale_tensor_impl,
+            dummy_overflow_buf,
+            [grads, grads],
+            clip_coeff.to(torch.float32),
         )
     elif clip_coeff < 1.0:
         multi_tensor_applier(

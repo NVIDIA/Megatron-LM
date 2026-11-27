@@ -102,7 +102,7 @@ def _gdp_moe_test_args(overlap, *, num_weight_shards):
         clip_grad=0.0,
         global_batch_size=4,
         tensor_parallel_num_weight_shards=num_weight_shards,
-        use_layer_wise_param_layout=True,
+        layer_wise_param_layout="padded",
         untie_embeddings_and_output_weights=True,
         hidden_dropout=0.0,
         attention_dropout=0.0,
@@ -137,7 +137,7 @@ class _GDPAdamWMuonHarness(_FP8ParamHarness):
         return matches[0]
 
     def _on_model_built(self, model_chunks, optimizer, args):
-        assert args.use_layer_wise_param_layout
+        assert args.layer_wise_param_layout == "padded"
         assert args.expert_gtp_weight_remat_size == 1
         gtp_enabled = args.gtp_weight_remat_size > 1
         native_mxfp8 = args.fp8_param_gather
@@ -503,11 +503,11 @@ class TestGTPFp8ParamGather:
     @pytest.mark.flaky_in_dev
     @pytest.mark.parametrize("overlap", [False, True])
     def test_muon_layout_and_mxfp8_param_gather_parity(self, overlap):
-        """Padded LayerWise MXFP8 sync must match the legacy LayerWise path.
+        """Padded LayerWise MXFP8 sync must match the compact LayerWise path.
 
         Both runs are configured with Muon, GTP2 x DP2, MXFP8 primary weights,
-        FP8 parameter gather, and grad-buffer reuse. The legacy LayerWise gather
-        is the oracle; the padded-layout run exercises the reused DDP grad buffer
+        FP8 parameter gather, and grad-buffer reuse. The compact layout's whole-param
+        gather is the oracle; the padded-layout run exercises the reused DDP grad buffer
         and is the regression target. Overlap selects synchronous step-time gather
         or asynchronous dispatch from the next forward pre-hook.
         """
@@ -542,22 +542,22 @@ class TestGTPFp8ParamGather:
                 overlap_grad_reduce=overlap,
             )
 
-            loss_legacy = harness._run_test_helper(
+            loss_compact = harness._run_test_helper(
                 tp_size=1,
                 recipe="mxfp8",
                 fp8_param_gather=True,
-                use_layer_wise_param_layout=False,
+                layer_wise_param_layout="compact",
                 **common,
             )
             loss_padded = harness._run_test_helper(
                 tp_size=1,
                 recipe="mxfp8",
                 fp8_param_gather=True,
-                use_layer_wise_param_layout=True,
+                layer_wise_param_layout="padded",
                 **common,
             )
 
-            max_diff = torch.tensor(float((loss_legacy - loss_padded).abs().max()), device="cuda")
+            max_diff = torch.tensor(float((loss_compact - loss_padded).abs().max()), device="cuda")
             # Compare the worst local GTP/DP trajectory, rather than rank 0 alone.
             # Map local non-finite values before MAX so NCCL cannot hide a NaN from one rank.
             max_diff.nan_to_num_(nan=float('inf'), posinf=float('inf'), neginf=float('inf'))
@@ -565,7 +565,7 @@ class TestGTPFp8ParamGather:
             diff = max_diff.item()
             tolerance = 2e-3
             assert math.isfinite(diff) and diff < tolerance, (
-                f"Padded LayerWise MXFP8 loss diverges from the legacy path "
+                f"Padded LayerWise MXFP8 loss diverges from the compact path "
                 f"(overlap={overlap}, max per-step |diff|={diff:.6f}, tolerance={tolerance})."
             )
         finally:
@@ -634,7 +634,7 @@ class TestGTPFp8ParamGather:
                 lr=1e-3,
                 clip_grad=0.0,
                 tensor_parallel_num_weight_shards=1,
-                use_layer_wise_param_layout=True,
+                layer_wise_param_layout="padded",
                 untie_embeddings_and_output_weights=True,
                 hidden_dropout=0.0,
                 attention_dropout=0.0,
