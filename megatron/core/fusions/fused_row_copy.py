@@ -6,6 +6,9 @@ of the last dimension.
 ``Tensor.contiguous`` copies such a view with PyTorch's generic strided copy kernel, which does
 not vectorize its accesses. This kernel copies 2D tiles instead. The values are copied unchanged
 and the gradient is passed through, as for ``Tensor.contiguous``.
+
+``cat_last_dim`` concatenates two tensors along the last dimension and copies the two halves of
+its gradient with this kernel, instead of handing the inputs' backward strided views of it.
 """
 
 from typing import Optional, Tuple
@@ -92,3 +95,41 @@ def contiguous_rows(x: torch.Tensor) -> torch.Tensor:
     if not HAVE_TRITON or not x.is_cuda or layout is None:
         return x.contiguous()
     return _RowContiguous.apply(x, *layout)
+
+
+class _CatLastDim(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, a, b):
+        """``torch.cat((a, b), -1)``."""
+        ctx.split = a.size(-1)
+        return torch.cat((a, b), -1)
+
+    @staticmethod
+    def backward(ctx, grad):
+        """The two halves of ``grad``, each copied to contiguous memory with ``contiguous_rows``."""
+        grad_a = contiguous_rows(grad[..., : ctx.split]) if ctx.needs_input_grad[0] else None
+        grad_b = contiguous_rows(grad[..., ctx.split :]) if ctx.needs_input_grad[1] else None
+        return grad_a, grad_b
+
+
+def cat_last_dim(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Return ``torch.cat((a, b), -1)`` whose backward gives contiguous input gradients.
+
+    The backward of ``torch.cat`` returns column slices of the output gradient. Consumers that
+    need contiguous gradients, such as Transformer Engine's normalization backward, then copy
+    each slice with PyTorch's strided copy kernel. Here the backward copies them with the
+    vectorized ``contiguous_rows`` instead. Forward values and gradients are the same as with
+    ``torch.cat``.
+
+    Args:
+        a (torch.Tensor): First input.
+        b (torch.Tensor): Second input, with the same shape as ``a`` except in the last dimension.
+
+    Returns:
+        torch.Tensor: The concatenation of ``a`` and ``b`` along the last dimension.
+    """
+    if not (HAVE_TRITON and a.is_cuda and torch.is_grad_enabled()):
+        return torch.cat((a, b), -1)
+    if not (a.requires_grad or b.requires_grad):
+        return torch.cat((a, b), -1)
+    return _CatLastDim.apply(a, b)

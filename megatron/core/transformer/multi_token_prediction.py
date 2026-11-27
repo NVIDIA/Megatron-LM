@@ -24,6 +24,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fusions.fused_row_copy import cat_last_dim
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.ops.mtp_kl_loss import vocab_parallel_kl_div, vocab_parallel_log_normalizer
@@ -2011,7 +2012,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
-            hidden_states = torch.cat((decoder_input, hidden_states), -1)
+            hidden_states = cat_last_dim(decoder_input, hidden_states)
             hidden_states, _ = self.eh_proj(hidden_states)
             if InferenceMode.is_active():
                 hidden_states = inference_all_gather_from_tensor_model_parallel_region(
