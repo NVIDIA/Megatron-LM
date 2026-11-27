@@ -1044,6 +1044,94 @@ def test_bulk_offload_group_relies_on_record_stream_for_allocator_storage():
     assert torch.equal(chunk.reload(group._tensors[(1, 0)]), source)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+@pytest.mark.parametrize("opt_out", [None, "_do_not_offload", "_TE_do_not_offload"])
+def test_bulk_offload_detaches_small_shared_storage_views(opt_out):
+    """Retained metadata must not pin an offloaded allocation; explicit opt-outs stay intact."""
+    allocated_before = torch.cuda.memory_allocated()
+    data_elements = 1 << 19
+    base = torch.empty(data_elements * 4 + 32, dtype=torch.uint8, device="cuda")
+    data = torch.empty(0, dtype=torch.float32, device="cuda").set_(
+        base.untyped_storage(), 0, (data_elements,)
+    )
+    metadata = torch.empty(0, dtype=torch.int64, device="cuda").set_(
+        base.untyped_storage(), data_elements // 2, (4,)
+    )
+    data.fill_(3)
+    metadata.copy_(torch.arange(4, device="cuda"))
+    if opt_out is not None:
+        setattr(metadata, opt_out, True)
+    original_storage = metadata.untyped_storage().data_ptr()
+    group = OffloadTensorGroup("fused_group_mlp")
+    group.push_tensor((1, 0), data)
+    group.push_tensor((1, 1), metadata)
+    chunk = _make_warmup_chunk([group])
+    chunk.min_offloaded_tensor_size = 1024
+    chunk.d2h_stream.wait_stream(torch.cuda.current_stream())
+    chunk.bulk_offload_group(group)
+    del base, data, metadata
+    torch.cuda.synchronize()
+    retained = group._tensors[(1, 1)]
+    assert torch.equal(retained.cpu(), torch.arange(4))
+    if opt_out is None:
+        assert retained.untyped_storage().data_ptr() != original_storage
+        assert retained.untyped_storage().nbytes() == 32
+        assert group._unrecorded_sources == []
+        assert torch.cuda.memory_allocated() < allocated_before + data_elements * 2
+    else:
+        assert retained.untyped_storage().data_ptr() == original_storage
+        assert getattr(retained, opt_out)
+    assert chunk.reload(group._tensors[(1, 0)]).eq(3).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_bulk_offload_keeps_small_views_without_offloaded_siblings():
+    """Small shared views require no clone when their allocation stays resident."""
+    base = torch.arange(16, device="cuda")
+    metadata = base[4:8]
+    group = OffloadTensorGroup("fused_group_mlp")
+    group.push_tensor((1, 0), metadata)
+    chunk = _make_warmup_chunk([group])
+    chunk.min_offloaded_tensor_size = 1024
+    chunk.bulk_offload_group(group)
+    assert group._tensors[(1, 0)] is metadata
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+@pytest.mark.skipif(
+    not (hasattr(torch.cuda, "_sleep") and hasattr(torch.cuda, "use_mem_pool")),
+    reason="requires CUDA stream delay and private memory pools",
+)
+def test_retained_metadata_survives_asynchronous_backward_consumption():
+    """The D2H stream must not reuse a clone while backward still reads it."""
+    group = OffloadTensorGroup("fused_group_mlp")
+    chunk = _make_warmup_chunk([group])
+    chunk.min_offloaded_tensor_size = 1024
+    result = torch.empty(4, dtype=torch.int64, device="cuda")
+    # Warm kernels before delaying the consumer stream.
+    result.fill_(0)
+    torch.cuda.synchronize()
+    pool = torch.cuda.MemPool()
+    with torch.cuda.use_mem_pool(pool):
+        base = torch.ones(1 << 18, dtype=torch.int64, device="cuda")
+        metadata = base[-4:]
+        metadata.copy_(torch.arange(4, device="cuda"))
+        group.push_tensor((1, 0), base[:-4])
+        group.push_tensor((1, 1), metadata)
+        chunk.bulk_offload_group(group)
+        del base, metadata
+        torch.cuda.synchronize()
+        metadata = group.pop_tensor((1, 1))
+        torch.cuda._sleep(200_000_000)
+        result.copy_(metadata)
+        del metadata
+        with torch.cuda.stream(chunk.d2h_stream):
+            overwrite = torch.full((4,), -1, dtype=torch.int64, device="cuda")
+        torch.cuda.synchronize()
+        assert torch.equal(result.cpu(), torch.arange(4))
+        assert overwrite.eq(-1).all()
+
+
 def _build_gpt_model(
     *,
     seed: int,
