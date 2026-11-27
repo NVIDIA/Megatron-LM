@@ -88,6 +88,9 @@ navigation:
           - page: "Design Document: MoE Router Replay Feature"
             path: ./api-guide/router_replay.md
             slug: router-replay
+      - page: "Engram n-gram memory"
+        path: ./user-guide/features/engram.md
+        slug: engram
       - page: "Megatron FSDP"
         path: ./user-guide/features/megatron_fsdp.md
         slug: megatron-fsdp

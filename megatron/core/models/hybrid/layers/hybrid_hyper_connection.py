@@ -51,6 +51,10 @@ class HyperConnectionHybridLayer(MegatronModule):
             return mixer.mamba_state_shapes_per_request()
         return None
 
+    def _inner_layer_owns_engram(self) -> bool:
+        """True when the wrapped layer carries an Engram memory, which this wrapper applies."""
+        return getattr(getattr(self, "inner_layer", None), "engram", None) is not None
+
     def _call_inner_layer(
         self,
         hidden_states: Tensor,
@@ -84,6 +88,10 @@ class HyperConnectionHybridLayer(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
                 input_ids=input_ids,
+                # forward() already added the Engram memory to the n-stream tensor, before the
+                # read gate; the inner layer must not add it a second time. Only passed to
+                # layers that own one, so the others keep their CUDA-graph kwarg set.
+                **({"skip_engram": True} if self._inner_layer_owns_engram() else {}),
             )
         else:
             # Mamba-like layers only consume the common HybridStack arguments.
@@ -187,6 +195,15 @@ class HyperConnectionHybridLayer(MegatronModule):
         input_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update."""
+        if self._inner_layer_owns_engram():
+            # The memory belongs to the residual streams, not to the wrapped layer's branch
+            # delta, so it is added to the n-stream tensor before the read gate. Both inner
+            # paths below bypass TransformerLayer's own injection: the fast path calls the
+            # sublayer helpers directly, and the fallback path passes skip_engram=True.
+            hidden_states = self.inner_layer._maybe_apply_engram(
+                hidden_states, input_ids, packed_seq_params
+            )
+
         aggregated, h_res, h_post, residual = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
         )

@@ -711,12 +711,16 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
             "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
+            "tests/unit_tests/test_layer_wise_expert_distopt.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
         "logging) launch the same multi_tensor kernels through multi_tensor_applier. "
-        "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies.",
+        "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies. "
+        "test_layer_wise_expert_distopt steps an expert-parallel Adam table through the "
+        "distributed optimizer it gets beside the layer-wise one and checks that the table's "
+        "expert-DP replicas hold identical values afterwards.",
     ),
     KernelEntry(
         name="tensor_metric_l2",
@@ -1161,6 +1165,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Tensor-based packed layout, index sanitation and compiled KL. "
         "FlashMLA/cuDNN attention backward remains unqualified for bit-exact replay; "
         "numerical CP parity is covered by test_dsv4_packed_cp.py.",
+    ),
+    KernelEntry(
+        name="engram_embedding",
+        sources=("megatron/core/models/engram/distributed_embedding.py",),
+        tests=(
+            "tests/unit_tests/models/engram/test_engram_numerics.py",
+            "tests/unit_tests/models/engram/test_ownership_and_optimizer.py",
+            "tests/unit_tests/models/engram/test_distributed_lookup.py",
+        ),
+        kind="torch-op",
+        notes="EP-sharded Engram tables: F.embedding lookup, or under deterministic_mode a "
+        "sorted segment_reduce backward that writes each touched row once; torch.bincount counts "
+        "the integer per-(peer, table) requests of the multi-rank all-to-all. "
+        "test_engram_numerics checks the single-rank lookup in both modes against an independent "
+        "FP64 F.embedding reference on CPU, and replays the deterministic backward bit-exactly on "
+        "GPU under stream contention. test_ownership_and_optimizer checks the deterministic "
+        "backward's sum over repeated rows exactly on CPU, and test_distributed_lookup checks the "
+        "EP2 and EP4 all-to-all lookup, its owner-side gradients and an Adam step against a "
+        "full-table FP64 reference on GPU; the multi-rank routing has no bit-exact replay yet.",
     ),
     KernelEntry(
         name="dsa_dispatch",

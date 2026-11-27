@@ -127,6 +127,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "enable_autocast": False,
     "enable_cuda_graph": False,
     "enable_mhc_connections": False,
+    "engram_enabled": False,
     "ep_overlap_early_attn_memory_release": False,
     "experimental_attention_variant": None,
     "experimental_attention_variant_loss_scale_func": None,
