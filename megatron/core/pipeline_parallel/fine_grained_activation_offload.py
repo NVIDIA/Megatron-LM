@@ -1292,29 +1292,6 @@ class ChunkOffloadHandler:
         debug_rank("------bulk_offload_group")
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
-        # Small saved views must not pin a bulk allocation whose larger views are
-        # being offloaded. Keep them on GPU, but give them independent storage.
-        offloaded_storages = {
-            tensor.untyped_storage()._cdata
-            for tensor in group_to_offload._tensors.values()
-            if self.tensor_need_offloading_checker(tensor)
-        }
-        # Allocate retained clones on the compute stream that will consume them.
-        # A clone allocated on D2H could otherwise be reused there during backward.
-        metadata_cloned = False
-        for tag, tensor in group_to_offload._tensors.items():
-            if (
-                self._can_manage_tensor_for_offload(tensor)
-                and 0 < tensor.numel() < self.min_offloaded_tensor_size
-                and not _te_do_not_offload(tensor)
-                and not getattr(tensor, "_do_not_offload", False)
-                and not is_checkpoint_without_output_tensor(tensor)
-                and tensor.untyped_storage()._cdata in offloaded_storages
-            ):
-                group_to_offload.push_tensor(tag, tensor.clone())
-                metadata_cloned = True
-        if metadata_cloned:
-            self.d2h_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.d2h_stream):
             if self.is_warmup:
                 self._collect_offload_info(group_to_offload)
