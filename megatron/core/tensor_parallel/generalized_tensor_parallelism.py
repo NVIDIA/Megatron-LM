@@ -92,7 +92,6 @@ try:
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
     from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
     from transformer_engine.pytorch.tensor import MXFP8TensorStorage, NVFP4TensorStorage
-    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
     from transformer_engine.pytorch.utils import (
         nvtx_range_pop,
         nvtx_range_push,
@@ -115,7 +114,6 @@ except (ImportError, ModuleNotFoundError):
     get_dummy_wgrad = MagicMock()
     QuantizedTensor = MagicMock()
     MXFP8TensorStorage = NVFP4TensorStorage = MagicMock()
-    MXFP8Quantizer = MagicMock()
     nvtx_range_pop = nvtx_range_push = round_up_to_nearest_multiple = MagicMock()
     HAVE_TE = False
 
@@ -529,6 +527,32 @@ def _wgrad_pool_put(buf: torch.Tensor, ready_event=None):
     _wgrad_buf_pool[key].append(buf)
 
 
+_COALESCED_PER_OP_COMPLETION: Dict[int, bool] = {}
+
+
+def _coalesced_per_op_handles_complete(group) -> bool:
+    """Which handle of a device-coalesced region is the completion of its collectives.
+
+    Both backends return a grouped work from the coalescing manager and a handle per collective
+    issued inside the region, but only one of the two orders the waiting stream after the
+    collectives, and it is not the same one:
+
+    * ``ProcessGroupNCCL`` records the completion event on the grouped work. The per-op
+      handles carry an event that is never recorded; waiting one orders nothing and, depending
+      on the CUDA driver, fails with "Event is not valid".
+    * ``ProcessGroupNCCL2`` records it per collective. Waiting the grouped work returns while
+      the collectives are still running.
+
+    A consumer that reads a coalesced collective's output on its own stream must wait the
+    handle that this returns ``True`` or ``False`` for, or it reads unwritten memory.
+    """
+    key = id(group)
+    if key not in _COALESCED_PER_OP_COMPLETION:
+        backend = group._get_backend(torch.device("cuda", torch.cuda.current_device()))
+        _COALESCED_PER_OP_COMPLETION[key] = type(backend).__name__ == "ProcessGroupNCCL2"
+    return _COALESCED_PER_OP_COMPLETION[key]
+
+
 class _GTPCompositeWorkHandle:
     """Waits on several collective handles as one, so GTPShardHandle still sees one handle."""
 
@@ -940,12 +964,14 @@ def _gtp_reclass_native_fp8_shard(param):
     param._quantizer = native_quantizer
     # Gather uses a SEPARATE quantizer copy for its per-direction set_usage; reusing the param's own
     # would leave rowwise=False after a bwd gather, freezing the rowwise data the forward reads. The
-    # copy also keeps MXFP8 scales compact for byte-concat scale all-gather.
+    # copy also keeps the scales compact (never GEMM-swizzled) for every format: the scale
+    # all-gather byte-concatenates the shards' compact scales, so a gather output marked as
+    # GEMM-swizzled would be misread by the GEMM (NaN with NVFP4 on TE >= #3817).
     gather_q = None
     if native_quantizer is not None:
         gather_q = native_quantizer.copy()
         gather_q.internal = False
-        gather_q.optimize_for_gemm = not isinstance(gather_q, MXFP8Quantizer)
+        gather_q.optimize_for_gemm = False
     param._gtp_gather_quantizer = gather_q
     param.quantized = param
     return param
@@ -2517,9 +2543,8 @@ class GTPShardedParam(torch.nn.Parameter):
                 if len(wgrads) > 1:
                     # Batched: group the all-to-alls into one ncclGroupStart/End, exactly like
                     # the plain batched RS below. Unlike that path we cannot hand the manager
-                    # back as the handle: the manager waits only on the underlying NCCL collective
-                    # to complete, and each fp32-accum handle still owes a local FP32 sum. So the
-                    # sums are deferred behind the manager's work in one composite handle.
+                    # back as the handle: each fp32-accum handle still owes a local FP32 sum, so
+                    # the sums are deferred behind the collectives in one composite handle.
                     with torch.distributed._coalescing_manager(
                         group=self.group, device=wgrads[0].device, async_ops=True
                     ) as cm:
@@ -2527,10 +2552,14 @@ class GTPShardedParam(torch.nn.Parameter):
                             out, h = self._reduce_scatter_fp32_accum(tensor, out_buffer)
                             outputs.append(out)
                             sum_handles.append(h)
-                    # The grouped work from _end_coalescing is the real completion; the per-op
-                    # handles returned inside the region are not, so drop them and let cm wait.
-                    for h in sum_handles:
-                        h.all_to_all_handle = None
+                    # Every FP32 sum must be ordered after its all-to-all, or it reads unwritten
+                    # scratch (NaN under full-iteration CUDA graphs, stale gradients in eager
+                    # mode). Which handle gives that ordering depends on the backend: keep the
+                    # per-op handles only where they are the completion, and drop them where the
+                    # manager's grouped work is and they must not be waited.
+                    if not _coalesced_per_op_handles_complete(self.group):
+                        for h in sum_handles:
+                            h.all_to_all_handle = None
                     handle = _GTPCompositeWorkHandle([cm, *sum_handles])
                 else:
                     out, handle = self._reduce_scatter_fp32_accum(wgrads[0], out_buffers[0])
@@ -2995,16 +3024,19 @@ class GTPWeightCache:
     def release(self, ticket: int):
         """Release a reusable buffer to the pool while keeping its ticket valid.
 
-        Captured reduce-scatter tickets keep exclusive ownership. ``slot.buf`` is never cleared,
-        so every CUDA-graph ticket retains a stable address across replays. Other tickets keep
-        ``slot.buf`` too, except eager reduce-scatter outputs (see below).
+        Reduce-scatter tickets captured in per-layer graphs keep exclusive ownership. ``slot.buf``
+        is never cleared, so every such ticket retains a stable address across replays. Other
+        tickets keep ``slot.buf`` too, except reduce-scatter outputs that are pooled: eager ones
+        and those of a full-iteration graph (see below).
         """
         slot = self._slots[ticket]
         if slot.buf is None:
             return
         # Independently replayed graphs may overlap, so a captured RS output must not be recycled
-        # into another fixed-address ticket.
-        if _chain_is_graphed(slot.chain_id) and slot.reduce_scatter:
+        # into another fixed-address ticket. A full-iteration graph is a single graph with a
+        # fixed order, so its RS outputs are pooled as eager ones are; keeping one buffer per
+        # weight there costs memory that grows with the number of layers.
+        if _chain_is_graphed(slot.chain_id) and slot.reduce_scatter and not _FULL_ITERATION:
             return
         # Use identity check — tensor == tensor returns a multi-element bool tensor
         # which crashes in a boolean context ("Boolean value of Tensor is ambiguous").
