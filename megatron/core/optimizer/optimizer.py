@@ -1120,7 +1120,11 @@ def _strip_module_prefix(name: str) -> str:
 
 
 def _backfill_gtp_sharded_param_map(
-    id_to_sharded_param_map: dict, float16_groups, model_sharded_state_dict=None
+    id_to_sharded_param_map: dict,
+    model_param_groups,
+    model_sharded_state_dict=None,
+    *,
+    pg_collection=None,
 ) -> None:
     """Backfill the optimizer id->ShardedTensor map with GTP_remat shards it is missing (in place).
 
@@ -1153,10 +1157,12 @@ def _backfill_gtp_sharded_param_map(
     except ImportError:
         return  # GTP not built in -- nothing to backfill.
 
+    # Groups must follow the complete optimizer order, including native FP32 and frozen
+    # parameters. Filtering to BF16 first would shift the serialized optimizer IDs.
     # is_gtp_param matches both the legacy BF16 slice params and native-FP8 GTP params.
     unmatched = [
         (param_id, p)
-        for param_id, p in enumerate(chain.from_iterable(float16_groups))
+        for param_id, p in enumerate(chain.from_iterable(model_param_groups))
         if param_id not in id_to_sharded_param_map and is_gtp_param(p)
     ]
     if not unmatched:
@@ -1208,11 +1214,19 @@ def _backfill_gtp_sharded_param_map(
                 "write duplicate shards across expert-parallel groups)."
             )
         if tp_group is None:
-            tp_group = parallel_state.get_tensor_model_parallel_group()
-            # Required kwarg, unused for GTP-sharded params (offset/replica from the gtp axis).
-            dp_cp_gtp_remat_group = parallel_state.get_data_parallel_group(
-                with_context_parallel=True
-            )
+            if pg_collection is not None:
+                tp_group = pg_collection.tp
+                dp_cp_gtp_remat_group = pg_collection.dp_cp
+                assert (
+                    tp_group is not None and dp_cp_gtp_remat_group is not None
+                ), "GTP optimizer checkpoint requires explicit TP and DP+CP groups"
+            else:
+                # Compatibility fallback for callers without an explicit process-group collection.
+                tp_group = parallel_state.get_tensor_model_parallel_group()
+                # Required kwarg; GTP shard offsets and replica IDs come from the param.
+                dp_cp_gtp_remat_group = parallel_state.get_data_parallel_group(
+                    with_context_parallel=True
+                )
         # Key by the param's dotted name (set in prod by tag_gtp_params_with_names); the fallback
         # keeps the function usable in tests where the name was not tagged.
         key = p._debug_name or f'_gtp_optim_param_{param_id}'
@@ -1246,9 +1260,12 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         config: OptimizerConfig,
         grad_scaler: MegatronGradScaler,
         init_state_fn: Callable,
+        *,
+        pg_collection=None,
     ):
 
         super().__init__(optimizer, config, grad_scaler, init_state_fn)
+        self.pg_collection = pg_collection
 
         # Handle main parameters.
 
@@ -1453,7 +1470,10 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         )
 
         _backfill_gtp_sharded_param_map(
-            id_to_sharded_param_map, self.float16_groups, model_sharded_state_dict
+            id_to_sharded_param_map,
+            [list(model_params_in_optimizer_order())],
+            model_sharded_state_dict,
+            pg_collection=self.pg_collection,
         )
 
         # Convert fp32_from_fp16_params
