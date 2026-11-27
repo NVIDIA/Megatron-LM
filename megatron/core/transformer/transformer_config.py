@@ -858,6 +858,19 @@ class TransformerConfig(ModelParallelConfig):
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
 
+    rmsnorm_impl: Literal["te", "liger"] = "te"
+    """Norm backend of the HybridModel stack spec. HybridModel only; GPTModel rejects it.
+
+    The Hybrid builders and HybridModel's default spec apply it with `with_norm_backend`, so
+    "liger" builds every norm slot of the spec (layer, QK, MoE pre-MLP, MTP and final norms) with
+    Liger-Kernel; a spec passed to HybridModel directly chooses its own norms. Norms fused into a
+    Transformer Engine linear, Mamba's gated norm and norms built outside the spec (MoE's latent
+    fc2 norm, shortcut-MoE norms) stay Transformer Engine. It is not a speedup: Liger is usually
+    slower than Transformer Engine's norms.
+    Requires `normalization="RMSNorm"` and `transformer_impl="transformer_engine"`; see
+    `__post_init__` for the other restrictions.
+    """
+
     use_kitchen_attention: bool = False
     """Use the kitchen extension for attention (instead of TE's attention)."""
 
@@ -1378,6 +1391,12 @@ class TransformerConfig(ModelParallelConfig):
     """Number of warmup steps for CUDA graphs. Note: GTP (``gtp_weight_remat_size > 1``) forces a
     minimum of 2 per-graph warmup steps regardless of this value, because the first warmup builds
     the weight-prefetch chain and the second exercises the prefetch path before capture."""
+
+    cuda_graph_pair_hybrid_layers: bool = False
+    """With cuda_graph_impl="transformer_engine", capture each Hybrid mixer layer and the MoE or
+    MLP layer that follows it as one CUDA graph instead of two, and also graph the layers of
+    Hybrid MTP blocks. Layers that cannot be paired keep their own graphs, and unsupported
+    configurations fall back with a warning; see docs/user-guide/features/cuda_graph.md."""
 
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.
@@ -1962,6 +1981,23 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.rmsnorm_impl not in ("te", "liger"):
+            raise ValueError(f"rmsnorm_impl must be 'te' or 'liger', not {self.rmsnorm_impl!r}.")
+        for unsupported, requirement in (
+            (self.normalization != "RMSNorm", "normalization='RMSNorm'"),
+            (
+                self.transformer_impl != "transformer_engine",
+                "transformer_impl='transformer_engine'",
+            ),
+            (
+                self.fused_residual_rmsnorm,
+                "fused_residual_rmsnorm=False (Liger has no residual fusion)",
+            ),
+            (self.use_kitchen, "use_kitchen=False"),
+            (self.experimental_attention_variant is not None, "no experimental_attention_variant"),
+        ):
+            if self.rmsnorm_impl == "liger" and unsupported:
+                raise ValueError(f"rmsnorm_impl='liger' requires {requirement}.")
         self._validate_cp_layouts()
 
         for name in ("mtp_ce_loss_weight", "mtp_kl_loss_weight"):

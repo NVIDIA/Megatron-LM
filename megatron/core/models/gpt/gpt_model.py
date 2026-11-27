@@ -181,6 +181,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 "GPTModel MTP requires its residual layout to match attention_cp_layout; "
                 "use HybridModel for MTP across different CP layouts"
             )
+        if config.rmsnorm_impl != "te":
+            raise ValueError("rmsnorm_impl='liger' is supported only by HybridModel.")
         if config.context_parallel_size > 1 and config.attention_cp_layout == "contiguous":
             raise ValueError("GPTModel does not support contiguous attention CP.")
         super().__init__(config=config, pg_collection=pg_collection)
