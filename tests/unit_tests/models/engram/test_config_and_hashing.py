@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -165,13 +166,14 @@ def test_packed_sequence_detection_matches_the_dataset_packing_rule():
 
 
 def test_inter_document_masking_follows_the_pretrain_hybrid_cp_split():
-    # Under CP, pretrain_hybrid splits these rows with a padded per-sequence zigzag, which the
-    # per-document partition Engram applies to packed rows does not reproduce.
+    # Under CP, pretrain_hybrid gives a zigzag layer these rows in a padded per-sequence zigzag,
+    # which the per-document partition Engram applies to packed zigzag rows does not reproduce.
+    # A stack whose layers all run contiguous is rejected with the rest.
     with pytest.raises(ValueError, match="inter-document-masking with context parallelism"):
         _validate_packed_sequence_args(
             _packed_args(dataloader_inter_document_masking=True, context_parallel_size=2)
         )
-    # With --sft the rows are split per document, so the same layout is accepted under CP.
+    # With --sft a zigzag layer gets the rows split per document, so they are accepted under CP.
     assert _validate_packed_sequence_args(
         _packed_args(dataloader_inter_document_masking=True, sft=True, context_parallel_size=2)
     )
@@ -278,23 +280,194 @@ def test_unsupported_transformer_features_are_rejected(tmp_path, overrides, mess
 
 
 @pytest.mark.parametrize(
-    "layout_field", ["attention_cp_layout", "linear_cp_layout", "cp_partition_mode"]
+    "contiguous",
+    [
+        dict(attention_cp_layout="contiguous"),
+        dict(linear_cp_layout="contiguous"),
+        # cp_partition_mode sets the layout of a stack without an explicit linear_cp_layout.
+        dict(_linear_cp_layout_explicit=False, cp_partition_mode="contiguous"),
+    ],
 )
-def test_context_parallelism_requires_the_zigzag_layout(tmp_path, layout_field):
+def test_context_parallelism_accepts_the_contiguous_layout(tmp_path, contiguous):
     config = _startup_engram_config(tmp_path)
-    contiguous = {layout_field: "contiguous"}
-    with pytest.raises(ValueError, match=f"{layout_field}='contiguous'"):
-        config.validate_startup(
-            _startup_transformer_config(context_parallel_size=2, **contiguous), 16
-        )
-    with pytest.raises(ValueError, match=f"{layout_field}='contiguous'"):
+    for packed_sequences in (False, True):
         config.validate_startup(
             _startup_transformer_config(context_parallel_size=2, **contiguous),
             16,
-            packed_sequences=True,
+            packed_sequences=packed_sequences,
         )
-    # Without context parallelism every layer sees the whole sequence in order.
     config.validate_startup(_startup_transformer_config(**contiguous), 16)
+
+
+@pytest.mark.parametrize(
+    "layouts",
+    [
+        dict(attention_cp_layout="contiguous", linear_cp_layout="contiguous"),
+        dict(_linear_cp_layout_explicit=False, cp_partition_mode="contiguous"),
+    ],
+)
+@pytest.mark.parametrize("packed_sequences", [False, True])
+def test_contiguous_slices_must_hold_the_convolution_history(tmp_path, layouts, packed_sequences):
+    # kernel_size 4 with max_ngram_order 3 reads 9 positions of left context, which a contiguous
+    # slice takes from the previous rank in one hop, packed or not.
+    config = _startup_engram_config(tmp_path)
+    transformer_config = _startup_transformer_config(context_parallel_size=4, **layouts)
+    with pytest.raises(ValueError, match="each contiguous slice to own at least 9 positions"):
+        config.validate_startup(
+            transformer_config, 16, packed_sequences=packed_sequences, sequence_length=32
+        )
+    config.validate_startup(
+        transformer_config, 16, packed_sequences=packed_sequences, sequence_length=36
+    )
+
+
+def test_a_stack_of_both_layouts_must_fit_the_history_in_each(tmp_path):
+    # linear_cp_layout='contiguous' next to zigzag attention layers: a memory may sit on a layer
+    # of either layout, so an unpacked row must fit the history in a zigzag chunk, which is half
+    # a contiguous slice, and a packed row in a contiguous slice.
+    config = _startup_engram_config(tmp_path)
+    transformer_config = _startup_transformer_config(
+        context_parallel_size=4, linear_cp_layout="contiguous"
+    )
+    with pytest.raises(ValueError, match="each zigzag chunk to own at least 9 positions"):
+        config.validate_startup(transformer_config, 16, sequence_length=64)
+    config.validate_startup(transformer_config, 16, sequence_length=72)
+    with pytest.raises(ValueError, match="each contiguous slice to own at least 9 positions"):
+        config.validate_startup(transformer_config, 16, packed_sequences=True, sequence_length=32)
+    config.validate_startup(transformer_config, 16, packed_sequences=True, sequence_length=36)
+
+
+def test_history_limit_follows_the_layout_of_the_memory_layers(tmp_path):
+    """With the layer pattern at hand, only the layouts of the memory layers limit the length.
+
+    linear_cp_layout='contiguous' leaves the attention layers of "*-*-" zigzag. A memory on an
+    MLP layer convolves contiguous slices, so 36 positions over 4 ranks hold its history of 9;
+    a memory on an attention layer convolves zigzag chunks and needs twice the length.
+    """
+    transformer_config = _startup_transformer_config(
+        context_parallel_size=4, linear_cp_layout="contiguous", num_layers=4
+    )
+    on_mlp = _startup_engram_config(tmp_path, layer_ids=(2, 4))
+    on_mlp.validate_startup(transformer_config, 16, sequence_length=36, hybrid_layer_pattern="*-*-")
+    with pytest.raises(ValueError, match="each contiguous slice to own at least 9 positions"):
+        on_mlp.validate_startup(
+            transformer_config, 16, sequence_length=32, hybrid_layer_pattern="*-*-"
+        )
+    # Without the pattern the zigzag attention layers count too.
+    with pytest.raises(ValueError, match="each zigzag chunk to own at least 9 positions"):
+        on_mlp.validate_startup(transformer_config, 16, sequence_length=36)
+
+    on_attention = _startup_engram_config(tmp_path, layer_ids=(1, 2))
+    with pytest.raises(ValueError, match="each zigzag chunk to own at least 9 positions"):
+        on_attention.validate_startup(
+            transformer_config, 16, sequence_length=64, hybrid_layer_pattern="*-*-"
+        )
+    on_attention.validate_startup(
+        transformer_config, 16, sequence_length=72, hybrid_layer_pattern="*-*-"
+    )
+
+
+def test_cp_partition_mode_is_ignored_under_an_explicit_linear_layout(tmp_path):
+    # With linear_cp_layout set the stack runs in the two layout fields, here both zigzag, so
+    # the zigzag chunk decides and a contiguous cp_partition_mode adds no slice check.
+    config = _startup_engram_config(tmp_path)
+    transformer_config = _startup_transformer_config(
+        context_parallel_size=4, cp_partition_mode="contiguous"
+    )
+    with pytest.raises(ValueError, match="each zigzag chunk to own at least 9 positions"):
+        config.validate_startup(transformer_config, 16, sequence_length=64)
+    config.validate_startup(transformer_config, 16, packed_sequences=True, sequence_length=32)
+
+
+@pytest.mark.parametrize(
+    "pattern, layer_ids, rejected",
+    [
+        ("*-*-", (1,), [1]),
+        ("*-*-", (1, 3), [1, 3]),
+        ("*-*-", (2, 4), None),
+        # Pipeline separators are not layers: layer 3 is the second attention layer.
+        ("*-|*-", (2, 3), [3]),
+        # MLA layers are attention layers too; MoE and MLP layers are not.
+        ("+E+-", (2, 3, 4), [3]),
+    ],
+)
+def test_packed_rows_need_contiguous_memory_layers_in_a_stack_of_both_layouts(
+    tmp_path, pattern, layer_ids, rejected
+):
+    """linear_cp_layout='contiguous' next to zigzag attention layers, with packed rows.
+
+    Such a row reaches a zigzag layer in the padded per-sequence zigzag, which the memory does
+    not follow, so the placement is rejected at startup rather than in the first forward of the
+    ranks that own the layer.
+    """
+    config = _startup_engram_config(tmp_path, layer_ids=layer_ids)
+    mixed = _startup_transformer_config(
+        context_parallel_size=2, linear_cp_layout="contiguous", num_layers=4
+    )
+    arguments = dict(packed_sequences=True, hybrid_layer_pattern=pattern)
+    if rejected is None:
+        config.validate_startup(mixed, 16, **arguments)
+    else:
+        message = f"engram_layer_ids {rejected} run in the zigzag context-parallel layout"
+        with pytest.raises(ValueError, match=re.escape(message)):
+            config.validate_startup(mixed, 16, **arguments)
+    # Unpacked rows, one layout for the whole stack, and no context parallelism are all fine.
+    config.validate_startup(mixed, 16, hybrid_layer_pattern=pattern)
+    for uniform in (
+        dict(context_parallel_size=2),
+        dict(
+            context_parallel_size=2, attention_cp_layout="contiguous", linear_cp_layout="contiguous"
+        ),
+        dict(linear_cp_layout="contiguous"),
+    ):
+        config.validate_startup(
+            _startup_transformer_config(num_layers=4, **uniform), 16, **arguments
+        )
+
+
+def test_from_args_checks_the_layer_pattern_against_packed_rows(tmp_path):
+    """The arguments carry the layer pattern, so the placement is rejected while they are read."""
+    mixed = _startup_transformer_config(
+        context_parallel_size=2, linear_cp_layout="contiguous", num_layers=2
+    )
+
+    def arguments(layer_id, **overrides):
+        artifact = write_tokenizer_map(
+            tmp_path / f"map_{layer_id}.json", vocab_size=16, layer_ids=(layer_id,)
+        )
+        values = dict(
+            sft=True,
+            context_parallel_size=2,
+            seq_length=64,
+            hybrid_layer_pattern="*-",
+            engram_vocab_sizes=[17, 19],
+            engram_layer_ids=[layer_id],
+            engram_max_ngram_order=3,
+            engram_num_hash_heads=2,
+            engram_memory_dim=8,
+            engram_kernel_size=4,
+            engram_hash_seed=0,
+            engram_tokenizer_map=str(artifact),
+            engram_variant="deepseek",
+            engram_pad_token_id=0,
+            engram_eos_token_id=None,
+            engram_unigram_vocab_size=None,
+            engram_embedding_lr_multiplier=1.0,
+            engram_embedding_weight_decay=0.0,
+        )
+        values.update(overrides)
+        return _packed_args(**values)
+
+    with pytest.raises(ValueError, match="run in the zigzag context-parallel layout"):
+        EngramConfig.from_args(arguments(1), mixed)
+    assert EngramConfig.from_args(arguments(2), mixed).layer_ids == (2,)
+    # --sft packs rows to --max-seq-length-per-sample when it is set, so the convolution history
+    # (9 positions here) is checked against that width: a contiguous slice of a 64-token row
+    # over two ranks holds it, that of a 16-token row does not.
+    wide_rows = arguments(2, seq_length=16, max_seq_length_per_sample=64)
+    assert EngramConfig.from_args(wide_rows, mixed).layer_ids == (2,)
+    with pytest.raises(ValueError, match="a row of 16 tokens over 2 context-parallel ranks"):
+        EngramConfig.from_args(arguments(2, seq_length=8, max_seq_length_per_sample=16), mixed)
 
 
 def test_unset_linear_cp_layout_is_treated_as_zigzag(tmp_path):

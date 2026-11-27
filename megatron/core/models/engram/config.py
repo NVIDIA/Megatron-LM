@@ -25,6 +25,13 @@ import torch
 from megatron.core.transformer.cuda_graph_config import normalize_cuda_graph_modules
 from megatron.core.transformer.enums import CudaGraphModule
 
+from .cp_layout import (
+    CONTIGUOUS_CP_LAYOUT,
+    ZIGZAG_CP_LAYOUT,
+    cp_layout_of_layer_type,
+    stack_cp_layouts,
+    stack_mixes_cp_layouts,
+)
 from .variants import DEEPSEEK_VARIANT_NAME, EngramVariant, resolve_variant
 
 TOKENIZER_MAP_FORMAT = "megatron-engram-token-map"
@@ -224,14 +231,15 @@ def _validate_packed_sequence_args(args: Any) -> bool:
         and not sft
         and getattr(args, "context_parallel_size", 1) > 1
     ):
-        # pretrain_hybrid splits these rows over CP with a padded per-sequence zigzag
-        # (use_per_sequence_balancing), while Engram restores and re-selects tokens with the
-        # per-document partition whenever cu_seqlens exist, so the n-gram hashes would land on
-        # the wrong positions.
+        # pretrain_hybrid gives a zigzag layer these rows in a padded per-sequence zigzag
+        # (use_per_sequence_balancing), while Engram restores and re-selects the tokens of a
+        # zigzag row with the per-document partition whenever cu_seqlens exist, so the n-gram
+        # hashes would land on the wrong positions. A stack whose layers all run contiguous
+        # splits these rows like any other; no test covers that, so it stays rejected too.
         raise ValueError(
             "Engram does not support --dataloader-inter-document-masking with context "
-            "parallelism unless --sft is set: those rows are split over CP with a padded "
-            "per-sequence zigzag, while Engram partitions packed rows per document."
+            "parallelism unless --sft is set: a zigzag layer gets those rows in a padded "
+            "per-sequence zigzag, while Engram partitions packed zigzag rows per document."
         )
     if packed_sequences and args.pipeline_model_parallel_size > 1:
         row_length = _dataset_row_length(args)
@@ -378,6 +386,7 @@ class EngramConfig:
             transformer_config,
             packed_sequences=packed_sequences,
             sequence_length=_dataset_row_length(args),
+            hybrid_layer_pattern=getattr(args, "hybrid_layer_pattern", None),
             use_fsdp=bool(
                 getattr(args, "use_torch_fsdp2", False) or getattr(args, "use_megatron_fsdp", False)
             ),
@@ -569,6 +578,7 @@ class EngramConfig:
         packed_sequences: bool = False,
         use_fsdp: bool = False,
         sequence_length: int | None = None,
+        hybrid_layer_pattern: str | None = None,
     ) -> None:
         """Validate layer placement, parallelism, and feature support.
 
@@ -584,12 +594,16 @@ class EngramConfig:
                 (--dataloader-inter-document-masking) are not.
             use_fsdp: Whether the model is wrapped with FSDP.
             sequence_length: Width of the rows the dataset emits, when known.
+            hybrid_layer_pattern: The hybrid layer pattern, when known; it gives the type, and
+                with it the context-parallel layout, of every layer that carries a memory.
         """
         self._validate_layer_placement(transformer_config)
         if expected_tokenizer_vocab_size is not None:
             self.validate_vocabulary(expected_tokenizer_vocab_size)
-        self._validate_parallelism(transformer_config, sequence_length, packed_sequences)
-        self._validate_packed_sequences(transformer_config, packed_sequences)
+        self._validate_parallelism(
+            transformer_config, sequence_length, packed_sequences, hybrid_layer_pattern
+        )
+        self._validate_packed_sequences(transformer_config, packed_sequences, hybrid_layer_pattern)
         self._validate_unsupported_features(transformer_config, use_fsdp)
 
     def _validate_layer_placement(self, transformer_config: Any) -> None:
@@ -627,8 +641,41 @@ class EngramConfig:
             return 0
         return (self.kernel_size - 1) * self.max_ngram_order
 
+    def _memory_layer_cp_layouts(
+        self, transformer_config: Any, hybrid_layer_pattern: str | None
+    ) -> dict[str, list[int]]:
+        """Return the memory layers by the context-parallel layout they run in.
+
+        The pattern gives the type of every layer, and the type gives the layout
+        (cp_layout.cp_layout_of_layer_type). Without a pattern the result is empty, as it is
+        for a layer the pattern does not describe, which the layer specs reject later.
+        """
+        if hybrid_layer_pattern is None:
+            return {}
+        # Imported here: the hybrid layer table imports every layer config, and layer_specs
+        # imports this module.
+        from megatron.core.models.hybrid.layers.utils import Symbols
+
+        from .layer_specs import hybrid_layer_types
+
+        layer_types = hybrid_layer_types(hybrid_layer_pattern)
+        layer_ids_by_layout: dict[str, list[int]] = {}
+        for layer_id in self.layer_ids:
+            if layer_id > len(layer_types):
+                continue
+            layer_config_type = Symbols.LAYER_CONFIG_MAP.get(layer_types[layer_id - 1])
+            if layer_config_type is None:
+                continue
+            layout = cp_layout_of_layer_type(transformer_config, layer_config_type)
+            layer_ids_by_layout.setdefault(layout, []).append(layer_id)
+        return layer_ids_by_layout
+
     def _validate_parallelism(
-        self, transformer_config: Any, sequence_length: int | None, packed_sequences: bool = False
+        self,
+        transformer_config: Any,
+        sequence_length: int | None,
+        packed_sequences: bool = False,
+        hybrid_layer_pattern: str | None = None,
     ) -> None:
         if (
             transformer_config.expert_tensor_parallel_size
@@ -645,33 +692,20 @@ class EngramConfig:
             )
         if getattr(transformer_config, "dynamic_context_parallel", False):
             raise ValueError(_DYNAMIC_CONTEXT_PARALLEL_UNSUPPORTED)
-        if transformer_config.context_parallel_size > 1:
-            # Engram restores the global token row from the zigzag CP partition and selects its
-            # hashes back with the same partition, so every layer boundary it can sit on must
-            # stay zigzag: attention layers run in attention_cp_layout, the other layer types in
-            # linear_cp_layout, and packed rows are split by cp_partition_mode. An unset
-            # linear_cp_layout is treated as zigzag, which is what TransformerConfig resolves
-            # it to.
-            linear_cp_layout = getattr(transformer_config, "linear_cp_layout", None)
-            layouts = {
-                "attention_cp_layout": getattr(transformer_config, "attention_cp_layout", "zigzag"),
-                "linear_cp_layout": linear_cp_layout or "zigzag",
-                "cp_partition_mode": getattr(transformer_config, "cp_partition_mode", "zigzag"),
-            }
-            non_zigzag = [
-                f"{name}={layout!r}" for name, layout in layouts.items() if layout != "zigzag"
-            ]
-            if non_zigzag:
-                raise ValueError(
-                    "Engram with context parallelism requires the zigzag CP layout for "
-                    "attention_cp_layout, linear_cp_layout and cp_partition_mode; got "
-                    f"{', '.join(non_zigzag)}."
-                )
-            if not packed_sequences and sequence_length is not None:
+        if transformer_config.context_parallel_size > 1 and sequence_length is not None:
+            # Engram restores the global token row from its layer's CP partition and selects
+            # its hashes back with the same partition, in the layout the layer runs in
+            # (cp_layout.resolve_layer_cp_layout), zigzag or contiguous. Only the convolution
+            # history limits the sequence length, and the limit depends on the layout: that of
+            # the memory layers when the pattern names them, of any layer of the stack otherwise.
+            context_parallel_size = transformer_config.context_parallel_size
+            layouts = set(
+                self._memory_layer_cp_layouts(transformer_config, hybrid_layer_pattern)
+            ) or stack_cp_layouts(transformer_config)
+            if ZIGZAG_CP_LAYOUT in layouts and not packed_sequences:
                 # An unpacked row gives each rank two zigzag chunks, and each chunk fetches its
                 # convolution history from its predecessor in one hop. Packed rows are restored
                 # whole before the convolution and have no such limit.
-                context_parallel_size = transformer_config.context_parallel_size
                 chunk_length = sequence_length // (2 * context_parallel_size)
                 if chunk_length < self.conv_history_length:
                     raise ValueError(
@@ -679,6 +713,17 @@ class EngramConfig:
                         f"least {self.conv_history_length} positions, but a row of "
                         f"{sequence_length} tokens over {context_parallel_size} context-parallel "
                         f"ranks gives {chunk_length}."
+                    )
+            if CONTIGUOUS_CP_LAYOUT in layouts:
+                # A contiguous slice, packed or not, fetches its convolution history from the
+                # previous rank in one hop.
+                slice_length = sequence_length // context_parallel_size
+                if slice_length < self.conv_history_length:
+                    raise ValueError(
+                        "Engram with context parallelism requires each contiguous slice to own "
+                        f"at least {self.conv_history_length} positions, but a row of "
+                        f"{sequence_length} tokens over {context_parallel_size} context-parallel "
+                        f"ranks gives {slice_length}."
                     )
         # Virtual pipeline parallelism needs no check: the tokens a layer hashes depend on the
         # microbatch, never on the model chunk.
@@ -695,13 +740,38 @@ class EngramConfig:
                     f"{local_sequence_length}."
                 )
 
-    def _validate_packed_sequences(self, transformer_config: Any, packed_sequences: bool) -> None:
+    def _validate_packed_sequences(
+        self,
+        transformer_config: Any,
+        packed_sequences: bool,
+        hybrid_layer_pattern: str | None = None,
+    ) -> None:
         if not packed_sequences:
             return
+        if transformer_config.context_parallel_size > 1 and stack_mixes_cp_layouts(
+            transformer_config
+        ):
+            # A stack that runs its attention layers and its other layers in different layouts
+            # gives a zigzag layer a packed row in the padded per-sequence zigzag, which Engram
+            # does not follow. Engram.lookup raises on such a row, but only on the ranks that
+            # own the layer, so reject the placement here, on every rank and before any table
+            # exists.
+            zigzag_layer_ids = self._memory_layer_cp_layouts(
+                transformer_config, hybrid_layer_pattern
+            ).get(ZIGZAG_CP_LAYOUT)
+            if zigzag_layer_ids:
+                raise ValueError(
+                    f"engram_layer_ids {zigzag_layer_ids} run in the zigzag context-parallel "
+                    "layout of a stack whose linear_cp_layout and attention_cp_layout differ. "
+                    "Packed sequences reach a zigzag layer of such a stack in the padded "
+                    "per-sequence zigzag, which Engram does not follow; place the memory on "
+                    "layers that run in the contiguous layout, or use one layout for the stack."
+                )
         # Context parallelism with packed rows is supported: packed rows zigzag per document,
         # and the convolution restores that layout from cu_seqlens before convolving (verified
         # at module level to 5.6e-17 against the un-sharded result at CP2 and CP4). The CP data
-        # path partitions unpadded packs by cu_seqlens when cu_seqlens_padded is None.
+        # path partitions unpadded packs by cu_seqlens when cu_seqlens_padded is None. In the
+        # contiguous layout a packed row is split like an unpacked one.
         if transformer_config.pipeline_model_parallel_size > 1:
             # Pipeline activations use the fixed sequence-capacity shape, so packed rows must
             # be padded to the capacity on every stage; the prefetched tokens are zero-padded

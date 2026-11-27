@@ -39,7 +39,7 @@ class EngramVariant:
             group RMSNorm per role, and a causal short convolution over the gated value.
             ``"gated"`` is the DeepSeek-V4.1 form: one bias-free projection for the keys and
             the value, two per-channel gate weights, gate arithmetic in FP32, no convolution,
-            and a closed gate on the positions after the last document boundary of a packed row.
+            and a closed gate on the positions of a packed row that hold no token.
         projection_bias: Dense value/key projections carry a bias term (``"gated_conv"`` only).
         zero_centered_gamma: Group RMSNorms store ``gamma - 1`` and scale by ``1 + weight``
             (``"gated_conv"`` only).

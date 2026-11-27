@@ -15,6 +15,7 @@ from megatron.core.models.engram.hashing import (
     build_ngram_hashes,
     segment_starts_from_cu_seqlens,
     shift_right_within_segments,
+    valid_positions_from_cu_seqlens,
 )
 
 _PAD = 0
@@ -45,6 +46,25 @@ def test_segment_starts_from_cu_seqlens_marks_each_document():
     torch.testing.assert_close(
         starts, torch.tensor([[0, 0, 0, 0, 4, 4, 4, 7, 7]], dtype=torch.int64)
     )
+
+
+def test_valid_positions_end_at_the_last_boundary():
+    # Two documents of length 4 and 3 inside a row of capacity 9; the tail belongs to neither.
+    cu_seqlens = torch.tensor([0, 4, 7], dtype=torch.int32)
+    valid = valid_positions_from_cu_seqlens(cu_seqlens, sequence_length=9)
+    torch.testing.assert_close(valid, torch.tensor([True] * 7 + [False] * 2))
+
+
+def test_valid_positions_exclude_the_padding_of_each_document():
+    # Documents of 3, 0 and 2 tokens occupy 4, 0 and 4 positions of a row of capacity 10.
+    cu_seqlens = torch.tensor([0, 4, 4, 8], dtype=torch.int32)
+    document_lengths = torch.tensor([3, 0, 2], dtype=torch.int32)
+    valid = valid_positions_from_cu_seqlens(cu_seqlens, 10, document_lengths)
+    expected = [True, True, True, False, True, True, False, False, False, False]
+    torch.testing.assert_close(valid, torch.tensor(expected))
+    # Documents that fill their positions leave only the tail out.
+    full = valid_positions_from_cu_seqlens(cu_seqlens, 10, cu_seqlens.diff())
+    torch.testing.assert_close(full, valid_positions_from_cu_seqlens(cu_seqlens, 10))
 
 
 def test_shift_never_crosses_a_packed_boundary():

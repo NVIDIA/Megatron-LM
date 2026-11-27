@@ -13,10 +13,12 @@ from unittest import mock
 import pytest
 import torch
 
+import megatron.core.context_parallel.layout as cp_layout_module
 from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.engram import apply_engram_to_hybrid_stack_spec
 from megatron.core.models.engram.config import EngramConfig
+from megatron.core.models.engram.cp_layout import resolve_layer_cp_layout
 from megatron.core.models.engram.engram import Engram
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
@@ -34,6 +36,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 
+from ._test_utils import packed_seq_params as tagged_packed_seq_params
 from ._test_utils import write_tokenizer_map
 
 # The hybrid stack specs hold Transformer Engine modules, which the composition copies.
@@ -676,3 +679,167 @@ def test_hybrid_model_rejects_engram_without_a_composed_stack_spec(monkeypatch):
     config = _transformer_config(num_layers=2, engram_enabled=True)
     with pytest.raises(ValueError, match="carries no Engram memory"):
         _hybrid_model(monkeypatch, config, hybrid_layer_pattern=Symbols.ATTENTION * 2)
+
+
+class _SizedGroup:
+    """A stand-in process group that only answers ``size()``."""
+
+    def __init__(self, size):
+        self._size = size
+
+    def size(self):
+        return self._size
+
+
+@pytest.mark.parametrize("full_recompute", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize(
+    "linear_cp_layout, attention_cp_layout",
+    [("contiguous", "zigzag"), ("zigzag", "contiguous"), ("contiguous", "contiguous")],
+)
+def test_mixed_stack_hands_engram_layers_their_layout(
+    monkeypatch, full_recompute, packed, linear_cp_layout, attention_cp_layout
+):
+    """A stack gives each memory the tokens and the packed metadata of its layer's layout.
+
+    The stage boundary runs in ``linear_cp_layout``, so the stack converts the tokens for the
+    layers in the other layout, whichever of the two fields is contiguous. A stack that is
+    contiguous throughout converts nothing. The layer configs, the layout manager and its state
+    are the real ones; only the collective that converts a tensor between layouts is replaced,
+    by one that tags converted token IDs.
+    """
+    monkeypatch.setattr(
+        tensor_parallel,
+        "checkpoint",
+        lambda function, _distribute_saved_activations, *args: function(*args),
+    )
+
+    def convert(input_, source_layout, target_layout, *args):
+        if source_layout == target_layout or input_.dtype != torch.int64:
+            return input_
+        return input_ + 1000
+
+    monkeypatch.setattr(cp_layout_module, "convert_cp_layout", convert)
+
+    recompute = (
+        dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=3)
+        if full_recompute
+        else {}
+    )
+    config = _transformer_config(
+        num_layers=3,
+        linear_cp_layout=linear_cp_layout,
+        attention_cp_layout=attention_cp_layout,
+        **recompute,
+    )
+    # Attention, MoE, MLP.
+    layer_configs = validate_segment_layers("*E-", config)
+    layers = [
+        _RecordingLayer(layer_number=index + 1, engram=_MemoryStub(), config=layer_config)
+        for index, layer_config in enumerate(layer_configs)
+    ]
+    one = _SizedGroup(1)
+    with mock.patch("megatron.core.models.hybrid.hybrid_block.build_module", side_effect=layers):
+        stack = HybridStack(
+            config=config,
+            # build_module is replaced, so the specs only have to be configured.
+            submodules=HybridStackSubmodules(
+                attention_layer=IdentityOp, mlp_layer=IdentityOp, moe_layer=IdentityOp
+            ),
+            layer_config_list=layer_configs,
+            post_process=False,
+            post_layer_norm=False,
+            pg_collection=SimpleNamespace(pp=one, tp=one, cp=_SizedGroup(2), tp_cp=None),
+        )
+    layouts = stack._cp_layout_manager.layer_layouts
+    assert layouts == (attention_cp_layout, linear_cp_layout, linear_cp_layout)
+    # What each memory resolves from the config of its own layer.
+    assert layouts == tuple(resolve_layer_cp_layout(layer.config) for layer in layers)
+
+    input_ids = torch.arange(8).view(2, 4)
+    packed_seq_params_by_layout = None
+    if packed:
+        cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+        # The batch split builds the metadata of the layouts the stack runs in, and a plan
+        # that converts between them when there are two.
+        packed_seq_params_by_layout = {
+            layout: tagged_packed_seq_params(
+                qkv_format="thd", cu_seqlens_q=cu_seqlens, cp_partition_mode=layout
+            )
+            for layout in set(layouts)
+        }
+    HybridStack.forward(
+        stack,
+        hidden_states=torch.randn(4, 2, 8),
+        attention_mask=None,
+        input_ids=input_ids,
+        packed_seq_params=packed_seq_params_by_layout[linear_cp_layout] if packed else None,
+        packed_seq_params_by_layout=packed_seq_params_by_layout,
+        cp_layout_plan=object() if packed and len(set(layouts)) > 1 else None,
+    )
+    for layer, layout in zip(layers, layouts):
+        call = layer.calls[0]
+        # The tokens arrive in linear_cp_layout, the layout of the stage boundary, so only a
+        # layer in the other layout gets converted tokens.
+        expected_ids = input_ids if layout == linear_cp_layout else input_ids + 1000
+        assert torch.equal(call["input_ids"], expected_ids)
+        if packed:
+            assert call["packed_seq_params"] is packed_seq_params_by_layout[layout]
+        else:
+            assert call["packed_seq_params"] is None
+
+
+@pytest.mark.parametrize("memory_on_attention", [False, True])
+def test_mixed_stack_converts_token_ids_for_memory_layers_only(monkeypatch, memory_on_attention):
+    """A hash-routed MoE layer takes the token IDs as they arrive, with or without a memory
+    elsewhere in the stack; only the layouts of memory layers are converted."""
+    converted_to = []
+
+    def convert(input_, source_layout, target_layout, *args):
+        if source_layout == target_layout or input_.dtype != torch.int64:
+            return input_
+        converted_to.append(target_layout)
+        return input_ + 1000
+
+    monkeypatch.setattr(cp_layout_module, "convert_cp_layout", convert)
+
+    config = _transformer_config(
+        num_layers=3, linear_cp_layout="contiguous", attention_cp_layout="zigzag"
+    )
+    # Attention, MoE, MLP.
+    layer_configs = validate_segment_layers("*E-", config)
+    layers = [
+        _RecordingLayer(layer_number=index + 1, config=layer_config)
+        for index, layer_config in enumerate(layer_configs)
+    ]
+    if memory_on_attention:
+        layers[0].engram = _MemoryStub()
+    layers[1].mlp = SimpleNamespace(router=SimpleNamespace(is_hash_layer=True))
+    one = _SizedGroup(1)
+    with mock.patch("megatron.core.models.hybrid.hybrid_block.build_module", side_effect=layers):
+        stack = HybridStack(
+            config=config,
+            # build_module is replaced, so the specs only have to be configured.
+            submodules=HybridStackSubmodules(
+                attention_layer=IdentityOp, mlp_layer=IdentityOp, moe_layer=IdentityOp
+            ),
+            layer_config_list=layer_configs,
+            post_process=False,
+            post_layer_norm=False,
+            pg_collection=SimpleNamespace(pp=one, tp=one, cp=_SizedGroup(2), tp_cp=None),
+        )
+    assert stack._cp_layout_manager.layer_layouts == ("zigzag", "contiguous", "contiguous")
+
+    input_ids = torch.arange(8).view(2, 4)
+    HybridStack.forward(
+        stack, hidden_states=torch.randn(4, 2, 8), attention_mask=None, input_ids=input_ids
+    )
+    attention_call, moe_call, mlp_call = (layer.calls[0] for layer in layers)
+    assert moe_call["input_ids"] is input_ids
+    assert "input_ids" not in mlp_call
+    if memory_on_attention:
+        assert torch.equal(attention_call["input_ids"], input_ids + 1000)
+        assert converted_to == ["zigzag"]
+    else:
+        assert "input_ids" not in attention_call
+        assert converted_to == []
