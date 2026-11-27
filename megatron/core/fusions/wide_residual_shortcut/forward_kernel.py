@@ -17,7 +17,6 @@ from triton.language.extra.cuda import gdc_wait
 
 from .configs import _BATCH_INVARIANT_ROWS, choose_forward_config
 from .kernel_utils import (
-    KERNEL_FORMAT_TAGS,
     OUTPUT_FORMATS,
     SavedWrite,
     _coefficient,
@@ -702,9 +701,8 @@ def _forward_body(
 
 
 def _forward_kernel_name(outputs):
-    """The profiler name of one variant: its readers, then each reader's output formats
-    (``KERNEL_FORMAT_TAGS``)."""
-    tags = "_".join(KERNEL_FORMAT_TAGS[f] for f in outputs)
+    """Include the reader count and each reader's output formats in the profiler name."""
+    tags = "_".join("bf16mxfp8" if fmt == "both" else fmt for fmt in outputs)
     return f"fwd_wr_writeread_{len(outputs)}reader_{tags}"
 
 

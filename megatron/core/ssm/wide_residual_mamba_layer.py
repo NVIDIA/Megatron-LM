@@ -20,6 +20,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     apply_combined_residual_keys,
+    fused_residual_layer_specs,
     load_residual_state,
 )
 from megatron.core.typed_torch import apply_module
@@ -49,6 +50,12 @@ class WideResidualMambaLayer(MambaLayer):
         """Where a spec puts this layer's input RMSNorm, as attribute names from the layer: its
         norm slot, or the mixer's in_proj it is fused into."""
         return ("norm",) if submodules.norm is not IdentityOp else ("mixer", "in_proj")
+
+    @staticmethod
+    def fused_residual_specs(spec):
+        """Choose the fused residual spec for each stack position."""
+        submodules = WideResidualMambaLayerSubmodules.widen(spec.submodules)
+        return fused_residual_layer_specs(spec, submodules, "residual_read", "residual_write")
 
     def seam_connections(self):
         """Return the constructed residual read and write for this branch."""

@@ -1147,13 +1147,15 @@ def test_mxfp8_high_precision_backward_uses_bf16_handoffs():
 
 
 @pytest.mark.usefixtures("model_parallel")
-def test_standalone_stack_links_with_grouped_precision_names():
+@pytest.mark.parametrize("standalone", [True, False])
+def test_stack_links_with_grouped_precision_names(standalone):
     from megatron.core.models.hybrid.hybrid_block import HybridStack
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.quantization.quant_config import GlobMatcher, RecipeConfig
 
+    path = "layers.1.compute_layer.self_attention.linear_proj"
     recipe = RecipeConfig(
-        matchers=[GlobMatcher("layers.1.compute_layer.self_attention.linear_proj", "proj")],
+        matchers=[GlobMatcher(path if standalone else "decoder." + path, "proj")],
         config_dict={
             "proj": {
                 "transformer_engine_config_type": "TEQuantizationParams",
@@ -1164,12 +1166,16 @@ def test_standalone_stack_links_with_grouped_precision_names():
             }
         },
     )
-    stack = HybridStack(
-        _fused_config(num_layers=3, hidden_size=2048, ffn_hidden_size=256, quant_recipe=recipe),
-        specs.wide_residual_shortcut_fusion_stack_spec.submodules,
-        layer_type_list=list("-*E"),
-        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
-    )
+    if standalone:
+        stack = HybridStack(
+            _fused_config(num_layers=3, hidden_size=2048, ffn_hidden_size=256, quant_recipe=recipe),
+            specs.wide_residual_shortcut_fusion_stack_spec.submodules,
+            layer_type_list=list("-*E"),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
+    else:
+        stack = _hybrid_model("-*E", hidden=2048, quant_recipe=recipe).decoder
+    assert stack.get_submodule(path).te_quant_params is not None
     read, write = stack.layers[1].compute_layer.seam_connections()
     assert read.consumer_formats == ("bf16",)
     assert write.update_formats == ("mxfp8",)
@@ -1472,7 +1478,7 @@ def test_fusion_spec_links_every_seam(monkeypatch):
     # A layer whose input norm is not where its class supports stays unfused in the fused spec;
     # building with it is rejected for that reason.
     mla = fused.submodules.mla_layer
-    assert mla.submodules.residual_read_self_attn is not WriteReadNorm
+    assert mla is specs.wide_residual_hybrid_stack_spec.submodules.mla_layer
     with pytest.raises(ValueError, match="must be fused into self_attention's linear_qkv"):
         mla.module.get_input_layernorm_module(mla.submodules)
 

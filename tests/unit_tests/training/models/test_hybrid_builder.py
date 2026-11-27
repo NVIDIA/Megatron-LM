@@ -64,6 +64,22 @@ def test_rmsnorm_impl_chooses_the_resolved_spec_norms():
     assert native is custom
 
 
+def test_fused_gdp_checkpoint_selects_gdp_inference_spec(monkeypatch):
+    from megatron.core.models.hybrid import hybrid_layer_specs as specs
+    from megatron.training.argument_utils import _hybrid_inference_stack_spec
+
+    # Restore a training --spec before its lazy inference counterpart has been imported.
+    monkeypatch.delitem(
+        vars(specs), "wide_residual_shortcut_fusion_gdp_inference_stack_spec", raising=False
+    )
+    inference = _hybrid_inference_stack_spec(
+        [specs.__name__, "wide_residual_shortcut_fusion_gdp_stack_spec"], wide_residual=True
+    )
+    assert inference is specs.shortcut_fusion_stack_spec(
+        specs.wide_residual_gated_delta_product_inference_stack_spec
+    )
+
+
 # =============================================================================
 # Section 1 — HybridModelConfig
 # =============================================================================

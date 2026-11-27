@@ -18,7 +18,6 @@ from triton.experimental.gluon.language.nvidia.hopper import fence_async_shared,
 
 from .configs import choose_backward_layout, get_backward_knobs, qualified_device
 from .kernel_utils import (
-    KERNEL_FORMAT_TAGS,
     OUTPUT_FORMATS,
     _coefficient,
     _descriptor,
@@ -1129,9 +1128,9 @@ def _backward_body(
 
 
 def _backward_kernel_name(readers, second, du):
-    """The profiler name of one variant: its readers, the gradients flowing into them (a reader
-    with two consumers takes two) and the update gradient's formats (``KERNEL_FORMAT_TAGS``)."""
-    return f"bwd_wr_writeread_{readers}reader_{readers + second}grad_{KERNEL_FORMAT_TAGS[du]}"
+    """Include reader count, incoming gradient count and update gradient formats in the name."""
+    tag = "bf16mxfp8" if du == "both" else du
+    return f"bwd_wr_writeread_{readers}reader_{readers + second}grad_{tag}"
 
 
 BACKWARD_KERNELS = {

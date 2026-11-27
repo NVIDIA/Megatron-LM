@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import replace
 from functools import partial
 from typing import Literal
 
@@ -506,14 +506,6 @@ def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -
     )
 
 
-@dataclass(frozen=True)
-class SeamInput:
-    """A layer input whose residual read and RMSNorm a fused seam kernel already applied."""
-
-    residual: Tensor
-    branch_input: Tensor
-
-
 class _FusedWideResidualConnection(StreamwiseSigmoidWideResidualConnection):
     def __init__(self, config, *args, **kwargs):
         if not config.moe_shortcut_wide_residual_norm_fusion:
@@ -525,7 +517,7 @@ class WriteReadNorm(_FusedWideResidualConnection):
     """Apply a deferred write, streamwise read and RMSNorm in one kernel.
 
     Each linked consumer receives its own BF16 or MXFP8 operand. A shortcut block
-    can apply both reads early and hand the compute layer its prepared SeamInput.
+    can apply both reads early and hand the compute layer its completed read result.
     """
 
     def __init__(
@@ -577,7 +569,7 @@ class WriteReadNorm(_FusedWideResidualConnection):
         install_columns(output, operand, slot)
 
     def hand(self, item) -> None:
-        """Hand ``item`` (PendingWideResidualWrites or SeamInput) to this empty read."""
+        """Hand a deferred write or a completed (branch_input, state) pair to this read."""
         if self.pending is not None:
             raise RuntimeError("a deferred residual write for this read was not applied")
         self.pending = item
@@ -653,8 +645,8 @@ class WriteReadNorm(_FusedWideResidualConnection):
         del hidden_states, fp32_residual_connection, branch_input_dtype
         del execution_context, recompute_context
         item = self.take()
-        if isinstance(item, SeamInput):
-            return item.branch_input, (item.residual,)
+        if isinstance(item, tuple):
+            return item
         residual, branch_input = self.apply_write(item)
         return branch_input, (residual,)
 
@@ -675,7 +667,7 @@ class ShortcutAddWideResidualWriteReadNorm(WriteReadNorm):
         residual, branch_input, shortcut_input = compute_read.apply_write(
             compute_read.take(), shortcut=self
         )
-        compute_read.hand(SeamInput(residual, branch_input))
+        compute_read.hand((branch_input, (residual,)))
         return residual, shortcut_input
 
 
@@ -772,6 +764,56 @@ def _gemm_autocast_recipe(stack_config, layer):
     return None
 
 
+def fused_residual_layer_specs(spec, submodules, read: str, write: str):
+    """Build first, interior and last layer specs, preserving the norm's checkpoint key."""
+    from megatron.core.extensions.transformer_engine import (
+        TEColumnParallelLinear,
+        TELayerNormColumnParallelLinear,
+    )
+    from megatron.core.tensor_parallel import (
+        InferenceColumnParallelLinear,
+        InferenceLayerNormColumnParallelLinear,
+    )
+    from megatron.core.transformer.identity_op import IdentityOp
+
+    try:
+        location = spec.module.get_input_layernorm_module(submodules)
+    except ValueError:
+        return (spec,) * 3
+
+    if len(location) == 1:  # the norm slot holds the norm
+        changes, norm_key = {location[0]: IdentityOp}, f"{location[0]}.weight"
+    else:  # the norm is fused into the branch's input projection
+        branch_name, projection = location
+        branch = getattr(submodules, branch_name)
+        # The MLP branch is a partial(MLP.as_mlp_submodule, submodules=...).
+        is_partial = isinstance(branch, partial)
+        branch_submodules = branch.keywords["submodules"] if is_partial else branch.submodules
+        unnormed_projections = {
+            TELayerNormColumnParallelLinear: TEColumnParallelLinear,
+            InferenceLayerNormColumnParallelLinear: InferenceColumnParallelLinear,
+        }
+        unfused = unnormed_projections.get(getattr(branch_submodules, projection, None))
+        if unfused is None:  # the projection does not apply the norm
+            return (spec,) * 3
+        branch_submodules = replace(branch_submodules, **{projection: unfused})
+        if is_partial:
+            branch = partial(branch, submodules=branch_submodules)
+        else:
+            branch = replace(branch, submodules=branch_submodules)
+        changes = {branch_name: branch}
+        norm_key = f"{branch_name}.{projection}.layer_norm_weight"
+    keys = {**submodules.sharded_state_dict_keys_map, f"{read}.weight": norm_key}
+    fused_read = replace(
+        submodules, **changes, sharded_state_dict_keys_map=keys, **{read: WriteReadNorm}
+    )
+    deferred_write = {write: DeferredWrite}
+    first = replace(spec, submodules=replace(submodules, **deferred_write))
+    middle = replace(spec, submodules=replace(fused_read, **deferred_write))
+    last = replace(spec, submodules=fused_read)
+    return first, middle, last
+
+
 def _unfused_error(layer) -> ValueError:
     """The error rejecting ``layer``, which was not built as a fused-seam layer, with the reason."""
     layer_class = type(layer)
@@ -792,16 +834,25 @@ def _unfused_error(layer) -> ValueError:
     )
 
 
-def link_residual_seams(layers, stack_config) -> None:
+def link_residual_seams(stack, *, prefix: str) -> None:
     """Link adjacent writes and reads in physical layer order, then close the replay chain.
 
     Standalone MoE reads serve the whole MoE as one BF16 consumer. Shortcut blocks
     have already linked their individual consumers.
     """
+    from megatron.core.quantization.utils import get_quant_config_or_none
     from megatron.core.transformer.moe.moe_layer import MoELayer
 
+    # Grouping changes recipe paths. Apply the stack recipe to the final names before
+    # binding formats, including clearing any override inherited from a layer config.
+    recipe = stack.config.quant_recipe
+    if recipe is not None or any(c.quant_recipe is not None for c in stack.layer_config_list):
+        for path, module in stack.named_modules(prefix=prefix):
+            if hasattr(module, "finish_init"):
+                module.finish_init(get_quant_config_or_none(path, recipe))
+
     connections = []
-    for layer in layers:
+    for layer in stack.physical_layers():
         if not hasattr(layer, "seam_connections"):
             raise _unfused_error(layer)
         try:
@@ -812,7 +863,7 @@ def link_residual_seams(layers, stack_config) -> None:
     def gemm_format(linear, layer, *, gradients=False):
         if linear is not None and takes_mxfp8(
             linear,
-            _gemm_autocast_recipe(stack_config, layer),
+            _gemm_autocast_recipe(stack.config, layer),
             layer.config.fp8,
             gradients=gradients,
             recipe_attrs=layer.config.fp8_recipe_attrs,

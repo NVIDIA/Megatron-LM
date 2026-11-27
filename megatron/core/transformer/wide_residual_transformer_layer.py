@@ -15,6 +15,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     apply_combined_residual_keys,
+    fused_residual_layer_specs,
     load_residual_state,
 )
 
@@ -63,6 +64,15 @@ class WideResidualTransformerLayer(TransformerLayer):
                 return ("self_attention", projection)
         raise ValueError(
             "its input RMSNorm must be fused into self_attention's linear_qkv or in_proj"
+        )
+
+    @staticmethod
+    def fused_residual_specs(spec):
+        """Choose the fused residual spec for each stack position."""
+        submodules = WideResidualTransformerLayerSubmodules.widen(spec.submodules)
+        branch = "mlp" if submodules.self_attention is IdentityOp else "self_attn"
+        return fused_residual_layer_specs(
+            spec, submodules, f"residual_read_{branch}", f"residual_write_{branch}"
         )
 
     def seam_connections(self):

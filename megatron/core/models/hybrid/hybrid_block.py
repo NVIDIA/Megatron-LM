@@ -34,7 +34,6 @@ from megatron.core.models.hybrid.shortcut_block import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.quantization.utils import finish_quantization_init
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -463,11 +462,8 @@ class HybridStack(MegatronModule):
                 )
                 for layer in self.layers
             ]
-        # Nested MTP stacks get their final module paths from the enclosing MTP block.
-        if not is_mtp_layer:
-            finish_quantization_init(self, config.quant_recipe, prefix=name or "")
-            if config.moe_shortcut_wide_residual_norm_fusion and self.uses_wide_residual_stream:
-                link_residual_seams(self.physical_layers(), config)
+        if config.moe_shortcut_wide_residual_norm_fusion and self.uses_wide_residual_stream:
+            link_residual_seams(self, prefix=name or "")
         self._residual_stream_atomic_layer_pairs = self._shortcut_layer_pairs()
         self._execution_layer_config_list = [
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices

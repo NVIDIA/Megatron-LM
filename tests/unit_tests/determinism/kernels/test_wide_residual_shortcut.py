@@ -147,9 +147,9 @@ FORWARD = [
     for i, (m, h) in enumerate(((32, 32), (64, 96), (96, 288), (160, 18432)))
     for s, u, inf in [((1, 2, 4, 6)[i], 1 + i % 2, i % 2 == 0), ((6, 4, 2, 1)[i], 2 - i % 2, i < 2)]
 ] + [
-    # Every BF16-stream inference table entry (512-1024 rows) with BF16 logits.
+    # Three-stream BF16 inference recipes at the upper end of the 512-1024 row window.
     pytest.param(1024, h, 3, n, u, T, q, T, BF16, 1e-5, F, T, marks=QUALIFIED if q else ())
-    for h, n, u, q in sorted(configs._FORWARD_CONFIGS_BF16)
+    for _, h in FLAGSHIPS for n, u in ((1, 1), (2, 1), (2, 2)) for q in (F, T)
 ] + [
     # Every leaf of the prefill tree (inference rows > 1024).
     pytest.param(m, h, s, len(o), u, T, o, T, d, 1e-5, F, T, marks=QUALIFIED)

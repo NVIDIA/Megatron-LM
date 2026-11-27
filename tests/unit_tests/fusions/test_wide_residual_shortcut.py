@@ -768,7 +768,7 @@ def test_reader_formats_store_one_normalization(dtype, readers, updates, inferen
 
 
 def test_config_tables():
-    """Training and prefill forwards follow their decision trees; the BF16-stream table serves
+    """Training and prefill forwards follow their decision trees; BF16 overrides serve
     512-1024-row inference; cached backward grids; every forward/backward config is valid;
     training and prefill own one CTA per row."""
     choose = configs.choose_forward_config
@@ -782,15 +782,18 @@ def test_config_tables():
         assert (bf16.TARGET_CTAS, bf16.MAXNREG) == (four, 128 if readers == 1 else 168)
         second = configs.get_backward_knobs(m, h, 3, 2, second=True)
         assert (second.TARGET_CTAS, second.MAXNREG) == ({3072: 300, 4096: 304, 10240: 280}[h], 255)
-    for (hidden, readers, updates, quantized), cfg in configs._FORWARD_CONFIGS_BF16.items():
-        assert cfg.LOADS_FIRST and cfg.WIDTH >= cfg.VECTOR * 32 * cfg.NUM_WARPS
-        assert not cfg.PAIRED_REDUCE or readers == 2
-        outputs = formats(readers, quantized)
-        options = dict(outputs=outputs, updates=updates, bf16_residual=True, inference=True)
-        assert choose(512, hidden, 3, readers, **options) is cfg
-        assert choose(1024, hidden, 3, readers, **options) is cfg
-        assert choose(1025, hidden, 3, readers, **options) is not cfg  # prefill tree
-        assert choose(1024, hidden, 3, readers, **dict(options, bf16_residual=False)) is not cfg
+    # The 4096-wide single reader uses the same measured BF16 schedule for both handoffs.
+    bf16_leaf = configs._ForwardConfig(
+        2048, REDUCE_VECTOR=0, MAXNREG=128, LOADS_FIRST=True, VECTOR=8
+    )
+    for quantized in (F, T):
+        options = dict(outputs=formats(1, quantized), bf16_residual=True, inference=True)
+        assert choose(512, 4096, 3, **options) == choose(1024, 4096, 3, **options) == bf16_leaf
+        assert choose(512, 4096, 4, **options) != bf16_leaf
+        assert choose(511, 4096, 3, **options) != bf16_leaf
+        assert choose(1025, 4096, 3, **options) != bf16_leaf
+        assert choose(512, 4096, 3, **dict(options, bf16_residual=False)) != bf16_leaf
+        assert choose(512, 4096, 3, updates=2, **options) != bf16_leaf
     # Training (2048+ rows, hidden 2048-16384, 1-6 streams): the tree's schedule, independent
     # of the readers' output formats and of a shortcut add.
     for h, s, (n, u), bf16 in itertools.product(

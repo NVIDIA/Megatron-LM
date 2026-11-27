@@ -13,10 +13,8 @@ from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language import BlockedLayout, NVMMASharedLayout
 from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
-# An operand's formats (a reader's outputs, the update gradient): BF16, MXFP8, or both from the
-# same values; and each one's tag in kernel names.
+# A reader output or update gradient can emit both formats from the same values.
 OUTPUT_FORMATS = ("bf16", "mxfp8", "both")
-KERNEL_FORMAT_TAGS = {"bf16": "bf16", "mxfp8": "mxfp8", "both": "bf16mxfp8"}
 
 # Host forms of Triton's integer helpers: their constexpr-function wrappers cost ~1 us a call.
 cdiv, next_power_of_2 = triton.cdiv.fn, triton.next_power_of_2.fn

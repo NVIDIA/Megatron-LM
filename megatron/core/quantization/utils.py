@@ -20,13 +20,6 @@ def get_quant_config_or_none(
     return recipe.match(MatchContext(module_path=module_path, layer_number=layer_number))
 
 
-def finish_quantization_init(module, recipe, *, prefix=""):
-    """Apply the precision recipe using final module paths, after any layer grouping."""
-    for name, child in module.named_modules(prefix=prefix):
-        if hasattr(child, "finish_init"):
-            child.finish_init(get_quant_config_or_none(name, recipe))
-
-
 def load_quantization_recipe(recipe_path: str) -> RecipeConfig:
     """Loads a quantization recipe from a path."""
     recipe = RecipeConfig.from_yaml_file(recipe_path)
