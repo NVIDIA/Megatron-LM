@@ -646,17 +646,24 @@ class TestConfigContainer_Integration:
         assert loaded_config.value == config.value
         assert loaded_config.description == config.description
 
-    def test_from_yaml_rejects_a_document_of_another_container(self):
-        """Reading a document through another container class raises instead of returning an
-        instance of the document's own class."""
+    @pytest.mark.parametrize("mode", list(InstantiationMode))
+    @pytest.mark.parametrize("saved_complex", [False, True])
+    def test_from_yaml_rejects_a_document_of_another_container(self, mode, saved_complex):
+        """Reading a document through another container class raises and names the document's
+        class, in both modes and for either class."""
+        simple = TestConfigContainer(name="saved")
+        nested = NestedDataclass(simple=SimpleDataclass())
+        other = ComplexConfigContainer(
+            simple_config=simple, nested_data=nested, items=["a"], metadata={"k": 1}
+        )
+        saved, loader = (other, TestConfigContainer) if saved_complex else (simple, type(other))
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = os.path.join(tmp_dir, "test_config.yaml")
-            TestConfigContainer(name="saved").to_yaml(tmp_path)
+            saved.to_yaml(tmp_path)
 
-            with pytest.raises(
-                TypeError, match="Expected ComplexConfigContainer, got TestConfigContainer"
-            ):
-                ComplexConfigContainer.from_yaml(tmp_path)
+            expected = f"Expected {loader.__qualname__}, got {type(saved).__qualname__}"
+            with pytest.raises(TypeError, match=expected):
+                loader.from_yaml(tmp_path, mode=mode)
 
 
 class TestConfigContainer_EdgeCases:

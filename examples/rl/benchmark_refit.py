@@ -31,15 +31,12 @@ from megatron.training import get_model as get_training_model
 from megatron.training import print_rank_0
 from megatron.training.argument_utils import (
     _default_config_from_args,
-    gpt_config_from_args,
-    hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.config import AlgorithmConfigContainer, RLConfig, RootConfigContainer
 from megatron.training.global_vars import get_run_config
 from megatron.training.initialize import initialize_megatron
-from megatron.training.utils import is_hybrid_model
 
 
 def add_benchmark_args(parser):
@@ -438,18 +435,12 @@ def main():
         },
         ignore_unknown_args=False,
     )
-    # The RL run config, composed as train_rl.py composes it:
-    # the training sections (the benchmark builds its models so they carry no model config),
-    # the destination deployment described like the RL loop's rollout engine, and the RL section.
+    # The RL run config, composed as train_rl.py composes it: the training sections, the
+    # destination deployment described like the RL loop's rollout engine, and the RL section.
     pretrain_container = pretrain_cfg_container_from_args(args)
-    model_cfg = (
-        hybrid_config_from_args(args) if is_hybrid_model(args) else gpt_config_from_args(args)
-    )
     root = RootConfigContainer(
         training=pretrain_container,
-        inference=rollout_inference_container_from_args(
-            args, pretrain_container, model_cfg=model_cfg
-        ),
+        inference=rollout_inference_container_from_args(args, pretrain_container),
         algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
     )
     root.finalize()

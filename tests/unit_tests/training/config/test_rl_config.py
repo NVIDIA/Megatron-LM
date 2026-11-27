@@ -761,7 +761,7 @@ def test_the_root_container_is_one_type_for_every_run(monkeypatch, tmp_path):
         inference=_inference_container(),
         algorithm=AlgorithmConfigContainer(rl=RLConfig(**GRPO_4x3)),
     )
-    global_vars.unset_root_config_container()
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
     set_rl_run_config(root)
     assert global_vars.get_run_config() is pretrain  # the loop keeps the pretrain container
     assert global_vars.get_root_config_container() is root

@@ -2,11 +2,10 @@
 
 import pytest
 
-from megatron.rl.config import unset_rl_run_config
+from megatron.training import global_vars
 
 
 @pytest.fixture(autouse=True)
-def reset_rl_run_config():
+def reset_rl_run_config(monkeypatch):
     """The run's root container is a process global; never leak it."""
-    yield
-    unset_rl_run_config()
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)

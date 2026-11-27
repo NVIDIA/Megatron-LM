@@ -53,6 +53,7 @@ from megatron.training.config.training_config import (
     ValidationConfig,
 )
 from megatron.training.config.utils import (
+    _resolve_target_class,
     sanitize_dataclass_config,
     serialize_dataclass,
     serialize_value,
@@ -140,6 +141,16 @@ class ConfigContainerBase:
         config_dict = copy.deepcopy(config_dict)
 
         assert "_target_" in config_dict
+
+        # Name the document's own container before the key checks below hide the mismatch.
+        target = config_dict["_target_"]
+        target_cls = _resolve_target_class(target) if isinstance(target, str) else None
+        if isinstance(target_cls, type) and not issubclass(target_cls, cls):
+            name = target_cls.__qualname__
+            raise TypeError(
+                f"Expected {cls.__qualname__}, got {name}; load this document with "
+                f"{name}.from_dict or {name}.from_yaml."
+            )
 
         # Apply backward compatibility: remove init=False fields that may have been
         # serialized by older versions (these are computed in __post_init__)
@@ -320,15 +331,11 @@ class PretrainConfigContainer(ConfigContainerBase):
     straggler: StragglerDetectionConfig | None = None
     fault_tolerance: FaultToleranceConfig = field(default_factory=FaultToleranceConfig)
 
-    @classmethod
-    def from_dict(
-        cls: Type[T],
-        config_dict: dict[str, Any],
-        mode: InstantiationMode = InstantiationMode.STRICT,
-    ) -> T:
-        """Create a container from a dictionary."""
-        config_dict = {key: value for key, value in config_dict.items() if key != "rl"}
-        return super().from_dict(config_dict, mode=mode)
+    @staticmethod
+    def upgrade_cfg_dict(section: dict) -> dict:
+        """Drop the `rl` section of a document saved while this container carried it
+        (``sanitize_dataclass_config`` hook)."""
+        return {key: value for key, value in section.items() if key != "rl"}
 
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""
@@ -1185,6 +1192,11 @@ class AlgorithmConfigContainer(ConfigContainerBase):
     offline_distillation: OfflineDistillationConfig | None = None
     """Offline logits KD: exactly one of teacher_save or student_load. `None` disables it."""
 
+    def to_dict(self, **section_overrides: Mapping[str, Any]) -> dict[str, Any]:
+        """The document holds only the sections the run has, as the root holds only its members."""
+        document = super().to_dict(**section_overrides)
+        return {key: value for key, value in document.items() if value is not None}
+
 
 @dataclass(kw_only=True)
 class RootConfigContainer(ConfigContainerBase):
@@ -1240,6 +1252,32 @@ class RootConfigContainer(ConfigContainerBase):
         if not inference.tokenizer.same_tokenizer(training.tokenizer):
             # For now, the rollout engine's token ids and log probabilities feed the training loss.
             raise ValueError("The rollout deployment's tokenizer must match the training one.")
+        # What the rollout model builders (`megatron.rl.training_setup`) rely on.
+        if inference.checkpoint.load is not None:
+            raise ValueError(
+                "The rollout deployment serves the training weights: leave its "
+                "checkpoint.load unset."
+            )
+        layouts = (
+            getattr(inference.model, "transformer", None),
+            getattr(training.model, "transformer", None),
+        )
+        if None not in layouts:
+            if spec_declares_disaggregation(inference.inference.inference_shards):
+                # Each shard takes its layout from the shard specification.
+                if any(
+                    getattr(layouts[0], name) != getattr(layouts[1], name)
+                    for name in ROLLOUT_LAYOUT_FIELDS
+                ):
+                    raise ValueError(
+                        "Disaggregated inference shards set each rank's parallelism: the "
+                        "rollout deployment's model must keep the training layout."
+                    )
+            elif layouts[0].context_parallel_size > 1:
+                raise ValueError(
+                    "Rollout inference does not support context parallelism: the rollout "
+                    "deployment's model needs context_parallel_size=1."
+                )
         if global_batch_size is None:
             global_batch_size = training.train.global_batch_size
         # The offload `_finalize_rl` will request, checked like the offload the DDP section
@@ -1271,9 +1309,9 @@ class RootConfigContainer(ConfigContainerBase):
             inference, training.model
         ):
             raise ValueError(
-                "--rl-offload-inference-model-weights requires a separate inference model. "
-                "This flag is only useful when doing refit since the weights are shared with "
-                "the training model."
+                "--rl-offload-inference-model-weights requires a separate inference model: "
+                "disaggregated --inference-shards or a rollout layout that differs from "
+                "training's (an --rl-inference-* value equal to training's shares the model)."
             )
 
     def _finalize_rl(self) -> None:

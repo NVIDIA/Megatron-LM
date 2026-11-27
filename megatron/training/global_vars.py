@@ -385,12 +385,6 @@ def set_root_config_container(root):
     _GLOBAL_ROOT_CONFIG_CONTAINER = root
 
 
-def unset_root_config_container():
-    """Forget the run's root container."""
-    global _GLOBAL_ROOT_CONFIG_CONTAINER
-    _GLOBAL_ROOT_CONFIG_CONTAINER = None
-
-
 def _set_train_state():
     """Create the train state for the current training run."""
     global _GLOBAL_TRAIN_STATE

@@ -12,12 +12,7 @@ from megatron.training.config.container import (
     PretrainConfigContainer,
 )
 from megatron.training.config.inference_config import InferenceSetupConfig
-from megatron.training.global_vars import (
-    get_root_config_container,
-    set_root_config_container,
-    unset_root_config_container,
-)
-from megatron.training.models.base import ModelConfig
+from megatron.training.global_vars import get_root_config_container, set_root_config_container
 
 # The flag that overrides each rollout layout field. CP has none: context-parallel training
 # forces the rollout's to 1.
@@ -39,11 +34,10 @@ ROLLOUT_MODEL_LAYOUT_FIELDS = (
 
 
 def rollout_inference_container_from_args(
-    args: Namespace, pretrain: PretrainConfigContainer, *, model_cfg: ModelConfig | None = None
+    args: Namespace, pretrain: PretrainConfigContainer
 ) -> InferenceConfigContainer:
     """Compose the rollout engine's deployment from the pretrain container and the RL arguments."""
-    if model_cfg is None:
-        model_cfg = pretrain.model
+    model_cfg = pretrain.model
     overrides = {
         name: getattr(args, arg)
         for name, arg in _DEPLOYMENT_ARGS.items()
@@ -119,30 +113,13 @@ def add_rl_args(parser: ArgumentParser) -> ArgumentParser:
 def add_rollout_inference_args(parser: ArgumentParser) -> ArgumentParser:
     """The rollout engine's deployment, read by `rollout_inference_container_from_args`."""
     group = parser.add_argument_group(title="rollout inference")
-    group.add_argument(
-        "--rl-inference-tensor-model-parallel-size",
-        type=int,
-        default=None,
-        help="Tensor model parallelism of the rollout engine (default: training).",
-    )
-    group.add_argument(
-        "--rl-inference-pipeline-model-parallel-size",
-        type=int,
-        default=None,
-        help="Pipeline model parallelism of the rollout engine (default: training).",
-    )
-    group.add_argument(
-        "--rl-inference-expert-model-parallel-size",
-        type=int,
-        default=None,
-        help="Expert model parallelism of the rollout engine (default: training).",
-    )
-    group.add_argument(
-        "--rl-inference-expert-tensor-model-parallel-size",
-        type=int,
-        default=None,
-        help="Expert tensor parallelism of the rollout engine (default: training).",
-    )
+    for field, arg in _DEPLOYMENT_ARGS.items():
+        group.add_argument(
+            "--" + arg.replace("_", "-"),
+            type=int,
+            default=None,
+            help=f"The rollout engine's {field} (default: training's).",
+        )
     return parser
 
 
@@ -167,8 +144,3 @@ def get_rl_run_config() -> RootConfigContainer:
 def get_rl_config() -> RLConfig:
     """Return the registered RL run's RL section."""
     return get_rl_run_config().algorithm.rl
-
-
-def unset_rl_run_config() -> None:
-    """Forget the run's root container (tests and multi-run processes)."""
-    unset_root_config_container()

@@ -54,7 +54,7 @@ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelpe
 from megatron.core.utils import get_pg_size
 from megatron.rl import rl_utils, training_setup
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
-from megatron.rl.config import add_rl_args, unset_rl_run_config
+from megatron.rl.config import add_rl_args
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.argument_utils import (
@@ -566,7 +566,6 @@ class TestRLUtils:
     def create_test_args(self, **kwargs):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
-        unset_rl_run_config()
 
         args = parse_args(ignore_unknown_args=True)
         args.num_layers = 8

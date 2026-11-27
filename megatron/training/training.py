@@ -1366,6 +1366,8 @@ def pretrain(
         4) train the model using the forward_step_func.
 
     Args:
+        cfg_container: the run's training container. It must be the registered run config
+            (`get_run_config()`): pretrain validates and finalizes the registered root.
         train_valid_test_dataset_provider: a function that takes the size of
             train/valid/test dataset and returns `train, valid, test` datasets.
             May be None when a caller-provided `next_train_iterator` supplies the training data;
@@ -1421,8 +1423,13 @@ def pretrain(
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
-    # The run's root container: `cfg_container` is its training member.
+    # The run's root container: `cfg_container` must be the run config registered in it.
     root = get_root_config_container()
+    if cfg_container is not root.run_config:
+        raise ValueError(
+            "pretrain() was given a config container that is not the registered run config; "
+            "register it with set_run_config() before calling pretrain()."
+        )
     root.validate()
 
     callback_manager = normalize_callbacks(callbacks)
