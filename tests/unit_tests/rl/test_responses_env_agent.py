@@ -11,6 +11,7 @@ import pytest
 
 from megatron.rl import GenericGenerationArgs
 from megatron.rl.agent.api import EvaluationRequest
+from megatron.rl.agent.registry import get_agent_class
 from megatron.rl.agent.responses_env_agent import (
     CAPTURE_CONTROL_PREFIX,
     ROLLOUT_ID_KEY,
@@ -19,11 +20,13 @@ from megatron.rl.agent.responses_env_agent import (
     EpisodeKeys,
     ResponsesEnvAgent,
     RunResult,
+    curriculum_collections,
     episode_keys_from_manifest,
     generation_args_to_run_payload,
     new_rollout_id,
     run_result_to_evaluation_response,
 )
+from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
 
 TOKEN_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 # Gym's capture-key charset: a key is a path segment and a file name.
@@ -428,6 +431,91 @@ class TestResponsesEnvAgent:
             assert key in params and params[key] == value, key
         # The dataset row itself is never mutated.
         assert row["responses_create_params"] == existing
+
+    # (iteration, prompts per collection, group size, grpo iterations, global batch size, expected)
+    @pytest.mark.parametrize(
+        "iteration, prompts, group_size, grpo_iterations, global_batch_size, expected",
+        [
+            (3, 8, 1, 1, None, 3),
+            (8, 4, 16, 1, 32, 4),
+            (8, 4, 16, 2, 32, 2),
+            (12, 4, 2, 3, 4, 2),
+            (1, 0, 1, 1, None, ValueError),
+        ],
+        ids=[
+            "one-batch-per-collection",
+            "batches-per-collection-cadence",
+            "grpo-iterations-cadence",
+            "both-cadences",
+            "invalid-prompts-raises",
+        ],
+    )
+    def test_curriculum_collections(
+        self, iteration, prompts, group_size, grpo_iterations, global_batch_size, expected
+    ):
+        args = (iteration, prompts, group_size, grpo_iterations, global_batch_size)
+        if expected is ValueError:
+            with pytest.raises(ValueError, match="must be positive"):
+                curriculum_collections(*args)
+        else:
+            assert curriculum_collections(*args) == expected
+
+    @pytest.mark.asyncio
+    async def test_curriculum_get_prompt(self, tmp_path, monkeypatch):
+        agent = _agent(tmp_path, curriculum_sampling=True)
+        train_state = SimpleNamespace(iteration=0)
+        rl = SimpleNamespace(grpo_prompts_per_step=2, grpo_group_size=1, grpo_iterations=1)
+        run_config = SimpleNamespace(rl=rl)
+        monkeypatch.setattr("megatron.training.global_vars.get_train_state", lambda: train_state)
+        monkeypatch.setattr("megatron.training.global_vars.get_run_config", lambda: run_config)
+        args = SimpleNamespace(global_batch_size=None)
+        monkeypatch.setattr("megatron.training.global_vars.get_args", lambda: args)
+        rows = [await agent.get_prompt(validation=False) for _ in range(3)]
+        assert [row["problem_id"] for row in rows] == ["p0", "p1", "p2"]
+        # The cursor never rewinds: one collection later its seed (2) is behind the cursor (3).
+        train_state.iteration = 1
+        assert (await agent.get_prompt(validation=False))["problem_id"] == "p3"
+
+        # A restart at that iteration seeds the cursor from training progress, scaled by the
+        # agent's share of the prompt groups.
+        agent2 = _agent(tmp_path, curriculum_sampling=True)
+        assert (await agent2.get_prompt(validation=False))["problem_id"] == "p2"
+        half_share = _agent(tmp_path, curriculum_sampling=True)
+        object.__setattr__(half_share, "_prompt_share", 0.5)
+        assert (await half_share.get_prompt(validation=False))["problem_id"] == "p1"
+
+        # Validation and missing training state fall back to uniform, cursor untouched.
+        assert await agent2.get_prompt(validation=True) in agent2.dataset
+        monkeypatch.setattr("megatron.training.global_vars.get_train_state", lambda: None)
+        assert await agent2.get_prompt(validation=False) in agent2.dataset
+
+        def _no_run_config():
+            # What get_run_config really raises when Megatron global state is uninitialized.
+            raise AssertionError("run config is not initialized.")
+
+        monkeypatch.setattr("megatron.training.global_vars.get_run_config", _no_run_config)
+        assert await agent2.get_prompt(validation=False) in agent2.dataset
+        assert agent2._curriculum_cursor == 3
+
+    def test_weighted_multi_task_stamps_prompt_share(self, tmp_path):
+        agent_cls = get_agent_class("ResponsesEnvAgent")
+        assert agent_cls is ResponsesEnvAgent
+
+        def config(name, weight, **kwargs):
+            args = {
+                "agent_name": name,
+                "dataset_file": _write_dataset(tmp_path),
+                "env_server_host_port": "h:1",
+                "capture_control_host_port": "h:2",
+            }
+            return AgentConfig(agent_type=agent_cls, agent_args=args, weight=weight, **kwargs)
+
+        multi = WeightedMultiTask(
+            [config("a", 3.0), config("b", 1.0), config("c", 1.0, evaluation_only=True)]
+        )
+        # The evaluation-only agent takes no rollout prompts and keeps the default share.
+        shares = {a.agent_name: a._prompt_share for a in multi.agents}
+        assert shares == {"a": pytest.approx(0.75), "b": pytest.approx(0.25), "c": 1.0}
 
     @pytest.mark.parametrize(
         "kind, error",

@@ -275,6 +275,22 @@ def episode_keys_from_manifest(
     )
 
 
+def curriculum_collections(
+    iteration: int,
+    prompts_per_collection: int,
+    group_size: int = 1,
+    grpo_iterations: int = 1,
+    global_batch_size: int | None = None,
+) -> int:
+    """Completed data collections at `iteration`; the cursor advances per collection, not step."""
+    if prompts_per_collection <= 0:
+        raise ValueError(f"grpo_prompts_per_step must be positive, got {prompts_per_collection}")
+    samples_per_collection = prompts_per_collection * max(1, group_size)
+    global_batch_size = global_batch_size or samples_per_collection
+    batches_per_collection = max(1, samples_per_collection // global_batch_size)
+    return int(iteration) // max(1, max(1, grpo_iterations) * batches_per_collection)
+
+
 def generation_args_to_run_payload(generation_args: GenericGenerationArgs, prompt: dict) -> dict:
     """Stamp the trainer's sampling settings over the row's `responses_create_params`"""
     if generation_args.top_k is not None and generation_args.top_k > 0:
@@ -377,6 +393,9 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
     # max_output_tokens_per_step takes priority over defer_output_cap_to_engine.
     max_output_tokens_per_step: int | None = None
     defer_output_cap_to_engine: bool = False
+    # Curriculum sampling assumes dataset rows are pre-sorted in curriculum order;
+    # the cursor is seeded from the training iteration so restarts resume, not reset.
+    curriculum_sampling: bool = False
     # Connection-establishment timeout; there is deliberately no read/total timeout,
     # so slow-but-alive episodes are never severed mid-flight.
     # rollout_timeout_s (opt-in) is the wall-clock bound; discards slow episodes' training signals.
@@ -386,6 +405,12 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
     # Bounded connect retries: give up at failure_cap so the pipeline slot frees as a placeholder.
     connect_failure_cap: int = Field(default=60, ge=1)
     connect_retry_wait_s: float = Field(default=5.0, ge=0)
+    # One warning per process when curriculum sampling degrades to uniform.
+    _curriculum_fallback_logged: bool = PrivateAttr(False)
+    # Next curriculum row, counted in prompt groups over the whole run.
+    _curriculum_cursor: int = PrivateAttr(0)
+    # This agent's share of each collection's prompt groups; WeightedMultiTask stamps it.
+    _prompt_share: float = PrivateAttr(1.0)
     # Engine uids recorded by evaluation episodes since run_evaluation last reported them.
     _evaluation_completion_ids: list[str] = PrivateAttr(default_factory=list)
 
@@ -417,8 +442,39 @@ class ResponsesEnvAgent(RolloutGenerator, GroupedRolloutGenerator, PassAtEvaluat
         return data
 
     async def get_prompt(self, validation: bool) -> dict:
-        """A dataset row, sampled uniformly."""
-        return self.dataset[np.random.randint(0, len(self.dataset))]
+        """Next dataset row: curriculum order for training, uniform for validation."""
+        if validation or not self.curriculum_sampling:
+            return self.dataset[np.random.randint(0, len(self.dataset))]
+        # Rollout collection only runs on one rank; DP peers must not advance the cursor.
+        try:
+            from megatron.training.global_vars import get_args, get_run_config, get_train_state
+
+            rl_config = get_run_config().rl
+            collections = curriculum_collections(
+                get_train_state().iteration,
+                rl_config.grpo_prompts_per_step,
+                rl_config.grpo_group_size,
+                rl_config.grpo_iterations,
+                get_args().global_batch_size,
+            )
+        except (ImportError, AssertionError, AttributeError) as e:
+            if not self._curriculum_fallback_logged:
+                self._curriculum_fallback_logged = True
+                logger.warning(
+                    "ResponsesEnvAgent[%s]: curriculum_sampling is enabled but no training "
+                    "state is available (%s: %s); falling back to uniform sampling.",
+                    self.agent_name,
+                    type(e).__name__,
+                    e,
+                )
+            return self.dataset[np.random.randint(0, len(self.dataset))]
+
+        # A restart seeds the cursor from the collections this agent already consumed; from
+        # there it only moves forward.
+        restart_seed = int(collections * rl_config.grpo_prompts_per_step * self._prompt_share)
+        index = max(self._curriculum_cursor, restart_seed)
+        self._curriculum_cursor = index + 1
+        return self.dataset[index % len(self.dataset)]
 
     def _placeholder(
         self,
