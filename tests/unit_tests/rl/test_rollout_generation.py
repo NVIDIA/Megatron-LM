@@ -11,6 +11,7 @@ from pydantic import Field, ValidationError
 
 from megatron.rl.agent.api import (
     EpisodeResult,
+    EvaluationRequest,
     GroupedRolloutGenerator,
     GroupedRolloutRequest,
     GroupRolloutParams,
@@ -175,6 +176,7 @@ class FilteringMockGenerator(MockGenerator):
                     reward=rollout.reward,
                     env_id=rollout.env_id,
                     completion_ids=[f"cc-{idx}-{member}"],
+                    retired_completion_ids=[f"cc-{idx}-{member}-retry"],
                 )
             return rollout
 
@@ -498,8 +500,9 @@ class TestGroupedRollouts:
             # Every dropped group cost exactly one extra prepare (no under-delivery).
             assert gen.prepare_group_rollout_calls == expected_count + num_degenerate
             assert pipeline.filtered_count == num_degenerate
-            # Dropped groups hand over their turns' completion ids once, for the ledger pops.
-            assert len(pipeline.take_dropped_completion_ids()) == 2 * num_degenerate
+            # Dropped groups hand over their turns' and retired calls' ids once (two rollouts
+            # per group, one turn and one retry each), for the ledger pops.
+            assert len(pipeline.take_dropped_completion_ids()) == 4 * num_degenerate
             assert pipeline.take_dropped_completion_ids() == []
 
     @pytest.mark.asyncio
@@ -1201,7 +1204,7 @@ TWO_TURN_EXPECTED = dict(
 )
 
 
-class ScriptedInterface(ReturnsTokens, ReturnsRaw):
+class ScriptedInterface(ReturnsTokens):
     """Inference stub whose reply is a pure function of the request: the conversation length
     maps to a response spec, so it stays deterministic under pipeline concurrency."""
 
@@ -1364,3 +1367,18 @@ class TestMultiTurnEpisode:
         assert agent.observation_turns == expected["observation_turns"]
         # get_trajectory_reward sees the full dialogue, ending on the final reply exactly once.
         assert [(m.role, m.content) for m in agent.reward_conversation] == expected["reward_conv"]
+
+    @pytest.mark.asyncio
+    async def test_evaluation_names_every_call_behind_a_result(self):
+        """A pass@k evaluation result names every request behind it, the k samples and the greedy
+        call, so the trainer can release their finished-request records."""
+        ids = (f"cc-{n}" for n in itertools.count())
+
+        class Counting(ReturnsTokens):
+            async def agenerate(self, request):
+                return make_response(2, 6, completion_id=next(ids), with_tokens=False)
+
+        request = EvaluationRequest(inference_interface=Counting(), num_prompts=1)
+        response = await EpisodeAgent(max_k=2).evaluation("hello", {"problem_id": "p0"}, request)
+        (result,) = response.results
+        assert sorted(result.completion_ids) == ["cc-0", "cc-1", "cc-2"]

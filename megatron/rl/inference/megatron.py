@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
+import uuid
 from typing import Any
 
 import httpx
@@ -27,6 +29,7 @@ from ..rollout_bank import (
     LedgerPayloadStager,
     gather_view,
     request_record_backup_path,
+    request_records_dir,
     resolve_bank_dir,
 )
 from ..server.api import InferenceServer
@@ -34,6 +37,30 @@ from ..token_custody import HeldPrefixPreparer, PrefixStore
 from .chat_interface import MegatronChatInterface
 
 logger = logging.getLogger(__name__)
+
+
+def _check_shared_bank_dir(bank_dir: str) -> None:
+    """Fail the launch unless every rank sees the files rank 0 writes under the bank directory.
+
+    Every engine backs its records up there and only rank 0 reads them back, so a node-local
+    path would lose the other nodes' records silently at every checkpoint and restart.
+    """
+    probe = [None]
+    if dist.get_rank() == 0:
+        os.makedirs(request_records_dir(bank_dir), exist_ok=True)
+        probe[0] = os.path.join(request_records_dir(bank_dir), f".probe-{uuid.uuid4().hex}")
+        open(probe[0], "w").close()
+    dist.broadcast_object_list(probe, src=0)
+    seen = [None] * dist.get_world_size()
+    dist.all_gather_object(seen, os.path.exists(probe[0]))
+    if dist.get_rank() == 0:
+        os.remove(probe[0])
+    if not all(seen):
+        missing = [rank for rank, ok in enumerate(seen) if not ok]
+        raise RuntimeError(
+            f"rollout-bank directory {bank_dir} is not shared: rank(s) {missing} cannot see the "
+            "files rank 0 writes there; point --rl-rollout-bank-dir at a shared file system"
+        )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
@@ -144,6 +171,7 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         if cfg.rl.rl_durable_rollout_bank:
             # Need to copy the staged payloads into the durable bank.
             bank_dir = resolve_bank_dir(cfg.rl.rl_rollout_bank_dir, cfg.checkpoint.save)
+            _check_shared_bank_dir(bank_dir)
             writer = FinishedRequestLedgerWriter(
                 request_record_backup_path(bank_dir, dist.get_rank(), get_train_state().iteration)
             )
@@ -229,7 +257,12 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
             self._client.stop_engines()
         await self._inference_engine.wait_until(EngineState.STOPPED)
 
-        self._inference_engine.payload_stager.close()
+        try:
+            self._inference_engine.payload_stager.close()
+        except RuntimeError:
+            # Keep tearing down: the coordinator below is a non-daemon child, and rank 0 cannot
+            # exit while it runs. The failed write is logged here with its cause.
+            logger.exception("Finished-request ledger writer failed; its backup is incomplete")
 
         if dist.get_rank() == 0:
             self._client.shutdown_coordinator()

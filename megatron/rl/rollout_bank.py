@@ -16,8 +16,8 @@ Per-request engine-related data is sourced from the inference engine's in-memory
 finished-request ledger, which is wrapped by a custom writer in this file and
 stored as per-rank backup files.
 
-Layout (manifests are single-writer rank-0; one record backup file per engine rank,
-all on Lustre)::
+Layout (manifests are single-writer rank-0; one record backup file per engine rank and
+collection window; every rank must see the same ``<bank_dir>``, e.g. on Lustre)::
 
     <bank_dir>/
         PIPELINE.json                 # atomically selects one complete generation
@@ -28,7 +28,7 @@ all on Lustre)::
                 consumed.log          # append-only markers {"uid", "iter"}
                 gen-<iter>/
                     ledger.log        # append-only JSONL, one manifest per group
-                    request_records.bin  # records referenced by this segment
+                    request_records.bin  # folded records still owed to a group
 
 Recovery guarantees: manifest appends are write-through with ``fsync`` per group,
 so a kill can damage only the final record, which its checksum drops on read.
@@ -397,6 +397,9 @@ class FinishedRequestLedgerWriter:
                 for item in batch:
                     if isinstance(item, _Rotate):
                         item.done.set()
+            # A stop message ends the thread even when its batch failed: close() joins it.
+            if any(isinstance(item, _Rotate) and item.path is None for item in batch):
+                return
 
 
 # Bytes per read while scanning a record file; a frame may span reads.
@@ -427,6 +430,10 @@ def _record_frames(path: str) -> Iterator[tuple[str, dict, bytes]]:
                         )
                         continue
                     yield uid, payload, frame
+        except OSError:
+            # A failed read is not a torn tail: the caller must not fold or prune this file.
+            logger.exception("Reading request records from %s failed", path)
+            raise
         except Exception:  # pylint: disable=broad-except
             logger.warning(
                 "Corrupt msgpack framing in %s; the records after it were skipped.", path
@@ -485,9 +492,12 @@ class LedgerPayloadStager:
         finished_metadata.payload = payload
         if self.writer is not None:
             self.writer.append(uid, finished_metadata)
+        # Index only what the joins read; the full payload (media tensors, routing indices)
+        # then lives until the writer has packed it, not until the next drain.
+        view = gather_view(finished_metadata)
         with self._lock:
             assert uid not in self.records, f"finished-request ledger: duplicate uid {uid!r}"
-            self.records[uid] = finished_metadata
+            self.records[uid] = view
         # Acknowledge custody before the writer's fsync: Gym's crash domain is this process,
         # and MRL never resumes an in-flight conversation across a restart.
         admission = (offload_params or {}).get(NG_CAPTURE_FIELD)
@@ -524,27 +534,32 @@ def gather_view(record: FinishedRequestRecord) -> FinishedRequestRecord:
     """Keep what the RL joins read: token ids, generated log probs and the staleness stamps."""
     payload = record.payload
     if payload is not None:
-        payload = dataclasses.replace(
-            payload,
+        # Built field by field, so a payload field added in core is not gathered by default.
+        payload = OffloadedRequestPayload(
+            prompt_token_ids=payload.prompt_token_ids,
+            generated_token_ids=payload.generated_token_ids,
+            generated_log_probs=payload.generated_log_probs,
             prompt_log_probs=None,
-            prompt_top_n_logprobs=None,
-            generated_top_n_logprobs=None,
             routing_indices=None,
-            media_tensors=None,
         )
     return dataclasses.replace(record, payload=payload)
 
 
-def _joinable(record: Optional[FinishedRequestRecord]) -> bool:
-    """Whether a record carries everything a restored TokenRollout turn is rebuilt from."""
-    p = None if record is None else record.payload
-    return (
-        p is not None
-        and bool(record.policy_epoch)
-        and bool(record.kv_cache_epoch)
-        and None not in (p.prompt_token_ids, p.generated_log_probs)
-        and len(p.generated_log_probs) == len(p.generated_token_ids)
-    )
+def unjoinable_reason(record: Optional[FinishedRequestRecord]) -> Optional[str]:
+    """Why ``rebuild_turns`` cannot rebuild a turn from this record; None when it can."""
+    if record is None:
+        return "is missing"
+    if not (record.policy_epoch and record.kv_cache_epoch):
+        return "has no epoch stamps"
+    p = record.payload
+    if p is None or p.prompt_token_ids is None or p.generated_log_probs is None:
+        return "has no token payload"
+    if len(p.generated_log_probs) != len(p.generated_token_ids):
+        return (
+            f"has {len(p.generated_log_probs)} log probs for "
+            f"{len(p.generated_token_ids)} generated tokens"
+        )
+    return None
 
 
 def rebuild_turns(turns: list[FinishedRequestRecord]) -> dict[str, list]:
@@ -609,17 +624,21 @@ class RolloutBank:
         self._bytes_written = 0
         self._warned_over_cap = False
         self._retired: set[str] = set()  # uids rank 0 retired, pruned once their records show
+        self._recovered: frozenset[str] = frozenset()  # uids recover() folded or dropped
         if not os.path.exists(self._manifest_path):
             # The engines may already have created their backup directory; anything
             # else in a manifest-less directory is bank data this run must not overwrite.
             leftovers = set(os.listdir(bank_dir)) - {_REQUEST_RECORDS_DIRNAME}
             if "MANIFEST.json" in leftovers:
-                raise ValueError(
+                message = (
                     f"{bank_dir} holds a rollout bank in the earlier on-disk format "
                     f"(MANIFEST.json; this version writes {_MANIFEST}, format_version "
                     f"{_FORMAT_VERSION}). It cannot be migrated: remove the rollout-bank "
                     "directory and its groups are regenerated."
                 )
+                # Logged first: rank 0 raises alone here and nothing above logs it.
+                logger.error(message)
+                raise ValueError(message)
             if leftovers:
                 raise FileNotFoundError(
                     f"RolloutBank manifest is missing at {self._manifest_path}, but "
@@ -830,6 +849,8 @@ class RolloutBank:
                 trajectory = member.pop("trajectory")  # None: staged, the records hold the turns
                 for field in _RECORD_DERIVED_FIELDS:
                     member.pop(field, None)
+                # Drained at the collection that banked the group; a restored group owns none.
+                member.pop("retired_completion_ids", None)
                 completion_ids = member.get("completion_ids") or []
                 if trajectory is not None and not trajectory:
                     # A placeholder's ids name calls the join released; nothing references them.
@@ -868,9 +889,7 @@ class RolloutBank:
 
     # --------------------------------------------------------------- restore
     def restore(
-        self,
-        trained_through: int,
-        request_records: Optional[dict[str, FinishedRequestRecord]] = None,
+        self, trained_through: int, request_records: dict[str, FinishedRequestRecord]
     ) -> list[RolloutGroup]:
         """Replay the ledger and return groups not yet trained through ``T``.
 
@@ -880,10 +899,9 @@ class RolloutBank:
             return [group for _, group in self._survivors(trained_through, request_records)]
 
     def _survivors(
-        self, trained_through: int, request_records: Optional[dict[str, FinishedRequestRecord]]
+        self, trained_through: int, request_records: dict[str, FinishedRequestRecord]
     ) -> list[tuple[LedgerRecord, RolloutGroup]]:
         """Surviving manifest records with their decoded groups; undecodable ones are dropped."""
-        request_records = request_records or {}
         records, _, _ = self._restore_state(trained_through)
         pairs = ((record, self._decode(record, request_records)) for record in records)
         return [(record, group) for record, group in pairs if group is not None]
@@ -964,12 +982,18 @@ class RolloutBank:
         else:
             members = []
             for m in group_dict["rollouts"]:
-                turns = [request_records.get(cid) for cid in m.get("completion_ids") or []]
-                if not all(_joinable(turn) for turn in turns):
+                completion_ids = m.get("completion_ids") or []
+                turns = [request_records.get(cid) for cid in completion_ids]
+                defects = [
+                    f"record {cid!r} {reason}"
+                    for cid, turn in zip(completion_ids, turns)
+                    if (reason := unjoinable_reason(turn)) is not None
+                ]
+                if defects:
                     logger.warning(
-                        "Dropping banked rollout group %s: its request records are missing or "
-                        "incomplete; its work will be regenerated.",
+                        "Dropping banked rollout group %s: %s; its work will be regenerated.",
                         uid,
+                        "; ".join(defects),
                     )
                     return None
                 members.append(TokenRollout.model_validate({**m, **rebuild_turns(turns)}))
@@ -998,7 +1022,7 @@ class RolloutBank:
         to now, are folded into the new generation and then pruned. A record is
         dropped once its group was reclaimed or rank 0 retired it; every other record
         is kept, so in-flight multi-window groups keep theirs across any number of
-        checkpoints. The writer stays closed until the next `set_collection()`.
+        checkpoints. The bank's own ledger handle stays closed until the next `set_collection()`.
         """
         with self._lock:
             survivors, reclaimed, markers = self._restore_state(iteration)
@@ -1011,7 +1035,13 @@ class RolloutBank:
             manifest = self._read_manifest()
             closed_backups = self._closed_backup_paths(open_window)
             # The fold works on uids and copies packed frames forward; nothing is decoded here.
-            available = _packed_records(_fold_paths(self.bank_dir, manifest) + closed_backups)
+            # A dead run's copy of a record recover() folded or dropped is not read again.
+            available = {
+                uid: frame
+                for uid, frame in _packed_records(closed_backups).items()
+                if uid not in self._recovered
+            }
+            available |= _packed_records(_fold_paths(self.bank_dir, manifest))
             released = set(self._referenced_records(reclaimed, available)) | self._retired
             folded = {uid: r for uid, r in available.items() if uid not in released}
             folded |= self._referenced_records(survivors, available)
@@ -1026,9 +1056,7 @@ class RolloutBank:
                     logger.warning("Could not prune consumed request-record backup %s", path)
 
     def recover(
-        self,
-        trained_through: int,
-        request_records: Optional[dict[str, FinishedRequestRecord]] = None,
+        self, trained_through: int, request_records: dict[str, FinishedRequestRecord]
     ) -> list[RolloutGroup]:
         """Rebase survivors at ``T`` into a new timeline with no old markers.
 
@@ -1038,8 +1066,10 @@ class RolloutBank:
         with self._lock:
             pairs = self._survivors(trained_through, request_records)
             survivors = [record for record, _ in pairs]
-            referenced = self._referenced_records(survivors, request_records or {})
-            self._retired.update(set(request_records or {}) - set(referenced))
+            referenced = self._referenced_records(survivors, request_records)
+            # Every loaded record is now either in the new generation or dead: a checkpoint
+            # skips the dead run's copies instead of folding them back in.
+            self._recovered = frozenset(request_records)
             self._publish_generation(
                 trained_through, survivors, {}, referenced, timeline=uuid.uuid4().hex
             )

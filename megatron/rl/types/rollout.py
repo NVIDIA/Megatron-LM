@@ -43,6 +43,9 @@ class TokenRollout(AgentBaseModel):
     env_id: str = ''
     problem_id: str | None = None
     completion_ids: list[str] = []
+    # Requests of a trainable episode that are not turns (retries, dead branches): their records
+    # are drained at collection and never trained on.
+    retired_completion_ids: list[str] = []
     policy_epochs: list[list[tuple[int, int]]] | None = None
     kv_cache_epochs: list[list[tuple[int, int]]] | None = None
     num_evictions: list[int] | None = None

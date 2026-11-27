@@ -667,27 +667,32 @@ class TestRLUtils:
         assert captured["initial_batch_id"] == 17
 
     @pytest.mark.parametrize(
-        "ready_batches, expected_skip, leftover",
+        "ready_batches, expected_skip, ledger",
         [
-            pytest.param(1, True, False, id="banked_batch_skips"),
-            pytest.param(0, False, False, id="empty_bank_runs_inference"),
-            pytest.param(None, False, False, id="no_pipeline_runs_inference"),
-            pytest.param(0, False, True, id="unconsumed_record_fails_loudly"),
+            pytest.param(1, True, "owned", id="banked_batch_skips"),
+            pytest.param(0, False, "owned", id="empty_bank_runs_inference"),
+            pytest.param(None, False, "owned", id="no_pipeline_runs_inference"),
+            # A record no consumer names may be a turn of a running episode: it waits.
+            pytest.param(0, False, "stray", id="unclaimed_record_waits"),
+            pytest.param(0, False, "lost", id="join_failure_reaches_every_rank"),
         ],
     )
     def test_can_skip_inference_routes_rollout_collection(
-        self, monkeypatch, ready_batches, expected_skip, leftover
+        self, monkeypatch, ready_batches, expected_skip, ledger
     ):
-        """can_skip_inference cold-reads the pipeline bank; a skip routes
-        get_environment_rollouts to consume banked groups without inference. Either way the
-        collection drains every engine's request ledger into rank 0 (rotating the backups to
-        the next window), pops the dropped groups' records before the broadcast and, with
-        nothing in flight, fails loudly on a record no consumer claimed."""
+        """A banked batch skips inference. Either way the collection drains every engine's ledger
+        into rank 0, rotates the backups, releases the dropped groups' records before the
+        broadcast, keeps an unclaimed record, and raises a rank-0 join failure on every rank."""
         n_prompts = 4
         # The last group holds a failed episode's placeholder naming the one call it made.
         fake_groups = [[f"group_{i}"] for i in range(n_prompts - 1)] + [
             [TokenRollout(trajectory=[], reward=0.0, completion_ids=["released-cid"])]
         ]
+        if ledger == "lost":
+            # A delivered turn whose record no drain holds: the join fails on rank 0.
+            fake_groups[0] = [
+                TokenRollout(trajectory=None, reward=0.0, completion_ids=["lost-cid"])
+            ]
         train_state = TrainState(iteration=1)
         loop = asyncio.new_event_loop()
 
@@ -696,7 +701,8 @@ class TestRLUtils:
                 yield group
 
         rollout_generator = gen()
-        dropped = iter([["dropped-cid"], []])
+        # The second dropped id has no record (a streamed call, for example, is never staged).
+        dropped = iter([["dropped-cid", "unrecorded-cid"], []])
         pipeline_stub = SimpleNamespace(
             settle=lambda loop: ready_batches or 0,
             take_dropped_completion_ids=lambda: next(dropped),
@@ -711,12 +717,13 @@ class TestRLUtils:
         drained = {
             "dropped-cid": object(),
             "released-cid": object(),
-            **({"stray-cid": object()} if leftover else {}),
+            **({"stray-cid": object()} if ledger == "stray" else {}),
         }
         interface = SimpleNamespace(
             merge_global_request_ledgers=MagicMock(return_value=drained),
             forget_held_prefixes=MagicMock(),
         )
+        bank = MagicMock()
         monkeypatch.setattr(
             rl_utils, "_ROLLOUT_PIPELINE", None if ready_batches is None else pipeline_stub
         )
@@ -733,16 +740,27 @@ class TestRLUtils:
         monkeypatch.setattr(rl_utils, "lang_rl_log_dir", None)
         runtime_state = rl_utils.RLRuntimeState()
         monkeypatch.setattr(rl_utils, "get_rl_runtime_state", lambda: runtime_state)
+        monkeypatch.setattr(rl_utils, "get_rollout_bank", lambda: bank)
+        rank, sent = [0], []
+
+        def broadcast(objects, src=0):
+            # One process plays both ranks in turn: rank 0 leaves what it sends, rank 1 takes it.
+            if rank[0] == src:
+                sent.append(list(objects))
+            else:
+                assert sent, "rank 0 raised without telling the other ranks"
+                objects[:] = sent.pop(0)
+
         try:
             with (
-                patch("torch.distributed.get_rank", return_value=0),
-                patch("torch.distributed.broadcast_object_list"),
+                patch("torch.distributed.get_rank", side_effect=lambda: rank[0]),
+                patch("torch.distributed.broadcast_object_list", side_effect=broadcast),
                 patch("torch.are_deterministic_algorithms_enabled", return_value=False),
             ):
-                skip = rl_utils.can_skip_inference()
-                assert skip == expected_skip
 
                 def collect():
+                    skip = rl_utils.can_skip_inference()
+                    assert skip == expected_skip
                     return rl_utils.get_environment_rollouts(
                         [MagicMock()],
                         inference_model=None,
@@ -752,19 +770,35 @@ class TestRLUtils:
                         run_inference=not skip,
                     )
 
-                if leftover:
-                    with pytest.raises(AssertionError, match="left unconsumed"):
-                        collect()
+                if ledger == "lost":
+                    # Rank 1 runs the same calls after rank 0 and must raise too; today it would
+                    # wait in the broadcast until the distributed timeout.
+                    for rank[0] in (0, 1):
+                        with pytest.raises(Exception, match="no record for 'lost-cid'"):
+                            collect()
                     return
                 rollouts = collect()
             assert rollouts == fake_groups
             assert colocated.called != expected_skip
-            # The ledger drain closes out this window's backups under the next window.
+            # The ledger drain flushes this window's backups and rotates the writers to the next.
             interface.merge_global_request_ledgers.assert_called_once_with(rotate_to=2)
-            # The dropped group's and the placeholder's records were popped; nothing is left.
-            assert runtime_state.request_ledger == {}
-            # The prefix store stops holding the consumed and released calls' tokens.
-            interface.forget_held_prefixes.assert_called_once_with({"dropped-cid", "released-cid"})
+            # A record leaves the ledger unless it may still find its rollout.
+            waiting = {"stray-cid"} if ledger == "stray" else set()
+            assert set(runtime_state.request_ledger) == waiting
+            left = sorted(set(drained) - waiting)
+
+            def ids(mock):
+                return sorted(uid for args, _ in mock.call_args_list for uid in args[0])
+
+            # The prefix store forgets every record that left; the bank stops owing the records
+            # no group will name (the dropped, recorded or not, and the released).
+            assert ids(interface.forget_held_prefixes) == left
+            assert ids(bank.retire_records) == sorted([*left, "unrecorded-cid"])
+            # A checkpoint before the next collection must leave the window this drain opened alone.
+            runtime_state.reset_iteration_counters(train_state.iteration)  # as the data hook does
+            rl_utils.maybe_compact_rollout_bank(9)
+            (drain,) = interface.merge_global_request_ledgers.call_args_list
+            bank.checkpoint.assert_called_once_with(9, open_window=drain.kwargs["rotate_to"])
         finally:
             loop.run_until_complete(rollout_generator.aclose())
             loop.close()
@@ -1016,7 +1050,7 @@ class TestRLUtils:
         response = SimpleNamespace(
             env_id="env",
             metrics=lambda: {"reward": [1.0, 0.5]},
-            results=[SimpleNamespace(completion_ids=["eval-1", "eval-2"])],
+            results=[SimpleNamespace(completion_ids=["eval-1", "eval-2", "eval-unrecorded"])],
         )
         agent = SimpleNamespace(run_evaluation=lambda request: [response])
         wandb_writer = MagicMock()
@@ -1069,8 +1103,9 @@ class TestRLUtils:
         # Evaluation records are popped right away; the straggler waits for its collection.
         interface.merge_global_request_ledgers.assert_called_once_with()
         assert set(runtime_state.request_ledger) == {"straggler"}
-        bank.retire_records.assert_called_once_with(["eval-1", "eval-2"])
-        interface.forget_held_prefixes.assert_called_once_with(["eval-1", "eval-2"])
+        # An evaluation id with no record (a streamed call is never staged) is released too.
+        bank.retire_records.assert_called_once_with(["eval-1", "eval-2", "eval-unrecorded"])
+        interface.forget_held_prefixes.assert_called_once_with({"eval-1", "eval-2"})
         if do_train:
             wandb_writer.log.assert_called_once_with({"env_eval_mean_reward": 0.75}, step=7)
             wandb_writer.define_metric.assert_not_called()
@@ -2846,14 +2881,10 @@ class TestRLUtils:
         assert reason_rows == [["http_500", 1, 1 / 6], ["judge_unparseable", 1, 1 / 6]]
 
     def test_join_request_records(self):
-        """join_request_records pops each turn's finished-request record onto its rollout
-        exactly once: the staleness stamps always, the log probs only when the interface returned
-        none, and the whole turn (tokens, mask, log probs) when the payload was staged. Text
-        rollouts join nothing, joined rollouts are skipped on a second pass, and a missing,
-        payload-less or stamp-less record or a turn/log-prob count mismatch is a hard error.
-        compute_group_stats then reads the stamps off the rollouts, and
-        prep_wandb_metrics filters staleness/eviction telemetry to joined rollouts, emitting none
-        when nothing joined."""
+        """The join pops each turn's record onto its rollout exactly once (stamps, log probs or
+        whole staged turns) and fails hard on a missing or unusable record; the settle releases
+        dropped, placeholder and retired calls around it; group stats and the wandb metrics read
+        the stamps off the rollouts and emit none when nothing joined."""
         eod = MockTokenizer().eod
 
         def token_rollout(turns, masks, completion_ids=None, inline_logprobs=True):
@@ -3005,6 +3036,39 @@ class TestRLUtils:
         # the rule at its own boundary rather than at the collection barrier on rank 0.
         with pytest.raises(ValueError, match="completion ids"):
             offloaded_turn(completion_ids=[])
+
+        # settle_request_ledger wraps the join for a collection or an evaluation: dropped calls,
+        # placeholder calls and a trainable rollout's retired calls are released whether or not a
+        # record arrived for them, the rest is joined, and a record nothing claims stays.
+        retrying = TokenRollout(
+            trajectory=None,
+            reward=1.0,
+            env_id='MEGAENV',
+            completion_ids=_mint_cids(1),
+            retired_completion_ids=["retry-cid"],  # the episode's retry: a record, not a turn
+        )
+        failed = TokenRollout(
+            trajectory=[], reward=0.0, env_id='MEGAENV', completion_ids=["failed-cid"]
+        )
+        ledger = {
+            retrying.completion_ids[0]: _ledger_record(
+                3, payload=_payload([1], [2, eod], [-0.1, -0.2])
+            ),
+            "retry-cid": _ledger_record(4),
+            "dropped-cid": _ledger_record(3),
+            "failed-cid": _ledger_record(3),
+            "stray-cid": _ledger_record(3),
+        }
+        retire, forget = rl_utils.settle_request_ledger(
+            ledger, [[retrying, failed]], ["dropped-cid", "unrecorded-cid"]
+        )
+        # The retired call is released, not joined: one turn, one stamp; the stray record stays.
+        assert retrying.trajectory == [[1, 2, eod]] and retrying.policy_epochs == [[(0, 3)]]
+        assert set(ledger) == {"stray-cid"}
+        # Every release is retired in the bank, recorded or not; only records that left the ledger
+        # need their held prefix forgotten.
+        assert retire == ["dropped-cid", "unrecorded-cid", "retry-cid", "failed-cid"]
+        assert forget == {retrying.completion_ids[0], "retry-cid", "dropped-cid", "failed-cid"}
 
         # Text (non-token) rollouts join no finished-request records and yield
         # empty epoch rows; staleness/eviction telemetry filters them out while

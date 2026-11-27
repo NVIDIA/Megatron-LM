@@ -26,7 +26,8 @@ logger = logging.getLogger(__name__)
 # Gym's admission rides in offload_params under this key (nemo_gym's NG_CAPTURE_FIELD).
 NG_CAPTURE_FIELD = "ng_capture"
 NG_COMMIT_COORDS_FIELD = "ng_commit_coords"
-# A store round trip that takes longer than this fails the request instead of stalling the engine.
+# Bounds the connection at launch and TCPStore.get()'s wait for a missing key; it is not a
+# deadline on check(), set() or delete_key().
 STORE_TIMEOUT = timedelta(seconds=5)
 
 HeldCall = tuple[list[int], list[int]]
@@ -40,7 +41,8 @@ class PrefixStore:
     """
 
     def __init__(self, host: str | None = None, port: int = 0, *, is_master: bool = False) -> None:
-        self.host = host or socket.gethostname()
+        # Rank 0 hands this to every rank, so resolve it here: other nodes may not know the name.
+        self.host = host or socket.gethostbyname(socket.gethostname())
         self._store = torch.distributed.TCPStore(
             self.host, port, is_master=is_master, timeout=STORE_TIMEOUT
         )
@@ -143,9 +145,11 @@ class HeldPrefixPreparer:
             )
         tokens = list(prompt) if isinstance(prompt, (list, tuple)) else prompt.tolist()
         spliced = replace_prefix_tokens(prefix, template_prefix, tokens, eos_token_ids)
-        # Inline the resolved prefix so the stager can prove the prompt began with it.
+        # Inline the resolved prefix so the stager can prove the prompt began with it. The
+        # rendered prefix is spent once spliced, so it does not ride on to the other ranks.
+        spent = (PREFIX_TEMPLATE_TOKEN_IDS_FIELD, PREFIX_EOS_TOKEN_ID_FIELD)
         offload_params = {
-            **offload_params,
+            **{key: value for key, value in offload_params.items() if key not in spent},
             NG_CAPTURE_FIELD: {**admission, "required_prefix_token_ids": prefix},
         }
         if PREFIX_MEDIA_COUNT_FIELD in offload_params:

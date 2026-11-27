@@ -512,7 +512,7 @@ class RolloutPipeline:
                     completion_id
                     for rollout in group.rollouts
                     if isinstance(rollout, TokenRollout)
-                    for completion_id in rollout.completion_ids
+                    for completion_id in (*rollout.completion_ids, *rollout.retired_completion_ids)
                 )
                 task = asyncio.create_task(
                     self._regenerate_group(group.batch_id, group.index_in_batch)
