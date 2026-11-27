@@ -42,11 +42,38 @@ Each module offloads its **input** activation to CPU during forward and reloads 
 | `expert_fc1` | First FC layer in MoE experts | MoE models only |
 | `moe_act` | Activation function in MoE experts | MoE models only |
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
+| `layer_input` | Full-recompute segment input | Full recompute only; mutually exclusive with other targets |
 | `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
 
 When selective `residual_stream` replay is active, its shared checkpoint manager owns the
 connected ShortcutMoE post-norm. In that case `shortcut_post_norm` offloading is skipped for the
 replay-owned forward so that replay and offloading do not release the same activation.
+
+### Full-Recompute Layer Inputs
+
+Use `layer_input` to offload the hidden-state input saved for each full-recompute
+segment. This mode supports `uniform` and `block` recompute, including the FP8/FP4
+Transformer Engine checkpoint path. It requires full recompute and cannot be
+combined with other offload targets. Activation offload scopes must not be nested.
+
+```bash
+--fine-grained-activation-offloading \
+--offload-modules layer_input \
+--recompute-granularity full \
+--recompute-method uniform \
+--recompute-num-layers 2
+```
+
+Masks, context tensors, rotary embeddings and other auxiliary inputs remain on
+device. Layer-input scopes do not enable TE operator-level CPU offload.
+The last physical pipeline rank is skipped, so this mode requires PP > 1.
+Existing size thresholds, offload fractions and resident-group policies apply.
+
+For eligible pipeline inputs sharing storage with a layer input, the original
+storage is released after its D2H event completes. This explicit storage release
+is disabled during CUDA graph capture and deferred TE graph replay. CPU buffers from the shape/dtype pool
+remain checked out until asynchronous H2D completes; the fixed pinned buffer
+continues to use its existing stream-based reader protection.
 
 ### Tuning Parameters
 

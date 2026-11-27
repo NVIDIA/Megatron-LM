@@ -4,6 +4,9 @@ from typing import List, Optional, Set, Tuple, Union
 
 from torch import Tensor
 
+from megatron.core.activation_policy.offload.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.context_parallel import ContextParallelLayoutState, CPLayout
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
@@ -76,6 +79,12 @@ def checkpointed_forward(
     is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
     assert not is_dual_rope or len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
     rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
+
+    offload_layer_input = (
+        self.config.fine_grained_activation_offloading
+        and "layer_input" in self.config.offload_modules
+        and self.pg_collection.pp.rank() != self.config.pipeline_model_parallel_size - 1
+    )
 
     def custom(start: int, end: int):
         def custom_forward(
@@ -238,13 +247,39 @@ def checkpointed_forward(
             input_ids,
         )
         if use_checkpoint:
-            hidden_states, context = precision_aware_checkpoint(
-                cf,
-                self.config,
-                self.pg_collection.tp,
-                *args,
-                distribute_saved_activations=self.config.distribute_saved_activations,
+            pipeline_input = None
+            if (
+                offload_layer_input
+                and start == 0
+                and not getattr(self, "pre_process", True)
+                and not self.config.distribute_saved_activations
+            ):
+                pipeline_input = getattr(self, "input_tensor", None)
+                if isinstance(pipeline_input, (list, tuple)):
+                    pipeline_input = pipeline_input[0] if len(pipeline_input) == 1 else None
+                if not isinstance(pipeline_input, Tensor):
+                    pipeline_input = None
+            offloader = off_interface(offload_layer_input, hidden_states, "layer_input")
+            with offloader as layer_input:
+                hidden_states, context = precision_aware_checkpoint(
+                    cf,
+                    self.config,
+                    self.pg_collection.tp,
+                    layer_input,
+                    *args[1:],
+                    distribute_saved_activations=self.config.distribute_saved_activations,
+                )
+            hidden_states = offloader.group_offload(
+                hidden_states,
+                forced_released_tensors=[] if pipeline_input is None else [pipeline_input],
             )
+            if offload_layer_input:
+                # The group-commit autograd identity can return a view. Pipeline
+                # output deallocation requires a viewless tensor while retaining
+                # the autograd graph for the commit/reload callback.
+                hidden_states = make_viewless_tensor(
+                    inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+                )
         else:
             # Note: original block-branch no-checkpoint path omitted padding_mask
             # (relied on its default=None); restored here for consistency.

@@ -1770,7 +1770,7 @@ class TransformerConfig(ModelParallelConfig):
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
              "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "gdp_qkv",
-             "shortcut_post_norm".
+             "shortcut_post_norm", "layer_input".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1789,6 +1789,8 @@ class TransformerConfig(ModelParallelConfig):
                GatedDeltaProduct mixer.
     "shortcut_post_norm": offload the input of the shortcut output normalization.
             Requires moe_shortcut_connection=True.
+    "layer_input": offload hidden-state inputs saved by full recompute checkpoints;
+        cannot be combined with module-internal offload targets.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -3500,6 +3502,7 @@ class TransformerConfig(ModelParallelConfig):
             ), "fine_grained_activation_offloading cannot be enabled with cpu_offloading."
             assert self.offload_modules is not None and len(self.offload_modules) > 0
             allowed_modules = {
+                "layer_input",
                 "core_attn",
                 "attn_proj",
                 "expert_fc1",
@@ -3516,6 +3519,13 @@ class TransformerConfig(ModelParallelConfig):
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
+            if "layer_input" in self.offload_modules:
+                if set(self.offload_modules) != {"layer_input"}:
+                    raise ValueError(
+                        "layer_input is mutually exclusive with module-internal activation offloading."
+                    )
+                if self.recompute_granularity != "full":
+                    raise ValueError("layer_input requires full activation recompute.")
             if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
                 raise ValueError(
                     "attn_proj cannot be set to offload_modules alone without core_attn "
