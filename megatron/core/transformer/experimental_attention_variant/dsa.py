@@ -2076,7 +2076,12 @@ def _dsa_weights_proj_wgrad(
         else:
             main_grad = getattr(weight, "main_grad", None)
         if main_grad is not None:
-            if is_first_microbatch is True or getattr(weight, "overwrite_main_grad", False):
+            # A projection reused in one forward runs backward in reverse order.
+            # The first visit must not overwrite a later visit's contribution.
+            first_wgrad = is_first_microbatch is True and not getattr(
+                weight, "grad_added_to_main_grad", False
+            )
+            if first_wgrad or getattr(weight, "overwrite_main_grad", False):
                 main_grad.copy_(grad_weight)
             else:
                 main_grad.add_(grad_weight)

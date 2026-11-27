@@ -17,6 +17,7 @@ from megatron.core.models.gpt.moe_module_specs import (
     get_moe_module_spec,
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.recurrence_gate import AdaptiveDeltaGate
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
 from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention, KimiDeltaAttentionSubmodules
 from megatron.core.ssm.gated_delta_product import (
@@ -408,6 +409,26 @@ gated_delta_product_stack_spec = ModuleSpec(
 )
 
 
+# Exact adaptive-delta updates with input re-injection at every marked region.
+# MTP remains an ordinary, unlooped stack with its original layer recipes.
+adaptive_delta_hybrid_stack_spec = replace(
+    hybrid_stack_spec,
+    submodules=replace(
+        hybrid_stack_spec.submodules,
+        recurrence_gate=ModuleSpec(module=AdaptiveDeltaGate),
+        mtp_stack_submodules=hybrid_stack_spec.submodules,
+    ),
+)
+adaptive_delta_gated_delta_product_stack_spec = replace(
+    gated_delta_product_stack_spec,
+    submodules=replace(
+        gated_delta_product_stack_spec.submodules,
+        recurrence_gate=ModuleSpec(module=AdaptiveDeltaGate),
+        mtp_stack_submodules=gated_delta_product_stack_spec.submodules,
+    ),
+)
+
+
 hybrid_inference_stack_spec = ModuleSpec(
     module=HybridStack,
     submodules=HybridStackSubmodules(
@@ -638,6 +659,26 @@ gated_delta_product_inference_stack_spec = ModuleSpec(
         mlp_layer=hybrid_inference_stack_spec.submodules.mlp_layer,
         moe_layer=hybrid_inference_stack_spec.submodules.moe_layer,
         mtp_block_spec=hybrid_inference_stack_spec.submodules.mtp_block_spec,
+    ),
+)
+
+
+# Preserve the gated architecture when inference builders resolve a training spec.
+# These do not enable recurrent KV caching; HybridModel still rejects inference contexts.
+adaptive_delta_hybrid_inference_stack_spec = replace(
+    hybrid_inference_stack_spec,
+    submodules=replace(
+        hybrid_inference_stack_spec.submodules,
+        recurrence_gate=ModuleSpec(module=AdaptiveDeltaGate),
+        mtp_stack_submodules=hybrid_inference_stack_spec.submodules,
+    ),
+)
+adaptive_delta_gated_delta_product_inference_stack_spec = replace(
+    gated_delta_product_inference_stack_spec,
+    submodules=replace(
+        gated_delta_product_inference_stack_spec.submodules,
+        recurrence_gate=ModuleSpec(module=AdaptiveDeltaGate),
+        mtp_stack_submodules=gated_delta_product_inference_stack_spec.submodules,
     ),
 )
 

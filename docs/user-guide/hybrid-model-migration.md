@@ -193,6 +193,12 @@ For a source checkpoint with *N* GPT layers:
 - Use `*-` repeated *N* times for a dense GPT model.
 - Use `*E` repeated *N* times for a GPT model whose MLP in every layer is MoE.
 
+For an ungated recurrent HybridModel target, the pattern can include `:` boundaries,
+e.g., `:*-:` for one GPT block. The converter maps only physical layers and
+retains the marked pattern in the saved checkpoint arguments, when present.
+See [Depth recurrence in HybridModel](../models/hybrid-recurrence.md) for configuring
+loop counts and importing weights into gated or conditioned variants.
+
 The converter maps parameters by occurrence, not merely by numeric layer index:
 
 | Source parameter | Target parameter |
