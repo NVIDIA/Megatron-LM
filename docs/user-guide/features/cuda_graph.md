@@ -124,6 +124,58 @@ not enable mHC capture by themselves.
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
 
+### Hybrid models: one graph per mixer and feed-forward pair
+
+`HybridModel` runs each block as two layers: a mixer (attention, GDN, and similar) without a
+feed-forward branch, followed by an MoE or MLP layer without an attention branch. With per-layer
+graphs, every block therefore launches two forward and two backward graphs.
+`--cuda-graph-pair-hybrid-layers` captures each mixer together with the MoE or MLP layer that
+follows it as one graph, which halves the graph launches per block:
+
+```bash
+--cuda-graph-impl transformer_engine \
+--cuda-graph-modules attn moe_router moe_preprocess \
+--cuda-graph-pair-hybrid-layers
+```
+
+- The pair's graph runs the same operations as the two per-layer graphs. The mixer launches it,
+  and the MoE or MLP layer then runs only its work outside the graph, such as the MoE token
+  dispatch, experts and combine. With `--fp32-residual-connection`, the pair rounds the mixer's
+  FP32 output to the BF16 graph input of the MoE or MLP layer, as the per-layer graphs do.
+- The pair is not part of the model, so parameter names and checkpoints do not change.
+- A layer keeps its own graph when it cannot be paired: Mamba layers, layers whose neighbor is not
+  graphed, pairs split by a pipeline stage boundary, hash-routed MoE layers, and pairs whose two
+  layers differ in their FP8/FP4 first/last-layer BF16 setting.
+- An MoE layer whose graph contains the MoE megakernel (`--moe-megakernel-backend`) keeps its own
+  graph, with a warning: the megakernel's weight views are refreshed eagerly right before that
+  graph replays.
+- A layer whose own config in a `hybrid_layer_config_list` sets a `cuda_graph_impl` other than
+  `transformer_engine` is not paired and runs as it does with per-layer graphs; its neighbor keeps
+  its own graph.
+- The layers of Hybrid MTP blocks, which per-layer graphs leave eager, are graphed too, paired the
+  same way. They stay eager, with a warning:
+  - with `--mtp-use-repeated-layer` and several MTP depths;
+  - with `--keep-mtp-in-bf16` in FP8 or FP4 training;
+  - when the MTP layer configs of a `hybrid_layer_config_list` select another FP8 or FP4 recipe
+    than the model (format, recipe, recipe options or amax reduction group), since one capture
+    uses the model's recipe for all layers;
+  - with `--fp32-residual-connection`, because the BF16 graph inputs would round the FP32
+    residual stream that the eager MTP layers keep.
+- The MoE layers of Hybrid MTP blocks also stay eager, with a warning, and the mixers before them
+  keep their own graphs, when an MoE layer's own config sets up a graph scope that pairing does
+  not capture:
+  - `--mlp-chunks-for-training` greater than 1 with `moe_router`;
+  - `moe` or whole-layer capture with `--moe-token-dispatcher-type allgather`;
+  - `moe` or whole-layer capture with neither drop-and-pad MoE (`--moe-expert-capacity-factor`
+    with `--moe-pad-expert-input-to-capacity`) nor `--moe-virtual-expert-load-balance`, which the
+    `moe` scope requires for decoder layers too.
+- Pairing is skipped, with a warning, with `--overlap-moe-expert-parallel-comm`,
+  `--delay-wgrad-compute`, `--fine-grained-activation-offloading`, `--sequence-packing-scheduler`,
+  `--enable-mhc-connections` or `--context-parallel-size` greater than 1.
+- Wide residual streams (`--wide-residual`) do not support Transformer Engine CUDA graphs:
+  configuration validation rejects that combination, with or without pairing.
+- The flag has no effect with other `--cuda-graph-impl` values.
+
 ---
 
 ## Full-Iteration Training CUDA Graph (`--cuda-graph-impl full_iteration`)
