@@ -343,7 +343,8 @@ class OptimizerConfig:
     muon_pipeline_chunks: bool = False
     """Overlap Newton-Schulz with shard exchanges within a serially scheduled
     layer-sharded Muon group. Applies to equal-shape, evenly homed GTP-only
-    groups with multiple NS batches and SYRK disabled."""
+    groups with multiple NS batches and SYRK disabled. Concurrent parameter
+    group execution takes priority when active."""
 
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.

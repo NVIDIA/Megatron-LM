@@ -2695,7 +2695,9 @@ def _add_regularization_args(parser):
                        help='Overlap Newton-Schulz and shard exchanges within eligible '
                        'GTP-only groups under --muon-tp-mode layer_sharded. Applies to '
                        'equal-shape, evenly homed groups with multiple NS batches, '
-                       'serial group scheduling and SYRK disabled.')
+                       'serial group scheduling and SYRK disabled. Use '
+                       '--muon-no-concurrent-groups to serialize groups that '
+                       'would otherwise run concurrently.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',

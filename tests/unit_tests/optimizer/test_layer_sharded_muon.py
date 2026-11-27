@@ -656,9 +656,8 @@ def test_dense_and_expert_groups_use_their_own_domains(ns_batch):
 
 
 @pytest.mark.launch_on_gb200
-def test_concurrent_groups_match_serial_bitwise():
-    """Per-group CUDA streams only reorder work across groups, so any difference is a
-    synchronization bug, not rounding."""
+def test_concurrent_groups_match_serial_bitwise(caplog):
+    """Concurrent groups take priority over chunk pipelining without changing updates."""
     cuda = os.environ.get("TEST_DEVICE", "cuda" if torch.cuda.is_available() else "cpu") == "cuda"
     if not cuda or dist.get_world_size() != 4:
         pytest.skip("Requires exactly 4 ranks on CUDA (streams are a no-op on CPU)")
@@ -668,28 +667,36 @@ def test_concurrent_groups_match_serial_bitwise():
     tp_group, gtp_remat_group = _get_2d_groups()
     egtp_group = _get_expert_group()
 
-    def _run(concurrent):
+    def _run(concurrent, pipeline):
         dense, _, _, expert, _, _, homes = _dense_and_expert_params(
-            t, g, ep_rank, egtp_rank, n_same_experts=2
+            t, g, ep_rank, egtp_rank, n_same_experts=4
         )
+        expert = expert[:-1]  # Keep only the equal-shape experts eligible for pipelining.
         opt = _muon(
             [{"params": dense}, {"params": expert}],
             gtp_remat_group=gtp_remat_group,
             tp_group=tp_group,
             concurrent_groups=concurrent,
+            pipeline_chunks=pipeline,
         )
         opt.set_group_process_groups({0: (gtp_remat_group, tp_group), 1: (egtp_group, None)})
         opt.set_param_ns_homes(homes)
         for _ in range(2):  # the second step reads momentum the first one wrote
             opt.step()
         torch.cuda.synchronize()
+        if pipeline:
+            routes = opt._plans[1].route_plans
+            expected_route = "s1f" if concurrent else ("pipeline_fwd", 0)
+            assert expected_route in routes
         return [p.data.clone() for p in dense + expert]
 
-    for i, (a, b) in enumerate(zip(_run(False), _run(True))):
-        assert torch.equal(a, b), (
-            f"param {i} differs between serial and concurrent groups on rank {r}: "
-            f"max |diff| = {(a - b).abs().max().item():.3e}"
-        )
+    expected = _run(False, False)
+    with caplog.at_level("INFO", logger=lsm.__name__):
+        for concurrent in (True, False):
+            for actual, ref in zip(_run(concurrent, True), expected):
+                assert torch.equal(actual, ref)
+    if r == 0:
+        assert caplog.text.count("parameter groups run on concurrent CUDA streams") == 1
 
 
 @pytest.mark.launch_on_gb200
@@ -899,7 +906,7 @@ def test_batched_matches_unbatched(ns_batch_size, n_same, n_other, home):
 
 @pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("layout", ["balanced", "uneven", "mixed_shapes"])
-def test_chunk_pipeline_matches_serial_bitwise(layout):
+def test_chunk_pipeline_matches_serial_bitwise(layout, caplog):
     """Keep the serial NS batches, padding, momentum, and updates across steps."""
     _require_multi_rank()
     _require_batched_ns(2)
@@ -927,18 +934,19 @@ def test_chunk_pipeline_matches_serial_bitwise(layout):
         )
         optimizers.append(optimizer)
 
-    for _ in range(3):
-        for serial, pipelined in zip(*models):
-            serial.grad = torch.randn_like(serial)
-            pipelined.grad = serial.grad.clone()
-        for optimizer in optimizers:
-            optimizer.step()
-        for serial, pipelined in zip(*models):
-            assert torch.equal(serial, pipelined)
-            assert torch.equal(
-                optimizers[0].state[serial]["momentum_buffer"],
-                optimizers[1].state[pipelined]["momentum_buffer"],
-            )
+    with caplog.at_level("INFO", logger=lsm.__name__):
+        for _ in range(3):
+            for serial, pipelined in zip(*models):
+                serial.grad = torch.randn_like(serial)
+                pipelined.grad = serial.grad.clone()
+            for optimizer in optimizers:
+                optimizer.step()
+            for serial, pipelined in zip(*models):
+                assert torch.equal(serial, pipelined)
+                assert torch.equal(
+                    optimizers[0].state[serial]["momentum_buffer"],
+                    optimizers[1].state[pipelined]["momentum_buffer"],
+                )
 
     # A balanced plan must use the new branch. Both unsuitable plans must use
     # the existing single forward exchange.
@@ -947,6 +955,8 @@ def test_chunk_pipeline_matches_serial_bitwise(layout):
         assert ("pipeline_fwd", 4 * world_size) in routes
     else:
         assert "s1f" in routes
+    if dist.get_rank() == 0:
+        assert caplog.text.count("skipping chunk pipelining:") == (0 if layout == "balanced" else 1)
 
 
 @pytest.mark.launch_on_gb200

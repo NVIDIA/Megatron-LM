@@ -276,6 +276,7 @@ class _GroupExchangePlan:
     tp_complete: list[int]  # k: complete after stage 1 (no TP axis), skips stage 2
     # Local index -> home for each contiguous chunk of the routed list.
     pipeline_homes: list[dict[int, int]] = dataclasses.field(default_factory=list)
+    pipeline_skip_reason: str | None = None
     # a2a routing metadata per stage ("s1f", "s1b", ("s2f", pd), ("s2b", pd)), filled by
     # the route_* helpers on the first step.
     route_plans: dict = dataclasses.field(default_factory=dict)
@@ -349,7 +350,10 @@ class LayerShardedMuon(TensorParallelMuon):
             serialized (NCCL forbids concurrent collectives on one communicator).
         pipeline_chunks: Overlap one chunk's Newton-Schulz with other chunks' exchanges
             within a serially scheduled group. Uses the existing NS batch boundaries for
-            equal-shape, evenly homed GTP-only groups with multiple batches. Defaults to False.
+            equal-shape, evenly homed GTP-only groups with multiple batches. When disjoint
+            groups run on concurrent streams, group-level overlap takes priority. Groups
+            with the same (GTP-remat, TP) domain are scheduled serially and remain eligible.
+            Defaults to False.
         All other args: same as :class:`TensorParallelMuon`. In particular
             ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode`` and
             ``pg_collection`` only take effect on the path that delegates to the
@@ -467,6 +471,7 @@ class LayerShardedMuon(TensorParallelMuon):
         self._warned_no_homes = False
         self._warned_missing_homes = False
         self._warned_shared_domain = False
+        self._logged_pipeline_skip_reasons: set[str] = set()
         # param_group index -> (gtp_remat_group, tp_group), overriding the constructor
         # defaults. Set via set_group_process_groups().
         self._group_process_groups: dict[int, tuple] = {}
@@ -721,6 +726,9 @@ class LayerShardedMuon(TensorParallelMuon):
                 }
                 tp_exchanges[pd] = (positions, t_home)
 
+        pipeline_homes, pipeline_skip_reason = self._build_pipeline_homes(
+            params, specs, routed, g_home, gtp_remat_group, gtp_remat_size, tp_size
+        )
         return _GroupExchangePlan(
             param_ids=tuple(id(p) for p in params),
             specs=specs,
@@ -732,26 +740,31 @@ class LayerShardedMuon(TensorParallelMuon):
             stage1_routed_indices=stage1_routed_indices,
             tp_exchanges=tp_exchanges,
             tp_complete=by_tp_dim[None],
-            pipeline_homes=self._build_pipeline_homes(
-                params, specs, routed, g_home, gtp_remat_group, gtp_remat_size, tp_size
-            ),
+            pipeline_homes=pipeline_homes,
+            pipeline_skip_reason=pipeline_skip_reason,
         )
 
     def _build_pipeline_homes(
         self, params, specs, routed, g_home, gtp_remat_group, gtp_remat_size, tp_size
-    ) -> list[dict[int, int]]:
+    ) -> tuple[list[dict[int, int]], str | None]:
         chunk_size = gtp_remat_size * self.ns_batch_size
+        if not self.pipeline_chunks:
+            return [], None
+        if not routed:
+            return [], "the group has no routed matrices"
+        if self.use_syrk:
+            return [], "SYRK is enabled"
+        if tp_size > 1 or gtp_remat_size <= 1:
+            return [], "chunk pipelining requires a multi-rank GTP-only group"
+        if len(routed) <= chunk_size:
+            return [], "the group fits in a single exchange chunk"
         if (
-            not self.pipeline_chunks
-            or self.use_syrk
-            or gtp_remat_size <= 1
-            or tp_size > 1
-            or len(routed) <= chunk_size
-            or not params[routed[0]].is_cuda
+            not params[routed[0]].is_cuda
             or torch.distributed.get_backend(gtp_remat_group) != 'nccl'
-            or len({specs[i].full_shape for i in routed}) != 1
         ):
-            return []
+            return [], "chunk pipelining requires CUDA tensors and NCCL"
+        if len({specs[i].full_shape for i in routed}) != 1:
+            return [], "the routed matrices have different full shapes"
 
         # All ranks derive the same schedule. Each full chunk must give each
         # home exactly one original NS batch, in the original matrix order.
@@ -763,12 +776,12 @@ class LayerShardedMuon(TensorParallelMuon):
                 len(indices) * gtp_remat_size != count
                 for indices in params_by_home(count, homes, gtp_remat_size)
             ):
-                return []
+                return [], "a chunk assigns different numbers of matrices to its NS homes"
             chunks.append(homes)
-        return chunks
+        return chunks, None
 
     def _step_routed_pipeline(self, params, shards, plan, gtp_remat_group, lr):
-        """Run the one-axis exchange with at most two NS chunks in flight."""
+        """Run the one-axis exchange with one lookahead chunk to bound temporary memory."""
         device = shards[0].device
         comm = torch.cuda.current_stream(device)
         compute = self._ns_streams.get(device)
@@ -854,6 +867,20 @@ class LayerShardedMuon(TensorParallelMuon):
             if not params:
                 continue
             plan = self._plan_for(group_index, params, gtp_remat_group, tp_group)
+            skip_reason = plan.pipeline_skip_reason
+            if streams is not None and plan.pipeline_homes:
+                skip_reason = (
+                    "parameter groups run on concurrent CUDA streams "
+                    "(use --muon-no-concurrent-groups to serialize them)"
+                )
+            if skip_reason and skip_reason not in self._logged_pipeline_skip_reasons:
+                self._logged_pipeline_skip_reasons.add(skip_reason)
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    "LayerShardedMuon: skipping chunk pipelining: %s.",
+                    skip_reason,
+                )
 
             # 1. Momentum update on the local shard.
             with _phase("momentum"):
