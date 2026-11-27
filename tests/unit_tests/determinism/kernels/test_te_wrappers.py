@@ -45,12 +45,15 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import init_method_normal
+from megatron.core.utils import init_method_normal, is_te_min_version
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     bytes_equal,
     seeded,
+)
+from tests.unit_tests.determinism.kernels.softmax_offset import (
+    assert_softmax_offset_clipping_replays,
 )
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
@@ -130,6 +133,13 @@ def test_te_wgrad_preserves_fp32_main_grad_accumulation():
             native_gemm(x, dy, out=expected, **options)
             te_cpp.general_gemm(x, dy, out=actual, **options)
             assert bytes_equal(actual, expected)
+
+
+def test_learnable_softmax_offset_clipping_replays():
+    """Every TE-attention head shard contributes to repeatable TP norm/clipping."""
+    if not is_te_min_version("2.8.0"):
+        pytest.skip("learnable softmax requires Transformer Engine >= 2.8")
+    assert_softmax_offset_clipping_replays(TEDotProductAttention)
 
 
 @pytest.fixture
@@ -923,6 +933,39 @@ class TestTEWrappers:
             replays=4,
             what="te_fused_cross_entropy",
         )
+
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 needs Blackwell")
+    @pytest.mark.parametrize("grad_fp8_format", ["e4m3", "e5m2"])
+    def test_te_fused_cross_entropy_mxfp8_grad_replays(self, grad_fp8_format):
+        """The MXFP8 gradient of the logits (cross_entropy_mxfp8_grad) replays bit-exactly."""
+        if not getattr(te_ext, "_TE_FUSED_PARALLEL_CE_GRAD_QUANTIZER", False):
+            pytest.skip(
+                "Transformer Engine's parallel_cross_entropy does not accept grad_quantizer"
+            )
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tokens = TOKENS // 2
+        logits = torch.randn(tokens, 1, 32768, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, 32768 * tp_group.size(), (tokens, 1), device="cuda")
+        buffers = (
+            "_rowwise_data",
+            "_rowwise_scale_inv",
+            "_columnwise_data",
+            "_columnwise_scale_inv",
+        )
+        ref = None
+        for replay in range(4):
+            x = logits.clone().requires_grad_()
+            loss = te_cross_entropy(x, target, tp_group, grad_fp8_format=grad_fp8_format)
+            (grad,) = torch.autograd.grad(loss, x, torch.ones_like(loss))
+            out = [loss.detach().clone()] + [getattr(grad, name).clone() for name in buffers]
+            if ref is None:
+                ref = out
+                continue
+            for name, a, b in zip(("loss",) + buffers, out, ref):
+                assert bytes_equal(a, b), f"replay {replay}: {name} differs"
 
     @pytest.mark.parametrize("backend", ["fused", "flash"])
     def test_te_dot_product_attention_replays(self, backend, monkeypatch):

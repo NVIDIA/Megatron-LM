@@ -30,9 +30,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.multi_token_prediction import (
-    get_mtp_ranks,
-)
+from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -262,17 +260,19 @@ def loss_func(
         a dict containing reporting metrics on the loss and number of tokens across
             the data parallel ranks
     """
-    args = get_args()
+    cfg = get_run_config()
 
-    if args.logits_load_dir is not None:
+    offline_kd_cfg = cfg.offline_distillation
+    if offline_kd_cfg is not None and offline_kd_cfg.student_load is not None:
+        student_load_cfg = offline_kd_cfg.student_load
         # Offline knowledge distillation loss using cached teacher log-probabilities.
         loss_func_cached_logits = _build_cached_logits_loss_func(
-            logprobs_dir=args.logits_load_dir,
-            decode_threads=args.logits_load_decode_threads,
-            msc_prefetch_depth=args.logits_load_msc_prefetch_depth,
-            kd_loss_alpha=args.logits_load_kd_loss_alpha,
-            ignore_errors=args.logits_load_ignore_errors,
-            ignore_hash=args.logits_load_ignore_hash,
+            logprobs_dir=student_load_cfg.directory,
+            decode_threads=student_load_cfg.decode_threads,
+            msc_prefetch_depth=student_load_cfg.msc_prefetch_depth,
+            kd_loss_alpha=student_load_cfg.loss_alpha,
+            ignore_errors=student_load_cfg.ignore_errors,
+            ignore_hash=student_load_cfg.ignore_hash,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and is_distillation_model(model):  # [ModelOpt]
@@ -287,7 +287,6 @@ def loss_func(
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
-    cfg = get_run_config()
     if cfg.rerun_state_machine.check_for_nan_in_loss:
         rerun_state_machine.validate_result(
             result=loss,

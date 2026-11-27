@@ -212,7 +212,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/extensions/transformer_engine.py",),
         tests=(K + "test_te_wrappers.py",),
         kind="external-lib",
-        notes="Replays TE's overwrite_input path when supported.",
+        notes="Replays TE's overwrite_input path when supported, and the MXFP8 gradient "
+        "output (cross_entropy_mxfp8_grad) when TE supports grad_quantizer.",
     ),
     KernelEntry(
         name="te_batched_linear_matrix_parameter",
@@ -222,7 +223,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(K + "test_te_batched_linear.py",),
         kind="external-lib",
-        notes="TE batched GEMM with a 2D optimizer owner; BF16/MXFP8 and fused main-grad replay.",
+        notes="TE batched GEMM with a 2D optimizer owner; BF16/MXFP8 and fused main-grad replay. "
+        "Also replays the batched-GEMM fallback used when TE lacks BatchedLinear.",
     ),
     KernelEntry(
         name="jit_fuser",
@@ -309,6 +311,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- apex CUDA extensions and local TP layers
     KernelEntry(
+        name="liger_rmsnorm",
+        sources=("megatron/core/ops/norm/liger_norm.py",),
+        tests=(K + "test_liger_norm.py",),
+        kind="external-lib",
+        notes="RMSNorm outputs, input and weight gradients replayed under contention, "
+        "with and without zero-centered gamma and deterministic algorithms.",
+    ),
+    KernelEntry(
         name="fused_layer_norm",
         sources=("megatron/core/ops/norm/fused_layer_norm.py",),
         tests=(K + "test_tensor_parallel_kernels.py",),
@@ -381,7 +391,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="tensor_parallel_random_share_storage",
-        sources=("megatron/core/tensor_parallel/random.py",),
+        sources=("megatron/core/activation_policy/recompute/checkpointing.py",),
         kind="cuda-ext",
         exempt_reason="load_inline extension aliases tensor storage on the host; no GPU compute.",
     ),
@@ -471,6 +481,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="torch.compile",
         notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
+        "Global-batch QB also compares histograms and the compact-output compatibility fallback. "
         "Fused aux_loss, seq_aux_loss and global_aux_loss replay their logged scalar, "
         "input and router-weight gradients with fused TopK routing, and compare to the unfused reference.",
     ),
@@ -500,9 +511,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
             K + "test_moe_kernels.py",
+            K + "test_inference_kernels.py",
         ),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert. "
+        "FlashInfer MXFP8/BF16 experts: top-k=1 side-stream graph replay matches serial.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
@@ -1083,6 +1096,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "NCCL_ALGO=Ring under --deterministic-mode, not exercised by the determinism model tests.",
     ),
     KernelEntry(
+        name="gtp_fp8_checkpoint_casts",
+        sources=("megatron/core/tensor_parallel/generalized_tensor_parallelism.py",),
+        tests=("tests/unit_tests/generalized_tensor_parallel/test_gtp_dcp.py",),
+        kind="dispatch",
+        notes="Native-FP8 checkpoint copy/dequantization, with legacy TE class compatibility.",
+    ),
+    KernelEntry(
         name="te_thd_partitioned_indices",
         sources=(
             "megatron/core/datasets/data_schedule.py",
@@ -1189,13 +1209,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference.py",
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference_kernels.py",
         ),
+        tests=(K + "test_inference_kernels.py",),
         kind="triton",
         training_path=False,
-        exempt_reason="FlashInfer GVR2 top-k can vary tied indices and output ordering. "
-        "Native DSA decode does not support deterministic mode and rejects it before top-k "
-        "execution; this path has no bit-exact replay guarantee.",
-        notes="Paged Triton prefill and Gluon/Triton decode have exact top-k and training/decode "
-        "numerical parity coverage in "
+        notes="Deterministic mode routes decode rows, like prefill rows, through Triton scores "
+        "and FlashInfer's deterministic ragged top-k; the replay covers decode, prefill and mixed steps with tied scores, "
+        "windowed score buffers, eager and CUDA-graph replay. Native decode's FlashInfer GVR2 "
+        "top-k can vary tied indices, so it runs only outside deterministic mode and rejects "
+        "direct calls in it. Paged Triton prefill and Gluon/Triton decode have exact top-k and "
+        "training/decode numerical parity coverage in "
         "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py, "
         "including empty/ragged requests, causal masks, and graph page-table refresh.",
     ),

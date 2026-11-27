@@ -822,6 +822,16 @@ class TransformerConfig(ModelParallelConfig):
     under the MXFP8 autocast context. Only active when fp8=True and
     fp8_recipe='mxfp8', or with fp4, where the LM head runs under its own MXFP8 autocast."""
 
+    cross_entropy_mxfp8_grad: bool = False
+    """With the MXFP8 LM head (fp8_output_proj) and Transformer Engine's fused cross entropy
+    (cross_entropy_loss_fusion=True, cross_entropy_fusion_impl='te'), let the cross entropy
+    backward return the gradient of the logits already quantized to MXFP8, in the LM head's
+    gradient format, so the LM head does not quantize it again. Transformer Engine writes it
+    from the loss kernel directly with tensor parallel size 1, BF16 logits and token count and
+    vocabulary multiples of 128, and quantizes the BF16 gradient otherwise. Either way the
+    gradient has the bytes the LM head's own quantization would produce. Requires a Transformer
+    Engine whose parallel_cross_entropy accepts grad_quantizer."""
+
     fp8_recipe_attrs: Optional[Dict[str, Any]] = None
     """Attributes to set in the FP8 recipe."""
 
@@ -847,6 +857,19 @@ class TransformerConfig(ModelParallelConfig):
 
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
+
+    rmsnorm_impl: Literal["te", "liger"] = "te"
+    """Norm backend of the HybridModel stack spec. HybridModel only; GPTModel rejects it.
+
+    The Hybrid builders and HybridModel's default spec apply it with `with_norm_backend`, so
+    "liger" builds every norm slot of the spec (layer, QK, MoE pre-MLP, MTP and final norms) with
+    Liger-Kernel; a spec passed to HybridModel directly chooses its own norms. Norms fused into a
+    Transformer Engine linear, Mamba's gated norm and norms built outside the spec (MoE's latent
+    fc2 norm, shortcut-MoE norms) stay Transformer Engine. It is not a speedup: Liger is usually
+    slower than Transformer Engine's norms.
+    Requires `normalization="RMSNorm"` and `transformer_impl="transformer_engine"`; see
+    `__post_init__` for the other restrictions.
+    """
 
     use_kitchen_attention: bool = False
     """Use the kitchen extension for attention (instead of TE's attention)."""
@@ -1355,6 +1378,12 @@ class TransformerConfig(ModelParallelConfig):
     """Number of warmup steps for CUDA graphs. Note: GTP (``gtp_weight_remat_size > 1``) forces a
     minimum of 2 per-graph warmup steps regardless of this value, because the first warmup builds
     the weight-prefetch chain and the second exercises the prefetch path before capture."""
+
+    cuda_graph_pair_hybrid_layers: bool = False
+    """With cuda_graph_impl="transformer_engine", capture each Hybrid mixer layer and the MoE or
+    MLP layer that follows it as one CUDA graph instead of two, and also graph the layers of
+    Hybrid MTP blocks. Layers that cannot be paired keep their own graphs, and unsupported
+    configurations fall back with a warning; see docs/user-guide/features/cuda_graph.md."""
 
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.
@@ -1922,6 +1951,23 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
+        if self.rmsnorm_impl not in ("te", "liger"):
+            raise ValueError(f"rmsnorm_impl must be 'te' or 'liger', not {self.rmsnorm_impl!r}.")
+        for unsupported, requirement in (
+            (self.normalization != "RMSNorm", "normalization='RMSNorm'"),
+            (
+                self.transformer_impl != "transformer_engine",
+                "transformer_impl='transformer_engine'",
+            ),
+            (
+                self.fused_residual_rmsnorm,
+                "fused_residual_rmsnorm=False (Liger has no residual fusion)",
+            ),
+            (self.use_kitchen, "use_kitchen=False"),
+            (self.experimental_attention_variant is not None, "no experimental_attention_variant"),
+        ):
+            if self.rmsnorm_impl == "liger" and unsupported:
+                raise ValueError(f"rmsnorm_impl='liger' requires {requirement}.")
         self._validate_cp_layouts()
 
         for name in ("mtp_ce_loss_weight", "mtp_kl_loss_weight"):
@@ -2316,6 +2362,20 @@ class TransformerConfig(ModelParallelConfig):
             if self.fp8_recipe != Fp8Recipe.mxfp8:
                 raise ValueError(
                     f"fp8_output_proj requires fp8_recipe='mxfp8', got " f"'{self.fp8_recipe}'."
+                )
+
+        if self.cross_entropy_mxfp8_grad:
+            if not self.fp8_output_proj:
+                raise ValueError("cross_entropy_mxfp8_grad requires fp8_output_proj=True.")
+            if not (self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == "te"):
+                raise ValueError(
+                    "cross_entropy_mxfp8_grad requires cross_entropy_loss_fusion=True and "
+                    "cross_entropy_fusion_impl='te'."
+                )
+            if self.use_mup:
+                raise ValueError(
+                    "cross_entropy_mxfp8_grad does not support use_mup: the MuP logit scaling "
+                    "between the LM head and the loss would take the MXFP8 gradient."
                 )
 
         # FP4 validation
@@ -4952,14 +5012,13 @@ class TransformerConfig(ModelParallelConfig):
                     "'tilelang' and 'cudnn' select fused kernels and are MLA-only."
                 )
                 # DSA over MLA supports CP/SP (upstream gates CP on cp_comm_type=allgather
-                # below). The GQA path does not: its min-memory kernels have no
-                # sequence-parallel gather and no CP support yet.
+                # below). The GQA path has no CP support yet. Sequence parallelism is supported
+                # by dynamic-batching inference only: its indexer gathers the sequence shards.
+                # Training and static inference (DSGQACoreAttention.forward) reject it at run
+                # time, since the min-memory kernels have no sequence-parallel gather.
                 assert (
                     self.context_parallel_size == 1
                 ), "Context parallelism is not supported by DSA over GQA."
-                assert (
-                    not self.sequence_parallel
-                ), "Sequence parallelism is not supported by DSA over GQA."
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
             if min_memory_dsa_backend:
                 if dense_dsa_warmup:

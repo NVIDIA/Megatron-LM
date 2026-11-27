@@ -254,6 +254,15 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # The only file that needs nonblocking NCCL communicators;
+  # the launcher enables them for this bucket alone.
+  - test_case: [tests/unit_tests/transformer/test_thd_correctness.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   # Engine tests run apart from the rest of inference so each job fits the CI time limit.
   - test_case: [tests/unit_tests/inference/engines/**/*.py]
     products:

@@ -201,8 +201,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             from megatron.core.models.hybrid.hybrid_layer_specs import (
                 hybrid_stack_spec as default_hybrid_stack_spec,
             )
+            from megatron.core.models.hybrid.hybrid_layer_specs import with_norm_backend
 
-            hybrid_stack_spec = default_hybrid_stack_spec
+            hybrid_stack_spec = with_norm_backend(default_hybrid_stack_spec, config.rmsnorm_impl)
         # Snapshot the container immediately. If the root config is also used as a layer entry,
         # detach it before applying model-level normalization so that entry remains caller-owned.
         hybrid_layer_config_list_snapshot = (
@@ -213,6 +214,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         ):
             config = type(config).from_config(config)
         super().__init__(config=config, pg_collection=pg_collection)
+        if self.config.cross_entropy_mxfp8_grad:
+            # Only GPTModel builds the MXFP8 LM head that takes an MXFP8 logits gradient.
+            raise ValueError(
+                "cross_entropy_mxfp8_grad requires GPTModel's MXFP8 LM head; "
+                "HybridModel builds a BF16 LM head."
+            )
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)

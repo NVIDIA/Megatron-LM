@@ -36,6 +36,7 @@ from megatron.core.tensor_parallel.layers import (
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
@@ -45,6 +46,9 @@ from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     deterministic_algorithms,
     seeded,
+)
+from tests.unit_tests.determinism.kernels.softmax_offset import (
+    assert_softmax_offset_clipping_replays,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -68,6 +72,11 @@ def _config(**overrides):
     )
     kwargs.update(overrides)
     return TransformerConfig(**kwargs)
+
+
+def test_learnable_softmax_offset_clipping_replays():
+    """Every local-attention head shard contributes to repeatable TP norm/clipping."""
+    assert_softmax_offset_clipping_replays(DotProductAttention)
 
 
 class TestTensorParallelLayers:
