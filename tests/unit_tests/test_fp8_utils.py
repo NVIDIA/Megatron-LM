@@ -13,7 +13,7 @@ from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    import transformer_engine_torch as tex
+    import transformer_engine.pytorch as te
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
     HAVE_MXFP8_TENSOR = True
@@ -222,7 +222,7 @@ class TestCopyTensorsToQuantizedParams:
     SHAPES = [(1024, 512), (2048, 256), (512, 1024)]
 
     def _make_param(self, shape):
-        quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        quantizer = MXFP8Quantizer(fp8_dtype=te.DType.kFloat8E4M3, rowwise=True, columnwise=True)
         tensor = quantizer.make_empty(shape, dtype=torch.bfloat16, device="cuda")
         return torch.nn.Parameter(tensor, requires_grad=False)
 

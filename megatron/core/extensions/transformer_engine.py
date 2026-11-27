@@ -4259,10 +4259,9 @@ try:
                 "An MXFP8 cross entropy gradient (cross_entropy_mxfp8_grad) requires a "
                 "Transformer Engine whose parallel_cross_entropy accepts grad_quantizer."
             )
-        import transformer_engine_torch as tex
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
-        fp8_dtypes = {"e4m3": tex.DType.kFloat8E4M3, "e5m2": tex.DType.kFloat8E5M2}
+        fp8_dtypes = {"e4m3": te.pytorch.DType.kFloat8E4M3, "e5m2": te.pytorch.DType.kFloat8E5M2}
         if grad_fp8_format not in fp8_dtypes:
             raise ValueError(f"grad_fp8_format must be 'e4m3' or 'e5m2', got {grad_fp8_format!r}")
         return MXFP8Quantizer(fp8_dtypes[grad_fp8_format], rowwise=True, columnwise=True)

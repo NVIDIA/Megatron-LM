@@ -21,7 +21,7 @@ quantized_dbuffer = pytest.importorskip(
 QuantizedDBuffer = quantized_dbuffer.QuantizedDBuffer
 update_mxfp8_tensor = quantized_dbuffer.update_mxfp8_tensor
 
-import transformer_engine_torch as tex
+import transformer_engine.pytorch as te
 from transformer_engine.pytorch import is_mxfp8_available
 from transformer_engine.pytorch.cpp_extensions import general_gemm
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
@@ -90,7 +90,7 @@ def test_quantized_dbuffer_quantization_matches_te(
         view = quantized.get_tensor_view(index)
         assert view._rowwise_scale_inv.shape == (view.shape[0], view.shape[1] // 32)
         assert view._columnwise_scale_inv.shape == (view.shape[0] // 32, view.shape[1])
-        reference = MXFP8Quantizer(tex.DType.kFloat8E4M3)(main_weight.get_tensor_view(index))
+        reference = MXFP8Quantizer(te.DType.kFloat8E4M3)(main_weight.get_tensor_view(index))
         assert view.shape == reference.shape
         for attribute in (
             "_rowwise_data",
@@ -128,7 +128,7 @@ def test_quantized_dbuffer_updated_tensor_supports_gemm(distributed_setup):
     quantized.quantize_(main_weight)
     gathered = quantized.redistribute([Replicate()])
     gathered_main = main_weight.redistribute([Replicate()])
-    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
+    quantizer = MXFP8Quantizer(te.DType.kFloat8E4M3)
     for index, shape in enumerate(shapes):
         tensor_view = gathered.get_tensor_view(index)
         compute_tensor = tensor_view.detach()
@@ -251,7 +251,7 @@ def test_quantized_dbuffer_partial_updated_tensor_supports_gemm(distributed_setu
         plane.release_storage()
     gathered_main = main_weight.redistribute([Replicate()])
 
-    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3)
+    quantizer = MXFP8Quantizer(te.DType.kFloat8E4M3)
     for index, shape in enumerate(shapes):
         tensor_view = gathered.get_tensor_view(index)
         compute_tensor = tensor_view.detach()

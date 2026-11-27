@@ -433,10 +433,10 @@ def _pre_quantize_linear(model: torch.nn.Module) -> None:
     ``nn.Parameter`` (production callers wrap weights via TE's ``fp8_param``
     machinery before calling this function).
     """
-    import transformer_engine_torch as tex
+    import transformer_engine.pytorch as te
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
-    quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    quantizer = MXFP8Quantizer(fp8_dtype=te.DType.kFloat8E4M3, rowwise=True, columnwise=False)
     for submodule in model.modules():
         if isinstance(submodule, torch.nn.Linear):
             te_mxfp8 = quantizer(submodule.weight.data)

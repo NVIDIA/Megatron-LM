@@ -1756,13 +1756,13 @@ class TestMoEModules:
         nondeterministic dequantize or quantize would move the logprobs between two
         identical forwards.
         """
-        import transformer_engine_torch as tex
+        import transformer_engine.pytorch as te
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
         from megatron.core.transformer.moe.training_matches_inference import mxfp8_training_stack
 
         seeded()
-        quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+        quantizer = MXFP8Quantizer(te.DType.kFloat8E4M3, rowwise=True, columnwise=False)
         num_experts = 4
         module = torch.nn.Module()
         module.num_local_experts = num_experts
