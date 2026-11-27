@@ -418,10 +418,10 @@ class TEGroupedMLP(MegatronModule):
             self.offload_expert_fc1 = True
             self.offload_moe_act = True
 
-        # Let TE keep small experts independent when they cannot be offloaded.
+        # Offload the quantized FC1 data when TE can keep its scales on device.
         keep_fp8_input = self.config.fp8_recipe == Fp8Recipe.mxfp8
-        if self.offload_expert_fc1 and hasattr(self.linear_fc1, "min_offloaded_tensor_size"):
-            self.linear_fc1.min_offloaded_tensor_size = self.config.min_offloaded_tensor_size
+        if self.offload_expert_fc1 and hasattr(self.linear_fc1, "bulk_offload_fp8_inputs"):
+            self.linear_fc1.bulk_offload_fp8_inputs = True
             keep_fp8_input = keep_fp8_input or self.config.fp8_recipe == Fp8Recipe.blockwise
         use_quantized_fp8 = self.config.fp8 and keep_fp8_input
         use_nvfp4 = self.config.fp4 and self.config.fp4_recipe == Fp4Recipe.nvfp4
