@@ -67,6 +67,7 @@ def test_chunkwise_cp_keeps_heads_when_cp_exceeds_head_count(monkeypatch, build_
             linear_cp_layout="contiguous",
             context_parallel_size=build_cp_size,
             dynamic_context_parallel=True,
+            deterministic_mode=False,  # dynamic CP does not support deterministic_mode
             calculate_per_token_loss=True,
             max_seqlen_per_dp_cp_rank=128,
         )

@@ -38,6 +38,8 @@ def _dynamic_cp_args(monkeypatch, **overrides):
     args.max_seqlen_per_dp_cp_rank = 1024
     args.calculate_per_token_loss = True
     args.dataloader_type = "single"
+    # Dynamic context parallelism does not support deterministic mode (on by default).
+    args.deterministic_mode = False
     for key, value in overrides.items():
         setattr(args, key, value)
     return args

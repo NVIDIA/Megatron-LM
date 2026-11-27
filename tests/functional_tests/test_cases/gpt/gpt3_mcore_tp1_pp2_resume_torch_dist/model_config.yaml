@@ -39,7 +39,6 @@ MODEL_ARGS:
   --transformer-impl: local
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 2
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --use-checkpoint-opt_param-scheduler: true
   --use-mcore-models: true

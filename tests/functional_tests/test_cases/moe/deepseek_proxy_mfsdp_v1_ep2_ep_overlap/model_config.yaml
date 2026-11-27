@@ -27,7 +27,6 @@ MODEL_ARGS:
   --use-megatron-fsdp: true
   --data-parallel-sharding-strategy: "optim_grads_params"
   --outer-dp-sharding-strategy: "no_shard"
-  --deterministic-mode: true
   --ckpt-format: "fsdp_dtensor"
   --no-gradient-accumulation-fusion: true
   --megatron-fsdp-main-params-dtype: fp32

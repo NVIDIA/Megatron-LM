@@ -43,7 +43,6 @@ MODEL_ARGS:
   --no-create-attention-mask-in-dataloader: true
   --num-workers: 8
   --micro-batch-size: 1
-  --deterministic-mode: true
   --temperature: 1.0
   --top_k: 1
   --return-log-probs: true

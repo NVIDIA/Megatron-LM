@@ -185,7 +185,7 @@ Per the testing skill, each new test requires:
 2. `tests/functional_tests/test_cases/<model>/<test_case>/golden_values_dev_dgx_h100.json`
 3. An entry in `tests/test_utils/recipes/h100/<model>-dynamic-inference.yaml`
 
-I will generate golden values by running each test on cw-dfw and capturing `INFERENCE_OUTPUT_PATH`. The configs include `--deterministic-mode: true` so the output should be reproducible.
+I will generate golden values by running each test on cw-dfw and capturing `INFERENCE_OUTPUT_PATH`. Deterministic mode is on by default, so the output should be reproducible.
 
 ### Step 2 — Single-feature tests (one per untested feature)
 

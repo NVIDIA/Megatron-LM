@@ -70,6 +70,8 @@ def _model_config(**overrides) -> Qwen35VLModelConfig:
         ),
     )
     model_config = Qwen35VLMoEBridge().hf_config_to_model_config(hf_config)
+    # GDN's FLA kernels are rejected by the default deterministic_mode.
+    overrides.setdefault("deterministic_mode", False)
     for name, value in overrides.items():
         setattr(model_config, name, value)
     return model_config

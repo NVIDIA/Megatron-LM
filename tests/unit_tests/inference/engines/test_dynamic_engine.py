@@ -1458,6 +1458,9 @@ class DynamicEngineTestConfig:
     top_k: int = 0
     top_p: float = 0.0
     offset_sampling_seed_by_dp_rank: bool = True
+    # None keeps the TransformerConfig default (deterministic_mode on, which also disables the
+    # DP-rank sampling-seed offset); False is needed to observe the offset.
+    deterministic_mode: Optional[bool] = None
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
     # Tests leave process-wide GC alone unless they exercise a gc mode.
     gc_mode: str = "default"
@@ -1681,6 +1684,11 @@ class DynamicInferenceEngineTestBase:
             transformer_config = TransformerConfig(
                 params_dtype=torch.bfloat16,
                 flash_attention_version=test_config.flash_attention_version,
+                **(
+                    {}
+                    if test_config.deterministic_mode is None
+                    else {"deterministic_mode": test_config.deterministic_mode}
+                ),
                 num_layers=4,
                 mtp_num_layers=test_config.mtp_num_layers,
                 mtp_use_repeated_layer=test_config.mtp_use_repeated_layer,
@@ -1795,6 +1803,11 @@ class DynamicInferenceEngineTestBase:
             ).cuda()
         elif test_config.model_provider == "hybrid":
             is_gdn = test_config.ssm_mixer == "gdn"
+            # An explicit test-config value overrides the mixer's own deterministic_mode choice
+            # (e.g. GDN turns it off); merge into one dict to avoid duplicate kwargs.
+            hybrid_kwargs = hybrid_mixer_kwargs(test_config.ssm_mixer)
+            if test_config.deterministic_mode is not None:
+                hybrid_kwargs["deterministic_mode"] = test_config.deterministic_mode
             pp_size = test_config.pipeline_model_parallel_size
             # Transformer config.
             transformer_config = TransformerConfig(
@@ -1810,7 +1823,7 @@ class DynamicInferenceEngineTestBase:
                 ),
                 moe_router_dtype=test_config.moe_router_dtype,
                 hidden_size=256,  # The Mamba layer places several constraints on this
-                **hybrid_mixer_kwargs(test_config.ssm_mixer),
+                **hybrid_kwargs,
                 num_attention_heads=16,
                 linear_conv_kernel_dim=4,
                 linear_key_head_dim=32,

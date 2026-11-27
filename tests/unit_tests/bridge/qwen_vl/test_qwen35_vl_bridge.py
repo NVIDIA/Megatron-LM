@@ -583,6 +583,8 @@ class TestQwen35VLBridgeModelConfig:
     def test_hybrid_export_preserves_language_blocks_and_attention_order(self, bridge_class, moe):
         hf_config = _qwen35_vl_config(moe=moe)
         config = bridge_class().hf_config_to_model_config(hf_config)
+        # GDN's FLA kernels are rejected by the default deterministic_mode.
+        config.deterministic_mode = False
         config.finalize()
         exported = bridge_class.megatron_to_hf_config(config)
 

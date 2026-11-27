@@ -268,6 +268,8 @@ def test_packed_cp_matches_full_attention_and_gradients(
             dsa_indexer_loss_coeff=coeff,
             dsa_indexer_use_sparse_loss=sparse,
             dsa_kernel_backend="cudnn",
+            # Packed DSv4 attention does not support deterministic mode yet.
+            deterministic_mode=False,
             context_parallel_size=cp_size,
             attention_cp_layout="contiguous",
             linear_cp_layout="contiguous",

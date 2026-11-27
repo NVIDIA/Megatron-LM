@@ -261,6 +261,7 @@ class TestTransformerBlockWithProcessGroups:
             hidden_dropout=0.0,
             bf16=True,
             context_parallel_size=cp_size,
+            deterministic_mode=False,
         )
 
         # Create a transformer block with default process groups

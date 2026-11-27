@@ -46,7 +46,6 @@ MODEL_ARGS:
   --overlap-param-gather-with-optimizer-step: true
   --check-weight-hash-across-dp-replicas-interval: 10
   --ckpt-fully-parallel-load: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
   --use-mcore-models: true

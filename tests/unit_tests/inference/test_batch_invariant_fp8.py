@@ -33,6 +33,7 @@ def _config(recipe, **overrides):
         hidden_dropout=0.0,
         batch_invariant_mode=True,
         batch_invariant_backend="te_native",
+        deterministic_mode=False,  # on by default in TransformerConfig; not under test here
         fp8="e4m3",
         fp8_recipe=recipe,
     )

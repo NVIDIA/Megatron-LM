@@ -12,7 +12,7 @@ DETERMINISTIC_CONFIG = """ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
 MODEL_ARGS:
-  --deterministic-mode: true
+  --bf16: true
 TEST_TYPE: regular
 """
 
@@ -20,7 +20,7 @@ APPROXIMATE_CONFIG = """ENV_VARS:
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NON_DETERMINSTIC_RESULTS: 1
 MODEL_ARGS:
-  --deterministic-mode: true
+  --bf16: true
 TEST_TYPE: regular
 """
 
