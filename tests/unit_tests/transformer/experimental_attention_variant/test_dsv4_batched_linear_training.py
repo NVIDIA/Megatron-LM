@@ -308,6 +308,7 @@ def _mxfp8_train_bf16_eval_recipe(fp8_param):
     )
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("recipe_storage", [None, "bf16", "mxfp8"])
 def test_per_module_quant_recipe(recipe_storage):
     """Built and run inside an MXFP8 layer's model-init and autocast contexts (fp8_param on),

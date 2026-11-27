@@ -1136,6 +1136,7 @@ class TestDSv4HybridGroupedOutput:
         tolerances = {"rtol": 0.125, "atol": 0.0675} if quantized_weight else {}
         torch.testing.assert_close(weight, expected, **tolerances)
 
+    @pytest.mark.launch_on_gb200
     @pytest.mark.parametrize("per_module_recipe", [False, True])
     def test_o_group_proj_follows_per_module_quant_recipe(self, per_module_recipe):
         """The attention hands its config and module path to TE BatchedLinear, so a per-module

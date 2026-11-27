@@ -21,7 +21,15 @@ from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exac
 @pytest.mark.skipif(
     TEBatchedLinear is None, reason="Transformer Engine BatchedLinear is unavailable"
 )
-@pytest.mark.parametrize("mode", ["bf16", "mxfp8", "primary_mxfp8", "per_module_recipe"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "bf16",
+        "mxfp8",
+        "primary_mxfp8",
+        pytest.param("per_module_recipe", marks=pytest.mark.launch_on_gb200),
+    ],
+)
 @pytest.mark.parametrize("fused", [False, True])
 def test_batched_linear_gradient_owner_replays(mode, fused):
     """Replay outputs/dgrad/wgrad, including fresh buffers and two accumulated microbatches.
