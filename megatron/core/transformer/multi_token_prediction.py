@@ -1055,23 +1055,48 @@ def get_mtp_num_layers_to_build(
     return num_layers_to_build
 
 
+class MTPLossGradMask:
+    """Multiplicative mask for one microbatch's MTP loss gradient, filled after the forward.
+
+    A caller that decides which tokens to train on only after the forward pass (for example,
+    a loss function that rejects sequences) returns one of these from the provider set with
+    ``MTPLossAutoScaler.set_grad_mask_provider`` before the forward, then sets ``mask`` before
+    the backward. ``MTPLossAutoScaler.backward`` multiplies the MTP loss gradient by it.
+
+    ``mask`` uses the layout of the ``loss_mask`` given to ``process_mtp_loss`` and is applied
+    to every MTP depth without rolling, so it must be constant within each sequence (packed
+    sub-sequence when ``packed_seq_params`` is set). Denominators still come from ``loss_mask``.
+    """
+
+    __slots__ = ("mask",)
+
+    def __init__(self) -> None:
+        self.mask: Optional[torch.Tensor] = None
+
+
 class MTPLossAutoScaler(torch.autograd.Function):
     """An AutoScaler that triggers the backward pass and scales the grad for mtp loss."""
 
     main_loss_backward_scale: torch.Tensor = torch.tensor(1.0)
+    grad_mask_provider: Optional[Callable[[], Optional[MTPLossGradMask]]] = None
 
     @staticmethod
-    def forward(ctx, output: torch.Tensor, mtp_loss: torch.Tensor):
+    def forward(ctx, output: torch.Tensor, mtp_loss: torch.Tensor, *grad_mask):
         """Preserve the mtp by storing it in the context to avoid garbage collection.
 
         Args:
             output (torch.Tensor): The output tensor.
             mtp_loss (torch.Tensor): The mtp loss tensor.
+            grad_mask: Optionally one ``MTPLossGradMask`` (or None) for this microbatch, kept per
+                call so overlapping microbatch schedules cannot read another one's mask. Optional
+                so existing two-argument callers keep working.
 
         Returns:
             torch.Tensor: The output tensor.
         """
         ctx.save_for_backward(mtp_loss)
+        ctx.num_extra_inputs = len(grad_mask)
+        ctx.grad_mask = grad_mask[0] if grad_mask else None
         return output
 
     @staticmethod
@@ -1088,7 +1113,15 @@ class MTPLossAutoScaler(torch.autograd.Function):
         (mtp_loss,) = ctx.saved_tensors
         mtp_loss_backward_scale = MTPLossAutoScaler.main_loss_backward_scale
         scaled_mtp_loss_grad = torch.ones_like(mtp_loss) * mtp_loss_backward_scale
-        return grad_output, scaled_mtp_loss_grad
+        if ctx.grad_mask is not None:
+            if ctx.grad_mask.mask is None:
+                raise RuntimeError(
+                    "An MTP gradient mask was requested for this microbatch but never filled."
+                )
+            scaled_mtp_loss_grad = scaled_mtp_loss_grad * ctx.grad_mask.mask.to(
+                scaled_mtp_loss_grad.dtype
+            )
+        return (grad_output, scaled_mtp_loss_grad) + (None,) * ctx.num_extra_inputs
 
     @staticmethod
     def set_loss_scale(scale: torch.Tensor):
@@ -1099,6 +1132,14 @@ class MTPLossAutoScaler(torch.autograd.Function):
                                   matches the scale of the main_loss.
         """
         MTPLossAutoScaler.main_loss_backward_scale = scale
+
+    @staticmethod
+    def set_grad_mask_provider(provider: Optional[Callable[[], Optional[MTPLossGradMask]]]) -> None:
+        """Set the callable that returns the current microbatch's ``MTPLossGradMask``.
+
+        ``process_mtp_loss`` calls it once per forward. ``None`` disables masking.
+        """
+        MTPLossAutoScaler.grad_mask_provider = provider
 
 
 class _MTPHeadGradInjector(torch.autograd.Function):
@@ -1360,6 +1401,15 @@ def process_mtp_loss(
 
         early_backward = not (is_graph_capturing() or is_graph_warmup())
 
+    grad_mask = None
+    if MTPLossAutoScaler.grad_mask_provider is not None and torch.is_grad_enabled():
+        grad_mask = MTPLossAutoScaler.grad_mask_provider()
+    if grad_mask is not None and early_backward:
+        raise ValueError(
+            "mtp_loss_early_backward runs the MTP backward during the forward, before an "
+            "MTPLossGradMask can be filled; disable one of them."
+        )
+
     for mtp_layer_number in range(config.mtp_num_layers):
         if config.attention_cp_layout == "contiguous":
             mtp_labels, loss_mask, mtp_input_mask = roll_contiguous_fields(
@@ -1520,7 +1570,7 @@ def process_mtp_loss(
             del mtp_loss, mtp_loss_normalized, head_input
             hidden_states = _MTPHeadGradInjector.apply(hidden_states, head_hidden, head_grad)
         else:
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
+            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized, grad_mask)
 
     return hidden_states
 
