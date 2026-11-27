@@ -42,6 +42,36 @@ def _reshape_like_labels(values: torch.Tensor, labels: torch.Tensor) -> torch.Te
     return values
 
 
+_VERL_LCE = None  # None: unresolved; False: VERL's fused kernel is unavailable.
+
+
+def _verl_linear_cross_entropy():
+    """VERL's fused kernel, resolved once.
+
+    Importing VERL pulls in libraries that draw from the global RNGs at import
+    time (rich's style ids). A first import inside a training step would advance
+    the streams a restored checkpoint just set, so resumed training would diverge
+    from continuous training; the import leaves them unchanged.
+    """
+    global _VERL_LCE
+    if _VERL_LCE is None:
+        import random
+
+        import numpy as np
+
+        states = random.getstate(), np.random.get_state(), torch.get_rng_state()
+        try:
+            from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy as fused
+        except Exception:
+            fused = False
+        finally:
+            random.setstate(states[0])
+            np.random.set_state(states[1])
+            torch.set_rng_state(states[2])
+        _VERL_LCE = fused
+    return _VERL_LCE or None
+
+
 def linear_cross_entropy(
     hidden: torch.Tensor,
     weight: torch.Tensor,
@@ -50,11 +80,7 @@ def linear_cross_entropy(
     tp_group=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return token log-probs and entropy without changing VERL's fused API."""
-    try:
-        from verl.utils.kernel.linear_cross_entropy import linear_cross_entropy as _verl_lce
-    except Exception:
-        _verl_lce = None
-
+    _verl_lce = _verl_linear_cross_entropy()
     if _verl_lce is not None and hidden.is_cuda:
         log_probs, entropy = _verl_lce(hidden, weight, labels, float(temperature), "none", tp_group)
         return _reshape_like_labels(log_probs, labels), _reshape_like_labels(entropy, labels)
