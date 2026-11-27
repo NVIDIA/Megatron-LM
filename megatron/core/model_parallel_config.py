@@ -704,7 +704,32 @@ class ModelParallelConfig:
                 )
 
         if self.gtp_remat_num_sequence_shards > 1 and self.sequence_packing_scheduler is not None:
-            raise ValueError("GTP sequence sharding does not support sequence_packing_scheduler")
+            # DpBalancedScheduler hands packed buffer ``j // cp_size`` to rank ``j`` of the
+            # dp_cp_gtp_remat group, so the CP ranks of one buffer must be consecutive there.
+            # With sequence shards the ranks are ordered TP, sequence shard, batch shard,
+            # configured CP, DP (GTPParallelLayout), so they are consecutive unless batch
+            # shards and configured CP are both present. Dynamic CP regroups the ranks per
+            # microbatch and is not covered.
+            if self.sequence_packing_scheduler != "dp_balanced":
+                raise ValueError(
+                    "GTP sequence sharding supports only the dp_balanced "
+                    "sequence_packing_scheduler, got "
+                    f"{self.sequence_packing_scheduler!r}"
+                )
+            num_batch_shards = self.gtp_weight_remat_size // self.gtp_remat_num_sequence_shards
+            if (
+                self.context_parallel_size != self.gtp_remat_num_sequence_shards
+                and num_batch_shards != 1
+            ):
+                raise ValueError(
+                    "GTP sequence sharding supports sequence_packing_scheduler with configured "
+                    "context parallelism on top of the sequence shards only when the shards "
+                    "span the whole GTP_remat group: runtime context_parallel_size "
+                    f"({self.context_parallel_size}) exceeds the number of sequence shards "
+                    f"({self.gtp_remat_num_sequence_shards}) while {num_batch_shards} batch "
+                    "shards remain in the group. Raise tensor_parallel_num_sequence_shards "
+                    "before adding context parallelism"
+                )
 
         if self.sequence_packing_scheduler is not None:
             supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
