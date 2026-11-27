@@ -452,10 +452,12 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_moe_kernels.py",
             "tests/unit_tests/transformer/moe/test_virtual_experts.py",
             "tests/unit_tests/transformer/moe/test_aux_loss.py",
+            "tests/unit_tests/transformer/moe/test_routers.py",
         ),
         kind="torch.compile",
         notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
         "Global-batch QB also compares histograms and the compact-output compatibility fallback. "
+        "Micro/global-batch QB diagnostic bias and load observations replay byte-exactly. "
         "Fused aux_loss, seq_aux_loss and global_aux_loss replay their logged scalar, "
         "input and router-weight gradients with fused TopK routing, and compare to the unfused reference.",
     ),
