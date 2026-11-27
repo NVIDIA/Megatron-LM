@@ -3568,6 +3568,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # When using precision-aware optimizer, main params are held by self.optimizer. It will also
         # do the work of copying data from main params to model params.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            self._reload_te_main_params(state_dict)
             return
 
         if state_dict is not None:
@@ -3609,6 +3610,48 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Copy model groups to shard groups.
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
+
+    @torch.no_grad()
+    def _reload_te_main_params(self, state_dict=None):
+        """Reload TE-owned masters"""
+        has_master_state = any(
+            self.optimizer.state.get(
+                self.optimizer.param_groups[group_index]["params"][group_order]
+            )
+            for group_index, group_order in self.model_param_group_index_map.values()
+        )
+        update_param = getattr(self.optimizer, "update_param", None)
+        if update_param is None and (state_dict is not None or has_master_state):
+            raise RuntimeError(
+                "Reloading precision-aware optimizer master weights requires Transformer Engine "
+                "with FusedAdam.update_param support. Upgrade Transformer Engine to use "
+                "--load-main-params-from-ckpt or to refresh existing master weights."
+            )
+        param_map = (
+            self._build_model_param_to_state_dict_param_map(state_dict)
+            if state_dict is not None
+            else None
+        )
+        for model_param, (group_index, group_order) in self.model_param_group_index_map.items():
+            inner_param = self.optimizer.param_groups[group_index]["params"][group_order]
+            if state_dict is None and not self.optimizer.state.get(inner_param):
+                # Fresh masters will be initialized lazily from the loaded model weights by TE.
+                continue
+            source = model_param if param_map is None else param_map[model_param]
+            if self._is_distopt_quantized_param(source):
+                source = (
+                    source.float()
+                    if self._is_grouped_quantized_tensor(source)
+                    else dequantize_fp8_tensor(source)
+                )
+            param_range = self._get_model_param_range_map(model_param)["param"]
+            master = source.detach().view(-1)[param_range.start : param_range.end].float()
+            update_param(inner_param, master)
+
+        # TE may update model values as well as masters. Replicate the updated shards before
+        # the next forward, including on ranks that own no slice of a given parameter.
+        for model_chunk in self.model_chunks:
+            model_chunk.start_param_sync(force_sync=True)
 
     def start_param_sync_for_bucket_group_subset(self) -> None:
         """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
