@@ -4,7 +4,7 @@
 import warnings
 from dataclasses import dataclass
 from functools import partial
-from typing import Callable, NoReturn, Optional, Union
+from typing import Callable, NoReturn, Optional, Protocol, Union
 
 import torch
 
@@ -64,6 +64,65 @@ def _initialize_grouped_output_projection(
 
 def _skip_initialization(weight: torch.Tensor) -> None:
     """Leave the weight uninitialized when ``perform_initialization`` is disabled."""
+
+
+class _GroupedOutputProjectionContext(Protocol):
+    """State supplied by autograd and saved by the grouped projection."""
+
+    groups: int
+    x_shape: torch.Size
+    needs_input_grad: tuple[bool, ...]
+
+    @property
+    def saved_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return tensors stored by ``save_for_backward``."""
+        ...
+
+    def save_for_backward(self, *tensors: torch.Tensor) -> None:
+        """Save tensors for the backward pass."""
+        ...
+
+
+class _GroupedOutputProjection(torch.autograd.Function):
+    """Per-group projection ``y[..., g, :] = x[..., g, :] @ w[g].T`` without layout copies.
+
+    Same math as ``einsum("...gd,grd->...gr")`` + reshape, but each batched GEMM reads and
+    writes the token-major ``[tokens, groups, dim]`` layout through strides, so neither the
+    output nor the input/weight gradients need a transpose copy.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: _GroupedOutputProjectionContext, x: torch.Tensor, weight: torch.Tensor, groups: int
+    ) -> torch.Tensor:
+        """x: [s, b, groups * d]; weight: [groups * r, d]. Returns [s, b, groups * r]."""
+        x3 = x.reshape(-1, groups, x.size(-1) // groups)
+        w3 = weight.view(groups, -1, x3.size(-1))
+        y = x.new_empty(x3.size(0), groups, w3.size(1))
+        torch.bmm(x3.transpose(0, 1), w3.transpose(1, 2), out=y.transpose(0, 1))
+        ctx.save_for_backward(x3, weight)
+        ctx.groups = groups
+        ctx.x_shape = x.shape
+        return y.view(*x.shape[:-1], -1)
+
+    @staticmethod
+    def backward(
+        ctx: _GroupedOutputProjectionContext, grad_y: torch.Tensor
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, None]:
+        """Writes both gradients straight into contiguous buffers."""
+        x3, weight = ctx.saved_tensors
+        groups = ctx.groups
+        w3 = weight.view(groups, -1, x3.size(-1))
+        gy = grad_y.reshape(x3.size(0), groups, w3.size(1)).transpose(0, 1)
+        grad_x = grad_w = None
+        if ctx.needs_input_grad[0]:
+            grad_x = x3.new_empty(x3.shape)
+            torch.bmm(gy, w3, out=grad_x.transpose(0, 1))
+            grad_x = grad_x.view(ctx.x_shape)
+        if ctx.needs_input_grad[1]:
+            grad_w = weight.new_empty(weight.shape)
+            torch.bmm(gy.transpose(1, 2), x3.transpose(0, 1), out=grad_w.view(w3.shape))
+        return grad_x, grad_w, None
 
 
 @dataclass
@@ -227,7 +286,7 @@ class DSv4HybridAttention(Attention):
             warnings.warn(
                 "transformer_engine.pytorch.ops.BatchedLinear is unavailable. Please upgrade "
                 "Transformer Engine to avoid a performance regression; "
-                "DSv4HybridAttention.linear_o_group_proj is falling back to torch.einsum.",
+                "DSv4HybridAttention.linear_o_group_proj is falling back to PyTorch batched GEMMs.",
                 stacklevel=2,
             )
             group_proj_out_size = (
@@ -378,13 +437,17 @@ class DSv4HybridAttention(Attention):
         return sharded_state_dict
 
     def _apply_linear_o_group_proj(self, input_: torch.Tensor) -> torch.Tensor:
-        """Apply TE BatchedLinear when available, otherwise use the legacy einsum."""
+        """Apply TE BatchedLinear when available, otherwise copy-free batched GEMMs.
+
+        The fallback computes the legacy ``einsum("...gd,grd->...gr")`` on ``[s, b, g, d]``.
+        """
         if self._uses_te_batched_linear:
             return self.linear_o_group_proj(input_)
-        weight = self._linear_o_group_proj_weight.reshape(
-            self.output_projection_local_groups, self.config.output_projection_lora_rank, -1
+        groups = self.output_projection_local_groups
+        output = _GroupedOutputProjection.apply(
+            input_.flatten(-2), self._linear_o_group_proj_weight, groups
         )
-        return torch.einsum("...gd,grd->...gr", input_, weight)
+        return output.unflatten(-1, (groups, -1))
 
     def forward(
         self,
