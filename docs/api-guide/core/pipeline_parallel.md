@@ -55,8 +55,7 @@ Inference wrappers also reject mHC when the resolved **inference** pipeline
 group has size greater than one: their receive buffers do not support the
 expanded residual width. This check is independent of the training PP setting.
 CUDA graph and offload combinations are not qualified by this pipeline support;
-existing full-recompute and selective-mHC-recompute/offload restrictions still
-apply.
+existing full-recompute restrictions still apply.
 
 For validation coverage, see
 `tests/unit_tests/pipeline_parallel/test_pp_mhc_compatibility.py` and the
