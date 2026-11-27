@@ -6,7 +6,7 @@ import operator
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -50,6 +50,7 @@ from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
+from .attention_context.dsa_flashinfer_metadata import FlashInferDSAMetadata
 from .attention_context.dsa_metadata import DSAMetadata
 from .attention_context.mamba_metadata import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
@@ -468,7 +469,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.dsa_indexer_head_dim = (
             getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0
         )
-        self.dsa_metadata: Optional[DSAMetadata] = None
+        self.dsa_metadata: Optional[Union[DSAMetadata, FlashInferDSAMetadata]] = None
+        if self.cache_dsa_indexer_keys:
+            self.dsa_backend = inference_config.dsa_backend
+            if self.dsa_backend not in ("triton", "flashinfer"):
+                raise ValueError(f"Unknown DSA inference backend {self.dsa_backend!r}.")
         if self.cache_mla_latent:
             assert (
                 inference_config.block_size_tokens == 64
@@ -489,6 +494,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
         else:
             self.num_attention_heads_per_partition = 1
+        if self.cache_dsa_indexer_keys and self.dsa_backend == "flashinfer":
+            # FlashInfer's step plan depends on the query heads (above counts KV heads) and top-k.
+            self.dsa_query_heads = core_divide(model_config.num_attention_heads, tp_size)
+            self.dsa_index_topk = model_config.dsa_indexer_topk
 
         self.batch_invariant_mode = model_config.batch_invariant_mode
         self.num_speculative_tokens = inference_config.num_speculative_tokens
@@ -1870,9 +1879,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         if self.cache_dsa_indexer_keys:
-            self.dsa_metadata = DSAMetadata(
-                max_requests=self.max_requests, max_tokens=self.max_tokens
-            )
+            if self.dsa_backend == "flashinfer":
+                from megatron.core.transformer.experimental_attention_variant import (
+                    dsa_gqa_flashinfer,
+                )
+
+                dsa_gqa_flashinfer.require_flashinfer_dsa()
+                self.dsa_metadata = FlashInferDSAMetadata(
+                    max_requests=self.max_requests,
+                    max_tokens=self.max_tokens,
+                    max_kv_blocks=self.max_kv_block_count,
+                    block_size_tokens=self.block_size_tokens,
+                    max_sequence_length=self.max_sequence_length,
+                    query_heads=self.dsa_query_heads,
+                    index_topk=self.dsa_index_topk,
+                )
+            else:
+                self.dsa_metadata = DSAMetadata(
+                    max_requests=self.max_requests, max_tokens=self.max_tokens
+                )
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
@@ -2015,7 +2040,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return
 
         # The early-return paths above preserve addresses and their captured graphs.
-        if self.dsa_metadata is not None:
+        if isinstance(self.dsa_metadata, DSAMetadata):
             self.dsa_metadata.topk_workspace = None
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
@@ -3172,10 +3197,22 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
 
         if self.cache_dsa_indexer_keys:
+            # The triton backend's plan also splits off the leading decode requests.
+            extra = {}
+            if isinstance(self.dsa_metadata, DSAMetadata):
+                extra["num_decode_requests"] = attn_dimensions.decode_req_count
+            else:
+                # Only prefill requests can take the FlashInfer plan's prefill tiles, so size them
+                # by the graph's padded prefill count (the step's own when eager), not every request.
+                extra["padded_prefill_requests"] = (
+                    self.padded_batch_dimensions.prefill_req_count
+                    if self.using_cuda_graph_this_step()
+                    else attn_dimensions.prefill_req_count
+                )
             self.dsa_metadata.update(
                 self._cpu_mha_query_lengths[:real_bs].tolist(),
                 self._cpu_mha_kv_seq_lengths[:real_bs].tolist(),
-                num_decode_requests=attn_dimensions.decode_req_count,
+                **extra,
                 padded_tokens=self.padded_active_token_count,
                 padded_requests=padded_bs,
                 decode_only=self.is_decode_only(),
