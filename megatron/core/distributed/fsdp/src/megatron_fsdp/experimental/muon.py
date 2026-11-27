@@ -5,6 +5,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
+from functools import cached_property
 from typing import Any, cast
 
 import torch
@@ -27,7 +28,7 @@ from .dbuffer import DBuffer
 from .gather_scatter import gather, get_sorted_rank_ranges, scatter
 from .owner_planning import assign_owner_work
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
-from .range import Range
+from .range import Range, intersect_ranges
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,32 @@ class _FsdpGroupAssignment:
     tensor_to_owner_rank: dict[int, int]
     # The layout is fixed, so the ranges are computed once instead of on every gather and scatter.
     rank_ranges: dict[int, Range]
+
+    @cached_property
+    def requires_communication(self) -> bool:
+        """Whether any of the optimized tensors has shards on several ranks."""
+        layout = self.fsdp_group.main_weight.layout
+        return any(
+            sum(
+                intersect_ranges(layout.get_tensor_range(i), rank_range).numel > 0
+                for rank_range in self.rank_ranges.values()
+            )
+            > 1
+            for i in self.tensor_to_optimizer_group_index
+        )
+
+
+def _schedule(pipelines: list["_GroupPipeline"]) -> None:
+    """Reorder the groups in place: spread those that need no communication over the others.
+
+    The last of them goes at the end. Their Newton-Schulz hides the transfers in flight, which the
+    other groups' own may be too short for.
+    """
+    free = [p for p in pipelines if not p.assignment.requires_communication]
+    comm = [p for p in pipelines if p.assignment.requires_communication]
+    position = {p: (k + 1) / len(free) for k, p in enumerate(free)}
+    position |= {p: (i + 0.5) / len(comm) for i, p in enumerate(comm)}
+    pipelines.sort(key=lambda p: (position[p], p.assignment.requires_communication))
 
 
 class _PipelineStage(Enum):
@@ -103,7 +130,11 @@ class _GroupPipeline:
         }
 
     def gather(self, optimizer: "FsdpMuon") -> None:
-        """Build sharded momentum from gradients; gather it into owners' full inputs."""
+        """Build sharded momentum from gradients; gather it into owners' full inputs.
+
+        A group without communication has nothing to gather: the owner of a tensor is the only
+        rank holding it, so its momentum input already is the full tensor.
+        """
         assert self._stage is _PipelineStage.IDLE
         group = self.assignment.fsdp_group
         owners = self._active_owners()
@@ -111,17 +142,22 @@ class _GroupPipeline:
         active = {i: self.assignment.tensor_to_optimizer_group_index[i] for i in owners}
         self._momentum_inputs = optimizer._compute_momentum_inputs(group, active)
         buffer = group.main_weight
-        self._full_inputs = {
-            i: torch.empty(buffer.layout.tensor_shapes[i], dtype=buffer.dtype, device=buffer.device)
-            for i, owner in owners.items()
-            if owner == group.mesh.get_rank()
-        }
-        self._gather_works = gather(
-            self._momentum_inputs,
-            self._full_inputs,
-            tensor_to_owner=owners,
-            rank_ranges=self.assignment.rank_ranges,
-        )
+        owned = [i for i, owner in owners.items() if owner == group.mesh.get_rank()]
+        if self.assignment.requires_communication:
+            self._full_inputs = {
+                i: torch.empty(
+                    buffer.layout.tensor_shapes[i], dtype=buffer.dtype, device=buffer.device
+                )
+                for i in owned
+            }
+            self._gather_works = gather(
+                self._momentum_inputs,
+                self._full_inputs,
+                tensor_to_owner=owners,
+                rank_ranges=self.assignment.rank_ranges,
+            )
+        else:
+            self._full_inputs = {i: self._momentum_inputs.get_tensor_view(i) for i in owned}
         self._stage = _PipelineStage.GATHER_POSTED
 
     def wait_for_gather(self) -> None:
@@ -139,18 +175,22 @@ class _GroupPipeline:
         self._stage = _PipelineStage.ORTHO_POSTED
 
     def scatter(self) -> None:
-        """Scatter full updates into local update shards; retain owner-local sources."""
+        """Scatter full updates into local update shards; retain owner-local sources.
+
+        A group without communication has nothing to scatter: its owners hold all its updates.
+        """
         assert self._stage is _PipelineStage.ORTHO_POSTED
-        buffer = self.assignment.fsdp_group.main_weight
-        self._local_updates = DBuffer(
-            buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
-        )
-        self._scatter_works = scatter(
-            self._full_updates,
-            self._local_updates,
-            tensor_to_owner=self._active_owners(),
-            rank_ranges=self.assignment.rank_ranges,
-        )
+        if self.assignment.requires_communication:
+            buffer = self.assignment.fsdp_group.main_weight
+            self._local_updates = DBuffer(
+                buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
+            )
+            self._scatter_works = scatter(
+                self._full_updates,
+                self._local_updates,
+                tensor_to_owner=self._active_owners(),
+                rank_ranges=self.assignment.rank_ranges,
+            )
         self._stage = _PipelineStage.SCATTER_POSTED
 
     def wait_for_scatter(self) -> None:
@@ -163,7 +203,6 @@ class _GroupPipeline:
     def apply_updates(self, optimizer: "FsdpMuon") -> None:
         """Apply received shards and owner-local full updates, then release both."""
         self.wait_for_scatter()
-        assert self._local_updates is not None
         optimizer._apply_local_updates(self.assignment, self._full_updates, self._local_updates)
         self._full_updates.clear()
         self._local_updates = None
@@ -193,11 +232,12 @@ class FsdpMuon(Muon):
 
     Momentum remains sharded. Owner assignments balance orthogonalization across a
     fixed set of buffers and are computed during initialization. Each step gathers,
-    orthogonalizes, and scatters each buffer on the caller's CUDA stream. Transfers are
-    asynchronous: the gathers of the next ``num_groups_in_flight`` buffers are posted before the
-    current one is orthogonalized, and a buffer's updates are applied after
-    ``num_groups_in_flight`` later buffers have been scattered, so each scatter overlaps their
-    Newton-Schulz.
+    orthogonalizes, and scatters each buffer. Transfers are asynchronous: the gathers of the next
+    ``num_groups_in_flight`` buffers are posted before the current one is orthogonalized, and a
+    buffer's updates are applied after ``num_groups_in_flight`` later buffers have been scattered,
+    so each scatter overlaps their Newton-Schulz. Buffers whose tensors all sit on one rank need
+    no communication; they are spread over the pipeline, the last one at the end, where their
+    Newton-Schulz hides the transfers in flight.
     Full matrices exist only on their assigned owners.
     The FSDP groups may use different meshes; owners are planned jointly across all ranks, so
     every rank must construct FsdpMuon.
@@ -283,11 +323,13 @@ class FsdpMuon(Muon):
             raise ValueError("closure is not supported")
 
         pipelines = [pipeline for pipeline in self._group_pipelines if pipeline.has_grad]
+        _schedule(pipelines)
 
-        # Software pipeline over groups. While group i is orthogonalized, the gathers of the next
-        # `num_groups_in_flight` groups and the scatters of the previous `num_groups_in_flight`
-        # groups are in flight, so communication overlaps Newton-Schulz. Each reusable
-        # pipeline owns its scratch until the corresponding stage has consumed it.
+        # n = num_groups_in_flight; N: Newton-Schulz, G: gather, S: scatter, A: apply.
+        #
+        #   G(pipelines[:n]) | for each group i: G(i + n), N(i), S(i), A(i - n)
+        #
+        # Each reusable pipeline owns its scratch until the corresponding stage has consumed it.
         # Every rank posts transfers in the same order.
         for pipeline in pipelines[: self.num_groups_in_flight]:
             pipeline.gather(self)
@@ -364,7 +406,7 @@ class FsdpMuon(Muon):
         self,
         assignment: _FsdpGroupAssignment,
         full_updates: dict[int, torch.Tensor],
-        local_updates: DBuffer,
+        local_updates: DBuffer | None,
     ) -> None:
         """Apply owned result slices and received updates to local parameter shards."""
         fsdp_group = assignment.fsdp_group
@@ -378,8 +420,11 @@ class FsdpMuon(Muon):
                 # Scatter writes only remote-owned shards; owners keep their full result.
                 offset: int = max(buffer.offset - buffer.layout.get_tensor_range(i).start, 0)
                 update: torch.Tensor = full_updates[i].view(-1).narrow(0, offset, weight.numel())
-            else:
+            elif local_updates is not None:
                 update = local_updates.get_tensor_view(i)
+            else:
+                # In a group without communication, only the owner holds the tensor.
+                continue
             update = update.reshape(weight.shape).to(weight.dtype)
             # These hooks are inherited from EO's OrthogonalizedOptimizer, via Muon.
             self.pre_weight_update_fn_inplace(weight, update)

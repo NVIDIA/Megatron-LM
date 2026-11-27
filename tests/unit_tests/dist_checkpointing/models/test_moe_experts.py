@@ -30,21 +30,22 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.dist_checkpointing.models.common import common_test_pg_distribution_cache_e2e
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, te_reads_legacy_grouped_env
 
 fp8_available, reason_for_no_fp8 = check_fp8_support()
 
 
 @pytest.fixture(autouse=True)
 def enable_te_cutedsl_fused_grouped_mlp():
-    """Enable TE's cuDSL fused grouped MLP path for the duration of the test.
+    """Enable TE's cuDSL fused grouped MLP path on TE before 2.21, which selects it by env var.
 
     The kernel additionally requires SM100 (Blackwell), so on H100/A100 CI this is
     a no-op; setting it here means the kernel is picked up automatically when
     Blackwell hardware joins the unit-test matrix.
     """
     previous = os.environ.get('NVTE_CUTEDSL_FUSED_GROUPED_MLP')
-    os.environ['NVTE_CUTEDSL_FUSED_GROUPED_MLP'] = '1'
+    if te_reads_legacy_grouped_env():
+        os.environ['NVTE_CUTEDSL_FUSED_GROUPED_MLP'] = '1'
     try:
         yield
     finally:

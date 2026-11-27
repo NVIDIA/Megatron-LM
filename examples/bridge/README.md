@@ -5,9 +5,20 @@ This directory provides Hugging Face import/export examples backed by
 
 ## Supported models and scope
 
-The registered families are Nemotron-H, Nemotron 3.5 Super VL, and the Qwen 3.5
-family's dense/MoE text and vision-language models, including compatible Qwen 3.8
-checkpoints. Other Bridge model families are not registered by this package.
+The registered families are DeepSeek-V3 (including checkpoints that declare its architecture,
+such as Kimi-K2 and Moonlight), GPT-OSS, Llama (including Llama 3.1 RoPE scaling), Nemotron-H
+(including Nemotron 3.5 Lightning), Nemotron 3.5 Super VL, and the Qwen 3.5 family's dense/MoE
+text and vision-language models, including Qwen 3.8 checkpoints such as the dense
+`Qwen/Qwen3.8-27B`. Other Bridge model families are not registered by this package.
+GPT-OSS imports dequantize MXFP4 expert weights to BF16, and exports always write BF16
+experts. Export GPT-OSS with a BF16 checkpoint such as `unsloth/gpt-oss-20b-BF16` as
+`--hf-model`, since the MXFP4 checkpoint's tensor names do not match the exported ones.
+DeepSeek-V3 imports dequantize its FP8 block-scaled weights to BF16, and exports write BF16
+weights without the `*_scale_inv` tensors, so the FP8 checkpoint itself can be `--hf-model`.
+When comparing Nemotron 3.5 Lightning outputs with Transformers 5.23, note that Transformers
+floors the Mamba `dt` at `time_step_min`, which NVIDIA's remote code and Megatron Core do not.
+Transformers' logits therefore differ from Megatron's even though the weights convert exactly;
+with that floor removed, the next-token predictions match.
 Super VL can also import/export its text-only projection with `--text-only`;
 Qwen VL does not support that projection.
 
