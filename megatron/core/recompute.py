@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from contextlib import nullcontext
+from contextvars import ContextVar
 from typing import List, Optional, Set, Tuple, Union
 
 from torch import Tensor
@@ -14,6 +15,29 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.utils import make_viewless_tensor
+
+# The checkpoint closure owns these tensors; neither the module nor reusable packed metadata
+# can keep a preceding microbatch's selection alive or accidentally serve it to another.
+_CHECKPOINT_TOPK_CACHE = ContextVar("checkpoint_topk_cache", default=None)
+
+
+def current_checkpoint_topk_cache():
+    """The current full-layer checkpoint's own top-k selections, or None outside it."""
+    return _CHECKPOINT_TOPK_CACHE.get()
+
+
+def with_checkpoint_topk_cache(function):
+    """Bind a private per-layer cache to both invocations of one reentrant checkpoint."""
+    selections = {}
+
+    def checkpoint_call(*args, **kwargs):
+        token = _CHECKPOINT_TOPK_CACHE.set(selections)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _CHECKPOINT_TOPK_CACHE.reset(token)
+
+    return checkpoint_call
 
 
 def checkpointed_forward(
@@ -224,6 +248,8 @@ def checkpointed_forward(
             input_ids,
         )
         if use_checkpoint:
+            if getattr(self.config, "ernie_reuse_checkpoint_topk", False):
+                cf = with_checkpoint_topk_cache(cf)
             hidden_states, context = precision_aware_checkpoint(
                 cf,
                 self.config,

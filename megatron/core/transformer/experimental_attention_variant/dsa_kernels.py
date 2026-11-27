@@ -7,7 +7,7 @@ from __future__ import annotations
 import logging
 from importlib import import_module
 from types import ModuleType
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 from torch import Tensor
 
@@ -151,7 +151,8 @@ def run_fused_qk_topk(
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_size: int = 1,
     varlen_is_plain_causal: bool = False,
-) -> Optional[Tuple[Tensor, Optional[Tensor]]]:
+    return_selected_scores: bool = False,
+) -> Optional[Union[Tuple[Tensor, Optional[Tensor]], Tuple[Tensor, Tensor, Tensor, Tensor]]]:
     """Optional fused indexer hook for backend-specific implementations.
 
     ``single_packed_thd_sequence`` and ``use_local_indexer_varlen`` are CP-only
@@ -182,6 +183,7 @@ def run_fused_qk_topk(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
+        **({"return_selected_scores": True} if return_selected_scores else {}),
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,
@@ -219,6 +221,7 @@ def run_fused_qk_topk_with_loss(
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_size: int = 1,
     varlen_is_plain_causal: bool = False,
+    cached_topk: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
 ) -> Optional[Tuple[Tensor, Optional[Tensor], Tensor]]:
     """Optional fused indexer+loss hook for backend-specific implementations.
 
@@ -257,6 +260,7 @@ def run_fused_qk_topk_with_loss(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
+        **({"cached_topk": cached_topk} if cached_topk is not None else {}),
         **_packed_layout_hook_kwargs(
             fn,
             varlen_is_plain_causal=varlen_is_plain_causal,

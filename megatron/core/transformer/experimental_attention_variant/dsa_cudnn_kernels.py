@@ -7,7 +7,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
-from typing import TYPE_CHECKING, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -1739,8 +1739,9 @@ def run_fused_qk_topk(
     varlen_is_plain_causal: bool = False,
     packed_thd_causal_identity_layout: Optional[bool] = None,
     packed_thd_single_sequence: Optional[bool] = None,
-) -> Optional[Tuple[Tensor, Tensor]]:
-    """Run the cuDNN fused indexer and return top-k indices for split DSA."""
+    return_selected_scores: bool = False,
+) -> Optional[Union[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor, Tensor, Tensor]]]:
+    """Return attention-ordered IDs and lengths, optionally with loss-order IDs and FP32 scores."""
     use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
         use_local_indexer_varlen=use_local_indexer_varlen,
         single_packed_thd_sequence=single_packed_thd_sequence,
@@ -1765,7 +1766,7 @@ def run_fused_qk_topk(
         _get_packed_thd_metadata(use_local_indexer_varlen, packed_seq_params)
     )
     q_bshd, k_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q, k, weights)
-    topk_indices, topk_length, _score_payload = _indexer_topk_bshd(
+    topk_indices, topk_length, selected = _indexer_topk_bshd(
         q_bshd,
         k_bsd,
         w_bsh,
@@ -1774,7 +1775,7 @@ def run_fused_qk_topk(
         varlen_ends=ends,
         key_positions=None,
         return_scores=False,
-        return_topk_scores=False,
+        return_topk_scores=return_selected_scores,
         use_local_indexer_varlen=use_local_indexer_varlen,
         single_packed_thd_sequence=single_packed_thd_sequence,
         local_packed_cp_rank=local_packed_cp_rank,
@@ -1787,6 +1788,11 @@ def run_fused_qk_topk(
         packed_cp_size=cp_size,
         varlen_is_plain_causal=varlen_is_plain_causal,
     )
+    if return_selected_scores:
+        # The attention consumes physical ID order. The teacher and student retain the
+        # native selection slot order to preserve the original loss reduction order.
+        attn_indices = _sort_valid_topk_indices_by_index(topk_indices, topk_length, k.size(0))
+        return attn_indices.int().contiguous(), topk_length, topk_indices, selected
     return topk_indices, topk_length
 
 
@@ -1817,6 +1823,7 @@ def run_fused_qk_topk_with_loss(
     varlen_is_plain_causal: bool = False,
     packed_thd_causal_identity_layout: Optional[bool] = None,
     packed_thd_single_sequence: Optional[bool] = None,
+    cached_topk: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
 ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
     """Run cuDNN fused indexer and sparse indexer loss for split DSA."""
     use_local_indexer_varlen, single_packed_thd_sequence = _resolve_packed_layout_flags(
@@ -1888,6 +1895,7 @@ def run_fused_qk_topk_with_loss(
         cp_size,
         tp_group,
         varlen_is_plain_causal,
+        cached_topk,
     )
 
 
@@ -2846,6 +2854,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         packed_cp_size: int,
         tp_group,
         varlen_is_plain_causal: bool = False,
+        cached_topk: Optional[Tuple[Tensor, Tensor, Tensor]] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Compute shared attention top-k metadata and sparse indexer loss."""
         _ensure_dsa_namespace()
@@ -2856,28 +2865,40 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         )
 
         q_idx_bshd, k_idx_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q_indexer, k_indexer, weights)
-        topk_indices_cmp, topk_length_cmp, indexer_score_payload = _indexer_topk_bshd(
-            q_idx_bshd,
-            k_idx_bsd,
-            w_bsh,
-            indexer_topk,
-            varlen_starts=varlen_starts,
-            varlen_ends=varlen_ends,
-            key_positions=None,
-            return_scores=False,
-            return_topk_scores=True,
-            use_local_indexer_varlen=use_local_indexer_varlen,
-            single_packed_thd_sequence=single_packed_thd_sequence,
-            local_packed_cp_rank=local_packed_cp_rank,
-            local_packed_cp_query_start=local_packed_cp_query_start,
-            local_packed_cp_query_len=local_packed_cp_query_len,
-            packed_cu_seqlens_q=packed_cu_seqlens_q,
-            packed_cu_seqlens_k=packed_cu_seqlens_k,
-            packed_max_seqlen_q=packed_max_seqlen_q,
-            packed_max_seqlen_k=packed_max_seqlen_k,
-            packed_cp_size=packed_cp_size,
-            varlen_is_plain_causal=varlen_is_plain_causal,
-        )
+        if cached_topk is None:
+            topk_indices_cmp, topk_length_cmp, indexer_score_payload = _indexer_topk_bshd(
+                q_idx_bshd,
+                k_idx_bsd,
+                w_bsh,
+                indexer_topk,
+                varlen_starts=varlen_starts,
+                varlen_ends=varlen_ends,
+                key_positions=None,
+                return_scores=False,
+                return_topk_scores=True,
+                use_local_indexer_varlen=use_local_indexer_varlen,
+                single_packed_thd_sequence=single_packed_thd_sequence,
+                local_packed_cp_rank=local_packed_cp_rank,
+                local_packed_cp_query_start=local_packed_cp_query_start,
+                local_packed_cp_query_len=local_packed_cp_query_len,
+                packed_cu_seqlens_q=packed_cu_seqlens_q,
+                packed_cu_seqlens_k=packed_cu_seqlens_k,
+                packed_max_seqlen_q=packed_max_seqlen_q,
+                packed_max_seqlen_k=packed_max_seqlen_k,
+                packed_cp_size=packed_cp_size,
+                varlen_is_plain_causal=varlen_is_plain_causal,
+            )
+        else:
+            topk_indices_cmp, topk_length_cmp, indexer_score_payload = cached_topk
+            if (
+                topk_indices_cmp.shape != (b, sq, indexer_topk)
+                or topk_length_cmp.shape != (b, sq)
+                or indexer_score_payload.shape != topk_indices_cmp.shape
+                or indexer_score_payload.dtype != torch.float32
+            ):
+                raise ValueError(
+                    "Stored indexer selection is incompatible with its checkpoint replay."
+                )
 
         if indexer_score_payload is None:
             raise RuntimeError("cuDNN sparse indexer loss requires selected top-k scores.")
@@ -2931,40 +2952,9 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             grad_k_indexer = None
             grad_weights = None
 
-        # Grads: q_indexer, k_indexer, weights, then None for query, kv_full,
-        #   indexer_topk, softmax_scale, loss_coeff, calculate_per_token_loss, d_v,
-        #   varlen_starts, varlen_ends, query_valid_rows, use_local_indexer_varlen,
-        #   single_packed_thd_sequence, local_packed_cp_rank,
-        #   local_packed_cp_query_start, local_packed_cp_query_len,
-        #   packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q,
-        #   packed_max_seqlen_k, packed_cp_size, tp_group,
-        #   varlen_is_plain_causal.
-        return (
-            grad_q_indexer,
-            grad_k_indexer,
-            grad_weights,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,  # varlen_is_plain_causal
+        # Some callers omit the optional cached selection. Return one gradient per supplied input.
+        return (grad_q_indexer, grad_k_indexer, grad_weights) + (None,) * (
+            len(ctx.needs_input_grad) - 3
         )
 
 
