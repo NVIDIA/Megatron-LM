@@ -355,9 +355,9 @@ class TestTraining:
         # The namespace carries no checkpoint settings: the section owns them.
         args = SimpleNamespace(logits_save_dir=None, logits_load_dir=None, moe_use_upcycling=False)
 
-        def load_checkpoint(*unused_args, **kwargs):
+        def load_checkpoint(ctx):
             # The source checkpoint is loaded under the run's own policy.
-            assert "checkpoint" not in kwargs
+            assert not hasattr(ctx, "checkpoint")
             return 123, 456
 
         def save_checkpoint(*unused_args, **kwargs):
@@ -381,7 +381,7 @@ class TestTraining:
         monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
         monkeypatch.setattr(training, "get_current_global_batch_size", lambda: 1)
         monkeypatch.setattr(training, "update_num_microbatches", Mock())
-        monkeypatch.setattr(training, "load_checkpoint", load)
+        monkeypatch.setattr(training, "get_checkpoint_manager", lambda: SimpleNamespace(load=load))
         monkeypatch.setattr(training, "save_checkpoint", save)
 
         with pytest.raises(SystemExit):

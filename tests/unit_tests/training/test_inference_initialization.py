@@ -124,7 +124,8 @@ def test_resume_updates_microbatches_before_setup_validation(
         assert events == ["load", "update"]
         raise ReachedBatchValidation
 
-    monkeypatch.setattr(training, "load_checkpoint", restore)
+    # The default checkpoint manager resolves load_checkpoint from checkpointing at call time.
+    monkeypatch.setattr("megatron.training.checkpointing.load_checkpoint", restore)
     monkeypatch.setattr(training, "update_num_microbatches", update)
     monkeypatch.setattr(training, "get_num_microbatches", validate)
     with pytest.raises(ReachedBatchValidation):
