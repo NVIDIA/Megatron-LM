@@ -90,16 +90,30 @@ class _MoKExperts(torch.nn.Module):
 
 
 @pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("backend", ["mok", "cutemok", "auto"])
 @pytest.mark.parametrize("gated", [False, True])
 @pytest.mark.parametrize("main_grad_dtype", [torch.float32, torch.bfloat16])
-def test_real_mok_ddp_numerics(gated, main_grad_dtype):
+def test_real_mok_ddp_numerics(gated, main_grad_dtype, backend, monkeypatch):
     """Two microbatches, all weight buffers, no parameter mutation, and SGD refresh."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
     ):
         pytest.skip("MoK requires Blackwell SM100/SM103")
-    functional = pytest.importorskip("mok.functional")
+    from megatron.core.transformer.moe.megakernel.mok import package
+    from megatron.core.transformer.moe.megakernel.mok.package import clear_mok_caches
+
+    # The backward entry point the adapter calls, which the mutation control below wraps.
+    # "auto" is the deprecated "mok" where CuTe MoK can run, so it runs CuTe MoK.
+    if backend == "mok":
+        backward_owner, backward_name = pytest.importorskip("mok.functional"), "backward"
+        # Deprecated "mok" runs the standalone package only where CuTe MoK cannot run.
+        monkeypatch.setattr(package, "cutemok_available", lambda: False)
+    else:
+        backward_owner = pytest.importorskip("cudnn.moe_ep.cutemok")
+        backward_name = "cutemok_backward"
+        if not package.cutemok_available():
+            pytest.skip("CuTe MoK cannot run here")
     pytest.importorskip("transformer_engine.pytorch")
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.models.gpt.gpt_layer_specs import (
@@ -132,7 +146,7 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype):
             gated_linear_unit=True,
             activation_func=F.silu,
             gradient_accumulation_fusion=True,
-            moe_megakernel_backend="mok",
+            moe_megakernel_backend="mok" if backend == "auto" else backend,
             moe_shared_expert_gate=gated,
             add_bias_linear=False,
             bf16=True,
@@ -163,6 +177,14 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype):
                 parameter.copy_(
                     torch.randn(parameter.shape, generator=generator, device="cuda") / 16
                 )
+        # No DDP yet, so no main_grad: forward only, as in --skip-train evaluation.
+        assert all(getattr(p, "main_grad", None) is None for p in model.parameters())
+        eval_generator = torch.Generator(device="cuda").manual_seed(4321)
+        x = torch.randn(512, 256, generator=eval_generator, device="cuda", dtype=torch.bfloat16)
+        probs = torch.randn(512, 2, generator=eval_generator, device="cuda").softmax(-1)
+        weights = {name: p.detach() for name, p in model.named_parameters()}
+        with torch.no_grad():
+            _assert_numerics(model(x, probs), _reference(x, probs, weights), "output without DDP")
         ddp = DistributedDataParallel(
             config,
             DistributedDataParallelConfig(
@@ -180,9 +202,10 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype):
         assert set(parameters) <= set(checkpoint)
         assert all(not name.startswith("megakernel_experts.") for name in checkpoint)
         assert all(not name.startswith("megakernel_experts.") for name in parameters)
-        backend = model.megakernel_experts
+        megakernel = model.megakernel_experts
+        assert (megakernel.cutemok is None) == (backend == "mok")
         if gated:
-            assert backend.shared_output_gate_weight is model.shared_experts.gate_weight
+            assert megakernel.shared_output_gate_weight is model.shared_experts.gate_weight
         buffers = {name: p.main_grad for name, p in parameters.items()}
         assert all(buf.dtype == main_grad_dtype for buf in buffers.values())
         original = {name: p.detach().clone() for name, p in parameters.items()}
@@ -229,7 +252,7 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype):
         optimizer.zero_grad(set_to_none=True)
         reference_optimizer.step()
         reference_optimizer.zero_grad(set_to_none=True)
-        backend.is_first_microbatch = True
+        megakernel.is_first_microbatch = True
         x, probs, upstream = batches[0]
         with torch.no_grad():
             updated = ddp(x, probs)
@@ -250,7 +273,7 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype):
                 wrong = ddp(x, probs)
             with pytest.raises(AssertionError, match="swapped gate/up"):
                 _assert_numerics(wrong, reference_updated, "swapped gate/up")
-            real_backward = functional.backward
+            real_backward = getattr(backward_owner, backward_name)
             for missing in ("experts.linear_fc1.weight0", "shared_experts.linear_fc2.weight"):
                 ddp.zero_grad_buffer()
                 _, _, _, expected_dw = _reference_backward(x, probs, reference_weights, upstream)
@@ -260,11 +283,13 @@ def test_real_mok_ddp_numerics(gated, main_grad_dtype):
                     parameters[missing].main_grad.zero_()
                     return result
 
-                with patch.object(functional, "backward", omit_write):
+                with patch.object(backward_owner, backward_name, omit_write):
                     ddp(x.requires_grad_(), probs.requires_grad_()).backward(upstream)
                 with pytest.raises(AssertionError, match=missing):
                     _assert_numerics(parameters[missing].main_grad, expected_dw[missing], missing)
+        clear_mok_caches()
+        assert not runtime._CUTEMOK_PLANS and not runtime._RETIRED_CUTEMOK_PLANS
     finally:
-        functional.clear_workspace_cache()
+        clear_mok_caches()
         torch.backends.cuda.matmul.allow_tf32 = old_tf32
         Utils.destroy_model_parallel()

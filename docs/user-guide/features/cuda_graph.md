@@ -124,6 +124,11 @@ not enable mHC capture by themselves.
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
 
+Hybrid strict runtime validation remains Python control flow during eager execution and
+capture. Its per-layer `strict_runtime_validation` flag is not a tensor input to TE graph
+replay, including for mHC wrappers. Attention that runs eagerly outside a partial graph
+continues to receive the flag.
+
 ### mHC Attention Split
 
 For mHC selective recompute, `--mhc-recompute-attn-cuda-graph-split` keeps mHC aggregation and

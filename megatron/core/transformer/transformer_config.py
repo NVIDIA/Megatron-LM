@@ -66,6 +66,56 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
+def _validate_dsa_index_share_pipeline_layout(
+    layout: PipelineParallelLayerLayout, num_layers: int, topk_freq: int, skip_topk_offset: int
+) -> None:
+    """Reject a pipeline layout whose model chunks would start on a DSA index-sharing layer.
+
+    With ``dsa_indexer_topk_freq > 1`` a skip layer reuses the top-k of the most recent
+    computing layer through the index-share holders of one model chunk's forward, so that
+    computing layer must run earlier in the same (PP rank, VPP stage) chunk. The model
+    builders check each local chunk once the model is built; this checks every chunk of the
+    layout at configuration time, so an invalid PP or VPP layout fails on every rank alike
+    and without a GPU.
+
+    Decoder layers are numbered 1..``num_layers`` in the layout's execution order (VPP stage
+    major, then PP rank) and MTP layers continue from ``num_layers + 1``. Within a chunk the
+    numbers are consecutive, so a chunk is valid exactly when its first DSA layer computes
+    its own top-k: every later skip layer of the chunk then finds its source inside the chunk.
+    """
+    # Lazy import: the DSA module imports this one.
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        is_dsa_skip_topk_layer,
+        source_dsa_compute_layer,
+    )
+
+    next_decoder_layer = 1
+    for vp_stage in range(layout.virtual_pipeline_model_parallel_size):
+        for pp_rank in range(layout.pipeline_model_parallel_size):
+            chunk = layout.layout[pp_rank][vp_stage]
+            num_decoder_layers = chunk.count(LayerType.decoder)
+            if num_decoder_layers > 0:
+                first_layer = next_decoder_layer
+                next_decoder_layer += num_decoder_layers
+            elif LayerType.mtp in chunk:
+                first_layer = num_layers + 1
+            else:
+                continue
+            if not is_dsa_skip_topk_layer(first_layer, skip_topk_offset, topk_freq):
+                continue
+            source_layer = source_dsa_compute_layer(first_layer, skip_topk_offset, topk_freq)
+            kind = "decoder" if num_decoder_layers > 0 else "MTP"
+            raise ValueError(
+                f"pipeline_model_parallel_layout {layout!r} is invalid for DSA top-k sharing: "
+                f"the chunk at PP rank {pp_rank}, VPP stage {vp_stage} starts on {kind} layer "
+                f"{first_layer}, which reuses the top-k of layer {source_layer} from an earlier "
+                "chunk. Cross-layer top-k sharing does not cross PP/VPP chunk boundaries, so "
+                "every chunk must start on a layer that computes its own top-k "
+                f"(dsa_indexer_topk_freq={topk_freq}, "
+                f"dsa_indexer_skip_topk_offset={skip_topk_offset})."
+            )
+
+
 @dataclass
 @experimental_api
 class TransformerConfig(ModelParallelConfig):
@@ -1131,8 +1181,11 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_megakernel_backend: Optional[str] = None
     """Optional backend that replaces MoE dispatch, expert computation, and combine.
-    Supported values: None and "mok". When set, the megakernel owns dispatch/combine;
-    moe_token_dispatcher_type and moe_flex_dispatcher_backend do not select its transport.
+    Supported values: None, "cutemok" (cuDNN frontend's CuTe MoK, an optimized version of MOK;
+    NVIDIA/cudnn-frontend#2767) and the deprecated "mok", which runs as "cutemok" when CuTe MoK is
+    available and otherwise through the standalone mok package, with a FutureWarning either way.
+    When set, the megakernel owns dispatch/combine; moe_token_dispatcher_type and
+    moe_flex_dispatcher_backend do not select its transport.
     """
 
     moe_megakernel_backend_config: Optional[dict] = None
@@ -3218,6 +3271,15 @@ class TransformerConfig(ModelParallelConfig):
                         " by dsa_indexer_kpool for pool selection; "
                         f"got topk={self.dsa_indexer_topk}, kpool={self.dsa_indexer_kpool}."
                     )
+            if self.dsa_indexer_kpool > 1 and self.dsa_indexer_mode == "simplified":
+                # The simplified (GQA) indexer has no pool code; without this rule a KPool
+                # config would be accepted and KPool silently ignored.
+                raise ValueError(
+                    "dsa_indexer_mode='simplified' does not support KPool selection "
+                    "(dsa_indexer_kpool > 1): the simplified indexer has no pool compression, "
+                    "so the pools would be silently ignored; got "
+                    f"dsa_indexer_kpool={self.dsa_indexer_kpool}."
+                )
             if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
                 raise ValueError(
                     "DSA indexer loss is not supported with kpool selection; set "
@@ -3949,7 +4011,7 @@ class TransformerConfig(ModelParallelConfig):
             ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
 
         if self.moe_virtual_expert_load_balance:
-            if self.moe_megakernel_backend == "mok":
+            if self.moe_megakernel_backend in ("mok", "cutemok"):
                 raise ValueError("MOK does not support MoonEP (moe_virtual_expert_load_balance)")
             MAX_VIRTUAL_EXPERT_EP_SIZE = 64
 
@@ -4059,16 +4121,16 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_router_load_balancing_type = "quantile_balancing"
             self.moe_aux_loss_coeff = self.moe_aux_loss_coeff[0]
 
-        if self.moe_megakernel_backend not in (None, "mok"):
+        if self.moe_megakernel_backend not in (None, "mok", "cutemok"):
             raise ValueError(
-                "moe_megakernel_backend must be None or 'mok', got "
+                "moe_megakernel_backend must be None, 'mok' or 'cutemok', got "
                 f"{self.moe_megakernel_backend!r}"
             )
         if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
             )
-        if self.moe_megakernel_backend == "mok":
+        if self.moe_megakernel_backend in ("mok", "cutemok"):
             from megatron.core.transformer.moe.megakernel import megakernel_fuses_shared_expert
 
             fuse_shared = megakernel_fuses_shared_expert(self)
@@ -4842,6 +4904,13 @@ class TransformerConfig(ModelParallelConfig):
                 # The base config cannot see layout-derived standalone MTP. Warn once when this
                 # post-layout transition makes the fixed-shape flag a no-op.
                 self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
+            if self.experimental_attention_variant == "dsa" and self.dsa_indexer_topk_freq > 1:
+                _validate_dsa_index_share_pipeline_layout(
+                    self.pipeline_model_parallel_layout,
+                    num_layers=self.num_layers,
+                    topk_freq=self.dsa_indexer_topk_freq,
+                    skip_topk_offset=self.dsa_indexer_skip_topk_offset,
+                )
 
         # Uneven PP
         elif (
@@ -5556,7 +5625,7 @@ class TransformerConfig(ModelParallelConfig):
                 "or dispatch. Use attention-only capture or unchunked MoE execution."
             )
 
-        if self.moe_megakernel_backend == "mok":
+        if self.moe_megakernel_backend in ("mok", "cutemok"):
             if self.cuda_graph_impl in ("local", "transformer_engine"):
                 # Empty modules mean whole-layer capture here, not full_iteration.
                 # Per-layer replay needs per-microbatch ownership or recomputation

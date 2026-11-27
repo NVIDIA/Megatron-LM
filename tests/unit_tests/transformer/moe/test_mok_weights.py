@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -88,8 +89,98 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
         },
     ],
 )
-def test_mok_accepts_key_supported_configurations(overrides):
-    assert _mok_transformer_config(**overrides).moe_megakernel_backend == "mok"
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
+def test_mok_accepts_key_supported_configurations(overrides, backend):
+    config = _mok_transformer_config(**{"moe_megakernel_backend": backend, **overrides})
+    assert config.moe_megakernel_backend == backend
+
+
+def test_megakernel_backend_name_is_validated():
+    with pytest.raises(ValueError, match="must be None, 'mok' or 'cutemok'"):
+        _mok_transformer_config(moe_megakernel_backend="cute_mok")
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_deprecated_mok_runs_as_cutemok_when_available(monkeypatch, available):
+    from megatron.core.transformer.moe.megakernel.mok import package
+
+    monkeypatch.setattr(package, "cutemok_available", lambda: available)
+    with pytest.warns(FutureWarning, match='"mok" is deprecated'):
+        assert package.resolve_mok_backend("mok") == ("cutemok" if available else "mok")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert package.resolve_mok_backend("cutemok") == "cutemok"
+
+
+def test_cutemok_cannot_run_without_its_cute_dsl(monkeypatch):
+    gate = pytest.importorskip("cudnn.moe_ep._cutemok.cutedsl._version_gate")
+    from megatron.core.transformer.moe.megakernel.mok import package
+
+    def missing():
+        raise gate.CuteDslRequirementError("CuTe DSL is not installed")
+
+    monkeypatch.setattr(gate, "require_cutedsl", missing)
+    assert not package.cutemok_available.__wrapped__()
+
+
+@pytest.mark.parametrize("capability", [(9, 0), (10, 7)])
+def test_cutemok_cannot_run_on_other_gpus(monkeypatch, capability):
+    from megatron.core.transformer.moe.megakernel.mok import package
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args: capability)
+    assert not package.cutemok_available.__wrapped__()
+
+
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
+def test_mok_rejects_megatron_fsdp_in_cli_arguments(monkeypatch, backend):
+    from megatron.training.arguments import parse_args, validate_args
+
+    argv = ["test_mok_weights.py", "--num-layers", "2", "--hidden-size", "128"]
+    argv += ["--num-attention-heads", "4", "--seq-length", "128", "--max-position-embeddings"]
+    argv += ["128", "--micro-batch-size", "1", "--num-experts", "8", "--moe-grouped-gemm"]
+    argv += ["--moe-megakernel-backend", backend, "--use-megatron-fsdp"]
+    monkeypatch.setattr("sys.argv", argv)
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    monkeypatch.setattr("megatron.training.arguments.get_device_arch_version", lambda: 10)
+    monkeypatch.setattr("megatron.training.arguments._print_args", lambda *_args: None)
+    with pytest.raises(ValueError, match="MOK has not been validated with Megatron-FSDP"):
+        validate_args(parse_args())
+
+
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
+def test_mok_rejects_megatron_fsdp_in_typed_config(monkeypatch, backend):
+    from megatron.core.distributed import DistributedDataParallelConfig
+    from megatron.core.optimizer import OptimizerConfig
+    from megatron.training.config import PretrainConfigContainer
+    from megatron.training.config.training_config import (
+        CheckpointConfig,
+        LoggerConfig,
+        SchedulerConfig,
+        TrainingConfig,
+    )
+    from megatron.training.models.gpt import GPTModelConfig
+
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    container = PretrainConfigContainer(
+        train=TrainingConfig(micro_batch_size=1, global_batch_size=4, train_iters=2),
+        model=GPTModelConfig(
+            transformer=_mok_transformer_config(moe_megakernel_backend=backend),
+            vocab_size=1024,
+            seq_length=512,
+        ),
+        optimizer=OptimizerConfig(optimizer="adam", lr=1e-4, min_lr=0.0),
+        scheduler=SchedulerConfig(lr_decay_iters=2),
+        logger=LoggerConfig(),
+        checkpoint=CheckpointConfig(ckpt_format="fsdp_dtensor"),
+        ddp=DistributedDataParallelConfig(
+            use_megatron_fsdp=True, data_parallel_sharding_strategy="optim_grads_params"
+        ),
+    )
+    with pytest.raises(ValueError, match="MOK has not been validated with FSDP"):
+        container._validate_ddp_config()
 
 
 def test_native_moe_still_accepts_fp64_router():
@@ -200,15 +291,19 @@ def test_shared_execution_is_independent_of_activation_and_preserves_native_prec
         ),
     ],
 )
-def test_mok_rejects_key_incompatible_configurations(overrides, error):
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
+def test_mok_rejects_key_incompatible_configurations(overrides, error, backend):
     with pytest.raises(ValueError, match=error):
-        _mok_transformer_config(**overrides)
+        _mok_transformer_config(**{"moe_megakernel_backend": backend, **overrides})
 
 
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
-def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl):
+def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl, backend):
     with pytest.raises(ValueError, match="whole-layer CUDA Graph capture"):
-        _mok_transformer_config(cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=[])
+        _mok_transformer_config(
+            moe_megakernel_backend=backend, cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=[]
+        )
 
 
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
@@ -221,10 +316,15 @@ def test_mok_rejects_per_layer_whole_layer_cuda_graph(cuda_graph_impl):
         [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
     ],
 )
-def test_mok_rejects_per_layer_cuda_graph_covering_moe(cuda_graph_impl, cuda_graph_modules):
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
+def test_mok_rejects_per_layer_cuda_graph_covering_moe(
+    cuda_graph_impl, cuda_graph_modules, backend
+):
     with pytest.raises(ValueError, match="moe/moe_router/moe_preprocess"):
         _mok_transformer_config(
-            cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=cuda_graph_modules
+            moe_megakernel_backend=backend,
+            cuda_graph_impl=cuda_graph_impl,
+            cuda_graph_modules=cuda_graph_modules,
         )
 
 

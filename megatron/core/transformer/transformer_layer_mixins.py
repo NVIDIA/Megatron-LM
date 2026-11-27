@@ -316,6 +316,9 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
         self, hidden_states: Tensor, *, padding_mask: Optional[Tensor] = None, **kwargs
     ):
         """Adapt padding and attention masks, then prepare tensor inputs for TE."""
+        # Validation is Python control flow for eager forward/capture. Eager attention
+        # has already consumed this flag when it runs outside the captured scope.
+        kwargs.pop("strict_runtime_validation", None)
         kwargs = {k: v for k, v in kwargs.items() if v is not None or k == "attention_mask"}
         # Attention inputs are absent when attention ran eagerly before the graph.
         if (

@@ -116,6 +116,10 @@ combination initializes a fresh local partial, and each nested entry attends
 over the trunk tuple plus that partial. The entry's bias/dropout contribution
 is added directly to the partial, without reconstructing a delta by subtracting
 BF16 tensors. Normal module hooks and selective recomputation are preserved.
+Hybrid AttnRes wrappers also forward the stack's
+`strict_runtime_validation_frequency` decisions to supported attention modules,
+including GDN/KDA, in both the trunk and nested MTP stacks. The split-entry delta
+path carries that decision through the normal module call into attention.
 
 At the end of each MTP depth, aggregate the trunk tuple plus its final partial
 once, then apply the existing MTP output norm. The result feeds the next depth's
