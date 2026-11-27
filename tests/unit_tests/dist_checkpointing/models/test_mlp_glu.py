@@ -1,4 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+import dataclasses
 import logging
 
 import pytest
@@ -8,6 +9,7 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -133,3 +135,59 @@ class TestParallelMLPWithGLU:
         with caplog.at_level(logging.WARNING):
             fc1_factory.merge_fn(loaded_state_dict)
             assert "CUDA OutOfMemoryError encountered during tensors merging" in caplog.text
+
+
+class _ScaledActivation(torch.nn.Module):
+    """An activation module with a replicated learnable parameter, such as xIELU."""
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(2.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.scale * x
+
+
+def initialize_mlp_with_activation_module():
+    model_parallel_cuda_manual_seed(123)
+    transformer_config = TransformerConfig(
+        num_layers=1,
+        hidden_size=12,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        gated_linear_unit=False,
+        bias_activation_fusion=False,
+    )
+    mlp_submodules = get_submodules(get_gpt_layer_local_submodules().mlp)
+    assert isinstance(mlp_submodules, MLPSubmodules)
+    mlp_submodules = dataclasses.replace(mlp_submodules, activation_func=_ScaledActivation)
+    return MLP(transformer_config, mlp_submodules)
+
+
+class TestMLPActivationModuleCheckpoint:
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def test_replicated_activation_parameter_round_trip(self, tmp_path_dist_ckpt):
+        """A replicated activation parameter has one main replica per TP group and round-trips."""
+        Utils.initialize_model_parallel(2, 1)
+        key = 'activation_func.scale'
+
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_mlp_activation_module') as ckpt_dir:
+            mlp_A = initialize_mlp_with_activation_module()
+            with torch.no_grad():
+                mlp_A.activation_func.scale.fill_(3.5)
+            sharded_sd_A = mlp_A.sharded_state_dict()
+
+            # Each TP rank holds a distinct replica, so exactly one is the main replica.
+            replica_id = sharded_sd_A[key].replica_id
+            assert replica_id[1] == parallel_state.get_tensor_model_parallel_rank(), replica_id
+
+            # save() validates the sharding and rejects duplicate main replicas.
+            save(sharded_sd_A, ckpt_dir)
+
+            mlp_B = initialize_mlp_with_activation_module()
+            assert mlp_B.activation_func.scale.item() == 2.0
+            state_dict = load(mlp_B.sharded_state_dict(), ckpt_dir)
+            mlp_B.load_state_dict(state_dict)
+            assert mlp_B.activation_func.scale.item() == 3.5

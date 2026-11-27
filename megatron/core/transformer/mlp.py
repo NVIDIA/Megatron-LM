@@ -434,7 +434,7 @@ class MLP(MegatronModule):
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
             sub_sd = sharded_state_dict_default(
-                module, f"{prefix}{name}.", sharded_offsets, metadata
+                module, f"{prefix}{name}.", sharded_offsets, metadata, tp_group=self.tp_group
             )
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
