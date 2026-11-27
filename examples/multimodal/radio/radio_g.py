@@ -1,4 +1,5 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+import warnings
 from functools import partial
 
 from examples.multimodal.layer_scaling import (
@@ -15,6 +16,7 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
+from megatron.core.utils import is_torch_min_version
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
@@ -37,14 +39,14 @@ try:
     import apex
 
     from megatron.core.ops.norm.fused_layer_norm import FusedLayerNorm
+    from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
-    import warnings
-
     from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 
+    HAVE_APEX = False
     warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
     LNImpl = WrappedTorchNorm
 

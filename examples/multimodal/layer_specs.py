@@ -1,4 +1,5 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+import warnings
 from functools import partial
 
 import torch
@@ -50,10 +51,9 @@ try:
     HAVE_APEX = True
     LNImpl = FusedLayerNorm
 except ImportError:
-    import warnings
-
     from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 
+    HAVE_APEX = False
     warnings.warn(f'Apex is not installed. Falling back to Torch Norm')
     LNImpl = WrappedTorchNorm
 
@@ -67,8 +67,8 @@ def get_layer_spec(is_vit, normalization) -> ModuleSpec:
             norm = TENorm
         else:
             version = torch.__version__.split('.')
-            version_geq_2_4 = int(TORCH_VERSION[0]) > 2 or (
-                int(TORCH_VERSION[0]) == 2 and int(TORCH_VERSION[1]) >= 4
+            version_geq_2_4 = int(version[0]) > 2 or (
+                int(version[0]) == 2 and int(version[1]) >= 4
             )
             assert version_geq_2_4, "Torch version >= 2.4.0 is required for RMSNorm"
             if HAVE_APEX:
