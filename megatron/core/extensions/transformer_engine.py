@@ -2574,6 +2574,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+        # TE creates a head-sharded learnable softmax_offset but does not mark it TP.
+        # Mark it so clip-norm includes every rank's sink grads. The helper asserts
+        # that TE has not already set the tensor-parallel attributes.
+        if self.config.softmax_type == "learnable":
+            set_tensor_model_parallel_attributes(self.softmax_offset, True, 0, 1)
+
         if self.config.attention_cp_layout == "contiguous":
             self.fused_attention.register_forward_hook(
                 self._make_fused_cp_grad_contiguous, with_kwargs=True

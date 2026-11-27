@@ -8,17 +8,11 @@ on:
         default: ${{ github.sha }}
       dry-run:
         required: false
-        description: Upload to PyPy Test instance
+        description: Build a unique development version for a rehearsal
         type: boolean
         default: true
-      no-publish:
-        required: false
-        description: Do not publish the wheel
-        type: boolean
-        default: true
-    secrets:
-      TWINE_PASSWORD:
-        required: false
+permissions:
+  contents: read
 
 jobs:
   build-and-test-wheels:
@@ -46,6 +40,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ inputs.ref }}
+          persist-credentials: false
 
       - name: Build wheel
         id: build-wheel
@@ -67,7 +62,7 @@ jobs:
 
           if [ "$PUBLISH_DRYRUN" = "true" ]; then
             PRE_RELEASE=$(sed -n "s/.*PRE_RELEASE = '\(.*\)'/\1/p" $ROOTDIR/package_info.py)
-            sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev$((RANDOM % 900000 + 100000))'" $ROOTDIR/package_info.py
+            sed -i "/^PRE_RELEASE/c\PRE_RELEASE = '${PRE_RELEASE}.dev${GITHUB_RUN_ID}'" $ROOTDIR/package_info.py
           fi
 
           pushd $BUILD_DIR
@@ -144,58 +139,7 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}-${{ inputs.dry-run && 'dry-run' || 'release' }}
-          path: dist/
-
-  publish-wheels:
-    needs: [build-and-test-wheels]
-    runs-on: ubuntu-latest
-    environment:
-      name: ${{ inputs.no-publish && 'public' || 'main' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - PACKAGE: megatron-core
-            PLATFORM: arm64
-          - PACKAGE: megatron-core
-            PLATFORM: amd64
-          - PACKAGE: megatron-fsdp
-            PLATFORM: amd64
-    env:
-      PACKAGE: ${{ matrix.PACKAGE }}
-    steps:
-      - name: Download wheels
-        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
-        with:
-          name: wheels-${{ matrix.PACKAGE }}-${{ matrix.PLATFORM }}-${{ inputs.dry-run && 'dry-run' || 'release' }}
-          path: dist/
-          merge-multiple: true
-
-      - name: Publish wheels
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
-          TWINE_REPOSITORY: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/r')) && 'pypi' || 'testpypi' }}
-          PLATFORM: ${{ matrix.PLATFORM }}
-          DRY_RUN: ${{ inputs.no-publish }}
-        run: |
-
-          # Delete sdist for arm64 since we already upload it with amd64.
-          if [ "$PLATFORM" == "arm64" ]; then
-            rm dist/*.tar.gz
-          fi
-
-          ls -al dist/
-          pip install twine
-
-          if [[ "$DRY_RUN" == "false" ]]; then
-            [[ -z "$TWINE_PASSWORD" ]] && { echo "::error::TWINE_PASSWORD unset"; exit 1; }
-            twine upload \
-              --verbose \
-              -r $TWINE_REPOSITORY \
-              -u $TWINE_USERNAME \
-              -p $TWINE_PASSWORD \
-              dist/*
-          else
-            echo "[dry-run] would execute: twine upload --verbose -r $TWINE_REPOSITORY -u <user> -p <pass> dist/*"
-          fi
+          path: |
+            dist/*.whl
+            ${{ matrix.PLATFORM == 'amd64' && 'dist/*.tar.gz' || '' }}
+          if-no-files-found: error
