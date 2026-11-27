@@ -216,8 +216,24 @@ def _is_mxfp8_attention_active() -> bool:
     )
 
 
+def _thd_attention_takes_unequal_head_dims(query: torch.Tensor) -> bool:
+    """Whether THD core attention on ``query``'s device takes a V head dim unequal to QK's.
+
+    On Blackwell (sm100 and newer) it does: cuDNN and FlashAttention 4 run MLA's unequal head
+    dims, such as DeepSeek's (192, 128), as they are, and both refuse V padded to the QK dim,
+    (192, 192). Padding there leaves a THD batch with padding between sequences no attention
+    backend at all, and one without such padding the slower unfused one. Earlier architectures
+    keep the pad.
+    """
+    return query.is_cuda and torch.cuda.get_device_capability(query.device)[0] >= 10
+
+
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
-    """Prepare value tensor for MLA core attention THD execution."""
+    """Prepare value tensor for MLA core attention THD execution.
+
+    For THD, V is padded to the QK head dim when they differ, except where attention takes
+    unequal head dims (``_thd_attention_takes_unequal_head_dims``).
+    """
     orig_v_dim = value.shape[-1] if value is not None else None
     padded_v_dim = orig_v_dim
     need_v_pad = (
@@ -226,6 +242,7 @@ def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_s
         and parallel_attention.config.experimental_attention_variant is None
         and value is not None
         and query.shape[-1] != orig_v_dim
+        and not _thd_attention_takes_unequal_head_dims(query)
     )
     if need_v_pad:
         value = F.pad(value, [0, query.shape[-1] - orig_v_dim])
