@@ -130,7 +130,7 @@ def _reference_plan(routes, num_experts, alignment=1):
     """CPU greedy placement and stable route assignment, using only semantic input routes."""
     ep_size, num_tokens, topk = routes.shape
     local_experts = num_experts // ep_size
-    counts = torch.stack([torch.bincount(row.flatten(), minlength=num_experts) for row in routes])
+    counts = torch.stack([torch.bincount(row[row >= 0], minlength=num_experts) for row in routes])
     totals = counts.sum(0).tolist()
     blocks = [(count + alignment - 1) // alignment for count in totals]
     total_blocks = sum(blocks)
@@ -178,8 +178,10 @@ def _reference_plan(routes, num_experts, alignment=1):
         copies.append(remote + [-1] * (local_experts - len(remote)))
     # Stable global order is source rank, token, top-k lane. Partition each expert's
     # positions directly by the CPU allocation, without reading kernel boundaries or slots.
-    order = routes.flatten().argsort(stable=True)
-    mapped = torch.empty(routes.numel(), dtype=torch.int16)
+    flat_routes = routes.flatten()
+    order = flat_routes.argsort(stable=True)
+    order = order[flat_routes[order] >= 0]
+    mapped = torch.full_like(flat_routes, -1, dtype=torch.int16)
     cursor = 0
     for expert, destinations in enumerate(allocation):
         remaining = totals[expert]
@@ -194,7 +196,7 @@ def _reference_plan(routes, num_experts, alignment=1):
                 )
                 mapped[order[cursor : cursor + count]] = destination * (2 * local_experts) + local
                 cursor += count
-    assert cursor == routes.numel()
+    assert cursor == order.numel()
     return (
         counts.int(),
         torch.tensor(allocation, dtype=torch.int32),
@@ -217,6 +219,17 @@ def _routes_for_skew(ep_size, num_experts, num_tokens, topk, skew):
         return torch.arange(9).repeat_interleave(4).reshape(4, 9, 1)
     rows = torch.arange(num_tokens)[:, None] + torch.arange(topk)
     local_experts = num_experts // ep_size
+    if skew == "all_padding":
+        return torch.full((ep_size, num_tokens, topk), -1, dtype=torch.int64)
+    if skew == "uneven_padding":
+        # rank 0 sends no real routes in multi-rank groups. Concentrate the remaining
+        # routes on a few experts, with holes in a top-k lane to exercise stable remapping.
+        routes = (rows % topk).repeat(ep_size, 1, 1)
+        for rank in range(ep_size):
+            valid_rows = num_tokens // 2 if ep_size == 1 else num_tokens * rank // (ep_size - 1)
+            routes[rank, valid_rows:] = -1
+            routes[rank, :valid_rows:7, -1] = -1
+        return routes
     if skew == "rank_ties":
         return (rows % (num_experts // 2)).repeat(ep_size, 1, 1)
     if skew in ("balanced", "local", "remote"):
@@ -322,16 +335,19 @@ def _check_planner_reference(group, num_experts, num_tokens, topk, skews, alignm
             # accepting a self-consistent allocation/slot table with the wrong expert owners.
             try:
                 assert actual.shape == (num_tokens, topk) and actual.dtype == torch.int16
-                assert ((actual >= 0) & (actual < 2 * num_experts)).all()
-                destination, local = actual.long() // (2 * local_experts), actual.long() % (
-                    2 * local_experts
-                )
+                valid = routes[rank] >= 0
+                assert (actual[~valid] == -1).all()
+                actual_ids = actual[valid].long()
+                logical_ids = routes[rank][valid]
+                assert ((actual_ids >= 0) & (actual_ids < 2 * num_experts)).all()
+                destination = actual_ids // (2 * local_experts)
+                local = actual_ids % (2 * local_experts)
                 semantic = destination * local_experts + local
                 remote = local >= local_experts
                 semantic[remote] = actual_copies[
                     destination[remote], local[remote] - local_experts
                 ].long()
-                torch.testing.assert_close(semantic, routes[rank], rtol=0, atol=0)
+                torch.testing.assert_close(semantic, logical_ids, rtol=0, atol=0)
                 if alignment == 1 and skew in ("balanced", "local", "remote"):
                     assert (actual_copies == -1).all()
                 if alignment == 1 and skew in ("local", "remote"):
@@ -339,8 +355,7 @@ def _check_planner_reference(group, num_experts, num_tokens, topk, skews, alignm
                         (destination == rank) if skew == "local" else (destination != rank)
                     ).all()
                 observed = torch.bincount(
-                    (routes[rank] * ep_size + destination).flatten(),
-                    minlength=num_experts * ep_size,
+                    logical_ids * ep_size + destination, minlength=num_experts * ep_size
                 ).to(device=device, dtype=torch.int32)
             except (AssertionError, IndexError) as exc:
                 errors.append(f"{skew} semantic routes: {exc}")
@@ -364,7 +379,7 @@ def _check_planner_reference(group, num_experts, num_tokens, topk, skews, alignm
                 f"{skew} balanced load",
                 errors,
             )
-            assert int(real_counts.sum()) == routes.numel()
+            assert int(real_counts.sum()) == int((routes >= 0).sum())
             capacity_owner = object.__new__(VirtualExpertLoadBalancer)
             capacity_owner.ep_size = ep_size
             capacity_owner.num_owned_experts = local_experts
@@ -388,7 +403,7 @@ def _check_planner_reference(group, num_experts, num_tokens, topk, skews, alignm
     "ep_size,num_experts,num_tokens,topk,skews",
     [
         (1, 8, 17, 3, "balanced concentrated balanced"),
-        (2, 8, 257, 3, "random concentrated balanced"),
+        (2, 8, 257, 3, "random concentrated uneven_padding all_padding balanced"),
         (2, 8, 0, 1, "balanced"),
         (4, 8, 17, 3, "balanced concentrated balanced"),
         (4, 8, 1, 1, "hot_expert random"),
@@ -441,7 +456,7 @@ def test_virtual_expert_planner_graph_replay(virtual_expert_planner_group, ep_si
             with torch.cuda.graph(graph):
                 captured = plan_virtual_expert_routes(own, workspace, alignment)
             dist.barrier(group=group)
-            for skew in ("concentrated", "balanced", "random", "balanced"):
+            for skew in ("concentrated", "uneven_padding", "all_padding", "random", "balanced"):
                 routes = _routes_for_skew(ep_size, 8, num_tokens, topk, skew)
                 counts, allocation, copies, mapped = _reference_plan(routes, 8, alignment)
                 own.copy_(routes[rank])
@@ -516,7 +531,8 @@ def test_virtual_expert_routing_adapter_replay(dtype, compiled):
     if compiled:
         adapt = torch.compile(adapt)
     indices, selected_probs = adapt(probs)
-    torch.testing.assert_close(indices, ids.long(), rtol=0, atol=0)
+    expected_indices = ids.long().masked_fill(flat_padding[:, None], -1)
+    torch.testing.assert_close(indices, expected_indices, rtol=0, atol=0)
     expected_probs = probs.masked_fill(flat_padding[:, None], 0)
     torch.testing.assert_close(selected_probs, expected_probs, rtol=0, atol=0)
     (gradient,) = torch.autograd.grad(selected_probs.sum(), probs)
