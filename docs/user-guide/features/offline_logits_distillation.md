@@ -114,8 +114,9 @@ should also pass `--freeze-all-layers`; without it, the model keeps training (LM
 computed, gradients applied) while logits are saved on the side.
 
 **Loading (student run):** pass `--logits-load-dir`. `StudentLogitsCapture` attaches a
-capture hook to the student's output layer; `LossFuncCallable` (constructed once per
-process, wired into `loss_func` in `pretrain_gpt.py` / `pretrain_hybrid.py`) streams the
+capture hook to the student's output layer; `LossFuncCallable` (built once per process
+by `build_loss_func` in `megatron/training/losses.py`, which the entry points inject into
+`forward_step` as the loss callback; it reuses its reader across microbatches) streams the
 matching tar shard(s) for the current DP rank and training iteration via a
 `torch.utils.data.DataLoader` (`pin_memory=True`, decode overlapped with GPU compute),
 and computes the sparse forward KL divergence `KL(teacher ‖ student)` between the
