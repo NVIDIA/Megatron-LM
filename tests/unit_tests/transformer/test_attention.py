@@ -9,6 +9,7 @@ from packaging import version
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
@@ -186,6 +187,23 @@ class TestParallelAttention:
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
+
+        if fused_qkv_rope:
+            attn = self.parallel_attention.float().eval()
+            x = torch.randn_like(hidden_states, dtype=torch.float32).requires_grad_()
+            rope = RotaryEmbedding(
+                config.kv_channels, 1.0, rotary_interleaved, cp_group=attn.pg_collection.cp
+            )(sequence_length)
+            upstream = torch.randn_like(x)
+            results = []
+            for fused in (True, True, False):  # Fused replay, then split/unfused reference.
+                config.fused_single_qkv_rope = config.apply_rope_fusion = fused
+                out, bias = attn(x, torch.zeros_like(attention_mask), rotary_pos_emb=rope)
+                grads = torch.autograd.grad(out + bias, (x, *attn.parameters()), upstream)
+                results.append(torch.cat([t.flatten() for t in (out, *grads)]))
+            assert torch.equal(results[0].view(torch.uint8), results[1].view(torch.uint8))
+            torch.testing.assert_close(results[0], results[2], rtol=1e-4, atol=1e-4)
+
         self.parallel_attention.config.apply_rope_fusion = False
         self.parallel_attention.config.rotary_interleaved = False
 
