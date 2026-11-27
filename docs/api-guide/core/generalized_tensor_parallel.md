@@ -705,14 +705,14 @@ Because the offsets reconstruct the global shape, the checkpoint is independent 
 
 **Alignment padding & cross-topology reshard.** When `_gtp_slice_one_param` pads `out_features` to a multiple of `gtp_remat_size · pad_for_alignment`, the saved global describes the *padded* shape, so the helper sets `allow_shape_mismatch=True`. DCP then tolerates a load-side topology whose alignment yields a different padded size — the unpadded data overlaps and the tail pad rows are zeros GTP_remat recomputes (§3.7 covers how that padding is laid out per rank).
 
-> Note: the SSM `in_proj` weights — Mamba's (`mamba_mixer.py`, split `[z|x|B|C|dt]`) and gated-delta-product's (`gated_delta_product.py`, split householder-major into `z|V*|K*|Q|b*|a`) — are a special case: they are saved as split chunks whose boundaries do not line up with the GTP_remat slice boundaries, under the pad-stripped TP-local global shapes a non-GTP_remat run uses, so they need no `allow_shape_mismatch` and the checkpoint matches a non-GTP_remat run byte-for-byte.
+> Note: the SSM `in_proj` weights — Mamba's (`mamba_mixer.py`, split `[z|x|B|C|dt]`), gated-delta-product's (`gated_delta_product.py`, split householder-major into `z|V*|K*|Q|b*|a`) and the gated-delta-net family's (GDN, GDN2 and KDA in `gated_delta_net/common.py`, split into the layer's named sections) — are a special case: they are saved as split chunks whose boundaries do not line up with the GTP_remat slice boundaries, under the pad-stripped TP-local global shapes a non-GTP_remat run uses, so they need no `allow_shape_mismatch` and the checkpoint matches a non-GTP_remat run byte-for-byte.
 >
-> - **Gated-delta-product** saves, on each GTP_remat rank, the piece of every chunk that the rank's own rows cover, as views of its shard at their offsets within the chunk (uneven shards, which DCP stores as-is); pad rows are not saved, and the load-side merge rebuilds the padded shard. No rank materializes the full tensor.
+> - **Gated-delta-product and the gated-delta-net family** save, on each GTP_remat rank, the piece of every chunk that the rank's own rows cover, as views of its shard at their offsets within the chunk (uneven shards, which DCP stores as-is); pad rows are not saved, and the load-side merge rebuilds the padded shard. No rank materializes the full tensor.
 > - **Mamba** still **all-gathers its GTP_remat shards** back to the TP-local size and strips the pad before splitting, so every GTP_remat rank briefly holds the full `in_proj` weight of every layer while a save is staged.
 >
-> On **load**, GDP rebuilds only the local shard and zero-fills its padding. Mamba concatenates the
-> TP-local chunks, re-pads, then slices by GTP_remat rank. With `gtp_remat_size == 1`, neither path
-> needs GTP padding or slicing.
+> On **load**, GDP and the gated-delta-net family rebuild only the local shard and zero-fill its
+> padding. Mamba concatenates the TP-local chunks, re-pads, then slices by GTP_remat rank. With
+> `gtp_remat_size == 1`, neither path needs GTP padding or slicing.
 >
 > **GDP padding-only ranks:** a zero-element `LocalNonpersistentObject` preserves the factory key
 > and device through load preprocessing. The merge function restores a zero-filled shard. **Padding
