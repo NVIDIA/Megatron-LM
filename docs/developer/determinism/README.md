@@ -25,6 +25,8 @@ This reference includes:
   registry, and the pull-request gate that requires a bit-exact test for every
   kernel change
 - [`glossary.md`](./glossary.md): definitions and abbreviations
+- [`training-state.md`](./training-state.md): fresh-process and checkpoint-resume
+  state comparisons, required capture components and pilot limitations
 
 The roadmap is tracked dynamically in
 [issue #5785](https://github.com/NVIDIA/Megatron-LM/issues/5785).
