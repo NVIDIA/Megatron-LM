@@ -25,7 +25,7 @@ from megatron.core.fusions.wide_residual_shortcut.api import check_mxfp8_call
 from megatron.core.fusions.wide_residual_shortcut.replay_kernel import replay_interval
 from megatron.core.fusions.wide_residual_shortcut.residual_replay import ReplayInterval
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.transformer.wide_residual import mxfp8_linear_eligible
+from megatron.core.transformer.wide_residual import takes_mxfp8
 from tests.unit_tests.determinism.kernels.harness import seeded
 from tests.unit_tests.fusions.test_wide_residual_shortcut import (
     BF16,
@@ -324,7 +324,7 @@ def test_graph_replay_restores_poisoned_outputs(monkeypatch, kind, case):
                 from transformer_engine.common.recipe import MXFP8BlockScaling
 
                 stack.enter_context(te.fp8_autocast(fp8_recipe=MXFP8BlockScaling()))
-                assert mxfp8_linear_eligible(layer)
+                assert takes_mxfp8(layer, "mxfp8")
                 check_mxfp8_call(raw[1][0])
             actual = invoke(raw, quantized)
             assert all(not t.requires_grad and t.grad_fn is None for t in actual)

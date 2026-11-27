@@ -85,16 +85,19 @@ class ReplayInterval:
         return previous
 
 
+def column_slot(q):
+    """The ColumnSlot a seam pinned on its MXFP8 read (through views of it), else None."""
+    data = getattr(q, "_rowwise_data", None)
+    data = data if data is None or data._base is None else data._base
+    return getattr(data, "_shortcut_columns", None)
+
+
 def install_columns(output, operand, slot) -> None:
     """After a TE Linear's forward (with grad) on a read's MXFP8 ``operand``: its backward
     unpacks ``slot``'s replayed columnwise operand in place of the saved rowwise one (TE's own
     save slot only; a scope-wide saved-tensor hook would detach the saved weight and lose GTP
     metadata). TE's backward, including weight-gradient accumulation and distributed-weight
     finalization, runs unchanged."""
-    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
-
-    if not FP8GlobalStateManager.is_fp8_enabled():
-        raise RuntimeError("an MXFP8 consumer of a fused read ran outside its FP8 context")
 
     def unpack(size):
         if slot.columns is None:

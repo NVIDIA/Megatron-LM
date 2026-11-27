@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import math
-import weakref
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -25,6 +24,7 @@ from megatron.core.fusions.wide_residual_shortcut import (
     fused_seam,
     install_columns,
 )
+from megatron.core.fusions.wide_residual_shortcut.residual_replay import column_slot
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.residual_connection import (
@@ -38,7 +38,10 @@ from megatron.core.transformer.streamwise_residual_ops import (
     streamwise_sigmoid_read,
     streamwise_sigmoid_writeback,
 )
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import (
+    TransformerConfig,
+    _validate_shortcut_fusion_config,
+)
 
 _MIN_CONTROLLER_NUMEL = 128
 
@@ -503,11 +506,6 @@ def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -
     )
 
 
-# Fused residual seams: a layer's last write is a DeferredWrite linked to the next layer's
-# WriteReadNorm. The DeferredWrite hands its write to that (empty) read instead of applying it, and
-# the read takes it and applies it with its read and RMSNorm in one kernel.
-
-
 @dataclass(frozen=True)
 class SeamInput:
     """A layer input whose residual read and RMSNorm a fused seam kernel already applied."""
@@ -516,18 +514,18 @@ class SeamInput:
     branch_input: Tensor
 
 
-class WriteReadNorm(nn.Module):
-    """Applies the previous layer's pending residual write, then this layer's read and RMSNorm, in
-    one fused kernel; owns the read logits and the norm weight.
+class _FusedWideResidualConnection(StreamwiseSigmoidWideResidualConnection):
+    def __init__(self, config, *args, **kwargs):
+        if not config.moe_shortcut_wide_residual_norm_fusion:
+            raise ValueError("a fused residual spec requires moe_shortcut_wide_residual_norm_fusion")
+        super().__init__(config, *args, **kwargs)
 
-    A fused layer spec selects this as the layer's read connection (with an identity input norm);
-    its predecessor's DeferredWrite always hands its write here, and the tensor this read is called
-    with is only that write's unwritten input residual. Every module consuming the read is linked
-    to it (``link_consumer``), and the stack fixes each consumer's format (``link_residual_seams``):
-    MXFP8 if it quantizes the read, else BF16. A read with two consumers is returned as one tensor
-    per consumer, in link order. A SeamInput (a fused shortcut block's two-reader kernel already
-    applied the write) passes through.
-    Returns ``(branch_input, (residual,))`` like a residual-connection read.
+
+class WriteReadNorm(_FusedWideResidualConnection):
+    """Apply a deferred write, streamwise read and RMSNorm in one kernel.
+
+    Each linked consumer receives its own BF16 or MXFP8 operand. A shortcut block
+    can apply both reads early and hand the compute layer its prepared SeamInput.
     """
 
     def __init__(
@@ -537,69 +535,46 @@ class WriteReadNorm(nn.Module):
         branch_name: str,
         operation: ResidualConnectionOperation = "read",
     ) -> None:
-        del branch_name
         if operation != "read":
             raise ValueError(f"WriteReadNorm is a read connection, got operation={operation!r}")
-        super().__init__()
-        self.read_map = StreamwiseSigmoidMap(config, map_kind="read")
+        super().__init__(config, layer_number, branch_name, operation=operation)
         device = "cpu" if config.use_cpu_initialization else torch.cuda.current_device()
         self.weight = nn.Parameter(
             torch.ones(config.hidden_size, dtype=config.params_dtype, device=device)
         )
         setattr(self.weight, "sequence_parallel", config.sequence_parallel)
         self.eps = config.layernorm_epsilon
-        # As TE's Linears do: the seam backward accumulates its controller and norm weight
-        # gradients into DDP's main_grad itself.
         self.fuse_wgrad_accumulation = config.gradient_accumulation_fusion
-        self.num_streams = config.wide_residual.num_streams
-        self.residual_stream_hidden_size = self.num_streams * config.hidden_size
-        self.branch_hidden_size = config.hidden_size
-        # Linked when the stack is wired (references, not submodules): every module consuming
-        # this read with its layer, the layer whose seam emits the read (a block's shortcut read is
-        # emitted by its compute layer's), and the stack's previous fused read.
-        self.consumers, self.seam_layer, self.previous_read = [], None, None
-        self.consumer_formats = ()  # fixed by the stack (``resolve_formats``)
-        # This forward's replay interval and ColumnSlot (a weak reference, for the consumers'
-        # saved-slot hooks).
-        self.interval = self.columns_slot = None
-        # The write handed here by the previous layer's DeferredWrite, until this read takes it.
-        self.pending = None
-        # Checkpoint replay: every N consecutive seams form one interval (without replay, every
-        # seam its own). The stack's second layer has its first seam, which starts the first
-        # interval, and one seam follows per layer.
+        # Stack links must not register neighboring layers as checkpoint submodules.
+        self.consumers, self.previous_read = (), None
+        self.consumer_formats = ()
+        self.interval = self.pending = None
+        # The first seam applies layer one's write at the read of layer two.
         every = config.residual_stream_recompute_num_layers
         self.starts_replay = every is None or every <= 1 or (layer_number - 2) % every == 0
 
-    def link_consumer(self, module, layer) -> None:
-        """Link ``module`` of ``layer`` as a consumer of this read."""
-        self.consumers.append((module, layer))
-
-    def resolve_formats(self, runs_mxfp8) -> None:
-        """Fix each consumer's format, in link order (the seam returns one output per consumer,
-        whose gradients its backward kernel sums): MXFP8 if it quantizes the read, a Linear that
-        ``takes_mxfp8`` under its layer's autocast (``runs_mxfp8(layer)``, as the stack's forward
-        enters it) in a seam whose layer runs MXFP8, else BF16."""
+    def resolve_formats(self, gemm_format) -> None:
+        """Choose formats in consumer order and hook Linears that need replayed columns."""
         if not 1 <= len(self.consumers) <= 2:
             raise RuntimeError("a fused read feeds one or two linked consumers")
-        formats = []
-        for module, layer in self.consumers:
-            if runs_mxfp8(self.seam_layer) and takes_mxfp8(module, runs_mxfp8(layer)):
-                if getattr(module, "_shortcut_mxfp8_read", None) is not None:
-                    raise RuntimeError("a Linear takes at most one fused read as MXFP8")
-                object.__setattr__(module, "_shortcut_mxfp8_read", self)
-                module.register_forward_hook(
-                    partial(_after_mxfp8_consumer_forward, self), with_kwargs=True
-                )
-                formats.append("mxfp8")
-            else:
-                formats.append("bf16")
-        self.consumer_formats = tuple(formats)
+        self.consumer_formats = tuple(gemm_format(*consumer) for consumer in self.consumers)
+        for (module, _), fmt in zip(self.consumers, self.consumer_formats):
+            if fmt != "mxfp8":
+                continue
+            if getattr(module, "_shortcut_replays_columns", False):
+                raise RuntimeError("a Linear takes at most one fused read as MXFP8")
+            module._shortcut_replays_columns = True
+            module.register_forward_hook(self._install_replayed_columns_for_wgrad, with_kwargs=True)
 
-    @property
-    def format(self) -> str:
-        """The seam kernel's output format for this read."""
-        formats = set(self.consumer_formats)
-        return formats.pop() if len(formats) == 1 else "both"
+    @staticmethod
+    def _install_replayed_columns_for_wgrad(module, args, kwargs, output):
+        if not torch.is_grad_enabled():
+            return
+        operand = args[0] if args else next(iter(kwargs.values()))
+        slot = column_slot(operand)
+        if slot is None:
+            raise RuntimeError("an MXFP8 consumer took a fused read emitted without gradients")
+        install_columns(output, operand, slot)
 
     def hand(self, item) -> None:
         """Hand ``item`` (PendingWideResidualWrites or SeamInput) to this empty read."""
@@ -615,13 +590,9 @@ class WriteReadNorm(nn.Module):
         return item
 
     def _open_interval(self) -> ReplayInterval:
-        """This forward's replay interval: a new one where an interval starts (following the
-        previous read's, which its first seam's backward replays), else the previous read's."""
-        if self.starts_replay:
-            previous = None if self.previous_read is None else self.previous_read.interval
-            self.interval = ReplayInterval(previous)
-        else:
-            self.interval = self.previous_read.interval
+        """Start a linked replay interval or continue the previous read's interval."""
+        previous = self.previous_read.interval if self.previous_read is not None else None
+        self.interval = ReplayInterval(previous) if self.starts_replay else previous
         return self.interval
 
     def _hooked_weight(self) -> Tensor:
@@ -636,11 +607,7 @@ class WriteReadNorm(nn.Module):
         return self.weight
 
     def apply_write(self, pending, shortcut: WriteReadNorm | None = None):
-        """Write ``pending`` and return ``(residual, branch_input)`` (plus ``shortcut``'s
-        normalized input, for a shortcut block's second reader) from one fused kernel. Each read
-        is emitted in its consumers' formats (one output per consumer). With gradients the write
-        is recorded into this forward's replay interval, which fills each MXFP8 read's
-        ColumnSlot."""
+        """Apply the write and emit normalized operands for one or two reads."""
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             is_batch_invariant_mode_enabled,
         )
@@ -649,21 +616,20 @@ class WriteReadNorm(nn.Module):
         # Inference builds no autograd graph (and uses the inference MXFP8 eligibility) even with
         # gradients enabled.
         with torch.no_grad() if InferenceMode.is_active() else nullcontext():
-            if any(read.format != "bf16" for read in reads):
+            outputs = tuple(read.consumer_formats for read in reads)
+            if any("mxfp8" in formats for formats in outputs):
                 check_mxfp8_call(pending.routed)  # never falls back to BF16
             interval, slots = None, (None,) * len(reads)
             if torch.is_grad_enabled():
                 interval = self._open_interval()
-                slots = tuple(ColumnSlot() if read.format != "bf16" else None for read in reads)
-            for read, slot in zip(reads, slots):
-                read.columns_slot = None if slot is None else weakref.ref(slot)
+                slots = tuple(ColumnSlot() if "mxfp8" in formats else None for formats in outputs)
             # A shortcut seam runs before this read's layer calls it: run its weight's hooks now.
             weight = self.weight if shortcut is None else self._hooked_weight()
             return fused_seam(
                 pending,
                 tuple(read.read_map(return_logits=True) for read in reads),
                 (weight, *(read.weight for read in reads[1:])),
-                outputs=tuple(read.consumer_formats for read in reads),
+                outputs=outputs,
                 columns=slots,
                 interval=interval,
                 num_streams=self.num_streams,
@@ -692,20 +658,9 @@ class WriteReadNorm(nn.Module):
         residual, branch_input = self.apply_write(item)
         return branch_input, (residual,)
 
-    @staticmethod
-    def residual_stream(state) -> Tensor:
-        """The carried residual stream of a read's state."""
-        return state[0]
-
 
 class ShortcutAddWideResidualWriteReadNorm(WriteReadNorm):
-    """A fused shortcut block's shortcut read and pre-MLP RMSNorm (owning their parameters).
-
-    Linked to the compute layer's WriteReadNorm (``link``), it applies the write handed to that
-    read with both reads and norms in one two-reader kernel (each in its own use's format); the
-    compute read's own call then returns its normalized input. Returns
-    ``(residual, shortcut_input)``.
-    """
+    """Apply both shortcut-block reads and hand the compute read its normalized input."""
 
     compute_read: WriteReadNorm | None = None
 
@@ -724,53 +679,19 @@ class ShortcutAddWideResidualWriteReadNorm(WriteReadNorm):
         return residual, shortcut_input
 
 
-class DeferredWrite(StreamwiseSigmoidWideResidualConnection):
-    """A residual write that its linked WriteReadNorm (the next layer's read) applies in its fused
-    kernel. Returns the unwritten input residual; only that read may consume it.
-
-    A fused layer spec selects this as every write but the stack's last (built like a write
-    connection); its layer (or shortcut block) links the Linear producing each update
-    (``link_producer``), and the stack links the write to its successor's read (``link``) and
-    fixes each update's gradient format (``resolve_formats``).
-    """
+class DeferredWrite(_FusedWideResidualConnection):
+    """Hand branch updates to the next layer's read and return the unwritten residual."""
 
     target: nn.Module | None = None
-    # Per update (routed, then a shortcut add's shared): ``(linear, layer)``, linear None for no
-    # Linear's output; and the gradient formats the seam may emit, one per update.
+    # Shortcut adds supply both producers in forward argument order (routed, shared).
     producers: tuple = ()
     update_formats: tuple | None = None
 
-    def link(self, target: nn.Module) -> None:
-        """Hand this write to ``target``, the next layer's read (a reference, not a submodule)."""
+    def link(self, target, layer, gemm_format) -> None:
+        """Bind the next read and resolve each update's gradient format."""
         object.__setattr__(self, "target", target)
-
-    def link_producer(self, linear, layer, update: int = 0) -> None:
-        """Link ``linear`` of ``layer`` (None: no Linear's output) as the producer of update
-        ``update`` (0 routed, 1 a shortcut add's shared): its output must be that update, which a
-        training forward checks before the seam may hand it an MXFP8 gradient."""
-        producers = list(self.producers) + [None] * (update + 1 - len(self.producers))
-        if producers[update] is not None:
-            raise RuntimeError("a fused write's update has one linked producer")
-        producers[update] = (linear, layer)
-        self.producers = tuple(producers)
-        if linear is not None:
-            self.produced = getattr(self, "produced", {})
-            linear.register_forward_hook(partial(_record_update, self, update))
-
-    def resolve_formats(self, stack_config) -> None:
-        """Fix each update's gradient format: "mxfp8" where its producer ``takes_mxfp8`` with E4M3
-        gradients under its layer's autocast (the seam backward then emits it quantized, replacing
-        the producer's own quantization), else "bf16"."""
-
-        def update_format(producer):
-            linear, layer = producer or (None, None)
-            if linear is None:
-                return "bf16"
-            quantized = runs_mxfp8(stack_config, layer)
-            takes = takes_mxfp8(linear, quantized, layer.config.fp8, gradients=True)
-            return "mxfp8" if takes else "bf16"
-
-        self.update_formats = tuple(map(update_format, self.producers)) or None
+        producers = self.producers or (layer.seam_output_projection(),)
+        self.update_formats = tuple(gemm_format(p, layer, gradients=True) for p in producers)
 
     def forward(  # pylint: disable=arguments-differ
         self,
@@ -783,23 +704,10 @@ class DeferredWrite(StreamwiseSigmoidWideResidualConnection):
         execution_context=None,
         recompute_context=None,
     ):
-        """Hand this write (plus an optional shared-expert update: a shortcut add) to the target
-        read as PendingWideResidualWrites; return the unwritten residual."""
-        del dropout_probability, training  # fusion requires hidden_dropout == 0
-        # Fusion rejects residual-stream recomputation (seams replay through their intervals).
-        del execution_context, recompute_context
+        """Defer this write, including the shared expert for a shortcut add."""
         update, bias = branch_output
         if bias is not None:
             raise ValueError("fused residual seams require a bias-free branch projection")
-        updates = (update, shared)
-        for index, fmt in enumerate(self.update_formats or ()):
-            if fmt == "mxfp8" and torch.is_grad_enabled():
-                if not _is_produced(self.produced.get(index), updates[index]):
-                    raise RuntimeError(
-                        f"update {index} of the fused write of layer {self.layer_number} is not "
-                        "its linked producer's output: its MXFP8 gradient would reach another "
-                        "module"
-                    )
         retain = None if self.retention is None else self.retention(return_logits=True)
         write_logits = self.write_map(return_logits=True)
         pending = PendingWideResidualWrites(
@@ -809,146 +717,59 @@ class DeferredWrite(StreamwiseSigmoidWideResidualConnection):
         return state[0]
 
 
-def seam_connections(layer) -> tuple[nn.Module, nn.Module]:
-    """A wide-residual layer's ``(read, write)`` connection modules, as its class names them."""
-    read, write = type(layer).get_wide_residual_modules(layer.submodules_config)
-    return getattr(layer, read), getattr(layer, write)
+def takes_mxfp8(
+    linear, autocast_recipe, fp8_format="e4m3", *, gradients=False, recipe_attrs=None
+) -> bool:
+    """Resolve a TE Linear's MXFP8 handoff using its inherited recipe and module override.
+    An MXFP8 gradient handoff also requires E4M3 grad_output."""
 
-
-# MXFP8 handoff: a fused read's eligible consumer Linears take it as rowwise MXFP8 from the seam
-# kernel, which emits it directly (format "mxfp8") or next to the BF16 output other modules read
-# ("both", one output per consumer). Their weight-gradient GEMMs need the columnwise operand: after
-# each consumer's forward, TE's own saved slot for that operand unpacks the read's ColumnSlot,
-# which the read's replay interval fills bit-exactly before any of its GEMMs. TE's backward,
-# including weight-gradient accumulation and distributed-weight finalization, runs unchanged.
-
-
-def mxfp8_linear_eligible(linear) -> bool:
-    """Whether ``linear`` can exchange MXFP8 operands with a seam: a TELinear on a qualified GB300
-    (TransformerConfig rejects MXFP8 fusion at unsupported hidden sizes, with TP or userbuffer
-    overlap)."""
     from megatron.core.extensions.transformer_engine import TELinear
-    from megatron.core.fusions.wide_residual_shortcut.configs import qualified_device
 
-    return bool(
-        isinstance(linear, TELinear)
-        and qualified_device(torch.cuda.get_device_properties(torch.cuda.current_device()))
-    )
-
-
-def takes_mxfp8(linear, quantized: bool, fp8_format="e4m3", *, gradients=False) -> bool:
-    """Whether eligible ``linear`` runs MXFP8 in training under its layer's autocast (MXFP8 with
-    ``fp8_format`` if ``quantized``, else none), as TE's per-module override from
-    ``--te-precision-config-file`` (``te_quant_params``) resolves it: an override applying in
-    that autocast must be a plain MXFP8 recipe, and the evaluation recipe may not differ.
-    ``gradients`` also requires E4M3 gradients (not the hybrid format's E5M2)."""
-    if not mxfp8_linear_eligible(linear):
+    if not isinstance(linear, TELinear):
         return False
     params = getattr(linear, "te_quant_params", None)
-    recipe = None if params is None else params.training_recipe
-    if recipe is not None and params.evaluation_recipe not in (None, recipe):
-        return False
-    applies = recipe is not None and (
-        recipe.override_quantized_autocast if quantized else recipe.override_nonquantized_autocast
-    )
-    if applies:
-        quantized = (
-            recipe.fp8_quantization_recipe == Fp8Recipe.mxfp8
-            and recipe.fp4_quantization_recipe is None
-            and not recipe.recipe_attrs
-        )
-        fp8_format = recipe.fp8_format
-    return quantized and (not gradients or fp8_format == "e4m3")
-
-
-def _record_update(write, update, linear, args, output):
-    """Record a producer's output, which ``write`` checks is its update."""
-    del linear, args
-    write.produced[update] = weakref.ref(output[0] if isinstance(output, tuple) else output)
-
-
-def _is_produced(produced, update) -> bool:
-    """Whether ``update`` is the recorded producer output: the tensor itself, or the same values
-    (storage, shape, strides) reached only through custom autograd Functions returning their
-    input as is, whose backward hands the gradient back unchanged: a virtual-expert hook, or a
-    reentrant activation checkpoint (TE's under FP8 runs the producer without gradients, and its
-    backward re-runs it with the update's gradient)."""
-    produced = None if produced is None else produced()
-    if produced is None or produced is update:
-        return produced is update
-    same = (produced.data_ptr(), produced.shape, produced.stride())
-    if same != (update.data_ptr(), update.shape, update.stride()):
-        return False
-    node, target = update.grad_fn, produced.grad_fn
-    while node is not target:
-        if not isinstance(node, torch.autograd.function.BackwardCFunction):
+    if params is not None and params.training_recipe is not None:
+        recipe = params.training_recipe
+        if params.evaluation_recipe not in (None, recipe):
             return False
-        if target is None:  # the producer ran without gradients inside this Function
-            return True
-        node = node.next_functions[0][0]  # the Function's first input
-    return True
+        applies = (
+            recipe.override_quantized_autocast
+            if autocast_recipe
+            else recipe.override_nonquantized_autocast
+        )
+        if applies:
+            if recipe.fp4_quantization_recipe is not None or recipe.recipe_attrs:
+                return False
+            autocast_recipe, fp8_format = recipe.fp8_quantization_recipe, recipe.fp8_format
+            recipe_attrs = recipe.recipe_attrs
+    if autocast_recipe != Fp8Recipe.mxfp8 or (gradients and fp8_format != "e4m3"):
+        return False
+
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+
+    # TE initializes this default from NVTE_BACKWARD_OVERRIDE at import. An override
+    # can require the original BF16 input for wgrad and a BF16 output gradient for dgrad.
+    default_backward = getattr(MXFP8BlockScaling, "backward_override", None)
+    return (recipe_attrs or {}).get("backward_override", default_backward) is None
 
 
-def _after_mxfp8_consumer_forward(read, linear, args, kwargs, output):
-    del linear
-    if not torch.is_grad_enabled():
-        return
-    slot = None if read.columns_slot is None else read.columns_slot()
-    if slot is None:
-        raise RuntimeError("an MXFP8 consumer took a fused read emitted without gradients")
-    install_columns(output, args[0] if args else next(iter(kwargs.values())), slot)
-
-
-def _per_layer_fp8(config) -> bool:
-    """Whether ``HybridStack.forward`` enters each layer's FP8 context itself (delayed scaling
-    wraps the whole pass in one context instead)."""
-    return bool(config.fp8) and config.fp8_recipe != Fp8Recipe.delayed
-
-
-def runs_mxfp8(stack_config, layer) -> bool:
-    """Whether ``HybridStack.forward`` runs ``layer``'s Linears under an MXFP8 autocast: the
-    per-layer context ``get_fp8_context`` builds from the layer's own config, unless the layer
-    forces its projections to BF16 (KDA's ``kda_disable_fp8``)."""
+def _gemm_autocast_recipe(stack_config, layer):
+    """The recipe a GEMM inherits from HybridStack.forward before its own TE override."""
     from megatron.core.fp8_utils import is_first_last_bf16_layer
     from megatron.core.ssm.kda_layer_config import KDALayerConfig
 
     config = layer.config
-    return (
-        _per_layer_fp8(stack_config)
-        and bool(config.fp8)
-        and config.fp8_recipe == Fp8Recipe.mxfp8
-        and not is_first_last_bf16_layer(config, layer.layer_number - 1)
-        # Other layers' configs may carry the stack's KDA settings (copied from its config).
-        and not (isinstance(config, KDALayerConfig) and config.kda_disable_fp8)
-    )
-
-
-def _input_projection(layer):
-    """The Linear a layer's input RMSNorm was fused into (as its class locates it), or None when
-    the norm had its own slot."""
-    location = type(layer).get_input_layernorm_module(layer.submodules_config)
-    if len(location) != 2:
+    if isinstance(config, KDALayerConfig) and config.kda_disable_fp8:
         return None
-    branch, projection = location
-    # A fused MoE layer's emptied norm slot points at mlp.linear_fc1, which an MoELayer lacks (its
-    # router and experts all take the read: no single consumer).
-    return getattr(getattr(layer, branch), projection, None)
-
-
-def link_branch_seam(layer, read, write, producer) -> None:
-    """Link a fused single-branch layer's Linears to its fused connections: the Linear its input
-    RMSNorm was fused into consumes its read (WriteReadNorm), and ``producer``'s output is its
-    write's update (DeferredWrite). Unfused connections link nothing, nor does an MoE layer (its
-    shortcut block links it; outside one the stack links its read to the MoE layer)."""
-    if isinstance(read, WriteReadNorm):
-        try:
-            consumer = _input_projection(layer)
-        except ValueError:  # not fusable: the stack rejects it with the reason
-            consumer = None
-        if consumer is not None:
-            read.link_consumer(consumer, layer)
-    if isinstance(write, DeferredWrite) and producer is not None:
-        write.link_producer(producer, layer)
+    if stack_config.fp8 and stack_config.fp8_recipe == Fp8Recipe.delayed:
+        return Fp8Recipe.delayed
+    if is_first_last_bf16_layer(config, layer.layer_number - 1):
+        return None
+    if stack_config.fp8 and config.fp8:
+        return config.fp8_recipe
+    if not stack_config.fp8 and stack_config.fp4 and config.fp4:
+        return config.fp4_recipe
+    return None
 
 
 def _unfused_error(layer) -> ValueError:
@@ -971,66 +792,71 @@ def _unfused_error(layer) -> ValueError:
     )
 
 
-def link_residual_seams(layers, stack_config) -> tuple:
-    """Check and wire a fused stack's residual seams (``layers``: physical layers in order, after
-    shortcut grouping, whose blocks have linked their own MoE and shortcut reads); returns the
-    stack's fused reads.
+def link_residual_seams(layers, stack_config) -> None:
+    """Link adjacent writes and reads in physical layer order, then close the replay chain.
 
-    The fused spec makes every write but the last a DeferredWrite and every read but the first a
-    WriteReadNorm; each layer linked their Linears when built (``link_branch_seam``). Each
-    deferred write is linked to the next layer's fused read, and a read still without consumers
-    (an MoE layer outside a shortcut block) to the MoE layer itself: its read reaches the router,
-    shared expert and dispatcher (or latent projection) as one BF16 tensor, so under MXFP8 its
-    Linears quantize it themselves, and autograd sums the three consumers' gradients. Every read's
-    and write's formats are then fixed with ``runs_mxfp8``, whether the stack's forward runs a
-    layer in MXFP8. Each read follows the
-    previous one's replay interval, and the stack's last write closes the last interval: its
-    output, the stack's residual, replays it before its readers' consumers' backward. A layer the
-    spec could not fuse is rejected with its reason, and so is a one-layer stack.
+    Standalone MoE reads serve the whole MoE as one BF16 consumer. Shortcut blocks
+    have already linked their individual consumers.
     """
     from megatron.core.transformer.moe.moe_layer import MoELayer
 
     connections = []
     for layer in layers:
-        if not hasattr(type(layer), "get_wide_residual_modules"):
+        if not hasattr(layer, "seam_connections"):
             raise _unfused_error(layer)
         try:
-            connections.append(seam_connections(layer))
+            connections.append((layer, *layer.seam_connections()))
         except ValueError:
             raise _unfused_error(layer) from None
-    reads = []
-    for index, (layer, (_, write)) in enumerate(zip(layers, connections)):
-        if index + 1 == len(layers):
-            if isinstance(write, DeferredWrite):
-                raise ValueError(
-                    "moe_shortcut_wide_residual_norm_fusion requires at least two layers: the "
-                    f"write of layer {layer.layer_number} is deferred to no following read"
-                )
-            if reads:  # the stack's last write stays plain and closes the last interval
-                last = reads[-1]
-                write.register_forward_hook(
-                    lambda module, args, output: (
-                        output if last.interval is None else last.interval.replay_before(output)
-                    )
-                )
-            continue
-        successor, read = layers[index + 1], connections[index + 1][0]
+
+    def gemm_format(linear, layer, *, gradients=False):
+        if linear is not None and takes_mxfp8(
+            linear,
+            _gemm_autocast_recipe(stack_config, layer),
+            layer.config.fp8,
+            gradients=gradients,
+            recipe_attrs=layer.config.fp8_recipe_attrs,
+        ):
+            if getattr(linear, "te_quant_params", None) is not None:
+                # An override can opt in on a BF16 stack, after initial config validation.
+                _validate_shortcut_fusion_config(layer.config, mxfp8_handoff=True)
+            return "mxfp8"
+        return "bf16"
+
+    last_read = None
+    for (layer, _, write), (successor, read, _) in zip(connections, connections[1:]):
         if not isinstance(write, DeferredWrite):
             raise _unfused_error(layer)
         if not isinstance(read, WriteReadNorm):
             raise _unfused_error(successor)
-        write.link(read)
-        write.resolve_formats(stack_config)
-        object.__setattr__(read, "seam_layer", successor)
-        object.__setattr__(read, "previous_read", reads[-1] if reads else None)
-        if not reads and not read.starts_replay:
+        write.link(read, layer, gemm_format)
+        object.__setattr__(read, "previous_read", last_read)
+        if last_read is None and not read.starts_replay:
             raise ValueError("a fused stack's first seam must start a replay interval")
-        reads.append(read)
-        if not read.consumers:  # an MoE layer outside a shortcut block takes it as one tensor
-            if not isinstance(getattr(successor, "mlp", None), MoELayer):
-                raise _unfused_error(successor)
-            read.link_consumer(successor.mlp, successor)
+        last_read = read
+        if not read.consumers:
+            if isinstance(getattr(successor, "mlp", None), MoELayer):
+                consumer = successor.mlp
+            else:
+                location = successor.get_input_layernorm_module(successor.submodules_config)
+                if len(location) != 2:
+                    raise _unfused_error(successor)
+                branch, projection = location
+                consumer = getattr(getattr(successor, branch), projection)
+            read.consumers = ((consumer, successor),)
         for fused in (read, getattr(read, "shortcut", None)):
             if fused is not None:
-                fused.resolve_formats(partial(runs_mxfp8, stack_config))
-    return tuple(reads)
+                fused.resolve_formats(gemm_format)
+    if connections:
+        layer, _, write = connections[-1]
+        if isinstance(write, DeferredWrite):
+            raise ValueError(
+                "moe_shortcut_wide_residual_norm_fusion requires at least two layers: the "
+                f"write of layer {layer.layer_number} is deferred to no following read"
+            )
+        if last_read is not None:
+            write.register_forward_hook(
+                lambda module, args, output: (
+                    output if last_read.interval is None else last_read.interval.replay_before(output)
+                )
+            )

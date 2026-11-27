@@ -462,27 +462,21 @@ class HybridStack(MegatronModule):
                 )
                 for layer in self.layers
             ]
-        self._fused_reads = ()
-        if self.config.moe_shortcut_wide_residual_norm_fusion and self.uses_wide_residual_stream:
-            # Fused residual seams, after grouping (whose blocks link their own MoE and shortcut
-            # reads): link each deferred write to the next physical layer's fused read and each
-            # remaining read to its consumer, in the formats this stack's forward runs them in.
-            self._fused_reads = link_residual_seams(
-                [
-                    sublayer
-                    for layer in self.layers
-                    for sublayer in (
-                        (layer.compute_layer, layer.moe_layer)
-                        if isinstance(layer, ShortcutMoEBlock)
-                        else (layer,)
-                    )
-                ],
-                self.config,
-            )
+        self._seams_need_linking = (
+            self.config.moe_shortcut_wide_residual_norm_fusion and self.uses_wide_residual_stream
+        )
+        if self._seams_need_linking and self.config.quant_recipe is None:
+            self.link_residual_seams()
         self._residual_stream_atomic_layer_pairs = self._shortcut_layer_pairs()
         self._execution_layer_config_list = [
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
         ]
+
+    def link_residual_seams(self):
+        """Resolve GEMM handoffs after any per-module precision recipes have been applied."""
+        if self._seams_need_linking:
+            link_residual_seams(self.physical_layers(), self.config)
+            self._seams_need_linking = False
 
     def _assert_submodule_configured(
         self, submodules: HybridStackSubmodules, attr_name: str
@@ -668,10 +662,8 @@ class HybridStack(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
-        for read in self._fused_reads:
-            # A forward that raised between a deferred write's hand-off and this read's take
-            # left the write behind; the next forward starts without it.
-            read.pending = None
+        if self._seams_need_linking:  # A standalone stack with per-module recipes.
+            self.link_residual_seams()
         if self._has_custom_layers and (inference_context is not None or InferenceMode.is_active()):
             raise ValueError("Custom hybrid layers do not support inference contexts yet.")
 

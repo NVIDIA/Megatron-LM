@@ -20,7 +20,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     apply_combined_residual_keys,
-    link_branch_seam,
     load_residual_state,
 )
 from megatron.core.typed_torch import apply_module
@@ -51,11 +50,13 @@ class WideResidualMambaLayer(MambaLayer):
         norm slot, or the mixer's in_proj it is fused into."""
         return ("norm",) if submodules.norm is not IdentityOp else ("mixer", "in_proj")
 
-    @classmethod
-    def get_wide_residual_modules(cls, submodules: MambaLayerSubmodules) -> tuple[str, str]:
-        """This layer's wide-residual (read, write) connection fields."""
-        del submodules
-        return "residual_read", "residual_write"
+    def seam_connections(self):
+        """Return the constructed residual read and write for this branch."""
+        return self.residual_read, self.residual_write
+
+    def seam_output_projection(self):
+        """Return the GEMM producing the branch update, if any."""
+        return getattr(self.mixer, "out_proj", None)
 
     def __init__(
         self,
@@ -114,10 +115,6 @@ class WideResidualMambaLayer(MambaLayer):
                 f"hidden_size={self.config.hidden_size}, got "
                 f"{self.residual_read.branch_hidden_size}."
             )
-        # Fused connections: the mixer's out_proj produces its update.
-        link_branch_seam(
-            self, self.residual_read, self.residual_write, getattr(self.mixer, "out_proj", None)
-        )
 
     def sharded_state_dict(
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: dict | None = None

@@ -57,13 +57,13 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
-def _validate_shortcut_fusion_config(config):
+def _validate_shortcut_fusion_config(config, *, mxfp8_handoff=False):
     """Reject features the fused residual seam kernels do not implement."""
     if not config.moe_shortcut_wide_residual_norm_fusion:
         return
     wr, interval = config.wide_residual, config.residual_stream_recompute_num_layers
     # Under MXFP8 each fused read hands reader zero to its consumer Linear directly as MXFP8.
-    mxfp8 = bool(config.fp8) and config.fp8_recipe == "mxfp8"
+    mxfp8 = mxfp8_handoff or (bool(config.fp8) and config.fp8_recipe == "mxfp8")
     # A shortcut block hands its MoE read to the shared expert's first Linear alone; a standalone
     # MoE layer takes its read whole (BF16) for its router, shared expert and dispatcher.
     blocks = config.moe_shortcut_connection

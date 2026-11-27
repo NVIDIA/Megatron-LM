@@ -15,7 +15,6 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     apply_combined_residual_keys,
-    link_branch_seam,
     load_residual_state,
 )
 
@@ -66,12 +65,20 @@ class WideResidualTransformerLayer(TransformerLayer):
             "its input RMSNorm must be fused into self_attention's linear_qkv or in_proj"
         )
 
-    @classmethod
-    def get_wide_residual_modules(cls, submodules: TransformerLayerSubmodules) -> tuple[str, str]:
-        """This single-branch layer's wide-residual (read, write) connection fields."""
-        if cls._is_attention_layer(submodules):
-            return "residual_read_self_attn", "residual_write_self_attn"
-        return "residual_read_mlp", "residual_write_mlp"
+    def seam_connections(self):
+        """Return the constructed residual read and write for this branch."""
+        if self._is_attention_layer(self.submodules_config):
+            return self.residual_read_self_attn, self.residual_write_self_attn
+        return self.residual_read_mlp, self.residual_write_mlp
+
+    def seam_output_projection(self):
+        """Return the GEMM producing the branch update, if any."""
+        if self._is_attention_layer(self.submodules_config):
+            projection = getattr(self.self_attention, "linear_proj", None)
+            if projection is None:
+                projection = getattr(self.self_attention, "out_proj", None)
+            return projection
+        return getattr(self.mlp, "linear_fc2", None)
 
     def __init__(
         self,
@@ -178,18 +185,6 @@ class WideResidualTransformerLayer(TransformerLayer):
                     f"hidden_size={self.config.hidden_size}, got "
                     f"{connection.branch_hidden_size}."
                 )
-        # Fused connections: the branch's output projection produces its update (attention's
-        # linear_proj, a GDN-style module's out_proj, the MLP's linear_fc2; an MoE layer's output
-        # is a combine plus shared experts, no Linear's).
-        if has_attention:
-            attention = self.self_attention
-            projection = getattr(attention, "linear_proj", None)
-            projection = getattr(attention, "out_proj", None) if projection is None else projection
-            read, write = self.residual_read_self_attn, self.residual_write_self_attn
-        else:
-            projection = getattr(self.mlp, "linear_fc2", None)
-            read, write = self.residual_read_mlp, self.residual_write_mlp
-        link_branch_seam(self, read, write, projection)
 
     def sharded_state_dict(
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None

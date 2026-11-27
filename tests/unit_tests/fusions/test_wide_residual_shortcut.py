@@ -33,6 +33,7 @@ from megatron.core.fusions.wide_residual_shortcut import (
 from megatron.core.fusions.wide_residual_shortcut.residual_replay import (
     ColumnSlot,
     ReplayInterval,
+    column_slot,
     install_columns,
 )
 from megatron.core.tensor_parallel.random import (
@@ -930,13 +931,6 @@ def test_replay_interval_records_one_connected_chain():
 mxfp8_test = QUALIFIED
 
 
-def column_slot(q):
-    """The ColumnSlot a seam pinned on its MXFP8 read (through views of it), else None."""
-    data = getattr(q, "_rowwise_data", None)
-    data = data if data is None or data._base is None else data._base
-    return getattr(data, "_shortcut_columns", None)
-
-
 def linear(h, *, mcore=False, bias=False):
     if mcore:
         config = TransformerConfig(
@@ -1023,7 +1017,7 @@ def reference_operand(operand, raw):
 @mxfp8_test
 @pytest.mark.parametrize("m,h", MX_SHAPES)
 @pytest.mark.parametrize("readers", [1, 2])
-def test_fp32_bytes_and_te_weight_gradient(monkeypatch, m, h, readers):
+def test_fp32_bytes_and_te_weight_gradient(m, h, readers):
     raw = mx_inputs(m, h, readers)
     r, us, cs, gs = raw
     # Use the quantized path's statistics so TE receives identical FP32 inputs;
@@ -1519,46 +1513,38 @@ def test_recomputed_consumer_and_retained_graph_backward():
 
 @pytest.mark.parametrize("eligible", [True, False])
 def test_direct_mxfp8_consumer_selection(monkeypatch, eligible):
-    """The stack fixes a fused read's formats once, from its consumers and the precision its
-    forward runs their layers and the read's seam layer in: MXFP8 if every consumer quantizes it
-    (an eligible Linear, both layers MXFP8), BF16 if none does, else both; each MXFP8 consumer is
-    hooked once, for one read. The seam then emits those formats, a ColumnSlot per MXFP8 read."""
-    monkeypatch.setattr(
-        wide_residual,
-        "mxfp8_linear_eligible",
-        lambda linear: eligible and hasattr(linear, "projection"),
-    )
-
+    """A read hooks each MXFP8 consumer once and requests its columns for replay."""
     def projection():
         linear = torch.nn.Linear(4, 4)
         linear.projection = True
         return linear
 
     layers = {n: SimpleNamespace(layer_number=n) for n in range(1, 5)}
-    runs_mxfp8 = lambda layer: layer.layer_number in (2, 3)  # BF16 first and last layers
 
-    def read(seam_layer, *consumers):
+    def gemm_format(module, layer):
+        if eligible and hasattr(module, "projection") and layer.layer_number in (2, 3):
+            return "mxfp8"
+        return "bf16"
+
+    def read(*consumers):
         module = object.__new__(wide_residual.WriteReadNorm)
         torch.nn.Module.__init__(module)
-        module.consumers, module.seam_layer = list(consumers), layers[seam_layer]
+        module.consumers = list(consumers)
         module.fuse_wgrad_accumulation = False
-        module.resolve_formats(runs_mxfp8)
+        module.resolve_formats(gemm_format)
         return module
 
     with pytest.raises(RuntimeError, match="one or two linked consumers"):
-        read(2)
+        read()
     linear = projection()
-    only = read(2, (linear, layers[2]))
-    assert only.format == ("mxfp8" if eligible else "bf16")
+    only = read((linear, layers[2]))
+    assert only.consumer_formats == (("mxfp8",) if eligible else ("bf16",))
     assert len(linear._forward_hooks) == eligible and not linear._forward_pre_hooks
     with pytest.raises(RuntimeError, match="at most one") if eligible else nullcontext():
-        read(3, (linear, layers[3]))
-    mixed = read(3, (torch.nn.Linear(4, 4), layers[3]), (projection(), layers[3]))
-    assert mixed.format == ("both" if eligible else "bf16")
-    # A read emitted or consumed in a BF16 layer (here the first or last) stays BF16.
-    for seam_layer, layer in [(1, 2), (2, 4)]:
-        bf16 = read(seam_layer, (projection(), layers[layer]))
-        assert bf16.format == "bf16"
+        read((linear, layers[3]))
+    mixed = read((torch.nn.Linear(4, 4), layers[3]), (projection(), layers[3]))
+    assert mixed.consumer_formats == ("bf16", "mxfp8" if eligible else "bf16")
+    assert read((projection(), layers[4])).consumer_formats == ("bf16",)
 
     seen = []
     monkeypatch.setattr(wide_residual, "check_mxfp8_call", lambda tensor: None)
@@ -1574,7 +1560,6 @@ def test_direct_mxfp8_consumer_selection(monkeypatch, eligible):
     assert options["outputs"] == (only.consumer_formats,)
     assert isinstance(options["interval"], ReplayInterval) and options["interval"] is only.interval
     assert (slot is not None) == eligible
-    assert only.columns_slot is None if slot is None else only.columns_slot() is slot
 
 
 def _recipe(**overrides):
@@ -1584,29 +1569,33 @@ def _recipe(**overrides):
 
 
 @pytest.mark.parametrize(
-    "override,quantized,fmt,takes,takes_gradients",
+    "override,autocast_recipe,fmt,takes,takes_gradients",
     [
-        (None, True, "e4m3", True, True),  # no override: the layer's autocast
-        (None, True, "hybrid", True, False),  # hybrid gradients are E5M2
-        (None, False, "e4m3", False, False),
-        (dict(fp8_quantization_recipe=None), True, "e4m3", False, False),  # override to BF16
-        ({}, True, "hybrid", True, True),  # MXFP8 E4M3 override inside a hybrid layer
-        (dict(fp8_format="hybrid"), True, "e4m3", True, False),
-        (dict(fp8_quantization_recipe=Fp8Recipe.tensorwise), True, "e4m3", False, False),
-        (dict(recipe_attrs={"fp8_dpa": True}), True, "e4m3", False, False),
-        (dict(override_quantized_autocast=False), True, "e4m3", True, True),  # inherits
-        ({}, False, "e4m3", False, False),  # does not override a BF16 layer's autocast
-        (dict(override_nonquantized_autocast=True), False, "e4m3", True, True),
-        ("evaluation", True, "e4m3", False, False),  # another evaluation recipe
+        (None, "mxfp8", "e4m3", True, True),  # no override: the layer's autocast
+        (None, "mxfp8", "hybrid", True, False),  # hybrid gradients are E5M2
+        (None, None, "e4m3", False, False),
+        (dict(fp8_quantization_recipe=None), "mxfp8", "e4m3", False, False),  # override to BF16
+        ({}, "mxfp8", "hybrid", True, True),  # MXFP8 E4M3 override inside a hybrid layer
+        (dict(fp8_format="hybrid"), "mxfp8", "e4m3", True, False),
+        (dict(fp8_quantization_recipe=Fp8Recipe.tensorwise), "mxfp8", "e4m3", False, False),
+        (dict(recipe_attrs={"fp8_dpa": True}), "mxfp8", "e4m3", False, False),
+        (dict(override_quantized_autocast=False), "mxfp8", "e4m3", True, True),  # inherits
+        ({}, None, "e4m3", False, False),  # does not override a BF16 layer's autocast
+        (dict(override_nonquantized_autocast=True), None, "e4m3", True, True),
+        ({}, "tensorwise", "e4m3", True, True),
+        (None, "tensorwise", "e4m3", False, False),
+        ("evaluation", "mxfp8", "e4m3", False, False),  # another evaluation recipe
     ],
 )
 def test_takes_mxfp8_follows_precision_overrides(
-    monkeypatch, override, quantized, fmt, takes, takes_gradients
+    monkeypatch, override, autocast_recipe, fmt, takes, takes_gradients
 ):
     """A seam hands a Linear MXFP8 (its read; its update gradient, which also needs E4M3) exactly
     where TE runs it MXFP8: under the layer's autocast, unless its --te-precision-config-file
     override applying there selects another recipe or precision."""
-    monkeypatch.setattr(wide_residual, "mxfp8_linear_eligible", lambda linear: True)
+    from megatron.core.extensions import transformer_engine
+
+    monkeypatch.setattr(transformer_engine, "TELinear", torch.nn.Linear)
     linear = torch.nn.Linear(4, 4)
     if override == "evaluation":
         evaluation = _recipe(fp8_quantization_recipe=Fp8Recipe.tensorwise)
@@ -1617,49 +1606,47 @@ def test_takes_mxfp8_follows_precision_overrides(
         linear.te_quant_params = SimpleNamespace(
             training_recipe=_recipe(**override), evaluation_recipe=None
         )
-    assert wide_residual.takes_mxfp8(linear, quantized, fmt) == takes
-    assert wide_residual.takes_mxfp8(linear, quantized, fmt, gradients=True) == takes_gradients
+    assert wide_residual.takes_mxfp8(linear, autocast_recipe, fmt) == takes
+    assert wide_residual.takes_mxfp8(linear, autocast_recipe, fmt, gradients=True) == takes_gradients
 
 
-def test_deferred_write_checks_its_producer(monkeypatch):
-    """A write hands its update an MXFP8 gradient only after checking, in every training
-    forward, that the update is its linked producer's output (or that output passed on as is by
-    custom autograd Functions); an update has one producer."""
-    monkeypatch.setattr(wide_residual, "takes_mxfp8", lambda *a, **k: True)
-    monkeypatch.setattr(wide_residual, "runs_mxfp8", lambda config, layer: True)
+def test_mxfp8_handoff_uses_effective_backward_override(monkeypatch):
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+
+    from megatron.core.extensions import transformer_engine
+
+    monkeypatch.setattr(transformer_engine, "TELinear", torch.nn.Linear)
+    linear = torch.nn.Linear(4, 4)
+    linear.te_quant_params = SimpleNamespace(
+        training_recipe=_recipe(override_nonquantized_autocast=True), evaluation_recipe=None
+    )
+    # The module opens its own MXFP8 context, replacing the layer's recipe attributes.
+    attrs = {"backward_override": "high_precision"}
+    monkeypatch.setattr(MXFP8BlockScaling, "backward_override", None, raising=False)
+    assert wide_residual.takes_mxfp8(linear, "mxfp8", recipe_attrs=attrs)
+    # On a BF16 stack the new context still inherits TE's environment-derived default.
+    monkeypatch.setattr(MXFP8BlockScaling, "backward_override", "high_precision")
+    assert not wide_residual.takes_mxfp8(linear, None)
+    assert not wide_residual.takes_mxfp8(linear, None, gradients=True)
+
+
+def test_deferred_write_uses_linked_producer_format():
+    """Each update's declared producer determines its gradient format."""
     write = object.__new__(wide_residual.DeferredWrite)
     torch.nn.Module.__init__(write)
     write.layer_number, write.retention = 3, None
     write.write_map = lambda return_logits: None
     handed = []
-    write.target = SimpleNamespace(hand=handed.append)
+    target = SimpleNamespace(hand=handed.append)
     linear, layer = torch.nn.Linear(4, 4), SimpleNamespace(config=SimpleNamespace(fp8="e4m3"))
-    write.link_producer(linear, layer)
-    with pytest.raises(RuntimeError, match="one linked producer"):
-        write.link_producer(torch.nn.Linear(4, 4), layer)
-    write.resolve_formats(None)
-    assert write.update_formats == ("mxfp8",)
-    state = (torch.zeros(2, 4),)
-    step = dict(state=state, dropout_probability=0.0, training=True)
-    with torch.enable_grad():
-        out = linear(torch.randn(2, 4))
-        write((out, None), **step)
-        assert handed[-1].routed is out and handed[-1].update_formats == ("mxfp8",)
-        with pytest.raises(RuntimeError, match="not its linked producer's output"):
-            write((out * 1, None), **step)
+    def gemm_format(module, layer, *, gradients):
+        return "mxfp8" if module is linear and gradients else "bf16"
 
-        class Identity(torch.autograd.Function):  # as a virtual-expert hook: input as is
-            forward = staticmethod(lambda ctx, x: x)
-            backward = staticmethod(lambda ctx, grad: grad)
-
-        class Copy(torch.autograd.Function):  # new values: rejected
-            forward = staticmethod(lambda ctx, x: x.clone())
-            backward = staticmethod(lambda ctx, grad: grad)
-
-        write((Identity.apply(Identity.apply(out)), None), **step)
-        with pytest.raises(RuntimeError, match="not its linked producer's output"):
-            write((Copy.apply(out), None), **step)
-        with pytest.raises(RuntimeError, match="not its linked producer's output"):
-            write((out.view(4, 2).view(2, 4), None), **step)  # a view chain, not a Function
-    with torch.no_grad():  # no gradient to hand on
-        write((torch.zeros(2, 4), None), **step)
+    write.producers = (linear, None)
+    write.link(target, layer, gemm_format)
+    assert not linear._forward_hooks
+    routed = linear(torch.randn(2, 4))
+    shared = torch.randn_like(routed)
+    write((routed, None), state=(routed,), dropout_probability=0.0, training=True, shared=shared)
+    assert handed[-1].routed is routed and handed[-1].shared is shared
+    assert handed[-1].update_formats == ("mxfp8", "bf16")

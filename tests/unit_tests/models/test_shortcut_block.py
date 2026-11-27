@@ -35,7 +35,6 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     WriteReadNorm,
-    seam_connections,
 )
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.determinism.kernels.harness import bytes_equal
@@ -877,6 +876,18 @@ def _train_step(model, tokens):
 
 
 @pytest.mark.usefixtures("model_parallel")
+def test_disabled_fusion_skips_seam_setup(monkeypatch):
+    def unexpected(*args, **kwargs):
+        pytest.fail("disabled fusion entered seam setup")
+
+    monkeypatch.setattr(specs, "shortcut_fusion_stack_spec", unexpected)
+    monkeypatch.setattr("megatron.core.models.hybrid.hybrid_block.link_residual_seams", unexpected)
+    model = _hybrid_model("M-*E", hidden=256, moe_shortcut_wide_residual_norm_fusion=False)
+    _train_step(model, 128)
+    assert not any(isinstance(module, WriteReadNorm) for module in model.modules())
+
+
+@pytest.mark.usefixtures("model_parallel")
 def test_fusion_leaves_ordinary_width_mtp_unfused():
     """A fused decoder's MTP stack (ordinary-width shortcut pairs) builds with plain seams."""
     model = _hybrid_model("M*E-/*E/*E", hidden=256, mtp_num_layers=2, mtp_use_repeated_layer=True)
@@ -1123,6 +1134,54 @@ def test_fused_seams_training_matches_unfused(
 
 
 @pytest.mark.usefixtures("model_parallel")
+@REQUIRES_FUSED_BACKWARD
+def test_mxfp8_high_precision_backward_uses_bf16_handoffs():
+    model = _hybrid_model(
+        "---", hidden=2048, fp8="e4m3", fp8_recipe="mxfp8",
+        fp8_recipe_attrs={"backward_override": "high_precision"},
+    ).train()
+    read, write = model.decoder.layers[1].seam_connections()
+    assert read.consumer_formats == write.update_formats == ("bf16",)
+    _train_step(model, 2048)
+    assert torch.isfinite(model.decoder.layers[1].mlp.linear_fc1.weight.grad).all()
+
+
+@pytest.mark.usefixtures("model_parallel")
+@pytest.mark.parametrize("stack_mxfp8", [False, True])
+@REQUIRES_FUSED_BACKWARD
+def test_mxfp8_handoff_uses_gemm_override(stack_mxfp8):
+    """The middle layer's GEMMs opt into or out of MXFP8 independently of the stack."""
+    from megatron.core.quantization.quant_config import GlobMatcher, RecipeConfig
+
+    training_recipe = {} if stack_mxfp8 else {
+        "fp8_quantization_recipe": "mxfp8",
+        "override_nonquantized_autocast": True,
+    }
+    recipe = RecipeConfig(
+        matchers=[GlobMatcher("*layers.1.mlp.linear_fc*", "middle")],
+        config_dict={
+            "middle": {
+                "transformer_engine_config_type": "TEQuantizationParams",
+                "training_recipe": training_recipe,
+            }
+        },
+    )
+    options = dict(fp8="e4m3", fp8_recipe="mxfp8") if stack_mxfp8 else {}
+    if not stack_mxfp8:
+        with pytest.raises(ValueError, match="MXFP8 at a hidden_size"):
+            _hybrid_model("---", hidden=256, quant_recipe=recipe)
+    model = _hybrid_model("---", hidden=2048, quant_recipe=recipe, **options).train()
+    first, middle, last = model.decoder.layers
+    inherited, overridden = ("mxfp8", "bf16") if stack_mxfp8 else ("bf16", "mxfp8")
+    assert first.seam_connections()[1].update_formats == (inherited,)
+    assert middle.seam_connections()[0].consumer_formats == (overridden,)
+    assert middle.seam_connections()[1].update_formats == (overridden,)
+    assert last.seam_connections()[0].consumer_formats == (inherited,)
+    _train_step(model, 2048)
+    assert torch.isfinite(middle.mlp.linear_fc1.weight.grad).all()
+
+
+@pytest.mark.usefixtures("model_parallel")
 @pytest.mark.parametrize("recompute_shared_experts", [False, True])
 @REQUIRES_FUSED_BACKWARD
 def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_shared_experts):
@@ -1142,7 +1201,9 @@ def test_mxfp8_training_absorbs_every_read_quantization(monkeypatch, recompute_s
     reads = [m for m in model.decoder.modules() if isinstance(m, WriteReadNorm)]
     # Two attention qkv reads, the MLP read and each block's MoE read are MXFP8; each block's
     # router/latent shortcut read is both (no read falls back to BF16).
-    assert sorted(read.format for read in reads) == ["both"] * 2 + ["mxfp8"] * 5
+    assert sorted(read.consumer_formats for read in reads) == (
+        [("bf16", "mxfp8")] * 2 + [("mxfp8",)] * 5
+    )
     consumers = {
         module
         for read in reads
@@ -1186,10 +1247,10 @@ def test_mxfp8_update_gradients_match_te_quantization(monkeypatch, fp32_residual
         options.update(recompute_granularity="selective", recompute_modules=["shared_experts"])
     model = _hybrid_model("-*E*E-", hidden=2048, **options).train()
     writes = [m for m in model.decoder.modules() if isinstance(m, wide_residual.DeferredWrite)]
-    shortcut_adds = [w for w in writes if len(w.producers) == 2]
+    shortcut_adds = [w for w in writes if len(w.update_formats) == 2]
     assert len(shortcut_adds) == 2
     assert all(w.update_formats == ("mxfp8", "mxfp8") for w in shortcut_adds)
-    lone = [w for w in writes if len(w.producers) == 1 and w.update_formats == ("mxfp8",)]
+    lone = [w for w in writes if w.update_formats == ("mxfp8",)]
     assert lone
     twin = _hybrid_model("-*E*E-", hidden=2048, **options).train()
     twin.load_state_dict(model.state_dict())
@@ -1231,7 +1292,7 @@ def test_mxfp8_training_with_standalone_moe_layers():
     options = dict(fp8="e4m3", fp8_recipe="mxfp8", residual_stream_recompute_num_layers=2)
     model = _hybrid_model("-*E-EE*E", hidden=2048, **options, **NO_SHORTCUT).train()
     reads = [m for m in model.decoder.modules() if isinstance(m, WriteReadNorm)]
-    assert sorted(read.format for read in reads) == ["bf16"] * 4 + ["mxfp8"] * 3
+    assert sorted(read.consumer_formats for read in reads) == [("bf16",)] * 4 + [("mxfp8",)] * 3
     received = {}
     for read in reads:
         ((consumer, _),) = read.consumers
@@ -1241,7 +1302,7 @@ def test_mxfp8_training_with_standalone_moe_layers():
     _train_step(model, 2048)
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
     for read in reads:
-        expected = MXFP8Tensor if read.format == "mxfp8" else torch.Tensor
+        expected = MXFP8Tensor if read.consumer_formats == ("mxfp8",) else torch.Tensor
         assert received[read.consumers[0][0]] == {expected}
 
 
@@ -1314,59 +1375,57 @@ def test_fusion_spec_links_every_seam(monkeypatch):
     (BF16) and the latent projection (MXFP8: both formats); a lone MoE layer's read to the MoE
     layer (BF16, also under MXFP8 and without shortcut blocks). Building rejects an unfused layer
     (with its reason) and a one-layer stack."""
-    from megatron.core.extensions.transformer_engine import TELinear
-
     def linked(read):
         """``(module, takes it as MXFP8)`` per consumer, in link order."""
         return [(m, f == "mxfp8") for (m, _), f in zip(read.consumers, read.consumer_formats)]
 
     with monkeypatch.context() as patch:
-        # As under MXFP8 on a GB300: every layer MXFP8, a TELinear eligible (never the router).
-        patch.setattr(wide_residual, "runs_mxfp8", lambda config, layer: True)
-        patch.setattr(
-            wide_residual, "mxfp8_linear_eligible", lambda linear: isinstance(linear, TELinear)
-        )
+        # Every layer inherits MXFP8. The router still receives BF16.
+        patch.setattr(wide_residual, "_gemm_autocast_recipe", lambda config, layer: "mxfp8")
         model = _hybrid_model("M-*EME-", hidden=256)
+        # The shortcut read runs in the BF16 compute layer and feeds the MXFP8 MoE layer.
+        patch.setattr(
+            wide_residual, "_gemm_autocast_recipe",
+            lambda config, layer: "mxfp8" if layer.layer_number == 3 else None,
+        )
         latent = _hybrid_model("-*E", hidden=256, moe_latent_size=64)
     for block in (b for b in model.decoder.layers if isinstance(b, ShortcutMoEBlock)):
         compute, moe = block.compute_layer, block.moe_layer
         branch = compute.mixer if isinstance(compute, MambaLayer) else compute.self_attention
         projection = getattr(branch, "in_proj", None) or branch.linear_qkv
-        assert linked(seam_connections(compute)[0]) == [(projection, True)]
+        assert linked(compute.seam_connections()[0]) == [(projection, True)]
         fc1 = moe.mlp.shared_experts.linear_fc1
-        assert linked(seam_connections(moe)[0]) == [(fc1, True)]
+        assert linked(moe.seam_connections()[0]) == [(fc1, True)]
         # The router and the dispatcher: two BF16 consumers, each handed its own output.
         dispatcher = moe.mlp.token_dispatcher
         shortcut = block.shortcut_residual_read
         assert linked(shortcut) == [(moe.mlp.router, False), (dispatcher, False)]
-        assert shortcut.seam_layer is compute
     plain = [layer for layer in model.decoder.layers if not isinstance(layer, ShortcutMoEBlock)]
-    mlp_read = seam_connections(plain[1])[0]  # an MLP layer
-    assert linked(mlp_read) == [(plain[1].mlp.linear_fc1, True)] and mlp_read.format == "mxfp8"
+    mlp_read = plain[1].seam_connections()[0]  # an MLP layer
+    assert linked(mlp_read) == [(plain[1].mlp.linear_fc1, True)]
     block = latent.decoder.layers[-1]
     mlp, shortcut = block.moe_layer.mlp, block.shortcut_residual_read
     assert linked(shortcut) == [(mlp.router, False), (mlp.fc1_latent_proj, True)]
-    assert shortcut.format == "both"
     lone = _hybrid_model("-*EE-", hidden=256, blocks=1)
     lone_moe = lone.decoder.layers[2]  # the second E follows a block, not a compute layer
     assert not isinstance(lone_moe, ShortcutMoEBlock)
-    assert linked(seam_connections(lone_moe)[0]) == [(lone_moe.mlp, False)]
+    assert linked(lone_moe.seam_connections()[0]) == [(lone_moe.mlp, False)]
     mxfp8 = dict(fp8="e4m3", fp8_recipe="mxfp8")
     lone_mxfp8 = _hybrid_model("-*EE-", hidden=2048, blocks=1, **mxfp8).decoder.layers[2]
-    assert linked(seam_connections(lone_mxfp8)[0]) == [(lone_mxfp8.mlp, False)]
+    assert linked(lone_mxfp8.seam_connections()[0]) == [(lone_mxfp8.mlp, False)]
     standalone = _hybrid_model("M*EE-", hidden=256, **NO_SHORTCUT)
     for layer in standalone.decoder.layers[1:]:
-        read = seam_connections(layer)[0]
+        read = layer.seam_connections()[0]
         moe = getattr(layer, "mlp", None)
         if layer.layer_number in (3, 4):  # the two E layers
-            assert linked(read) == [(moe, False)] and read.format == "bf16"
+            assert linked(read) == [(moe, False)]
         else:
             assert len(read.consumers) == 1 and read.consumers[0][0] is not moe
     layers = []
     for layer in model.decoder.layers:
         is_block = isinstance(layer, ShortcutMoEBlock)
         layers += [layer.compute_layer, layer.moe_layer] if is_block else [layer]
-    reads, writes = zip(*(seam_connections(layer) for layer in layers))
+    reads, writes = zip(*(layer.seam_connections() for layer in layers))
     assert not isinstance(reads[0], WriteReadNorm)
     assert all(isinstance(read, WriteReadNorm) for read in reads[1:])
     assert all(write.target is read for write, read in zip(writes, reads[1:]))
@@ -1389,13 +1448,9 @@ def test_fusion_spec_links_every_seam(monkeypatch):
         mla.module.get_input_layernorm_module(mla.submodules)
 
 
-def test_mxfp8_handoff_never_falls_back(monkeypatch):
-    """An MXFP8 seam never changes precision per call: an unsupported token count or a missing
-    FP8 context raises."""
-    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
-
+def test_mxfp8_handoff_never_falls_back():
+    """Validate MXFP8 shapes even when the seam executes outside FP8 autocast."""
     rows = lambda m, h=3072: torch.empty(m, h, device="cuda", dtype=torch.bfloat16)
-    monkeypatch.setattr(FP8GlobalStateManager, "is_fp8_enabled", lambda: True)
     with torch.enable_grad():
         check_mxfp8_call(rows(2048))
         with pytest.raises(ValueError, match="1024 tokens .* in training"):
@@ -1404,17 +1459,12 @@ def test_mxfp8_handoff_never_falls_back(monkeypatch):
         check_mxfp8_call(rows(64))
         with pytest.raises(ValueError, match="33 tokens .* in inference"):
             check_mxfp8_call(rows(33))
-    monkeypatch.setattr(FP8GlobalStateManager, "is_fp8_enabled", lambda: False)
-    with pytest.raises(RuntimeError, match="outside its FP8 context"):
-        check_mxfp8_call(rows(64))
 
 
 @pytest.mark.usefixtures("model_parallel")
 @pytest.mark.parametrize("training", [False, True])
 def test_deferred_writes_are_consumed_within_one_forward(training):
-    """A deferred write goes only to an empty read and is taken exactly once; a forward leaves
-    every fused read empty (no residual or branch tensors held across forwards), and a forward
-    after one that raised mid-seam does not see that forward's write."""
+    """Each forward consumes every deferred write exactly once and leaves all reads empty."""
     model = _hybrid_model("M-*E-ME", hidden=256).train(training)
     reads = [m for m in model.modules() if isinstance(m, WriteReadNorm)]
     read = reads[0]
@@ -1428,7 +1478,6 @@ def test_deferred_writes_are_consumed_within_one_forward(training):
     tokens = 1024 if training else 64  # training seams need a multiple of 1024 tokens
     ids = torch.randint(0, 128, (1, tokens), device="cuda")
     positions = torch.arange(tokens, device="cuda")
-    model.decoder._fused_reads[-1].hand("left by a forward that raised after its hand-off")
     for _ in range(2):
         with torch.set_grad_enabled(training):
             out = model(ids, positions[None], None)

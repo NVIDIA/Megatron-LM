@@ -619,6 +619,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+        if (
+            self.config.moe_shortcut_wide_residual_norm_fusion
+            and self.config.quant_recipe is not None
+            and hasattr(self.decoder, "link_residual_seams")
+        ):
+            self.decoder.link_residual_seams()
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.

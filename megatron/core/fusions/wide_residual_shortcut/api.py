@@ -63,7 +63,7 @@ class _Boundary(torch.autograd.Function):
         from .forward_kernel import forward
 
         # values: updates, write, retain, then one read and one gamma per reader.
-        count = (len(values) - 2 - update_count) // 2
+        count = len(uses)
         updates = values[:update_count]
         write, retain = values[update_count : update_count + 2]
         reads = values[update_count + 2 : update_count + 2 + count]
@@ -225,28 +225,21 @@ def _trains_on(device_index: int) -> bool:
 
 
 def check_mxfp8_call(tensor) -> None:
-    """For a seam emitting an MXFP8 reader: raise unless an FP8 context is active and the kernel
-    takes this token count. Precision never changes per call: training shapes are fixed for a run
-    (the tuned set), and inference rows must be divisible by 32, as TE's MXFP8 GEMM requires too
-    (Megatron's inference pads to 64)."""
-    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
-
-    from .configs import SHAPES
-
-    if not FP8GlobalStateManager.is_fp8_enabled():
-        raise RuntimeError("an MXFP8 layer's fused seam ran outside its FP8 context")
-    rows, hidden = tensor.numel() // tensor.shape[-1], tensor.shape[-1]
-    training = torch.is_grad_enabled()
-    if (rows, hidden) not in SHAPES if training else rows % 32:
-        raise ValueError(
-            f"the MXFP8 seam handoff does not support {rows} tokens at hidden size {hidden} in "
-            + (
-                "training (supported: multiples of 1024 from 2048 tokens, up to 16384 above "
-                "hidden 4096)"
-                if training
-                else "inference (rows must be divisible by 32)"
-            )
-        )
+    """An MXFP8 handoff needs a tuned training shape or an inference row count divisible by 32."""
+    hidden = tensor.shape[-1]
+    rows = tensor.numel() // hidden
+    if torch.is_grad_enabled():
+        max_rows = 65536 if hidden <= 4096 else 16384
+        if hidden in range(2048, 16385, 1024) and rows in range(2048, max_rows + 1, 1024):
+            return
+        reason = f"training (widths 2048–16384 and rows 2048–{max_rows}, both in steps of 1024)"
+    elif rows % 32:
+        reason = "inference (rows must be divisible by 32)"
+    else:
+        return
+    raise ValueError(
+        f"the MXFP8 seam handoff does not support {rows} tokens at hidden size {hidden} in {reason}"
+    )
 
 
 def fused_seam(
@@ -284,11 +277,9 @@ def fused_seam(
     uses = tuple(
         _consumer_formats(fmt) for fmt in (("bf16",) * len(reads) if outputs is None else outputs)
     )
-    formats = tuple(_kernel_format(use) for use in uses)
     slots = (None,) * len(reads) if columns is None else tuple(columns)
-    if len(formats) != len(reads) or len(slots) != len(reads):
+    if len(uses) != len(reads) or len(slots) != len(reads):
         raise ValueError("a seam takes one output format and column slot per reader")
-    update_formats = p.update_formats
     options = (
         num_streams,
         interval,
@@ -298,11 +289,11 @@ def fused_seam(
         len(updates),
         batch_invariant,
         fuse_wgrad_accumulation,
-        update_formats,
+        p.update_formats,
     )
     if not torch.is_grad_enabled():
         return _regroup(uses, _Boundary.forward(None, options, *inputs))
-    if any((fmt == "bf16") != (slot is None) for fmt, slot in zip(formats, slots)):
+    if any(("mxfp8" in use) != (slot is not None) for use, slot in zip(uses, slots)):
         raise ValueError("in training an MXFP8 seam reader (and only one) requires a ColumnSlot")
     if not isinstance(interval, ReplayInterval):
         raise ValueError("a seam with gradients records into a ReplayInterval")
