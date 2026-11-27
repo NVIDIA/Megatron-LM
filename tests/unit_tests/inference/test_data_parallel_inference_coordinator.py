@@ -152,8 +152,9 @@ def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator()
         coordinator
     )
     coordinator._handlers = HANDLERS
-    # The spawner keeps the pipe open for the two submissions, then closes it.
-    coordinator.pipe_connection.poll.side_effect = [False, False, True]
+    # The spawner closes the pipe once both submissions are drained.
+    coordinator.pipe_connection.fileno.return_value = 3
+    coordinator._poller.poll.return_value = [(3, zmq.POLLIN)]
     submissions = [
         [
             b"client",
@@ -165,7 +166,7 @@ def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator()
         ]
         for request_id, media in [(7, {"image": [b"image"]}), (8, None)]
     ]
-    coordinator.router_socket.recv_multipart.side_effect = submissions
+    coordinator.router_socket.recv_multipart.side_effect = [*submissions, zmq.Again()]
 
     DataParallelInferenceCoordinator.start(coordinator)
 

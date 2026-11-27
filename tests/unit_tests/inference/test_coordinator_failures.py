@@ -58,6 +58,8 @@ class _CoordinatorRuntime(CoordinatorThread):
 
     def shutdown(self):
         self.pipe.close()  # tells the coordinator to exit
+        # disable_monitor() blocks without a live peer; context.term() blocks until it is closed.
+        assert self.monitor_released.wait(5.0), "coordinator loop did not exit"
         self.monitor.close(linger=0)
         self.thread.join(timeout=5.0)
         assert not self.thread.is_alive(), "coordinator thread did not stop"

@@ -53,6 +53,7 @@ CONTROL_TRANSITIONS = {
     Headers.RESUME: ControlTransition(
         allowed_from=frozenset({CoordinatorState.SUSPENDED}), new_state=CoordinatorState.PAUSED
     ),
+    # Transition back to RUNNING temporarily, until the engine process kills the coordinator.
     Headers.STOP: ControlTransition(
         allowed_from=frozenset({CoordinatorState.PAUSED, CoordinatorState.SUSPENDED}),
         new_state=CoordinatorState.RUNNING,

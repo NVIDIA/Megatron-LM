@@ -53,6 +53,7 @@ class CoordinatorThread:
         # The spawner's end of the startup pipe; closing it tells the coordinator to exit.
         self.pipe, pipe_child = multiprocessing.Pipe()
         self.ready = threading.Event()
+        self.monitor_released = threading.Event()
         self.coordinator = None
         self.thread = threading.Thread(
             target=self._run, args=(dp_size, tokenizer, setup, options, pipe_child), daemon=True
@@ -102,6 +103,7 @@ class CoordinatorThread:
             pipe_child.close()
             if self.coordinator is not None:
                 self.coordinator.router_socket.disable_monitor()
+                self.monitor_released.set()
                 self.coordinator.stop()
 
     def assert_requests_retired(self):
