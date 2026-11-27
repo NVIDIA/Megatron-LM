@@ -45,7 +45,7 @@ def _attention_config(**overrides):
     return TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4, **overrides)
 
 
-@pytest.mark.parametrize("backend", [*AttnBackend, "unfused"])
+@pytest.mark.parametrize("backend", [*AttnBackend, "unfused", "cudnn"])
 def test_set_attention_backend_accepts_all_enums_and_string(backend, isolated_nvte_attention_env):
     set_attention_backend(_attention_config(attention_backend=backend))
 
