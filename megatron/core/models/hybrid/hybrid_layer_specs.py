@@ -731,18 +731,19 @@ def with_norm_backend(stack_spec: ModuleSpec, norm_backend: str = "te") -> Modul
     if norm_backend == "te":
         return stack_spec
     return _replace_norm(stack_spec, get_norm_module_spec(norm_backend))
-_SHORTCUT_FUSION_BASE_SPECS = {
-    "wide_residual_shortcut_fusion_stack_spec": wide_residual_hybrid_stack_spec,
-    "wide_residual_shortcut_fusion_gdp_stack_spec": wide_residual_gated_delta_product_stack_spec,
-    "wide_residual_shortcut_fusion_inference_stack_spec": wide_residual_hybrid_inference_stack_spec,
-    "wide_residual_shortcut_fusion_gdp_inference_stack_spec": (
-        wide_residual_gated_delta_product_inference_stack_spec
-    ),
-}
 
 
-def _fuse_wide_residual_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
-    """Fuse each read except the first and defer each write except the last."""
+def shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
+    """Fuse interior seams of the built-in wide specs. Custom specs own their seams."""
+    wide_specs = (
+        wide_residual_hybrid_stack_spec,
+        wide_residual_gated_delta_product_stack_spec,
+        wide_residual_hybrid_inference_stack_spec,
+        wide_residual_gated_delta_product_inference_stack_spec,
+    )
+    if not any(stack_spec is base for base in wide_specs):
+        return stack_spec
+
     submodules = stack_spec.submodules
     first, middle, last = {}, {}, {}
     for field in fields(submodules):
@@ -759,24 +760,6 @@ def _fuse_wide_residual_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
             last_layer_submodules=replace(submodules, **last),
         ),
     )
-
-
-def shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
-    """Select the fused counterpart of a built-in wide spec. Custom specs own their seams."""
-    for name, base in _SHORTCUT_FUSION_BASE_SPECS.items():
-        if stack_spec is base:
-            # Publish the derived spec once under its explicit --spec import name.
-            if name not in globals():
-                globals()[name] = _fuse_wide_residual_stack_spec(stack_spec)
-            return globals()[name]
-    return stack_spec
-
-
-def __getattr__(name: str):
-    """Keep named fusion specs available to explicit imports and --spec."""
-    if name in _SHORTCUT_FUSION_BASE_SPECS:
-        return shortcut_fusion_stack_spec(_SHORTCUT_FUSION_BASE_SPECS[name])
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # Backward-compatible aliases

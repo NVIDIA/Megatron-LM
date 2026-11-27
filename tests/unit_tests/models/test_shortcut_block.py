@@ -1169,7 +1169,7 @@ def test_stack_links_with_grouped_precision_names(standalone):
     if standalone:
         stack = HybridStack(
             _fused_config(num_layers=3, hidden_size=2048, ffn_hidden_size=256, quant_recipe=recipe),
-            specs.wide_residual_shortcut_fusion_stack_spec.submodules,
+            specs.shortcut_fusion_stack_spec(specs.wide_residual_hybrid_stack_spec).submodules,
             layer_type_list=list("-*E"),
             pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
@@ -1398,7 +1398,6 @@ def test_fusion_spec_keeps_sharded_checkpoint_keys():
 
     assert keys(True) == keys(False)
     fused = specs.shortcut_fusion_stack_spec(specs.wide_residual_hybrid_stack_spec)
-    assert fused is specs.wide_residual_shortcut_fusion_stack_spec
     assert specs.shortcut_fusion_stack_spec(fused) is fused  # fusion and custom specs unchanged
 
 
@@ -1466,7 +1465,7 @@ def test_fusion_spec_links_every_seam(monkeypatch):
     assert all(write.target is read for write, read in zip(writes, reads[1:]))
     assert type(writes[-1]) is StreamwiseSigmoidWideResidualConnection
 
-    fused = specs.wide_residual_shortcut_fusion_stack_spec
+    fused = specs.shortcut_fusion_stack_spec(specs.wide_residual_hybrid_stack_spec)
     stock_mamba = specs.wide_residual_hybrid_stack_spec.submodules.mamba_layer
     unfused_mamba = replace(fused, submodules=replace(fused.submodules, mamba_layer=stock_mamba))
     monkeypatch.setattr(specs, "shortcut_fusion_stack_spec", lambda spec: unfused_mamba)

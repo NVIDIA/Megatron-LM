@@ -64,20 +64,25 @@ def test_rmsnorm_impl_chooses_the_resolved_spec_norms():
     assert native is custom
 
 
-def test_fused_gdp_checkpoint_selects_gdp_inference_spec(monkeypatch):
+def test_gdp_checkpoint_selects_fused_inference_with_flag():
     from megatron.core.models.hybrid import hybrid_layer_specs as specs
+    from megatron.core.transformer.wide_residual import WriteReadNorm
     from megatron.training.argument_utils import _hybrid_inference_stack_spec
+    from megatron.training.models.hybrid import resolve_hybrid_stack_spec
 
-    # Restore a training --spec before its lazy inference counterpart has been imported.
-    monkeypatch.delitem(
-        vars(specs), "wide_residual_shortcut_fusion_gdp_inference_stack_spec", raising=False
+    base = _hybrid_inference_stack_spec(
+        [specs.__name__, "wide_residual_gated_delta_product_stack_spec"], wide_residual=True
     )
-    inference = _hybrid_inference_stack_spec(
-        [specs.__name__, "wide_residual_shortcut_fusion_gdp_stack_spec"], wide_residual=True
-    )
-    assert inference is specs.shortcut_fusion_stack_spec(
-        specs.wide_residual_gated_delta_product_inference_stack_spec
-    )
+    assert base is specs.wide_residual_gated_delta_product_inference_stack_spec
+    config = _make_hybrid_config(hybrid_stack_spec=base)
+    assert resolve_hybrid_stack_spec(config) is base
+    config.transformer.moe_shortcut_wide_residual_norm_fusion = True
+    assert resolve_hybrid_stack_spec(config) is base
+    config.transformer.wide_residual = WideResidualConfig(num_streams=2)
+    fused = resolve_hybrid_stack_spec(config)
+    mamba = fused.submodules.mamba_layer.submodules
+    assert mamba.residual_read is WriteReadNorm
+    assert mamba.mixer.module is base.submodules.mamba_layer.submodules.mixer.module
 
 
 # =============================================================================

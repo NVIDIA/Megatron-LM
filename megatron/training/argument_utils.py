@@ -701,12 +701,14 @@ def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> Module
     training_spec = import_module((base_path, name))
     module = importlib.import_module(base_path)
     # dir() and getattr() rather than vars(): a deprecated import path (megatron.core.ops._compat)
-    # serves its names, private ones included, through module __getattr__.
-    aliases = [
-        alias
-        for alias in dir(module)
-        if alias.endswith("_stack_spec") and getattr(module, alias) is training_spec
-    ]
+    # serves its names, private ones included, through module __getattr__, which answers no
+    # dunder names.
+    module_specs = {
+        spec: getattr(module, spec)
+        for spec in dir(module)
+        if not (spec.startswith("__") and spec.endswith("__"))
+    }
+    aliases = sorted({alias for alias, value in module_specs.items() if value is training_spec})
     for alias in aliases or [name]:
         stem = alias.removeprefix("wide_residual_").replace("_inference_", "_")
         if not stem.endswith("_stack_spec"):
@@ -714,10 +716,8 @@ def _hybrid_inference_stack_spec(spec: list[str], wide_residual: bool) -> Module
         candidate = stem.removesuffix("_stack_spec") + "_inference_stack_spec"
         if wide_residual:
             candidate = "wide_residual_" + candidate
-        # A named inference spec may be provided lazily through module __getattr__.
-        inference_spec = getattr(module, candidate, None)
-        if isinstance(inference_spec, ModuleSpec):
-            return inference_spec
+        if isinstance(module_specs.get(candidate), ModuleSpec):
+            return module_specs[candidate]
     return None
 
 
