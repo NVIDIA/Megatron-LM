@@ -102,8 +102,8 @@ and adds are fused. A GPU test forces every candidate of each default entry and
 checks for bit-identical outputs. A pinned kernel without a table entry falls
 back to the cheapest candidate, which can be several times slower than the
 fastest one. The packaged `sm100` and `sm103` tables carry entries for the
-in-tree MLA RoPE and mHC kernels; on other architectures, record a table to
-recover their throughput.
+in-tree MLA RoPE (including CSA output-RoPE reconstruction) and mHC kernels; on
+other architectures, record a table to recover their throughput.
 
 In-tree SSM kernels also use `autotune_configs()` at decoration time. That helper
 uses the explicit deterministic-mode setter or PyTorch's deterministic flag and,
