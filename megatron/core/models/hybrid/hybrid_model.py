@@ -17,13 +17,14 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid import HybridLayerEntry
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.quantization.utils import finish_quantization_init
 from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
@@ -615,16 +616,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
 
-        for name, module in self.named_modules():
-            if hasattr(module, 'finish_init'):
-                quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
-                module.finish_init(quant_config)
-        if (
-            self.config.moe_shortcut_wide_residual_norm_fusion
-            and self.config.quant_recipe is not None
-            and hasattr(self.decoder, "link_residual_seams")
-        ):
-            self.decoder.link_residual_seams()
+        for name, child in self.named_children():
+            if child is self.decoder and isinstance(child, HybridStack):
+                continue  # The decoder finalized its precision recipes after grouping.
+            finish_quantization_init(child, self.config.quant_recipe, prefix=name)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.

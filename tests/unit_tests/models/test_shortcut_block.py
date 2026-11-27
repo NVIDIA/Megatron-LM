@@ -1147,6 +1147,35 @@ def test_mxfp8_high_precision_backward_uses_bf16_handoffs():
 
 
 @pytest.mark.usefixtures("model_parallel")
+def test_standalone_stack_links_with_grouped_precision_names():
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.quantization.quant_config import GlobMatcher, RecipeConfig
+
+    recipe = RecipeConfig(
+        matchers=[GlobMatcher("layers.1.compute_layer.self_attention.linear_proj", "proj")],
+        config_dict={
+            "proj": {
+                "transformer_engine_config_type": "TEQuantizationParams",
+                "training_recipe": {
+                    "fp8_quantization_recipe": "mxfp8",
+                    "override_nonquantized_autocast": True,
+                },
+            }
+        },
+    )
+    stack = HybridStack(
+        _fused_config(num_layers=3, hidden_size=2048, ffn_hidden_size=256, quant_recipe=recipe),
+        specs.wide_residual_shortcut_fusion_stack_spec.submodules,
+        layer_type_list=list("-*E"),
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
+    read, write = stack.layers[1].compute_layer.seam_connections()
+    assert read.consumer_formats == ("bf16",)
+    assert write.update_formats == ("mxfp8",)
+
+
+@pytest.mark.usefixtures("model_parallel")
 @pytest.mark.parametrize("stack_mxfp8", [False, True])
 @REQUIRES_FUSED_BACKWARD
 def test_mxfp8_handoff_uses_gemm_override(stack_mxfp8):
