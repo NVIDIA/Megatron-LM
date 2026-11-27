@@ -40,6 +40,7 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
     reset_fp8_state,
     reset_gtp_globals,
 )
+from tests.unit_tests.test_utilities import te_reads_legacy_grouped_env
 
 
 @pytest.fixture
@@ -190,7 +191,8 @@ def _native_model(group, recipe):
 def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8, registered):
     if mxfp8:
         _requires_mxfp8()
-        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")
+        if te_reads_legacy_grouped_env():
+            monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")
     recipe = MXFP8BlockScaling() if mxfp8 else None
     model = (
         _native_model(expert_group, recipe)
