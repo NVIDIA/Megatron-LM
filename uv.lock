@@ -2468,6 +2468,15 @@ wheels = [
 ]
 
 [[package]]
+name = "liger-kernel"
+version = "0.8.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3c/4e/98697a67e4e45f9faad58fe478e5f877137bf7a6ad1068179ff77e9efed6/liger_kernel-0.8.5.tar.gz", hash = "sha256:4e8f8f611a8ad735c37c989410d09820bb08881f131851a3967c34baa7889d66", size = 6832492, upload-time = "2026-10-21T00:35:33.161Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/73/9667e4a05457e99ec921380df8d279fbcb8f8e8bd76b033ee0c82bb1d3a0/liger_kernel-0.8.5-py3-none-any.whl", hash = "sha256:60789cd576af073ab9b192b570d2597fd0cdad489cd62fb44fb16256d43754c9", size = 910117, upload-time = "2026-10-21T00:35:30.998Z" },
+]
+
+[[package]]
 name = "limits"
 version = "5.8.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2693,6 +2702,7 @@ dev = [
     { name = "flash-attn-4", extra = ["cu13"] },
     { name = "flashinfer-python" },
     { name = "hypercorn" },
+    { name = "liger-kernel", marker = "sys_platform == 'linux'" },
     { name = "megatron-energon", extra = ["av-decode"] },
     { name = "multi-storage-client", marker = "sys_platform != 'win32'" },
     { name = "nemo-lens" },
@@ -2850,6 +2860,7 @@ requires-dist = [
     { name = "gigatoken", marker = "extra == 'training'", specifier = ">=0.11.0" },
     { name = "hypercorn", marker = "extra == 'dev'" },
     { name = "hypercorn", marker = "extra == 'inference'" },
+    { name = "liger-kernel", marker = "sys_platform == 'linux' and extra == 'dev'", specifier = "==0.8.5" },
     { name = "mamba-ssm", marker = "extra == 'ssm'", git = "https://github.com/state-spaces/mamba.git?rev=0048fbf2e7b2f214dcbe703ea3dec2b9647595e1" },
     { name = "megatron-energon", extras = ["av-decode"], marker = "extra == 'dev'", specifier = "~=7.0" },
     { name = "msgpack", marker = "extra == 'inference'" },
