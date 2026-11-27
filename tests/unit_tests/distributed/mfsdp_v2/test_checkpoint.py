@@ -43,8 +43,10 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
+from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import unwrap_model
+from megatron.training.checkpointing import preprocess_fsdp_dtensor_state_dict
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
@@ -494,7 +496,10 @@ def test_metadata_attach_issues_no_collectives(
 
 
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
-def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_size):
+@pytest.mark.parametrize("mixed_precision_wrapper", [False, True], ids=["bare", "bf16-wrapper"])
+def test_ep_fsdp_checkpoint_roundtrip(
+    distributed_setup, tmp_path_dist_ckpt, ep_size, mixed_precision_wrapper
+):
     """MCore checkpoint save/load reproduces uninterrupted BF16 MoE training.
 
     Use MCore's existing global expert names and optimizer checkpoint format.
@@ -524,6 +529,8 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
                 moe_grouped_gemm=True,
                 moe_ffn_hidden_size=128,
                 add_bias_linear=False,
+                gated_linear_unit=True,
+                activation_func=torch.nn.functional.silu,
                 gradient_accumulation_fusion=False,
                 # GPU initialization uses the expert-parallel RNG stream.
                 use_cpu_initialization=False,
@@ -541,6 +548,8 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
                 hybrid_layer_pattern="*E",
                 pg_collection=groups,
             ).cuda()
+            if mixed_precision_wrapper:
+                model = Float16Module(config, model)
             model = FullyShardedDataParallel(
                 config=config,
                 ddp_config=DistributedDataParallelConfig(
@@ -597,13 +606,15 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
 
         def checkpoint_state(model, optimizer, *, is_loading=False):
             state = {
-                "model": handle_experts_in_state_dict(
-                    model.state_dict_for_save_checkpoint(), model.config.num_moe_experts
-                ),
+                "model": model.state_dict_for_save_checkpoint(),
                 "optimizer": optimizer.sharded_state_dict({}, is_loading=is_loading),
             }
-            preprocess_state_dict_for_uneven_dtensor(state)
-            return state
+            return preprocess_fsdp_dtensor_state_dict(
+                model.config,
+                state,
+                unwrap_model(model),
+                megatron_fsdp_version=model.ddp_config.megatron_fsdp_version,
+            )
 
         train(source, source_optimizer)
         with TempNamedDir(tmp_path_dist_ckpt / f"ep{ep_size}_mcore_roundtrip", sync=True) as path:

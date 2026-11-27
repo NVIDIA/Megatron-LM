@@ -1127,7 +1127,12 @@ def save_checkpoint(
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
             if ckpt_format == 'fsdp_dtensor':
-                state_dict = preprocess_fsdp_dtensor_state_dict(cfg.model.transformer, state_dict, model[0])
+                state_dict = preprocess_fsdp_dtensor_state_dict(
+                    cfg.model.transformer,
+                    state_dict,
+                    model[0],
+                    megatron_fsdp_version=cfg.ddp.megatron_fsdp_version,
+                )
 
             if checkpoint.async_save:
                 from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
@@ -2025,7 +2030,9 @@ def _localize_redundant_extra_states(state_dict):
     dict_list_map_inplace(_maybe_localize, state_dict)
 
 
-def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
+def preprocess_fsdp_dtensor_state_dict(
+    config, raw_state_dict, model, *, megatron_fsdp_version: int
+):
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict['model'])
 
@@ -2038,14 +2045,14 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
         if 'optimizer' in state_dict:
             state_dict['optimizer'] = optimizer_state_dict
 
-    if (
-        config.gated_linear_unit
-        and config.activation_func is torch.nn.functional.silu
-    ):
-        apply(handle_swiglu_in_state_dict)
-    # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
-    # layout used on disk. No-op for unfused models.
-    apply(handle_mla_down_proj_in_state_dict)
+    # V1's fused-parameter conversions require its wrapper and flat-shard metadata.
+    # V2 checkpoints retain the native fused DTensors for both saving and loading.
+    # Use the configured version: mixed-precision unwrapping can remove the root FSDP mixin.
+    if megatron_fsdp_version == 1:
+        if config.gated_linear_unit and config.activation_func is torch.nn.functional.silu:
+            apply(handle_swiglu_in_state_dict)
+        # Split a fused MLA q/kv down-projection back into the unfused layout used on disk.
+        apply(handle_mla_down_proj_in_state_dict)
     if config.num_moe_experts:
         state_dict['model'] = handle_experts_in_state_dict(
             state_dict['model'], config.num_moe_experts
@@ -2513,7 +2520,12 @@ def _load_base_checkpoint(
         raw_model_state_dict = state_dict['model'].copy() if 'model' in state_dict else None
         model = state_dict.pop('_model')
         cfg = get_run_config()
-        state_dict = preprocess_fsdp_dtensor_state_dict(cfg.model.transformer, state_dict, model[0])
+        state_dict = preprocess_fsdp_dtensor_state_dict(
+            cfg.model.transformer,
+            state_dict,
+            model[0],
+            megatron_fsdp_version=cfg.ddp.megatron_fsdp_version,
+        )
         fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
         state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
         if gpt_compat_layer_maps is not None:
