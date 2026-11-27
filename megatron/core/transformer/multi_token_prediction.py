@@ -24,6 +24,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fusions.fused_mtp_acceptance_counts import fused_mtp_acceptance_counts
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
 from megatron.core.ops.mtp_kl_loss import vocab_parallel_kl_div, vocab_parallel_log_normalizer
@@ -835,11 +836,9 @@ def _compute_mtp_acceptance_counts(
             else:
                 preds = torch.argmax(mtp_logits, dim=-1)  # [s, b]
 
-        labels_match = mtp_labels.transpose(0, 1).contiguous()  # [b, s] => [s, b]
-        mask_match = loss_mask.transpose(0, 1).contiguous()  # [b, s] => [s, b]
-        valid_positions = mask_match.bool()
-        correct = ((preds == labels_match) & valid_positions).sum().float()
-        total = valid_positions.sum().float()
+        # One kernel for the [s, b] preds against the [b, s] labels and mask; falls back to
+        # PyTorch for inputs the kernel does not handle.
+        correct, total = fused_mtp_acceptance_counts(preds, mtp_labels, loss_mask)
 
     return correct, total
 
