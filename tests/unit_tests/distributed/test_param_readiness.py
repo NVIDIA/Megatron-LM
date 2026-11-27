@@ -20,6 +20,7 @@ from megatron.core.distributed.distributed_data_parallel import (
 )
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
+from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import PARAM_READY_CALLBACK_ATTR, ensure_params_ready
@@ -184,3 +185,31 @@ class TestDSAFineGrainedReadiness:
         )
 
         assert DSAttention not in recurse_types
+
+
+class TestFusedQKNormRoPEFineGrainedReadiness:
+    def test_fused_qk_norm_rope_gathers_at_called_self_attention_boundary(self):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=1,
+            qk_layernorm=True,
+            fused_single_qkv_rope=True,
+        )
+
+        recurse_types = FullyShardedDataParallelV1._fine_grained_recurse_module_types(
+            config, DistributedDataParallelConfig()
+        )
+
+        assert SelfAttention in recurse_types
+
+    def test_unfused_qk_norm_keeps_leaf_level_gather(self):
+        config = TransformerConfig(
+            num_layers=1, hidden_size=16, num_attention_heads=1, qk_layernorm=True
+        )
+
+        recurse_types = FullyShardedDataParallelV1._fine_grained_recurse_module_types(
+            config, DistributedDataParallelConfig()
+        )
+
+        assert SelfAttention not in recurse_types
