@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Save / load / export coverage smoke across the supported models and backends.
 
-Matrix: {qwen3_5, qwen3_moe, kimi_k2, glm5, deepseek_v4} x {dist_opt, fsdp2}.
+Matrix: {qwen3_5, qwen3_moe, kimi_k2, glm5, deepseek_v4, minimax_m3} x {dist_opt, fsdp2}.
 
 Each (model, backend) case does a faithful round-trip:
   build -> train one real step -> save checkpoint -> build fresh -> load ->
@@ -212,12 +212,76 @@ def _deepseek_v4():
     return cfg, protocol
 
 
+def _minimax_m3():
+    pytest.importorskip("msa_v1", reason="minimax_m3 Magi MSA needs the msa_v1 kernels.")
+    pytest.importorskip("magi_attn_extensions.MSA", reason="minimax_m3 needs the Magi MSA extension.")
+    _require_te()
+    from megatron.lite.model.minimax_m3.config import MiniMaxM3Config
+    from megatron.lite.model.minimax_m3.lite import protocol
+
+    # Layers 0-1 dense, 2-3 MSA + MoE; the msa_v1 kernels fix 64/4 heads x 128 head_dim and a 128-dim indexer.
+    cfg = MiniMaxM3Config._from_hf_dict(
+        dict(
+            model_type="minimax_m3_vl_text",
+            vocab_size=256,
+            hidden_size=512,
+            num_hidden_layers=4,
+            num_attention_heads=64,
+            num_key_value_heads=4,
+            head_dim=128,
+            dense_intermediate_size=1024,
+            intermediate_size=256,
+            shared_intermediate_size=256,
+            n_shared_experts=1,
+            num_local_experts=4,
+            num_experts_per_tok=2,
+            moe_layer_freq=[0, 0, 1, 1],
+            scoring_func="sigmoid",
+            use_routing_bias=True,
+            routed_scaling_factor=2.0,
+            hidden_act="swigluoai",
+            swiglu_alpha=1.702,
+            swiglu_limit=7.0,
+            rms_norm_eps=1e-6,
+            use_gemma_norm=True,
+            use_qk_norm=True,
+            qk_norm_type="per_head",
+            rope_theta=5_000_000,
+            rotary_dim=64,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=65536,
+            tie_word_embeddings=False,
+            attention_output_gate=False,
+            sparse_attention_config=dict(
+                use_sparse_attention=True,
+                sparse_index_dim=128,
+                sparse_num_index_heads=4,
+                sparse_topk_blocks=16,
+                sparse_block_size=128,
+                sparse_score_type="max",
+                sparse_init_block=0,
+                sparse_local_block=1,
+                sparse_disable_index_value=[0, 0, 1, 1],
+                sparse_attention_freq=[0, 0, 1, 1],
+            ),
+            output_router_logits=False,
+            router_aux_loss_coef=0.001,
+            attention_dropout=0.0,
+            bos_token_id=1,
+            eos_token_id=2,
+            pad_token_id=0,
+        )
+    )
+    return cfg, protocol
+
+
 MODELS = {
     "qwen3_5": _qwen3_5,
     "qwen3_moe": _qwen3_moe,
     "kimi_k2": _kimi_k2,
     "glm5": _glm5,
     "deepseek_v4": _deepseek_v4,
+    "minimax_m3": _minimax_m3,
 }
 
 BACKENDS = (
@@ -324,9 +388,9 @@ _PS_GROUP_ATTRS = (
     "ep_dp_group",
 )
 
-# GLM5 / DeepSeek-V4 native lite support TP=ETP=VPP=1 only (EP/PP/CP wired
-# through primitives), so their dist_opt topology shards via ep/pp/cp instead.
-_TP1_ONLY = {"glm5", "deepseek_v4"}
+# GLM5 / DeepSeek-V4 / MiniMax-M3 native lite support TP=ETP=VPP=1 only (EP/PP/CP
+# wired through primitives), so their dist_opt topology shards via ep/pp/cp instead.
+_TP1_ONLY = {"glm5", "deepseek_v4", "minimax_m3"}
 
 
 def _topology(model_name: str, backend: str) -> ParallelConfig:
@@ -377,13 +441,15 @@ def _build_handle(
     torch.cuda.manual_seed_all(seed)
 
     parallel = topology or _topology(model_name, backend)
-    impl_cfg = protocol.ImplConfig(
+    impl_kwargs = dict(
         parallel=parallel,
         optimizer=backend,
         optimizer_config=_optimizer_config(offload_fraction),
-        use_deepep=False,
         deterministic=True,
     )
+    if "use_deepep" in protocol.ImplConfig.__dataclass_fields__:
+        impl_kwargs["use_deepep"] = False  # minimax_m3 selects the dispatcher via moe_dispatcher instead
+    impl_cfg = protocol.ImplConfig(**impl_kwargs)
     bundle = protocol.build_model(cfg, impl_cfg=impl_cfg)
     chunks = bundle.chunks
 
@@ -636,7 +702,7 @@ def _offload_topology(model_name: str) -> ParallelConfig:
     if forced:
         tp, ep, etp, pp, cp = (int(x) for x in forced.split(","))
         return ParallelConfig(tp=tp, ep=ep, etp=etp, pp=pp, cp=cp)
-    if model_name in _TP1_ONLY:  # glm5, deepseek_v4: CSA/DSA are TP=1 only
+    if model_name in _TP1_ONLY:  # glm5, deepseek_v4, minimax_m3: CSA/DSA/MSA are TP=1 only
         return ParallelConfig(tp=1, ep=2, etp=1, pp=2, cp=2)
     return ParallelConfig(tp=2, ep=2, etp=1, pp=2, cp=2)
 
