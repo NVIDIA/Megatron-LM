@@ -48,6 +48,19 @@ def _copy_database(cache_dir: Path, phase: str, rank: int) -> Path:
     return destination
 
 
+def _without_testmon_options(pytest_args: list[str]) -> list[str]:
+    """Drop --testmon-env (a profile's Testmon environment) for a rank that runs without it."""
+    kept, skip = [], False
+    for arg in pytest_args:
+        if skip:
+            skip = False
+        elif arg == "--testmon-env":
+            skip = True
+        elif not arg.startswith("--testmon-env="):
+            kept.append(arg)
+    return kept
+
+
 def _testmon_dependency_override() -> str:
     from testmon_cache import is_tracked_package
 
@@ -80,9 +93,15 @@ def _run(args: argparse.Namespace) -> int:
     if args.mode == "baseline":
         # pytest-cov combines its own files at exit; separate ranks so they never race.
         os.environ["COVERAGE_FILE"] = f".coverage.unit_tests.rank{rank}"
+        if args.append and any(arg == "--cov" or arg.startswith("--cov=") for arg in pytest_args):
+            # pytest-cov erases that file when a session starts; keep the earlier launches' lines.
+            pytest_args.append("--cov-append")
         if rank == 0:
             database = _database(args.cache_dir, args.phase)
-            _clear_database_files(database)
+            if args.append:
+                validate_phase(args.cache_dir, args.phase)
+            else:
+                _clear_database_files(database)
             (database.parent / "metadata.json").unlink(missing_ok=True)
             os.environ["TESTMON_DATAFILE"] = str(database)
             pytest_args.extend(
@@ -90,6 +109,8 @@ def _run(args: argparse.Namespace) -> int:
             )
         else:
             os.environ.pop("TESTMON_DATAFILE", None)
+            # Other ranks run without Testmon, so they must not receive its options.
+            pytest_args = _without_testmon_options(pytest_args)
             pytest_args.extend(("-p", "no:testmon", "-p", "no:pytest-testmon"))
     else:
         validate_phase(args.cache_dir, args.phase)
@@ -180,6 +201,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("baseline", "select"), required=True)
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--phase", choices=PHASES, required=True)
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help=(
+            "Record another baseline environment, keeping the completed phase database and each "
+            "rank's coverage."
+        ),
+    )
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     return parser
 
@@ -188,7 +217,10 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] in ("select", "prepare"):
         return _run_plan(argv)
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.append and args.mode != "baseline":
+        parser.error("--append requires --mode baseline")
     try:
         return _run(args)
     except (OSError, RuntimeError, ValueError) as error:

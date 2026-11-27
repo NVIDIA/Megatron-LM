@@ -53,9 +53,8 @@ def moe_state(engine):
 
 @mock.patch.object(dynamic_tests, "TransformerConfig", MOE_CONFIG)
 @mock.patch.object(dynamic_tests, "get_gpt_layer_with_transformer_engine_spec", MOE_SPEC)
-@pytest.mark.parametrize("live_loop", [False, True], ids=["bare-engine", "live-ep-loop"])
 @torch.inference_mode()
-def test_real_moe_ep2_handoff(tmp_path, live_loop):
+def test_real_moe_ep2_handoff(tmp_path):
     Utils.initialize_model_parallel(expert_model_parallel_size=2)
     control = dist.new_group(backend="gloo")
     rank = dist.get_rank()
@@ -113,7 +112,9 @@ def test_real_moe_ep2_handoff(tmp_path, live_loop):
                 )
                 target_group = next(g for g in target_groups if not set(g) & set(source_group))
                 assert len(source_group) == len(target_group) == 2
-                consumers = target_group[:1] if live_loop else target_group
+                # As in production, one EP rank owns the imported request; its idle peer keeps
+                # the expert collectives going through the live loop's consensus.
+                consumers = target_group[:1]
                 target_layers, target_weights = moe_state(target)
                 weights_match = rank not in target_group
                 if rank in target_group:
@@ -123,14 +124,13 @@ def test_real_moe_ep2_handoff(tmp_path, live_loop):
                         for name, value in target_weights.items()
                     )
                 assert all(topology.gather(weights_match, control))
-                if live_loop:
-                    target._loop.run_until_complete(
-                        target.start_listening_to_data_parallel_coordinator(
-                            inference_coordinator_port=1,
-                            launch_inference_coordinator=False,
-                            hostname="127.0.0.1",
-                        )
+                target._loop.run_until_complete(
+                    target.start_listening_to_data_parallel_coordinator(
+                        inference_coordinator_port=1,
+                        launch_inference_coordinator=False,
+                        hostname="127.0.0.1",
                     )
+                )
                 future = pending = None
                 if rank in consumers:
                     future = dtu._enqueue_decode_handoff(target, handoff, tokens, dtu.sampling())
@@ -178,17 +178,14 @@ def test_real_moe_ep2_handoff(tmp_path, live_loop):
                             consensus.append((local_work, *result))
                             return result
 
-                        if live_loop:
-                            stack.enter_context(
-                                mock.patch.object(
-                                    target, "_ep_establish_consensus", side_effect=observe_consensus
-                                )
+                        stack.enter_context(
+                            mock.patch.object(
+                                target, "_ep_establish_consensus", side_effect=observe_consensus
                             )
-                            actual = target._loop.run_until_complete(
-                                finish_live_request(target, future, control)
-                            )
-                        else:
-                            actual = dtu.run_to_completion(target, future)
+                        )
+                        actual = target._loop.run_until_complete(
+                            finish_live_request(target, future, control)
+                        )
                     if rank in consumers:
                         assert actual.generated_tokens == expected
                         assert all(not step[2] for step in decode_witness.steps)
@@ -202,15 +199,12 @@ def test_real_moe_ep2_handoff(tmp_path, live_loop):
                     local_calls = sum(probe.call_count for probe in probes)
                     local_tokens = sum(call.args[0].shape[0] for call in probes[2].call_args_list)
                     local_dummy = dummy.call_count
-                elif live_loop:
-                    target._loop.run_until_complete(finish_live_request(target, future, control))
                 else:
-                    for _ in expected:
-                        assert not target.step_modern()["finished_requests"]
+                    target._loop.run_until_complete(finish_live_request(target, future, control))
                 witnesses = topology.gather(
                     (rank, local_calls, local_tokens, local_dummy, tuple(consensus)), control
                 )
-                if live_loop and rank == 0:
+                if rank == 0:
                     print("LIVE_EP_WITNESSES", witnesses)
                 assert all(witnesses[member][1] > 0 for member in target_group)
                 assert sum(witnesses[member][2] for member in target_group) > 0

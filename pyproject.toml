@@ -374,9 +374,15 @@ markers = [
     "flaky: mark flaky tests for LTS environment",
     "flaky_in_dev: mark flaky tests for DEV environment",
     "launch_on_gb200: mark a unit test to be launched on GB200 hardware (4 GPUs/node)",
+    "single_rank: the test needs one rank and no other rank's participation; full CI runs pack these tests as concurrent one-GPU shards (tests/unit_tests/run_ci_test.sh)",
 ]
 
 [tool.coverage.run]
+# Python 3.12's sys.monitoring tracer: it stops reporting code outside the measured source after
+# the first event, so imports and library code run near full speed (the default C tracer slowed
+# test-process startup by about 30% and inference test buckets by about 15%). Testmon builds its
+# own Coverage without this file, so its per-test contexts keep the default tracer.
+core = "sysmon"
 concurrency = ["thread", "multiprocessing"]
 omit = [
     "/tmp/*",

@@ -2020,6 +2020,7 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
         _reset_rounder()
         Utils.destroy_model_parallel()
 
+    @pytest.mark.single_rank
     @pytest.mark.parametrize("scenario", _ASYNC_PAIR_SCENARIOS, ids=lambda case: case.name)
     @torch.inference_mode()
     def test_async_matches_legacy_for_owned_pair(self, scenario):
@@ -2031,6 +2032,7 @@ class TestAsyncSchedulePairwise(_AsyncPairwiseHarness):
             delete_cuda_graphs()
             torch.cuda.empty_cache()
 
+    @pytest.mark.single_rank
     @pytest.mark.parametrize(
         "scenario", _ASYNC_SUSPEND_RESUME_SCENARIOS, ids=lambda case: case.name
     )
@@ -2313,6 +2315,7 @@ def test_base_engine_rejects_kv_handoff_commands():
         engine.release_handoff_blocks(1)
 
 
+@pytest.mark.single_rank
 def test_disagg_engine_resolves_handoff_methods_from_mixin():
     for engine_cls in (StateHandoffDynamicInferenceEngine, DisaggDynamicInferenceEngine):
         assert (

@@ -61,6 +61,7 @@ def rounder_override(n):
         DynamicInferenceContext.REQUEST_ROUNDER = original_request_rounder
 
 
+@pytest.mark.single_rank
 @pytest.mark.parametrize(
     "using_cuda_graph, num_prefill_requests, padded_prefill_requests, expected",
     [(False, 0, 1, True), (False, 1, 0, False), (True, 1, 0, True), (True, 0, 1, False)],
@@ -172,6 +173,7 @@ def test_zero_padding_tokens_accepts_empty_activation():
     assert activations.numel() == 0
 
 
+@pytest.mark.single_rank
 @CONTIGUITY
 @pytest.mark.parametrize("num_rows, real_token_count", [(16, 10), (16, 16), (16, 0), (7, 1)])
 def test_zero_padding_tokens_zeroes_rows_past_real_token_count(
@@ -339,6 +341,7 @@ class TestDynamicContext:
     def teardown_class(cls):
         Utils.destroy_model_parallel()
 
+    @pytest.mark.single_rank
     @pytest.mark.internal
     def test_prefill_batch_never_advertises_max_seqlen_q_of_one(self):
         """A batch containing prefill must not publish max_seqlen_q == 1.
@@ -369,6 +372,7 @@ class TestDynamicContext:
         _, max_seqlen_q = ctx.cu_query_lengths()
         assert max_seqlen_q >= 2
 
+    @pytest.mark.single_rank
     @pytest.mark.internal
     @pytest.mark.parametrize("flash_attention_version", [2, 4])
     def test_one_token_prefill_metadata_is_correct_under_flash_attention(
@@ -5001,6 +5005,7 @@ def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite
             assert int(torch.isfinite(log_probs[row]).sum()) == finite_count
 
 
+@pytest.mark.single_rank
 @pytest.mark.parametrize(
     "no_top_k,no_top_p,top_k,top_p,expected_kernel",
     [

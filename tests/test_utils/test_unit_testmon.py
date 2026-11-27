@@ -36,11 +36,31 @@ def _function(source: str, name: str) -> str:
     return source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
 
-def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=()):
+# The runner functions that launch the tests Testmon selected, and the state the runner sets
+# up for them in a bucket without profiles or packing.
+SELECTED_RUN_FUNCTIONS = (
+    "uses_mark",
+    "main_uses_mark",
+    "run_test_cmd",
+    "run_prod_tests",
+    "run_bucket",
+)
+SELECTED_RUN_STATE = (
+    "UNIT_PROFILES=() MAIN_ARGS=() ISOLATED_DIR=tests/unit_tests/inference/isolated "
+    "PACK_SHARDS=1 PACK_SINGLE_RANK=false"
+)
+
+
+def _functions(source: str, *names: str) -> str:
+    return "\n".join(name + "() {" + _function(source, name) + "\n}" for name in names)
+
+
+def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=(), wrapper_args=()):
     return subprocess.run(
         [
             sys.executable,
             str(WRAPPER_PATH),
+            *wrapper_args,
             "--mode",
             mode,
             "--cache-dir",
@@ -159,6 +179,59 @@ def test_nonzero_baseline_rank_runs_without_recording(project, tmp_path):
     assert not cache.exists()
 
 
+def test_appended_baseline_keeps_earlier_launch_coverage(project, tmp_path):
+    pytest.importorskip("pytest_cov")
+    coverage = pytest.importorskip("coverage")
+    cache = tmp_path / "appended-cache"
+
+    def active_return_covered():
+        data = coverage.CoverageData(str(project / ".coverage.unit_tests.rank0"))
+        data.read()
+        return 2 in (data.lines(str((project / "app.py").resolve())) or ())
+
+    # The first launch runs active(); the appended launch runs only test_other. As in CI, the
+    # source is a directory (Testmon hands pytest-cov the lines of files under it) and the
+    # config is explicit (otherwise an outer `coverage run` passes its own via COVERAGE_RCFILE).
+    config = project / ".coveragerc"
+    config.write_text("[run]\n")
+    for wrapper_args, test in (((), "test_active"), (("--append",), "test_other")):
+        result = _invoke(
+            project,
+            cache,
+            "baseline",
+            pytest_args=(f"--cov={project}", f"--cov-config={config}", "--cov-report=", "-k", test),
+            wrapper_args=wrapper_args,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert active_return_covered()
+
+
+def test_appended_profile_environment_keeps_the_default_environment(project, tmp_path):
+    cache = tmp_path / "environments-cache"
+    profile = ("--testmon-env=profile",)
+    for wrapper_args, pytest_args in (((), ()), (("--append",), profile)):
+        result = _invoke(
+            project, cache, "baseline", pytest_args=pytest_args, wrapper_args=wrapper_args
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+    # Ranks other than 0 run without Testmon, so they drop the profile's environment option.
+    for rank_args in (profile, ("--testmon-env", "profile")):
+        result = _invoke(
+            project, tmp_path / "rank-three", "baseline", rank=3, pytest_args=rank_args
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    def selected(environment):
+        result = _invoke(project, cache, "select", pytest_args=environment)
+        assert result.returncode == 0, result.stdout + result.stderr
+        return (cache / ".testmon-work/prod/rank-0/selected-tests").read_text().splitlines()
+
+    # Both environments know every test, so nothing is new to either.
+    assert selected(()) == selected(profile) == []
+    (project / "app.py").write_text("def active(value):\n    return value + 2\n")
+    assert selected(()) == selected(profile) == ["tests/test_app.py::test_active"]
+
+
 @pytest.mark.parametrize("rank", (0, 3))
 def test_baseline_can_start_spawned_checkpoint_workers(project, tmp_path, rank):
     (project / "tests/test_app.py").write_text(textwrap.dedent(f"""\
@@ -260,17 +333,19 @@ def test_changed_function_selects_and_runs_only_affected_cases_in_same_file(proj
             (
                 "NUM_NODES=1",
                 "GPUS_PER_NODE=2",
+                "PLATFORM=h100",
                 "DISTRIBUTED_ARGS=()",
                 "IGNORE_ARGS=()",
                 "MARKER_ARG='not flaky'",
+                SELECTED_RUN_STATE,
                 # Replace only uv/torchrun; run the actual coverage/pytest command locally.
                 "uv() {",
                 '    [[ "$1 $2 $3 $4 $5" == "run --no-sync python -m torch.distributed.run" ]]',
                 "    shift 5",
                 '    "$TEST_PYTHON" "$@"',
                 "}",
-                "merge_rank_selections() {" + _function(runner, "merge_rank_selections") + "\n}",
-                "run_selected_phase() {" + _function(runner, "run_selected_phase") + "\n}",
+                _functions(runner, "merge_rank_selections", "run_selected_phase"),
+                _functions(runner, *SELECTED_RUN_FUNCTIONS),
                 "merge_rank_selections prod",
                 "run_selected_phase prod",
             )
@@ -376,6 +451,69 @@ def test_empty_phase_does_not_launch_pytest(tmp_path):
     )
     assert "Testmon selected no prod tests." in result.stdout
     assert "UNEXPECTED_EXECUTION" not in result.stdout
+
+
+def _run_runner_functions(runner, cwd, *lines):
+    environment = {key: value for key, value in os.environ.items() if key != "UNIT_TEST_PROFILES"}
+    return subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail"],
+        input="\n".join(("ISOLATED_DIR=tests/unit_tests/inference/isolated", *lines)),
+        cwd=cwd,
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+
+@pytest.mark.parametrize("has_isolated_dir", (True, False))
+def test_inference_profiles_run_only_in_suites_that_have_them(tmp_path, has_isolated_dir):
+    # The legacy suite is an older release's tests, from before the isolated directory.
+    if has_isolated_dir:
+        (tmp_path / "tests/unit_tests/inference/isolated").mkdir(parents=True)
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    result = _run_runner_functions(
+        runner,
+        tmp_path,
+        "BUCKET='tests/unit_tests/inference/**/*.py' PLATFORM=h100 GPUS_PER_NODE=8",
+        "UNIT_PROFILES=() MAIN_ARGS=()",
+        "uv() { return 1; }",  # No NIXL.
+        _functions(runner, "profile_spec", "set_unit_profiles"),
+        "set_unit_profiles",
+        'echo "profiles=${UNIT_PROFILES[*]} main_args=${MAIN_ARGS[*]}"',
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected = (
+        "profiles=delayed blockwise transfer pairs "
+        "main_args=--ignore=tests/unit_tests/inference/isolated"
+        if has_isolated_dir
+        else "profiles= main_args="
+    )
+    assert result.stdout.splitlines()[-1] == expected
+
+
+@pytest.mark.parametrize("pack", (1, 0))
+def test_profile_launches_follow_the_packing_switch(tmp_path, pack):
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    result = _run_runner_functions(
+        runner,
+        tmp_path,
+        f"UNIT_TEST_PACK={pack} NUM_NODES=1 UNIT_LAUNCH=0",
+        "NODE_DEVICES=(0 1 2 3 4 5 6 7) NODE_GPUS=8",
+        "UNIT_PROFILES=(delayed blockwise pairs)",
+        'launch_profile() { echo "$3 devices=$4 shard=$7"; }',
+        _functions(runner, "profile_spec", "run_profiled_command"),
+        "run_profiled_command prod full false tests/unit_tests/testmon_selector.py",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    if pack:
+        # Concurrent one-GPU FP8 processes, then the two-rank pairs as four disjoint shards.
+        expected = ["delayed devices=0 shard=", "blockwise devices=1 shard="] + [
+            f"pairs devices={2 * shard},{2 * shard + 1} shard={shard}/4" for shard in range(4)
+        ]
+    else:
+        expected = ["delayed devices= shard=", "blockwise devices= shard=", "pairs devices= shard="]
+    assert sorted(result.stdout.splitlines()) == sorted(expected)
 
 
 def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
@@ -637,14 +775,18 @@ def test_cpu_plan_execution(tmp_path, validation_status, selected_runs):
         (directory / "mandatory-tests").write_text("")
     (tmp_path / ".coverage.unit_tests").touch()
     runner = _source("tests/unit_tests/run_ci_test.sh")
-    functions = "\n".join(
-        name + "() {" + _function(runner, name) + "\n}"
-        for name in ("run_selected_phase", "write_testmon_summary", "run_enforced_tests")
+    functions = _functions(
+        runner,
+        "run_selected_phase",
+        "write_testmon_summary",
+        "run_enforced_tests",
+        *SELECTED_RUN_FUNCTIONS,
     )
     script = "\n".join(
         (
             "set -euo pipefail",
             "DISTRIBUTED_ARGS=() IGNORE_ARGS=()",
+            SELECTED_RUN_STATE,
             "MARKER_ARG='not flaky_in_dev'",
             "UNIT_TEST_REPEAT=2 NUM_NODES=1 GPUS_PER_NODE=8 PLATFORM=h100",
             "BUCKET=tests/unit_tests/test_example.py",

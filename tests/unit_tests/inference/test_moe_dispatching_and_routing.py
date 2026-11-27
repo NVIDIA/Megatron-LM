@@ -178,6 +178,7 @@ class TestInferenceTopKRouter:
             .to(torch.bfloat16)
         )
 
+    @pytest.mark.single_rank
     def test_init_rejects_num_groups(self):
         """InferenceTopKRouter requires moe_router_num_groups=None."""
         with pytest.raises(AssertionError, match="moe_router_num_groups"):
@@ -208,6 +209,7 @@ class TestInferenceTopKRouter:
         )
         assert router is not None
 
+    @pytest.mark.single_rank
     def test_training_mode_forward_returns_sparse(self):
         """In training mode, forward delegates to parent and returns sparse tensors."""
         router = self._make_router()
@@ -1381,6 +1383,7 @@ class TestMaskRoutingPadding:
     def _real_token_count(self, count):
         return torch.tensor([count], dtype=torch.int32, device="cuda")
 
+    @pytest.mark.single_rank
     @pytest.mark.parametrize("n_rows, real_count", [(16, 10), (128, 1), (7, 7), (64, 0)])
     def test_masks_rows_past_real_count(self, n_rows, real_count):
         """Rows >= real_count become -1; rows < real_count are untouched (tp_rank=0)."""
@@ -1416,6 +1419,7 @@ class TestMaskRoutingPadding:
         torch.testing.assert_close(routing_map[:3], original[:3])
         assert torch.all(routing_map[3:] == -1)
 
+    @pytest.mark.single_rank
     def test_sp_rank_fully_masked(self):
         """An SP rank entirely beyond real_count is fully masked.
 

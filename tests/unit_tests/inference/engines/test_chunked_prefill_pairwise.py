@@ -720,6 +720,20 @@ def _initialize_topology(case: _ChunkCase) -> None:
         assert parallel_state.get_data_parallel_world_size() == 2
 
 
+def _case_marks(case: _ChunkCase) -> list:
+    """Skip long-KV cases FA4 cannot split on SM90; a TP=PP=EP=1 case needs one rank."""
+    marks = []
+    if case.prefix_flow or case.name == "cuda-graph-mixed-phase":
+        marks.append(_SKIP_LONG_KV)
+    config = case.scenario.config
+    if all(
+        int(config.get(f"{dim}_model_parallel_size", 1)) == 1
+        for dim in ("tensor", "pipeline", "expert")
+    ):
+        marks.append(pytest.mark.single_rank)
+    return marks
+
+
 def _cleanup() -> None:
     gc.collect()
     delete_cuda_graphs()
@@ -1190,19 +1204,7 @@ class TestChunkedPrefillPairwise(_AsyncPairwiseHarness):
             ]
 
     @pytest.mark.parametrize(
-        "case",
-        [
-            pytest.param(
-                case,
-                id=case.name,
-                marks=(
-                    _SKIP_LONG_KV
-                    if case.prefix_flow or case.name == "cuda-graph-mixed-phase"
-                    else ()
-                ),
-            )
-            for case in _CASES
-        ],
+        "case", [pytest.param(case, id=case.name, marks=_case_marks(case)) for case in _CASES]
     )
     @torch.inference_mode()
     def test_chunked_prefill_matches_one_shot(self, case: _ChunkCase) -> None:

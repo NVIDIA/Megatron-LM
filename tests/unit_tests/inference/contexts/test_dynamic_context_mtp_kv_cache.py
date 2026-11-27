@@ -40,6 +40,8 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.paged_attention_test_utils import reference_paged_attention
 from tests.unit_tests.test_utilities import Utils
 
+pytestmark = pytest.mark.single_rank
+
 # Small, fixed geometry: block_size_tokens=8 keeps block-boundary crossings reachable with
 # two-digit positions, and max_sequence_length=64 gives max_kv_block_count=8 block columns.
 BLOCK_SIZE_TOKENS = 8

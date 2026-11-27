@@ -153,6 +153,12 @@ def model_defaults(backend, fa_version):
     )
 
 
+# Batch invariance is a property of each step's numerics, which the engine's GC mode cannot
+# change. The production default (freeze_overlap) runs two full collections at every engine
+# start and stop, and these tests build two to four engines per case.
+GC_MODE = "default"
+
+
 def build_engine(case, backend, fa_version):
     """Build the same tiny, real model for every ordering of a case."""
     torch.manual_seed(321)
@@ -212,6 +218,7 @@ def build_engine(case, backend, fa_version):
         use_cuda_graphs_for_non_decode_steps=False,
         unified_memory_level=0,
         async_sched_mode=AsyncScheduleMode.LEGACY,
+        gc_mode=GC_MODE,
     )
     options.update(case.context)
     ctx = DynamicInferenceContext(cfg, InferenceConfig(**options))
@@ -468,8 +475,18 @@ def target_prompt(length):
     return [(7 + i * 13) % (VOCAB - 2) + 1 for i in range(length)]
 
 
-def run_order(case, backend, fa_version, order, *, sampling=None):
-    """Run identical target histories alone, moved in a batch, or amid arrivals."""
+@contextmanager
+def labeled(label):
+    """Name the case in any failure inside it, for cases that share one test item."""
+    try:
+        yield
+    except BaseException as error:
+        error.add_note(f"case: {label}")
+        raise
+
+
+def new_engine(case, backend, fa_version):
+    """Build an engine whose CUDA-graph captures later witnesses can attribute."""
     with pytest.MonkeyPatch.context() as construction_patch:
         create_graphs = DynamicInferenceEngine.create_cuda_graphs
 
@@ -478,7 +495,24 @@ def run_order(case, backend, fa_version, order, *, sampling=None):
             return create_graphs(engine, *args, **kwargs)
 
         construction_patch.setattr(DynamicInferenceEngine, "create_cuda_graphs", capture)
-        engine = build_engine(case, backend, fa_version)
+        return build_engine(case, backend, fa_version)
+
+
+def run_order(case, backend, fa_version, order, *, sampling=None, engine=None):
+    """Run identical target histories alone, moved in a batch, or amid arrivals.
+
+    Runs share one build by passing the same `engine` from `new_engine(case, ...)`, which
+    each run first resets; only their request options (`sampling`) may differ. A builder
+    that must prepare every run on its engine sets `engine._bi_before_run`.
+    """
+    if engine is None:
+        engine = new_engine(case, backend, fa_version)
+    else:
+        engine.reset()
+        # Reset hands out the same blocks again. Refill the KV pool so a read of a slot this
+        # run never wrote finds new values, as on a fresh engine, not an earlier run's.
+        engine.context.memory_buffer.normal_()
+    getattr(engine, "_bi_before_run", lambda: None)()
     params = dict(
         num_tokens_to_generate=6,
         top_k=1,

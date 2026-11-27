@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Recurrent-state and real-inner-MTP complements to the dense BI campaign."""
 
+from copy import copy
 from functools import partial
 
 import pytest
@@ -88,6 +89,7 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
         materialize_only_last_token_logits=False,
         use_cuda_graphs_for_non_decode_steps=False,
         async_sched_mode="legacy",
+        gc_mode=bi.GC_MODE,
     )
     context_options.update(case.context)
     ctx = DynamicInferenceContext(cfg, InferenceConfig(**context_options))
@@ -188,6 +190,15 @@ def _build_model_engine(case, backend, version, *, mamba, engines, patch):
     return engine
 
 
+def _take_evidence(engine):
+    """Return what the finished run recorded and empty the record for the next run."""
+    evidence = engine._bi_model_evidence
+    taken = {key: copy(value) for key, value in evidence.items()}
+    for value in evidence.values():
+        value.clear()
+    return taken
+
+
 def _assert_same_mtp(reference, actual, depth):
     expected = {key: logits for key, _, _, logits in reference["mtp"]}
     compared = {d: 0 for d in range(depth)}
@@ -213,7 +224,15 @@ MAMBA_CASES = [
 ]
 
 
-@pytest.mark.parametrize("case", MAMBA_CASES, ids=lambda case: case.name)
+@pytest.mark.parametrize(
+    "case",
+    # A TP=PP=1 case builds one full model and needs no other rank.
+    [
+        pytest.param(case, marks=pytest.mark.single_rank) if case.tp == case.pp == 1 else case
+        for case in MAMBA_CASES
+    ],
+    ids=lambda case: case.name,
+)
 def test_mamba_dynamic_batch_invariance(case):
     engines = []
     with bi.invariant_runtime(case) as (backend, version), pytest.MonkeyPatch.context() as patch:
@@ -245,9 +264,11 @@ def test_mamba_dynamic_batch_invariance(case):
         )
 
 
-@pytest.mark.parametrize("depth", [1, 2])
+@pytest.mark.single_rank
 @pytest.mark.parametrize("graph_mode", ["eager", "decode", "mixed"])
-def test_mtp_dynamic_batch_invariance(depth, graph_mode):
+def test_mtp_dynamic_batch_invariance(graph_mode):
+    # Two speculative tokens run MTP depth 0 as well; nothing branches on a single depth.
+    depth = 2
     context = dict(num_speculative_tokens=depth)
     if graph_mode != "eager":
         context.update(num_cuda_graphs=-1, max_tokens=256)
@@ -264,18 +285,18 @@ def test_mtp_dynamic_batch_invariance(depth, graph_mode):
         sampling={"num_tokens_to_generate": 10},
         prompt_length=401 if graph_mode == "mixed" else 17,
     )
-    engines = []
     with bi.invariant_runtime(case) as (backend, version), pytest.MonkeyPatch.context() as patch:
         patch.setattr(
-            bi,
-            "build_engine",
-            partial(_build_model_engine, mamba=False, engines=engines, patch=patch),
+            bi, "build_engine", partial(_build_model_engine, mamba=False, engines=[], patch=patch)
         )
-        reference = bi.run_order(case, backend, version, "solo")
-        actual = bi.run_order(case, backend, version, "staggered")
+        # The orders differ only in their requests, so both run on one engine.
+        engine = bi.new_engine(case, backend, version)
+        reference = bi.run_order(case, backend, version, "solo", engine=engine)
+        expected = _take_evidence(engine)
+        actual = bi.run_order(case, backend, version, "staggered", engine=engine)
         bi.assert_same_target(reference, actual)
-        evidence = engines[1]._bi_model_evidence
-        compared, mtp_shapes = _assert_same_mtp(engines[0]._bi_model_evidence, evidence, depth)
+        evidence = engine._bi_model_evidence
+        compared, mtp_shapes = _assert_same_mtp(expected, evidence, depth)
         print("BI_MTP_LOGIT_WITNESS", depth, graph_mode, compared, mtp_shapes)
         if graph_mode == "eager":
             assert evidence["inner_calls"] == set(range(depth)), "missing actual target MTP depth"

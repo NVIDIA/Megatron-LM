@@ -907,6 +907,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
     def teardown_method(self):
         _cleanup()
 
+    @pytest.mark.single_rank
     @torch.inference_mode()
     def test_natural_depth_one_matches_ordinary_same_weight_rope(self):
         """An untouched real MTP head preserves greedy tokens and scores."""
@@ -922,6 +923,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         )
         assert treatment.witness.raw_depths and set(treatment.witness.raw_depths) == {0}
 
+    @pytest.mark.single_rank
     @torch.inference_mode()
     def test_local_rmsnorm_is_explicit_and_matches_ordinary(self, monkeypatch):
         """Local MTP selects RMSNorm independent of an earlier factory side effect."""
@@ -954,15 +956,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
                 )
             )
 
-    @torch.inference_mode()
-    def test_separate_depth_three_all_accept(self):
-        """Each distinct real MTP layer contributes a fully accepted proposal."""
-        case = _Case(name="separate-depth3-accept", depth=3, pattern="accept")
-        _, treatment = _run_mtp_pair(case)
-        assert set(treatment.witness.raw_depths) == {0, 1, 2}
-        assert set(treatment.witness.logical_depths) == {0, 1, 2}
-        assert all(value > 0 for value in treatment.accepted)
-
+    @pytest.mark.single_rank
     @pytest.mark.parametrize("repeated", [False, True], ids=["separate", "cached-repeated"])
     @torch.inference_mode()
     def test_depth_three_request_local_acceptance_and_block_rewind(self, repeated):
@@ -991,6 +985,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         else:
             assert any(before > after for _, _, before, after in rewinds)
 
+    @pytest.mark.single_rank
     @torch.inference_mode()
     def test_mtp_lru_prefix_cache_pressure_matches_cache_off(self):
         """A hit-bearing MTP request survives real LRU exhaustion and eviction."""
@@ -999,6 +994,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             {"name": "mtp2-lru", "feature": "mtp", "policy": PrefixCachingEvictionPolicy.LRU}
         )
 
+    @pytest.mark.single_rank
     @pytest.mark.parametrize("mode", ["persist", "offload", "recompute"])
     @torch.inference_mode()
     def test_suspend_resume_preserves_or_rebuilds_request_owned_mtp_state(self, mode):
@@ -1061,6 +1057,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             assert set(state["after_resume_waiting_ids"]) == set(request_ids)
             assert state["suspended_bytes"] == 0
 
+    @pytest.mark.single_rank
     @pytest.mark.parametrize("backend", ["torch", "flashinfer"])
     @torch.inference_mode()
     def test_sampling_filters_are_reproducible_with_mtp(self, backend):
@@ -1107,6 +1104,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
                 for token in request.generated_tokens
             )
 
+    @pytest.mark.single_rank
     @pytest.mark.parametrize("output_length", [5, 6])
     @torch.inference_mode()
     def test_length_remainder_trims_tokens_and_scores(self, output_length):
@@ -1121,6 +1119,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             )
         )
 
+    @pytest.mark.single_rank
     @pytest.mark.parametrize("keep", [True, False], ids=["keep", "strip"])
     @torch.inference_mode()
     def test_stop_sequence_trims_one_mtp_burst(self, keep):
@@ -1142,6 +1141,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
             _assert_complete(treatment, case)
             _assert_mtp_active(treatment, case)
 
+    @pytest.mark.single_rank
     @torch.inference_mode()
     def test_hybrid_mamba_partial_acceptance_selects_exact_intermediate_state(self):
         """Hybrid rewind commits the recurrent state at each accepted depth."""
@@ -1160,6 +1160,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         assert treatment.runtime["module-forward:hybrid"] > 0
         assert treatment.runtime["mamba-selective-rewind-checks"] > 0
 
+    @pytest.mark.single_rank
     @torch.inference_mode()
     def test_transformer_engine_fp8_executes_mtp_layers(self):
         """MTP and base TE modules both execute inside an enabled FP8 context."""
@@ -1186,6 +1187,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         assert treatment.runtime["mtp-fp8-context-forwards"] > 0
         assert treatment.runtime["mtp-fp8-recipe-forwards"] > 0
 
+    @pytest.mark.single_rank
     @torch.inference_mode()
     def test_dense_batch_invariant_mtp_is_exact_across_batch_composition(self):
         """A natural MTP request is bitwise invariant to neighbors and row order."""
@@ -1231,6 +1233,7 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         assert target_first.witness.accepted_by_request[0] == alone.witness.accepted_by_request[0]
         assert target_last.witness.accepted_by_request[0] == alone.witness.accepted_by_request[0]
 
+    @pytest.mark.single_rank
     @torch.inference_mode()
     def test_alternating_swa_executes_with_mtp(self):
         """Both local-window and full-attention layers run in an MTP session."""
@@ -1252,14 +1255,8 @@ class TestMTPPairwise(_DynamicEngineTestBase):
         assert treatment.runtime["mtp-full-attention-forwards"] > 0
 
 
+# tp2-pp2-sp-dp2 makes every pipeline assertion a pipeline-only case would.
 _PARALLEL_CASES = (
-    _Case(
-        name="pp2",
-        depth=2,
-        pattern="accept",
-        config={"pipeline_model_parallel_size": 2},
-        signals=("gpt",),
-    ),
     _Case(
         name="ep2-moe-optimized",
         depth=2,
@@ -1321,10 +1318,7 @@ class TestMTPPairwiseParallel(_DynamicEngineTestBase):
             assert parallel_state.get_expert_model_parallel_world_size() == ep
             ordinary, treatment = _run_mtp_pair(case)
             runtime = treatment.runtime
-            if case.name == "pp2":
-                assert runtime["pipeline-logits-broadcasts"] > 0
-                assert runtime["mtp-pipeline-logits-broadcasts"] > 0
-            elif case.name == "ep2-moe-optimized":
+            if case.name == "ep2-moe-optimized":
                 assert runtime["module-forward:inference-optimized"] > 0
                 assert runtime["module-forward:moe"] > 0
                 assert runtime["nccl-dispatchers-installed"] > 0
@@ -1339,7 +1333,7 @@ class TestMTPPairwiseParallel(_DynamicEngineTestBase):
                 assert parallel_state.get_data_parallel_world_size() == 2
                 outputs = [request.generated_tokens for request in treatment.requests]
                 acceptance = dict(treatment.witness.accepted_by_request)
-                dp_group = parallel_state.get_data_parallel_group_gloo()
+                dp_group = parallel_state.get_data_parallel_group()
                 gathered = [None] * torch.distributed.get_world_size(group=dp_group)
                 torch.distributed.all_gather_object(gathered, (outputs, acceptance), group=dp_group)
                 assert all(rank_result == (outputs, acceptance) for rank_result in gathered)

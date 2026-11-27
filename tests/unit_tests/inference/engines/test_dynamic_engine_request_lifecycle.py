@@ -15,6 +15,8 @@ from tests.unit_tests.inference.engines.request_lifecycle_test_utils import (
 )
 from tests.unit_tests.inference.engines.test_dynamic_engine_async_sched import _AsyncPairScenario
 
+pytestmark = pytest.mark.single_rank
+
 REQUEST_FIELD_POLICY = {
     "request_id": "checkpoint:preserve / merge:first",
     "uid": "checkpoint:regenerate-segment / merge:first",

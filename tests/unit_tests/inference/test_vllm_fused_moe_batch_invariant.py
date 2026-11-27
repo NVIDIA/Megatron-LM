@@ -25,10 +25,13 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     set_batch_invariant_mode,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not HAVE_TRITON,
-    reason="batch-invariant MoE kernels require CUDA and Triton",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or not HAVE_TRITON,
+        reason="batch-invariant MoE kernels require CUDA and Triton",
+    ),
+    pytest.mark.single_rank,
+]
 
 
 def _vt(n):

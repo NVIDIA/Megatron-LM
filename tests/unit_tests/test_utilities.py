@@ -279,6 +279,15 @@ class Utils:
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
     inited = False
     store = None
+    # Default for initialize_model_parallel's create_gloo_process_groups. A package whose
+    # tests never use Gloo groups can turn it off in its conftest.py: each group costs a
+    # TCP rendezvous to create and a blocking teardown to destroy.
+    create_gloo_process_groups = True
+    # Whether destroy_model_parallel also destroys the NCCL groups model-parallel init created.
+    # parallel_state drops its references but torch keeps every group registered until
+    # destroy_process_group(), which then spends ~27 ms on each: 14-35 s at the end of a
+    # multi-rank test process. Destroying a test's groups when it tears down costs less.
+    destroy_nccl_process_groups = False
 
     @staticmethod
     def initialize_distributed():
@@ -344,6 +353,10 @@ class Utils:
         except Exception:
             Utils.inited = False
             return
+        if Utils.destroy_nccl_process_groups:
+            for group in ps._global_process_group_list or ():
+                if group is not None and torch.distributed.get_backend(group) == "nccl":
+                    torch.distributed.destroy_process_group(group)
         ps.destroy_model_parallel()
         Utils.inited = False
         torch.cuda.memory.empty_cache()
@@ -368,6 +381,7 @@ class Utils:
             torch.distributed.barrier()
         ps.destroy_model_parallel()
         Utils.initialize_distributed()
+        kwargs.setdefault("create_gloo_process_groups", Utils.create_gloo_process_groups)
         ps.initialize_model_parallel(
             tensor_model_parallel_size,
             pipeline_model_parallel_size,
