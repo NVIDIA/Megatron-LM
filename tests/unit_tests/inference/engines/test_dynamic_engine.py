@@ -9258,8 +9258,8 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             # reconstructing acceptance reads a length the request never produced.
             assert sum(req.acceptance_step_lengths) == len(req.generated_tokens), (
                 f"Request {req.request_id}: acceptance_step_lengths "
-                f"{req.acceptance_step_lengths} sums to {sum(req.acceptance_step_lengths)} "
-                f"across {len(record.requests)} segment(s), but the request emitted "
+                f"{req.acceptance_step_lengths} sums to {sum(req.acceptance_step_lengths)}, "
+                f"but the request emitted "
                 f"{len(req.generated_tokens)} tokens"
             )
 
