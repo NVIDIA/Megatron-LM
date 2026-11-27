@@ -3,7 +3,31 @@
 import threading
 from unittest.mock import Mock
 
+import pytest
+
 from tests.test_utils.python_scripts import launch_nemo_run_workload
+
+
+@pytest.mark.parametrize("target", ["tests/unit_tests/bridge", "tests/unit_tests/**/*.py"])
+def test_unit_test_launch_target(monkeypatch, target):
+    # Capture the script the launcher builds from the actual H100 recipe.
+    class ScriptReady(Exception):
+        pass
+
+    script = Mock(side_effect=ScriptReady)
+    monkeypatch.setattr(launch_nemo_run_workload.run, "Script", script)
+    with pytest.raises(ScriptReady):
+        launch_nemo_run_workload.main.callback(
+            scope="unit-tests",
+            model="unit-tests",
+            test_case=target,
+            environment="dev",
+            platform="dgx_h100",
+            tag="latest",
+            container_image="test",
+        )
+
+    assert f'BUCKET="{target}"' in script.call_args.kwargs["inline"].splitlines()
 
 
 def test_nccl_watchdog_timeout_is_flaky():
