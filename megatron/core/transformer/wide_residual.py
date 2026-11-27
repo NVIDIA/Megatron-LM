@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import math
 from contextlib import nullcontext
-from dataclasses import replace
 from functools import partial
 from typing import Literal
 
@@ -762,56 +761,6 @@ def _gemm_autocast_recipe(stack_config, layer):
     if not stack_config.fp8 and stack_config.fp4 and config.fp4:
         return config.fp4_recipe
     return None
-
-
-def fused_residual_layer_specs(spec, submodules, read: str, write: str):
-    """Build first, interior and last layer specs, preserving the norm's checkpoint key."""
-    from megatron.core.extensions.transformer_engine import (
-        TEColumnParallelLinear,
-        TELayerNormColumnParallelLinear,
-    )
-    from megatron.core.tensor_parallel import (
-        InferenceColumnParallelLinear,
-        InferenceLayerNormColumnParallelLinear,
-    )
-    from megatron.core.transformer.identity_op import IdentityOp
-
-    try:
-        location = spec.module.get_input_layernorm_module(submodules)
-    except ValueError:
-        return (spec,) * 3
-
-    if len(location) == 1:  # the norm slot holds the norm
-        changes, norm_key = {location[0]: IdentityOp}, f"{location[0]}.weight"
-    else:  # the norm is fused into the branch's input projection
-        branch_name, projection = location
-        branch = getattr(submodules, branch_name)
-        # The MLP branch is a partial(MLP.as_mlp_submodule, submodules=...).
-        is_partial = isinstance(branch, partial)
-        branch_submodules = branch.keywords["submodules"] if is_partial else branch.submodules
-        unnormed_projections = {
-            TELayerNormColumnParallelLinear: TEColumnParallelLinear,
-            InferenceLayerNormColumnParallelLinear: InferenceColumnParallelLinear,
-        }
-        unfused = unnormed_projections.get(getattr(branch_submodules, projection, None))
-        if unfused is None:  # the projection does not apply the norm
-            return (spec,) * 3
-        branch_submodules = replace(branch_submodules, **{projection: unfused})
-        if is_partial:
-            branch = partial(branch, submodules=branch_submodules)
-        else:
-            branch = replace(branch, submodules=branch_submodules)
-        changes = {branch_name: branch}
-        norm_key = f"{branch_name}.{projection}.layer_norm_weight"
-    keys = {**submodules.sharded_state_dict_keys_map, f"{read}.weight": norm_key}
-    fused_read = replace(
-        submodules, **changes, sharded_state_dict_keys_map=keys, **{read: WriteReadNorm}
-    )
-    deferred_write = {write: DeferredWrite}
-    first = replace(spec, submodules=replace(submodules, **deferred_write))
-    middle = replace(spec, submodules=replace(fused_read, **deferred_write))
-    last = replace(spec, submodules=fused_read)
-    return first, middle, last
 
 
 def _unfused_error(layer) -> ValueError:

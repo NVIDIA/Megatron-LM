@@ -27,7 +27,10 @@ from megatron.core.ssm.gated_delta_product import (
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
-from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
+from megatron.core.ssm.wide_residual_mamba_layer import (
+    WideResidualMambaLayer,
+    WideResidualMambaLayerSubmodules,
+)
 from megatron.core.tensor_parallel import (
     InferenceColumnParallelLinear,
     InferenceLayerNormColumnParallelLinear,
@@ -79,7 +82,11 @@ from megatron.core.transformer.transformer_layer import (
     TransformerLayer,
     TransformerLayerSubmodules,
 )
-from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
+from megatron.core.transformer.wide_residual import DeferredWrite, WriteReadNorm
+from megatron.core.transformer.wide_residual_transformer_layer import (
+    WideResidualTransformerLayer,
+    WideResidualTransformerLayerSubmodules,
+)
 
 # This should be private and should not be used outside of this file.
 moe = get_moe_module_spec(
@@ -733,24 +740,71 @@ def with_norm_backend(stack_spec: ModuleSpec, norm_backend: str = "te") -> Modul
     return _replace_norm(stack_spec, get_norm_module_spec(norm_backend))
 
 
-def shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
-    """Fuse interior seams of the built-in wide specs. Custom specs own their seams."""
-    wide_specs = (
-        wide_residual_hybrid_stack_spec,
-        wide_residual_gated_delta_product_stack_spec,
-        wide_residual_hybrid_inference_stack_spec,
-        wide_residual_gated_delta_product_inference_stack_spec,
-    )
-    if not any(stack_spec is base for base in wide_specs):
-        return stack_spec
+def _shortcut_fusion_layer_specs(spec: ModuleSpec) -> tuple[ModuleSpec, ModuleSpec, ModuleSpec]:
+    """Move the input norm into the residual read and defer writes at interior seams."""
+    # The fused kernel performs the layernorm, so first map the linear's layernorm to its
+    # no norm version, while keeping the checkpoint key unchanged
+    try:
+        location = spec.module.get_input_layernorm_module(spec.submodules)
+    except ValueError:
+        return (spec,) * 3
+    if len(location) == 1:
+        (norm,) = location
+        without_norm = {norm: IdentityOp}
+        norm_key = f"{norm}.weight"
+    else:
+        branch_name, projection = location
+        branch = getattr(spec.submodules, branch_name)
+        # Dense MLP binds submodules by keyword. Attention and mixers use ModuleSpec.
+        if isinstance(branch, partial):
+            modules, rebuild = branch.keywords["submodules"], partial
+        else:
+            modules, rebuild = branch.submodules, replace
+        linear = {
+            TELayerNormColumnParallelLinear: TEColumnParallelLinear,
+            InferenceLayerNormColumnParallelLinear: InferenceColumnParallelLinear,
+        }.get(getattr(modules, projection, None))
+        if linear is None:
+            return (spec,) * 3
+        modules = replace(modules, **{projection: linear})
+        without_norm = {branch_name: rebuild(branch, submodules=modules)}
+        norm_key = f"{branch_name}.{projection}.layer_norm_weight"
 
+    # Map the fused residual read's weight to the original norm key.
+    if spec.module is WideResidualMambaLayer:
+        layer = WideResidualMambaLayerSubmodules.widen(spec.submodules)
+        suffix = ""
+    else:
+        layer = WideResidualTransformerLayerSubmodules.widen(spec.submodules)
+        suffix = "_mlp" if layer.self_attention is IdentityOp else "_self_attn"
+    read = f"residual_read{suffix}"
+    write = {f"residual_write{suffix}": DeferredWrite}
+    fused_read = replace(
+        layer,
+        **without_norm,
+        **{read: WriteReadNorm},
+        sharded_state_dict_keys_map={
+            **layer.sharded_state_dict_keys_map,
+            f"{read}.weight": norm_key,
+        },
+    )
+
+    first = replace(spec, submodules=replace(layer, **write))
+    middle = replace(spec, submodules=replace(fused_read, **write))
+    last = replace(spec, submodules=fused_read)
+    return first, middle, last
+
+
+def _get_shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
+    """Build a static wide-residual spec that fuses each interior seam."""
     submodules = stack_spec.submodules
     first, middle, last = {}, {}, {}
-    for field in fields(submodules):
-        spec = getattr(submodules, field.name)
-        if isinstance(spec, ModuleSpec) and hasattr(spec.module, "fused_residual_specs"):
-            name = field.name
-            first[name], middle[name], last[name] = spec.module.fused_residual_specs(spec)
+    for name, layer in vars(submodules).items():
+        if isinstance(layer, ModuleSpec) and layer.module in (
+            WideResidualMambaLayer,
+            WideResidualTransformerLayer,
+        ):
+            first[name], middle[name], last[name] = _shortcut_fusion_layer_specs(layer)
     return replace(
         stack_spec,
         submodules=replace(
@@ -760,6 +814,33 @@ def shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
             last_layer_submodules=replace(submodules, **last),
         ),
     )
+
+
+wide_residual_fused_hybrid_stack_spec = _get_shortcut_fusion_stack_spec(
+    wide_residual_hybrid_stack_spec
+)
+wide_residual_fused_gated_delta_product_stack_spec = _get_shortcut_fusion_stack_spec(
+    wide_residual_gated_delta_product_stack_spec
+)
+wide_residual_fused_hybrid_inference_stack_spec = _get_shortcut_fusion_stack_spec(
+    wide_residual_hybrid_inference_stack_spec
+)
+wide_residual_fused_gated_delta_product_inference_stack_spec = _get_shortcut_fusion_stack_spec(
+    wide_residual_gated_delta_product_inference_stack_spec
+)
+
+
+def shortcut_fusion_stack_spec(stack_spec: ModuleSpec) -> ModuleSpec:
+    """Select the fused counterpart of a built-in wide spec. Custom specs own their seams."""
+    if stack_spec is wide_residual_hybrid_stack_spec:
+        return wide_residual_fused_hybrid_stack_spec
+    if stack_spec is wide_residual_gated_delta_product_stack_spec:
+        return wide_residual_fused_gated_delta_product_stack_spec
+    if stack_spec is wide_residual_hybrid_inference_stack_spec:
+        return wide_residual_fused_hybrid_inference_stack_spec
+    if stack_spec is wide_residual_gated_delta_product_inference_stack_spec:
+        return wide_residual_fused_gated_delta_product_inference_stack_spec
+    return stack_spec
 
 
 # Backward-compatible aliases

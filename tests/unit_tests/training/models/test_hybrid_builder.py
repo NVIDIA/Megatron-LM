@@ -80,6 +80,7 @@ def test_gdp_checkpoint_selects_fused_inference_with_flag():
     assert resolve_hybrid_stack_spec(config) is base
     config.transformer.wide_residual = WideResidualConfig(num_streams=2)
     fused = resolve_hybrid_stack_spec(config)
+    assert fused is specs.wide_residual_fused_gated_delta_product_inference_stack_spec
     mamba = fused.submodules.mamba_layer.submodules
     assert mamba.residual_read is WriteReadNorm
     assert mamba.mixer.module is base.submodules.mamba_layer.submodules.mixer.module
