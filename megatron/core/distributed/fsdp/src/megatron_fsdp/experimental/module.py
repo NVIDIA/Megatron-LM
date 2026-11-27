@@ -371,6 +371,9 @@ class FsdpModule:
         # weights serve both phases already.
         if phase is Phase.BACKWARD and self._schedule_policy.unshard_all_planes_in_backward:
             phase = None
+        # Some forwards save MXFP8 weights for backward and need both planes up front.
+        if phase is Phase.FORWARD and self._schedule_policy.unshard_all_planes_in_forward:
+            phase = None
         with torch.cuda.stream(self.context.allgather_stream):
             for group in self._parameter_groups:
                 group.unshard_parameters(phase)
