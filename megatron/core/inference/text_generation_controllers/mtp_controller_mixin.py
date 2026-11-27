@@ -162,7 +162,9 @@ class MTPControllerMixin:
         Requires a graphed, decode-only main step. Under the NVLS dispatcher each rank decides
         locally (its all-gather-v / reduce-scatter-v accept per-rank token counts); under the NCCL
         and training dispatchers the EP batch-dimension sync makes every graphed step decode-only
-        on all ranks, so the decision is uniform there.
+        on all ranks, so the decision is uniform there. Idle EP ranks evaluate the same decision in
+        `_run_dummy_serial_mtp_forward` and then run `_mtp_dummy_commit_graphed_forward`, which
+        issues the commit pass's MoE collectives with the same token count.
         """
         return (
             self._mtp_resolved_padded_count is not None
@@ -192,22 +194,39 @@ class MTPControllerMixin:
         active_request_count: int,
         padded_count: int,
         base_position,
+        token_row_indices: Optional[Tensor] = None,
     ) -> None:
         """Commit pass for a graphed decode-only step, replayed from a CUDA graph.
 
-        Same KV writes as `_mtp_commit_pass` on a decode-only step: request r's accepted drafts
-        are refreshed from the main hiddens at positions `base_r - 1 - a_r ..`. Instead of
-        packing the variable number of refreshed rows, every request gets
-        `num_speculative_tokens` rows whose unused tail writes the dummy block, so the forward's
-        shape depends only on `padded_count`, needs no host sync, and replays the
+        Same KV writes as `_mtp_commit_pass` on a decode-only step, given the same
+        `token_row_indices`: request r's accepted drafts are refreshed from the main hiddens at
+        positions `base_r - 1 - a_r ..`. Instead of packing the variable number of refreshed rows,
+        every request gets `num_speculative_tokens` rows whose unused tail writes the dummy block,
+        so the forward's shape depends only on `padded_count`, needs no host sync, and replays the
         ("mtp_commit", padded_count) graph.
+
+        `token_row_indices` is async scheduling's map from each token row of the survivor-ordered
+        batch to its row in the forward that produced `gathered_hidden` (see `_mtp_commit_pass`);
+        None means the two orders agree. The gather reads through it on the GPU before the
+        replay, so it stays sync-free and leaves the captured shape unchanged.
         """
         num_slots = self.num_speculative_tokens
         real_rows = active_request_count * num_slots
         rows = self._mtp_commit_row_indices(padded_count)
-        hidden = gathered_hidden.index_select(0, rows.clamp(max=gathered_hidden.shape[0] - 1))
+        hidden_rows = rows
+        token_rows = rows + 1
+        if token_row_indices is not None:
+            # Async compaction leaves the hidden states and input tokens in the pending forward's
+            # row order; read them through the same row map as verification. Padded rows past
+            # the map are clamped here and zeroed below.
+            last = token_row_indices.shape[0] - 1
+            hidden_rows = token_row_indices[hidden_rows.clamp(max=last)]
+            token_rows = token_row_indices[token_rows.clamp(max=last)]
+        hidden = gathered_hidden.index_select(
+            0, hidden_rows.clamp(max=gathered_hidden.shape[0] - 1)
+        )
         input_ids = context.gpu_view.token_to_input_ids
-        tokens = input_ids.index_select(0, (rows + 1).clamp(max=input_ids.shape[0] - 1))
+        tokens = input_ids.index_select(0, token_rows.clamp(max=input_ids.shape[0] - 1))
         # Rows past the real requests read padding (or clamped) main-forward rows.
         hidden[real_rows:] = 0
         tokens[real_rows:] = 0
@@ -250,6 +269,7 @@ class MTPControllerMixin:
         num_decode_requests: int,
         active_request_count: int,
         base_position,
+        token_row_indices: Optional[Tensor] = None,
     ) -> bool:
         """Refresh every committed position's draft KV from the MAIN hidden (a per-step first pass).
 
@@ -259,6 +279,10 @@ class MTPControllerMixin:
         projections of the input (no RoPE), so only the write positions matter; the output hidden
         is discarded. `_mtp_decode_commit_segments` and `_mtp_prefill_commit_segments` derive the
         per-request positions.
+
+        `token_row_indices` is the async-scheduling map from each token row of the current
+        (survivor-ordered) batch to its row in the forward that produced `gathered_hidden`; None
+        means the two orders agree.
 
         Returns True if it issued a forward (caller runs a dummy slot otherwise for EP balance).
         """
@@ -270,7 +294,12 @@ class MTPControllerMixin:
         if num_decode_requests > 0:
             segments.append(
                 self._mtp_decode_commit_segments(
-                    context, gathered_hidden, num_decode_requests, base_position, stride
+                    context,
+                    gathered_hidden,
+                    num_decode_requests,
+                    base_position,
+                    stride,
+                    token_row_indices,
                 )
             )
         if active_request_count > num_decode_requests:
@@ -307,7 +336,13 @@ class MTPControllerMixin:
         return True
 
     def _mtp_decode_commit_segments(
-        self, context, gathered_hidden, num_decode_requests: int, base_position, stride: int
+        self,
+        context,
+        gathered_hidden,
+        num_decode_requests: int,
+        base_position,
+        stride: int,
+        token_row_indices: Optional[Tensor] = None,
     ) -> _CommitSegments:
         """Refresh the accepted-draft positions of every decode request from this step's hiddens.
 
@@ -317,7 +352,6 @@ class MTPControllerMixin:
         decode depth 0, so it is excluded here.
         """
         device = gathered_hidden.device
-        decode_len = num_decode_requests * stride
         accepted = (
             self._accepted_token_counts_per_request[:num_decode_requests]
             .to(device, non_blocking=True)
@@ -332,8 +366,6 @@ class MTPControllerMixin:
         # segment count must stay equal to the active request count.
         total_a = int(accepted.sum().item())
 
-        decode_hidden = gathered_hidden[:decode_len]  # [num_decode*stride, 1, H]
-        decode_tokens = context.gpu_view.token_to_input_ids[:decode_len]
         # `output_size` is already known on the host, so pass it and skip repeat_interleave's
         # own device sync.
         rows_d = torch.repeat_interleave(
@@ -343,11 +375,19 @@ class MTPControllerMixin:
             torch.arange(total_a, device=device) - (torch.cumsum(accepted, 0) - accepted)[rows_d]
         )
         hidden_idx = rows_d * stride + within_d  # base..draft_{a-2} main hiddens
+        token_idx = hidden_idx + 1  # draft_0..draft_{a-1}
+        if token_row_indices is not None:
+            # Async compaction reorders the pending forward's logits into survivor order but
+            # leaves its hidden states and input tokens in the forward's own row order. Read
+            # them through the same row map as verification, or a request moved into a
+            # finished request's row would commit that request's hiddens and tokens.
+            hidden_idx = token_row_indices[hidden_idx]
+            token_idx = token_row_indices[token_idx]
         return _CommitSegments(
             counts=accepted,
             starts=starts,
-            hidden=decode_hidden[hidden_idx],
-            tokens=decode_tokens[hidden_idx + 1],  # draft_0..draft_{a-1}
+            hidden=gathered_hidden[hidden_idx],
+            tokens=context.gpu_view.token_to_input_ids[token_idx],
         )
 
     def _mtp_prefill_commit_segments(
@@ -579,13 +619,17 @@ class MTPControllerMixin:
         )
         context.mtp_metadata.end_forward()
 
-    def _compute_serial_mtp_and_sample(self, base_position: Optional[Tensor] = None) -> None:
+    def _compute_serial_mtp_and_sample(
+        self, base_position: Optional[Tensor] = None, token_row_indices: Optional[Tensor] = None
+    ) -> None:
         """Run the MTP phase with the main forward's execution state held across it."""
         context = self.inference_wrapped_model.inference_context
         with context._mtp_forward_phase():
-            self._compute_serial_mtp_and_sample_impl(base_position)
+            self._compute_serial_mtp_and_sample_impl(base_position, token_row_indices)
 
-    def _compute_serial_mtp_and_sample_impl(self, base_position: Optional[Tensor]) -> None:
+    def _compute_serial_mtp_and_sample_impl(
+        self, base_position: Optional[Tensor], token_row_indices: Optional[Tensor] = None
+    ) -> None:
         """Compute MTP logits serially after verification and sample speculative tokens.
 
         This ensures that MTP predictions are always conditioned on verified tokens.
@@ -600,6 +644,9 @@ class MTPControllerMixin:
         Args:
             base_position (Optional[Tensor]): GPU position of the first new MTP draft
                 for each request. Legacy scheduling derives it from rewound CPU state.
+            token_row_indices (Optional[Tensor]): Async scheduling's map from each token row
+                of the survivor-ordered batch to its row in the pending forward, whose hidden
+                states and input tokens the commit pass reads. None when the orders agree.
         """
         nvtx_range_push("mtp-spec-decoding/serial-mtp-init")
         context = self.inference_wrapped_model.inference_context
@@ -683,6 +730,7 @@ class MTPControllerMixin:
                     active_request_count=active_request_count,
                     padded_count=padded_count,
                     base_position=base_position,
+                    token_row_indices=token_row_indices,
                 )
             elif not self._mtp_commit_pass(
                 context,
@@ -691,6 +739,7 @@ class MTPControllerMixin:
                 num_decode_requests=active_request_count - context.num_prefill_requests,
                 active_request_count=active_request_count,
                 base_position=base_position,
+                token_row_indices=token_row_indices,
             ):
                 self._mtp_dummy_prefill_forward(context, unwrapped_model)
 
@@ -831,7 +880,6 @@ class MTPControllerMixin:
         # overwritten by draft depth 0, or remains beyond the causal read range until a later
         # depth overwrites it. The main verifier reads a separate KV plane.
 
-    @torch.inference_mode()
     def _run_dummy_serial_mtp_forward(self) -> None:
         """Run dummy MTP forward passes to participate in EP collectives.
 
@@ -887,8 +935,9 @@ class MTPControllerMixin:
         context = self.inference_wrapped_model.inference_context
 
         # When the MTP KV cache is active, real ranks run one commit-pass forward before the
-        # depth loop. The dummy EP rank must mirror both the count (D+1 forwards) and the
-        # graph/eager mode, else the shared MoE all-to-all count/shape
+        # depth loop. The dummy EP rank must mirror the count (D+1 forwards), the commit pass's
+        # layout (fixed-shape on graphed decode-only steps, else the one-row prefill-style pass)
+        # and the graph/eager mode, else the shared MoE all-to-all count/shape
         # mismatches and the collective hangs. Mirror the real path's mode via the EP-synced
         # `_mtp_resolved_padded_count` (None iff the main step was eager) -- NOT the local live
         # `using_cuda_graph_this_step()`, which the commit pass clobbers on the real ranks.

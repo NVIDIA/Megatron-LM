@@ -40,7 +40,7 @@ from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_conte
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils, is_nccl_ep_available
+from tests.unit_tests.test_utilities import Utils, is_nccl_ep_available, te_reads_legacy_grouped_env
 
 pytestmark = [
     pytest.mark.internal,
@@ -518,7 +518,8 @@ class TestGroupedTensorDispatcherNumerics:
             pytest.skip("Distributed dispatcher tests must be launched with torchrun")
         self._old_single_param_env = os.environ.get("NVTE_GROUPED_LINEAR_SINGLE_PARAM")
         self._previous_experimental = mcore_config.ENABLE_EXPERIMENTAL
-        os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = "1"
+        if te_reads_legacy_grouped_env():
+            os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = "1"
         Utils.initialize_distributed()
 
     def teardown_method(self, method):
