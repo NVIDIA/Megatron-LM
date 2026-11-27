@@ -284,6 +284,14 @@ class OptimizerConfig:
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
+    muon_split_qkv_per_head: bool = False
+    """Under muon_tp_mode='layer_sharded', orthogonalize every attention head of a split QKV
+    weight on its own instead of every projection: per query group the fused rows are
+    [Q | gate | K | V], Q and the gate as heads of kv_channels rows, K and V one head each.
+    All heads of a weight run as one batched Newton-Schulz (emerging-optimizers >= 0.3.0).
+    A different update rule, off by default; requires muon_split_qkv and
+    muon_tp_mode='layer_sharded'."""
+
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
@@ -311,9 +319,10 @@ class OptimizerConfig:
     (P, Q) momentum on the home, the exact same full-matrix Newton-Schulz as duplicated
     mode runs there with zero communication and zero redundancy, and reverse all_to_all
     stages scatter the result back to the original shards. layer_sharded requires
-    optimizer='muon', the layer-wise distributed optimizer path and muon_split_qkv=False
-    (split-QKV Newton-Schulz is not implemented on the layer-sharded path); validate_run
-    checks all three. Defaults to "duplicated"."""
+    optimizer='muon', the layer-wise distributed optimizer path, and either
+    muon_split_qkv=False or muon_split_qkv_per_head=True (of the split-QKV rules only the
+    per-head one is implemented on the layer-sharded path); validate_run checks all three.
+    Defaults to "duplicated"."""
 
     muon_use_syrk: bool = False
     """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
@@ -513,6 +522,19 @@ class OptimizerConfig:
             and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
         )
 
+        if self.muon_split_qkv_per_head:
+            if not self.muon_split_qkv:
+                raise ValueError(
+                    "muon_split_qkv_per_head=True (--muon-split-qkv-per-head) is a split-QKV "
+                    "rule and cannot be combined with muon_split_qkv=False (--muon-no-split-qkv)."
+                )
+            if self.muon_tp_mode != 'layer_sharded':
+                raise ValueError(
+                    "muon_split_qkv_per_head is implemented for muon_tp_mode='layer_sharded' "
+                    f"only (got {self.muon_tp_mode!r}); use muon_tp_mode='layer_sharded' or "
+                    "drop muon_split_qkv_per_head."
+                )
+
         if self.muon_tp_mode == 'layer_sharded':
             # 'dist_muon' is the deprecated alias for muon + the layer-wise path.
             if self.optimizer not in ('muon', 'dist_muon'):
@@ -526,10 +548,11 @@ class OptimizerConfig:
                     "muon_tp_mode='layer_sharded' requires the layer-wise distributed "
                     "optimizer path (use_layer_wise_distributed_optimizer=True)."
                 )
-            if self.muon_split_qkv:
+            if self.muon_split_qkv and not self.muon_split_qkv_per_head:
                 raise ValueError(
-                    "muon_tp_mode='layer_sharded' does not implement split-QKV Newton-Schulz; "
-                    "set muon_split_qkv=False."
+                    "muon_tp_mode='layer_sharded' implements split-QKV Newton-Schulz per head "
+                    "only; set muon_split_qkv_per_head=True (--muon-split-qkv-per-head) or "
+                    "muon_split_qkv=False (--muon-no-split-qkv)."
                 )
 
         # Dtypes may still be CLI strings here; finalize_optimizer_config maps them to torch.dtype.
