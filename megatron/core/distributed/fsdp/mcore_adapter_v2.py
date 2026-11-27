@@ -308,6 +308,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     schedule_policy=replace(
                         schedule_policy,
                         unshard_all_planes_in_backward=collector.is_partially_recomputed(submodule),
+                        unshard_all_planes_in_forward=any(
+                            getattr(child, "needs_all_weight_planes_in_forward", False)
+                            for child in submodule.modules()
+                        ),
                     ),
                     **common_fully_shard_kwargs,
                 )

@@ -519,3 +519,110 @@ def test_mxfp8_backward_unshard_gathers_rowwise_for_recompute_inside_fsdp_module
     assert recomputed == [True]
     assert not _is_rowwise_allocated(model)
     assert not _is_columnwise_allocated(model)
+
+
+@pytest.mark.launch_on_gb200
+@requires_mxfp8
+@pytest.mark.parametrize(
+    "unshard_all_planes_in_forward", [False, True], ids=["phase_planes", "all_planes_in_forward"]
+)
+def test_mxfp8_forward_unshard_gathers_columnwise_only_when_requested(
+    distributed_setup, unshard_all_planes_in_forward
+):
+    """Checks a unit's forward gathers its columnwise planes only with the opt-in.
+
+    Only ``fc1`` opts in; ``fc2`` keeps rowwise-only forward planes, and backward still
+    releases every plane.
+    """
+    device = distributed_setup.device
+    if distributed_setup.world_size < 2:
+        pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
+
+    recipe = MXFP8BlockScaling()
+    with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+        model = _RecomputedMLP(device, use_reentrant=None)
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    policy = SchedulePolicy(unshard_all_planes_in_forward=unshard_all_planes_in_forward)
+    with fully_shard_context(FsdpContext(device=device)):
+        fully_shard(model.fc1, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
+        fully_shard(model.fc2, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+        fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+
+    planes = []
+
+    # Registered after fully_shard(), so it runs after fc1's FSDP pre-hook has unsharded it.
+    def record_forward_planes(_module, _args):
+        planes.append(
+            (
+                (_is_rowwise_allocated(model.fc1), _is_columnwise_allocated(model.fc1)),
+                (_is_rowwise_allocated(model.fc2), _is_columnwise_allocated(model.fc2)),
+            )
+        )
+
+    model.fc1.register_forward_pre_hook(record_forward_planes)
+    x = torch.randn(32, 64, dtype=torch.bfloat16, device=device)
+    with te.autocast(recipe=recipe):
+        output = model(x)
+    output.float().square().mean().backward()
+
+    # fc1 prefetched fc2 for its forward GEMMs, which need only rowwise planes.
+    assert planes == [((True, unshard_all_planes_in_forward), (True, False))]
+    for module in (model.fc1, model.fc2):
+        assert not _is_rowwise_allocated(module)
+        assert not _is_columnwise_allocated(module)
+
+
+class _BatchedProjectionBlock(nn.Module):
+    """DSv4-style grouped projection followed by a dense output layer."""
+
+    def __init__(self, device) -> None:
+        super().__init__()
+        from megatron.core.extensions.te_batched_linear import TEBatchedLinear
+
+        self.proj = TEBatchedLinear(
+            2, 128, 128, input_batch_dim=-2, bias=False, dtype=torch.bfloat16, device=device
+        )
+        self.out = te.Linear(256, 64, params_dtype=torch.bfloat16, device=device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Project each group, then mix the groups."""
+        return self.out(self.proj(x).flatten(-2))
+
+
+@pytest.mark.launch_on_gb200
+@requires_mxfp8
+def test_mxfp8_batched_linear_trains_with_all_planes_in_forward(distributed_setup):
+    """Checks DSv4's batched projection trains as a sharded MXFP8 unit with the opt-in.
+
+    TE's BatchedLinear saves the weight for backward, so the projection rejects a forward
+    whose unit gathered only rowwise planes. MCore requests both planes for modules that
+    declare ``needs_all_weight_planes_in_forward``.
+    """
+    from megatron.core.extensions.te_batched_linear import TEBatchedLinear
+
+    if TEBatchedLinear is None:
+        pytest.skip("Transformer Engine BatchedLinear is unavailable.")
+    device = distributed_setup.device
+    if distributed_setup.world_size < 2:
+        pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
+    assert TEBatchedLinear.needs_all_weight_planes_in_forward
+
+    recipe = MXFP8BlockScaling()
+    with te.quantized_model_init(recipe=recipe, preserve_high_precision_init_val=True):
+        model = _BatchedProjectionBlock(device)
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    policy = SchedulePolicy(unshard_all_planes_in_forward=True)
+    with fully_shard_context(FsdpContext(device=device)):
+        fully_shard(model.proj, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
+        fully_shard(model.out, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+        fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
+
+    torch.manual_seed(1234 + distributed_setup.rank)
+    for _ in range(2):
+        x = torch.randn(128, 2, 128, dtype=torch.bfloat16, device=device, requires_grad=True)
+        with te.autocast(recipe=recipe):
+            output = model(x)
+        output.float().square().mean().backward()
+        assert torch.isfinite(x.grad).all() and torch.count_nonzero(x.grad)
+        assert not _is_rowwise_allocated(model.proj)
+        assert not _is_columnwise_allocated(model.proj)

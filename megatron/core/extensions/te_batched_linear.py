@@ -38,10 +38,13 @@ if BatchedLinear is not None:
         The operation view shares storage, but never replaces the registered
         parameter during forward/backward or changes its shape in place.
 
-        Training with MFSDPv2 phase-sharded MXFP8 primary weights is unsupported:
-        TE saves a weight view that needs both orientations available in forward.
-        BF16 primary weights and replicated MXFP8 compute weights are unaffected.
+        With MXFP8 primary weights TE saves a weight view that needs both orientations
+        in forward. MFSDP v2 gathers forward weights rowwise only, so this module asks it
+        to gather both planes in forward (``needs_all_weight_planes_in_forward``).
         """
+
+        # Read by MFSDP v2 when choosing which MXFP8 planes a forward unshard gathers.
+        needs_all_weight_planes_in_forward = True
 
         weight: torch.nn.Parameter
         _init_method: Callable[[torch.Tensor], object]

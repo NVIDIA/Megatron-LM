@@ -39,6 +39,11 @@ class SchedulePolicy:
             re-entering this module's forward hooks, e.g. a checkpointed submodule.
             Otherwise, backward unshards gather only columnwise planes, and the
             recomputation fails in Transformer Engine.
+        unshard_all_planes_in_forward: Whether forward unshards and prefetches of this
+            module gather MXFP8 columnwise planes along with rowwise ones. Enable it when
+            a module's forward needs both orientations of its MXFP8 weights, e.g. an
+            operation that saves the weight for backward and validates both planes up
+            front. Backward still re-gathers the columnwise planes into the same storage.
     """
 
     forward_prefetch_size: int | None = None
@@ -46,6 +51,7 @@ class SchedulePolicy:
     register_hooks: bool = True
     grad_accumulation_count: int | None = None
     unshard_all_planes_in_backward: bool = False
+    unshard_all_planes_in_forward: bool = False
 
     def __post_init__(self) -> None:
         """Validate non-negative prefetch budgets."""
