@@ -186,6 +186,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         FullyShardedDataParallelV2._validate_config(
             config, ddp_config, module, pg_collection, disable_bucketing
         )
+        active_context = current_fully_shard_context()
+        if config.overlap_moe_expert_parallel_comm and (
+            ddp_config.fsdp_grad_staging_on_compute
+            or (active_context is not None and active_context.grad_staging_on_compute_stream)
+        ):
+            raise ValueError(
+                "Compute-stream gradient staging requires MoE EP overlap to be disabled."
+            )
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -271,6 +279,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         common_fully_shard_kwargs = dict(
             mixed_precision_policy=self.mp_policy,
+            gradient_accumulation_fusion=config.gradient_accumulation_fusion,
             shard_layout=(
                 ShardLayout.PADDED
                 if ddp_config.megatron_fsdp_padded_shards
@@ -280,7 +289,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
-        active_context = current_fully_shard_context()
         if active_context is None:
             construction_context = fully_shard_context(
                 FsdpContext(
@@ -289,6 +297,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
+                        grad_staging_on_compute_stream=ddp_config.fsdp_grad_staging_on_compute,
                     ),
                 )
             )
@@ -438,8 +447,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires "
                 "expert_num_distributed_optimizer_instances > 1."
             )
-        if config.gradient_accumulation_fusion:
-            raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
         if config.calculate_per_token_loss and (
             config.pipeline_model_parallel_size != 1
             or ddp_config.num_distributed_optimizer_instances != 1
