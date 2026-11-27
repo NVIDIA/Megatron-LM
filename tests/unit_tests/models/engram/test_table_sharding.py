@@ -25,6 +25,13 @@ sum once.
 
 One case sets the expert grid to EP1 or EP4 instead. ``parallel_size=2`` then shards and
 replicates the rows over groups that the expert grid does not have.
+
+Every case looks rows up with NCCL all-to-alls (``communication_backend='nccl'``) unless it
+names the symmetric backend. The symmetric parametrization of the lookup case needs GPUs and
+the transport's libraries (CuTe DSL >= 4.8.1, nccl4py >= 0.6.0 with a matching NCCL runtime and
+device bitcode, PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True) and skips without them. It
+sums the gradients of duplicate rows on the requester before the owner adds them, so with
+random gradients it matches the other layouts to bf16 rounding.
 """
 
 import hashlib
@@ -42,9 +49,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from megatron.core.models.engram import distributed_embedding, table_sharding
+from megatron.core.models.engram import distributed_embedding, symmetric_lookup, table_sharding
 from megatron.core.models.engram.config import EngramConfig
 from megatron.core.models.engram.distributed_embedding import EPShardedMultiTableEmbedding
+from megatron.core.models.engram.symmetric_lookup import (
+    initialize_engram_transports,
+    select_engram_lookup,
+)
 from megatron.core.models.engram.table_sharding import (
     ENGRAM_PARAMETER_DOMAIN,
     clear_engram_parallel_state,
@@ -59,6 +70,14 @@ from megatron.core.process_groups_config import (
 )
 from megatron.core.utils import get_pg_rank, get_pg_size
 
+from ._reference_transport import ReferenceEngramTransport
+from ._test_utils import (
+    closing_symmetric_transports,
+    make_module_config,
+    make_pg_collection,
+    symmetric_transport_or_skip,
+)
+
 WORLD_SIZE = 4
 EP_SIZE = 2
 EXPERT_DP_SIZE = 2
@@ -71,8 +90,12 @@ SHARDED_SIZES = (WORLD_SIZE, EP_SIZE)
 ORDER = "tp-cp-ep-dp-pp"
 
 
-def _engram_config(parallel_size=None):
-    """A small configuration; the qwen variant needs no tokenizer artifact."""
+def _engram_config(parallel_size=None, communication_backend="nccl", **overrides):
+    """A small configuration; the qwen variant needs no tokenizer artifact.
+
+    The NCCL lookup unless a case names another backend: the symmetric one, the sharded
+    layout's default, needs GPUs and the transport's libraries.
+    """
     return EngramConfig(
         global_vocab_sizes=(11, 11),
         layer_ids=(1,),
@@ -85,6 +108,8 @@ def _engram_config(parallel_size=None):
         variant="qwen",
         unigram_vocab_size=32,
         parallel_size=parallel_size,
+        communication_backend=communication_backend,
+        **overrides,
     )
 
 
@@ -179,12 +204,19 @@ _ENGRAM_FLAGS = (
 )
 
 
-def _validate_cli(monkeypatch, flags, engram=True, world_size=WORLD_SIZE):
-    """Parse and validate the arguments of a run, of four ranks unless told otherwise."""
+def _validate_cli(monkeypatch, flags, engram=True, backend="nccl", world_size=WORLD_SIZE):
+    """Parse and validate the arguments of a run, of four ranks unless told otherwise.
+
+    With Engram, the NCCL lookup unless ``backend`` names another one or is None (the
+    layout's default).
+    """
     from megatron.training.arguments import parse_args, validate_args
 
     monkeypatch.setenv("WORLD_SIZE", str(world_size))
-    argv = f"{_TRAINING_ARGV} {_ENGRAM_FLAGS if engram else ''} {flags}"
+    engram_flags = _ENGRAM_FLAGS if engram else ""
+    if engram and backend is not None:
+        engram_flags += f" --engram-communication-backend {backend}"
+    argv = f"{_TRAINING_ARGV} {engram_flags} {flags}"
     monkeypatch.setattr(sys, "argv", argv.split())
     args = parse_args()
     validate_args(args)
@@ -395,6 +427,213 @@ def test_cli_rejects_unsupported_max_parallel_sizes(monkeypatch, flags, world_si
         _validate_cli(monkeypatch, flags, world_size=world_size)
 
 
+def test_communication_backend_follows_the_layout(monkeypatch):
+    """None looks the EP layout up with NCCL and the sharded one with the symmetric transport,
+    except one rank per row group, whose rows either backend looks up locally."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert _engram_config(communication_backend=None).communication_backend == "nccl"
+    assert _engram_config(WORLD_SIZE).communication_backend == "nccl"
+    # Without CUDA too: a single-rank row group asks nothing of the symmetric toolchain.
+    assert _engram_config(1, communication_backend=None).communication_backend == "nccl"
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    sharded = _engram_config(WORLD_SIZE, communication_backend=None)
+    assert sharded.communication_backend == "symmetric"
+    assert sharded.symmetric_workspace_mb == 64
+    assert _engram_config(EP_SIZE, communication_backend=None).communication_backend == (
+        "symmetric"
+    )
+    # Named explicitly, symmetric stays symmetric (and is checked) with one rank per row group.
+    assert _engram_config(1, "symmetric").communication_backend == "symmetric"
+
+
+@pytest.mark.parametrize(
+    ("parallel_size", "overrides", "cuda", "error"),
+    [
+        (None, dict(communication_backend="symmetric"), True, "requires engram_parallel_size"),
+        (WORLD_SIZE, dict(communication_backend="all_to_all"), True, "must be one of"),
+        (WORLD_SIZE, dict(communication_backend="symmetric"), False, "needs CUDA"),
+        # Without CUDA the sharded layout's default fails too (above one rank per row group); it
+        # never turns into NCCL silently.
+        (WORLD_SIZE, dict(communication_backend=None), False, "needs CUDA"),
+        (WORLD_SIZE, dict(symmetric_workspace_mb=0), True, "positive integer"),
+        (WORLD_SIZE, dict(symmetric_workspace_mb=64.0), True, "positive integer"),
+    ],
+    ids=[
+        "ep_layout",
+        "unknown_backend",
+        "no_cuda",
+        "default_without_cuda",
+        "empty_workspace",
+        "float_workspace",
+    ],
+)
+def test_communication_backend_rejections(monkeypatch, parallel_size, overrides, cuda, error):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    with pytest.raises(ValueError, match=error):
+        _engram_config(parallel_size, **overrides)
+
+
+# A sharded run that validate_args accepts with the symmetric backend's setup.
+_SHARDED_FLAGS = "--engram-parallel-size 4 --use-distributed-optimizer"
+
+
+def _symmetric_setup(
+    monkeypatch, cuda=True, alloc_conf="expandable_segments:True", generic_alloc_conf=None
+):
+    """Pretend CUDA (validate_args queries no GPU for these arguments) and set the allocator:
+    ``alloc_conf`` in PYTORCH_CUDA_ALLOC_CONF, ``generic_alloc_conf`` in PYTORCH_ALLOC_CONF."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda)
+    monkeypatch.delenv("PYTORCH_HIP_ALLOC_CONF", raising=False)
+    for name, value in (
+        ("PYTORCH_CUDA_ALLOC_CONF", alloc_conf),
+        ("PYTORCH_ALLOC_CONF", generic_alloc_conf),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+def test_cli_resolves_the_communication_backend(monkeypatch):
+    """Each layout's default backend reaches EngramConfig, with the workspace size."""
+    args = _validate_cli(monkeypatch, "", backend=None)
+    assert args.engram_communication_backend == "nccl"
+    # One rank per row group defaults to NCCL, without CUDA or the allocator setup.
+    _symmetric_setup(monkeypatch, cuda=False, alloc_conf=None)
+    args = _validate_cli(
+        monkeypatch, "--engram-parallel-size 1 --use-distributed-optimizer", backend=None
+    )
+    assert args.engram_communication_backend == "nccl"
+    assert EngramConfig.from_args(args, _transformer_config()).communication_backend == "nccl"
+    # The device-generic variable counts when the CUDA one is unset.
+    _symmetric_setup(monkeypatch, alloc_conf=None, generic_alloc_conf="expandable_segments:True")
+    args = _validate_cli(monkeypatch, _SHARDED_FLAGS, backend=None)
+    assert args.engram_communication_backend == "symmetric"
+    _symmetric_setup(monkeypatch, alloc_conf="max_split_size_mb:512,expandable_segments:True")
+    args = _validate_cli(
+        monkeypatch, f"{_SHARDED_FLAGS} --engram-symmetric-workspace-mb 16", backend=None
+    )
+    assert args.engram_communication_backend == "symmetric"
+    config = EngramConfig.from_args(args, _transformer_config())
+    assert (config.parallel_size, config.communication_backend, config.symmetric_workspace_mb) == (
+        WORLD_SIZE,
+        "symmetric",
+        16,
+    )
+    # The NCCL reference stays available to the sharded layout, without the symmetric setup.
+    _symmetric_setup(monkeypatch, cuda=False, alloc_conf=None)
+    args = _validate_cli(monkeypatch, _SHARDED_FLAGS)
+    assert EngramConfig.from_args(args, _transformer_config()).communication_backend == "nccl"
+
+
+# Neither CUDA nor expandable segments: the setups the transport cannot serve at all are named
+# before its CUDA and allocator requirements.
+_BARE = dict(cuda=False, alloc_conf=None)
+
+
+@pytest.mark.parametrize(
+    ("flags", "setup", "error"),
+    [
+        ("--engram-communication-backend symmetric", {}, "requires --engram-parallel-size"),
+        (_SHARDED_FLAGS, dict(cuda=False), "needs CUDA"),
+        (_SHARDED_FLAGS, dict(alloc_conf=None), "expandable_segments:True"),
+        (_SHARDED_FLAGS, dict(alloc_conf="expandable_segments:False"), "expandable_segments:True"),
+        # PyTorch reads the CUDA variable when it is set and ignores the device-generic one.
+        (
+            _SHARDED_FLAGS,
+            dict(alloc_conf="max_split_size_mb:512", generic_alloc_conf="expandable_segments:True"),
+            "expandable_segments:True",
+        ),
+        (f"{_SHARDED_FLAGS} --fake-process-group", _BARE, "fake process group"),
+        (
+            f"{_SHARDED_FLAGS} --moe-use-upcycling --save /nonexistent --save-interval 1",
+            _BARE,
+            "--moe-use-upcycling",
+        ),
+        (f"{_SHARDED_FLAGS} --inprocess-restart", _BARE, "--inprocess-restart"),
+        (f"{_SHARDED_FLAGS} --engram-symmetric-workspace-mb 0", {}, "must be positive"),
+    ],
+    ids=[
+        "ep_layout",
+        "no_cuda",
+        "no_expandable_segments",
+        "expandable_segments_off",
+        "generic_alloc_conf_hidden",
+        "fake_process_group",
+        "upcycling",
+        "inprocess_restart",
+        "empty_workspace",
+    ],
+)
+def test_cli_rejects_unsupported_symmetric_setups(monkeypatch, flags, setup, error):
+    """The symmetric transport's requirements are errors at startup, not warnings."""
+    _symmetric_setup(monkeypatch, **setup)
+    with pytest.raises(AssertionError, match=error):
+        _validate_cli(monkeypatch, flags, backend=None)
+
+
+def test_cli_backend_requires_engram(monkeypatch):
+    with pytest.raises(AssertionError, match="requires Engram"):
+        _validate_cli(monkeypatch, "--engram-communication-backend nccl", engram=False)
+
+
+def test_engram_lookup_adds_no_state_dict_keys(monkeypatch):
+    """The Engram layer calls its lookup through a bound method or a plain object, which adds
+    no submodule and no state-dict key, with either backend."""
+    from megatron.core.models.engram import engram as engram_module
+
+    def build(engram_config):
+        torch.manual_seed(0)
+        return engram_module.Engram(
+            config=make_module_config(),
+            engram_config=engram_config,
+            layer_number=1,
+            pg_collection=make_pg_collection(),
+        )
+
+    nccl = build(_engram_config())
+    # NCCL lookups call the embedding module itself, hooks included, as before.
+    assert nccl._lookup == nccl.embedding.__call__
+    # The symmetric lookup of a two-rank row group, without its libraries or a process group:
+    # the embedding then holds whole tables, which changes none of its keys.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(symmetric_lookup, "require_symmetric_transport", lambda: None)
+    monkeypatch.setattr(symmetric_lookup, "select_row_accumulation", lambda: None)
+    monkeypatch.setattr(symmetric_lookup, "get_pg_size", lambda group: 2)
+    monkeypatch.setattr(
+        engram_module,
+        "resolve_engram_groups",
+        lambda pg_collection, engram_config: (None, None, ENGRAM_PARAMETER_DOMAIN),
+    )
+    symmetric = build(_engram_config(2, "symmetric"))
+    assert isinstance(symmetric._lookup, symmetric_lookup.SymmetricEngramLookup)
+    assert symmetric._lookup.embedding is symmetric.embedding
+    for module in (nccl, symmetric):
+        assert all(name != "_lookup" for name, _ in module.named_modules())
+        assert all(not name.startswith("_lookup") for name in module.state_dict())
+    assert list(symmetric.state_dict()) == list(nccl.state_dict())
+    assert [name for name, _ in symmetric.named_parameters()] == [
+        name for name, _ in nccl.named_parameters()
+    ]
+    # Distributed checkpoints see the same sharded keys and shard geometry too. A stand-in
+    # one-rank dp_cp group keeps the default-group lookup out of this single-process test.
+    one_rank = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+
+    def sharded_geometry(module):
+        state = module.sharded_state_dict(metadata={"dp_cp_group": one_rank})
+        return {key: (tensor.global_shape, tensor.global_offset) for key, tensor in state.items()}
+
+    assert sharded_geometry(symmetric) == sharded_geometry(nccl)
+    assert "embedding.tables.0.weight" in sharded_geometry(symmetric)
+    # forward looks the rows up through the selected lookup.
+    calls = []
+    lookup = nccl._lookup
+    nccl._lookup = lambda hash_ids: calls.append(tuple(hash_ids.shape)) or lookup(hash_ids)
+    input_ids = torch.tensor([[1, 4, 2, 7], [3, 5, 9, 2]])
+    nccl(torch.randn(4, 2, 8, dtype=torch.float64), input_ids)
+    assert calls == [(2, 4, 2)]
+
+
 @pytest.mark.parametrize(
     "ep, dp, pp, cp", [(2, 4, 1, 1), (4, 4, 1, 1), (2, 4, 2, 1), (2, 2, 1, 2), (4, 4, 1, 2)]
 )
@@ -417,7 +656,8 @@ def test_dp_cp_holds_the_expert_grid_in_ep_blocks(ep, dp, pp, cp):
 
 
 def test_builder_sets_up_the_groups_before_building_the_model(monkeypatch):
-    """Every rank sets the groups up on the collection that the stages and DDP get, first."""
+    """Every rank sets the groups up on the collection that the stages and DDP get, first, and
+    starts the lookup transports on the wrapped stages, before any post-wrap hook."""
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.training.models import hybrid
 
@@ -427,21 +667,35 @@ def test_builder_sets_up_the_groups_before_building_the_model(monkeypatch):
         "initialize_engram_parallel_state",
         lambda pg_collection, config: events.append(("initialize", pg_collection, config)),
     )
+    stages = [object()]
 
     def build_stages(build_model, transformer_config, pg_collection, *args, **kwargs):
         events.append(("build", pg_collection))
-        return [object()]
+        return stages
 
     monkeypatch.setattr(hybrid, "unimodal_build_distributed_models", build_stages)
+    monkeypatch.setattr(
+        hybrid,
+        "initialize_engram_transports",
+        lambda model_list, pg_collection, config: events.append(
+            ("transports", model_list, pg_collection, config)
+        ),
+    )
     engram_config = _engram_config(WORLD_SIZE)
     model_config = hybrid.HybridModelConfig(
         transformer=TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=1),
         vocab_size=1024,
         engram_config=engram_config,
+        post_wrap_hooks=[lambda model_list: events.append(("post_wrap", model_list)) or model_list],
     )
     pg_collection = object()
     hybrid.HybridModelBuilder(model_config).build_distributed_models(pg_collection)
-    assert events == [("initialize", pg_collection, engram_config), ("build", pg_collection)]
+    assert events == [
+        ("initialize", pg_collection, engram_config),
+        ("build", pg_collection),
+        ("transports", stages, pg_collection, engram_config),
+        ("post_wrap", stages),
+    ]
 
 
 def test_legacy_hybrid_builder_rejects_table_sharding():
@@ -469,6 +723,43 @@ def test_destroy_model_parallel_clears_the_engram_state(monkeypatch):
     monkeypatch.setitem(table_sharding._ROW_GROUPS, (stale, WORLD_SIZE), (stale, stale))
     parallel_state.destroy_model_parallel()
     assert table_sharding._ROW_GROUPS == {}
+
+
+def test_destroy_model_parallel_aborts_the_engram_transports(monkeypatch):
+    """Teardown aborts open symmetric transports without a device barrier (a failed peer would
+    never join one), found by module name like the table state; once closed, it is a no-op."""
+    from megatron.core import parallel_state
+
+    closed = []
+    monkeypatch.setitem(
+        symmetric_lookup._TRANSPORTS,
+        object(),
+        SimpleNamespace(close=lambda clean=False: closed.append(clean)),
+    )
+    monkeypatch.setattr(symmetric_lookup, "_INITIALIZED", True)
+    parallel_state.destroy_model_parallel()
+    assert closed == [False]
+    assert symmetric_lookup._TRANSPORTS == {} and not symmetric_lookup._INITIALIZED
+    parallel_state.destroy_model_parallel()
+    assert closed == [False]
+
+
+def test_symmetric_backend_rejects_a_fake_process_group(monkeypatch):
+    """A configuration built in code reaches the core check, which the CLI's does not cover: on
+    a fake process group, the transport's first NCCL communicator would wait forever for row
+    ranks that do not exist. Every rank raises before the library check and any collective."""
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_backend", lambda group=None: "fake")
+    checked = []
+    monkeypatch.setattr(
+        symmetric_lookup, "require_symmetric_transport", lambda: checked.append("require")
+    )
+    engram_config = _engram_config(WORLD_SIZE)
+    # Built for NCCL, which needs no CUDA; the backend only steers the initialization here.
+    engram_config.communication_backend = "symmetric"
+    with pytest.raises(ValueError, match="fake process group"):
+        initialize_engram_parallel_state(ProcessGroupCollection(), engram_config)
+    assert checked == []
 
 
 # ---------------------------------------------------------------------------------------------
@@ -702,6 +993,128 @@ def test_ep_layout_and_repeated_setups_run_no_collective(tmp_path):
     _spawn_gloo_case(tmp_path, _reuse_case)
 
 
+def _symmetric_initialization_case(rank):
+    groups = _mpu_groups(rank, ep=EP_SIZE)
+
+    def config(parallel_size):
+        # Built for NCCL, which needs no CUDA; the backend only steers the initialization here.
+        engram_config = _engram_config(parallel_size)
+        engram_config.communication_backend = "symmetric"
+        return engram_config
+
+    # A library missing on rank 1 fails on every rank, before any group is created.
+    def require():
+        if rank == 1:
+            raise ImportError("simulated missing NCCL device bitcode")
+
+    symmetric_lookup.require_symmetric_transport = require
+    with pytest.raises(ImportError, match=r"unavailable on ranks \[1\]") as error:
+        initialize_engram_parallel_state(_collection(groups), config(WORLD_SIZE))
+    assert ("simulated missing NCCL device bitcode" in str(error.value)) == (rank == 1)
+    assert table_sharding._ROW_GROUPS == {}
+
+    # With the libraries on every rank: the row and replica groups are created.
+    checked = []
+    symmetric_lookup.require_symmetric_transport = lambda: checked.append(rank)
+    pg_collection = _collection(groups)
+    initialize_engram_parallel_state(pg_collection, config(WORLD_SIZE))
+    assert checked == [rank]
+    assert _ranks(pg_collection.engram) == _ranks(groups["dp_cp"])
+    assert pg_collection.parameter_replica_groups == {
+        ENGRAM_PARAMETER_DOMAIN: pg_collection.engram_dp
+    }
+    # The NCCL reference over the same row groups needs no library check.
+    initialize_engram_parallel_state(_collection(groups), _engram_config(WORLD_SIZE))
+    assert checked == [rank]
+
+    # The EP layout rejects the symmetric backend on every rank alike, before any collective.
+    engram_config = _engram_config()
+    engram_config.communication_backend = "symmetric"
+    with pytest.raises(ValueError, match="requires parallel_size"):
+        initialize_engram_parallel_state(_collection(groups), engram_config)
+    engram_config.communication_backend = None
+    with pytest.raises(ValueError, match="must be resolved"):
+        initialize_engram_parallel_state(_collection(groups), engram_config)
+    dist.barrier()
+
+
+def test_symmetric_backend_checks_every_rank(tmp_path):
+    _spawn_gloo_case(tmp_path, _symmetric_initialization_case)
+
+
+def _engram_layer_case(rank):
+    """Engram layers of the sharded layout with either backend, wired as the model builder does.
+
+    The symmetric backend runs on the all-to-all reference transport here, so its selection,
+    transport start-up and lookup path run on CPU; outputs and dense gradients must equal the
+    NCCL lookup's, the table gradients to FP64 round-off (the sums run in another order).
+    """
+    from megatron.core.models.engram.engram import Engram
+
+    symmetric_lookup.require_symmetric_transport = lambda: SimpleNamespace(
+        EngramDeviceTransport=ReferenceEngramTransport,
+        create_unique_id=lambda: f"uid-{rank}".encode(),
+    )
+    groups = _mpu_groups(rank, ep=EP_SIZE)
+    generator = torch.Generator().manual_seed(rank)
+    input_ids = torch.randint(0, 32, (2, 6), generator=generator)
+    input_ids[:, 0] = 1  # repeated n-grams across ranks
+    hidden = torch.randn(6, 2, 8, dtype=torch.float64, generator=generator)
+    projection = torch.randn(6, 2, 8, dtype=torch.float64, generator=generator)
+    results = {}
+    for parallel_size, backend in (
+        (WORLD_SIZE, "nccl"),
+        (WORLD_SIZE, "symmetric"),
+        (2, "nccl"),
+        (2, "symmetric"),
+    ):
+        engram_config = _engram_config(parallel_size)
+        # Built for NCCL, which needs no CUDA.
+        engram_config.communication_backend = backend
+        pg_collection = _collection(groups)
+        initialize_engram_parallel_state(pg_collection, engram_config)
+        torch.manual_seed(0)
+        layer = Engram(
+            config=make_module_config(),
+            engram_config=engram_config,
+            layer_number=1,
+            pg_collection=pg_collection,
+        )
+        with torch.no_grad():
+            layer.short_conv.weight.normal_(mean=0.0, std=0.03, generator=generator.manual_seed(7))
+        initialize_engram_transports([layer], pg_collection, engram_config)
+        if backend == "symmetric":
+            assert isinstance(layer._lookup, symmetric_lookup.SymmetricEngramLookup)
+            transport = symmetric_lookup._TRANSPORTS[layer.embedding.ep_group]
+            assert transport.initialized and transport.describes == 1
+        else:
+            assert layer._lookup == layer.embedding.__call__
+            assert symmetric_lookup._TRANSPORTS == {}
+        output = layer(hidden, input_ids)
+        (output * projection).sum().backward()
+        results[parallel_size, backend] = (
+            output.detach(),
+            [table.weight.grad for table in layer.embedding.tables],
+            [p.grad for name, p in layer.named_parameters() if not name.startswith("embedding.")],
+        )
+        if backend == "symmetric":
+            # Every lookup ran one count and two row exchanges, every backward one more.
+            assert transport.exchanges == 1 + 4
+            symmetric_lookup.close_engram_transports(clean=True)
+            assert transport.closed is True and symmetric_lookup._TRANSPORTS == {}
+    for parallel_size in (WORLD_SIZE, 2):
+        nccl, symmetric = results[parallel_size, "nccl"], results[parallel_size, "symmetric"]
+        assert torch.equal(symmetric[0], nccl[0])
+        for actual, expected in zip(symmetric[1], nccl[1]):
+            torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+        for actual, expected in zip(symmetric[2], nccl[2]):
+            assert torch.equal(actual, expected)
+
+
+def test_engram_layers_look_rows_up_through_the_selected_backend(tmp_path):
+    _spawn_gloo_case(tmp_path, _engram_layer_case)
+
+
 # ---------------------------------------------------------------------------------------------
 # Lookups, gradients and checkpoints (torchrun, exactly four ranks)
 # ---------------------------------------------------------------------------------------------
@@ -745,12 +1158,15 @@ def _full_tables(device, dtype):
     return tables
 
 
-def _build(parallel_size, device, dtype, deterministic=False):
-    """The tables of one layout (None is the EP layout), set up as the Engram module does."""
-    engram_config = _engram_config(parallel_size)
+def _build(parallel_size, device, dtype, deterministic=False, backend="nccl"):
+    """The tables of one layout (None is the EP layout) and the lookup the Engram module calls
+    on them, set up as the Engram module and the model builder do: the embedding itself for the
+    NCCL backend, or the symmetric lookup bound to it once its transport has started."""
+    engram_config = _engram_config(parallel_size, backend)
     pg_collection = _collection(_GROUPS)
     initialize_engram_parallel_state(pg_collection, engram_config)
     row_group, replica_group, domain = resolve_engram_groups(pg_collection, engram_config)
+    make_lookup = select_engram_lookup(engram_config, row_group)
     config = SimpleNamespace(
         use_cpu_initialization=device.type == "cpu",
         params_dtype=dtype,
@@ -772,7 +1188,10 @@ def _build(parallel_size, device, dtype, deterministic=False):
     with torch.no_grad():
         for table, full in zip(embedding.tables, _full_tables(device, dtype)):
             table.weight.copy_(full[table.row_start : table.row_end])
-    return embedding
+    lookup = make_lookup(embedding)
+    # A no-op for the NCCL backend.
+    initialize_engram_transports([embedding], pg_collection, engram_config)
+    return embedding, lookup
 
 
 def _hash_ids(rank, microbatch, empty_microbatch):
@@ -797,8 +1216,11 @@ def _output_gradients(rank, microbatch, num_tokens, exact):
     return torch.randn(shape, generator=generator)
 
 
-def _train_microbatches(embedding, rank, device, exact, empty_microbatch):
-    """Forward/backward every microbatch, accumulating into fp32 main grads as DDP does."""
+def _train_microbatches(embedding, lookup, rank, device, exact, empty_microbatch):
+    """Forward/backward every microbatch, accumulating into fp32 main grads as DDP does.
+
+    The tables have no ``main_grad``, so the symmetric lookup returns dense table gradients too.
+    """
     main_grads = [
         torch.zeros(table.weight.shape, dtype=torch.float32, device=device)
         for table in embedding.tables
@@ -806,7 +1228,7 @@ def _train_microbatches(embedding, rank, device, exact, empty_microbatch):
     outputs = []
     for microbatch in range(NUM_MICROBATCHES):
         hash_ids = _hash_ids(rank, microbatch, empty_microbatch).to(device)
-        output = embedding(hash_ids)
+        output = lookup(hash_ids)
         output_grad = _output_gradients(rank, microbatch, hash_ids.shape[1], exact)
         (output * output_grad.to(device=device, dtype=output.dtype)).sum().backward()
         outputs.append(output.detach())
@@ -889,19 +1311,35 @@ def _assert_equal(actual, expected, what):
 
 
 @pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("backend", ["nccl", pytest.param("symmetric", marks=pytest.mark.internal)])
 @pytest.mark.parametrize("parallel_size", SHARDED_SIZES)
 @pytest.mark.parametrize("exact", [True, False], ids=["exact", "random"])
 @pytest.mark.parametrize("empty_microbatch", [False, True], ids=["full", "empty-microbatch"])
 @pytest.mark.parametrize("deterministic", [False, True], ids=["default", "deterministic"])
 def test_lookup_and_gradients_match_ep_layout(
-    parallel_size, exact, empty_microbatch, deterministic
+    backend, parallel_size, exact, empty_microbatch, deterministic
 ):
+    """The sharded layout, with either backend, against the EP layout's NCCL lookup."""
     rank, device = _distributed()
+    if backend == "symmetric":
+        if deterministic:
+            pytest.skip("deterministic_mode changes only the NCCL lookup's table gather")
+        symmetric_transport_or_skip()
+    with closing_symmetric_transports():
+        _check_lookup_and_gradients(
+            backend, parallel_size, exact, empty_microbatch, deterministic, rank, device
+        )
+
+
+def _check_lookup_and_gradients(
+    backend, parallel_size, exact, empty_microbatch, deterministic, rank, device
+):
     dtype = torch.bfloat16
     layouts = {
-        layout: _build(layout, device, dtype, deterministic) for layout in (None, parallel_size)
+        layout: _build(layout, device, dtype, deterministic, layout_backend)
+        for layout, layout_backend in ((None, "nccl"), (parallel_size, backend))
     }
-    sharded = layouts[parallel_size]
+    sharded, sharded_lookup = layouts[parallel_size]
     if parallel_size == WORLD_SIZE:
         assert _ranks(sharded.ep_group) == list(range(WORLD_SIZE))
     else:
@@ -909,13 +1347,18 @@ def test_lookup_and_gradients_match_ep_layout(
     assert get_pg_size(sharded.tables[0].expt_dp_group) == WORLD_SIZE // parallel_size
     for table in sharded.tables:
         assert get_parameter_parallel_domain(table.weight) == ENGRAM_PARAMETER_DOMAIN
-    for table in layouts[None].tables:
+    for table in layouts[None][0].tables:
         assert get_parameter_parallel_domain(table.weight) == "expert"
         assert not hasattr(table.weight, "parallel_domain")
+    if backend == "symmetric":
+        assert isinstance(sharded_lookup, symmetric_lookup.SymmetricEngramLookup)
+        assert sharded.ep_group in symmetric_lookup._TRANSPORTS
 
     results = {}
-    for layout, embedding in layouts.items():
-        outputs, main_grads = _train_microbatches(embedding, rank, device, exact, empty_microbatch)
+    for layout, (embedding, lookup) in layouts.items():
+        outputs, main_grads = _train_microbatches(
+            embedding, lookup, rank, device, exact, empty_microbatch
+        )
         _finish_grad_sync(embedding, main_grads)
         results[layout] = (outputs, _assemble(embedding, main_grads, device))
 
@@ -939,15 +1382,21 @@ def test_lookup_and_gradients_match_ep_layout(
             _assert_equal(grad_ep, reference[table_id], f"EP layout gradient, table {table_id}")
             _assert_equal(grad_sharded, reference[table_id], f"sharded gradient, table {table_id}")
             continue
-        if parallel_size == EP_SIZE:
+        if backend == "symmetric":
+            # Requesters sum the gradients of their duplicate rows in fp32 before the owner adds
+            # them, so the fp32 sums run in another order than the all-to-all's and may round
+            # differently before the bf16 cast.
+            torch.testing.assert_close(grad_sharded, grad_ep, rtol=2**-6, atol=2**-6)
+        elif parallel_size == EP_SIZE:
             # The EP layout's groups: the same reductions in the same order.
             _assert_equal(grad_sharded, grad_ep, f"gradient, table {table_id}")
             continue
-        exclusive = torch.ones(TABLE_SIZES[table_id], dtype=torch.bool, device=device)
-        exclusive[list(shared_rows[table_id])] = False
-        _assert_equal(
-            grad_sharded[exclusive], grad_ep[exclusive], f"exclusive rows, table {table_id}"
-        )
+        else:
+            exclusive = torch.ones(TABLE_SIZES[table_id], dtype=torch.bool, device=device)
+            exclusive[list(shared_rows[table_id])] = False
+            _assert_equal(
+                grad_sharded[exclusive], grad_ep[exclusive], f"exclusive rows, table {table_id}"
+            )
         # Shared rows differ by bf16 rounding of the per-replica partial sums.
         torch.testing.assert_close(grad_sharded, reference[table_id], rtol=2**-6, atol=2**-6)
         torch.testing.assert_close(grad_ep, reference[table_id], rtol=2**-6, atol=2**-6)
@@ -967,18 +1416,18 @@ def test_replicated_shards_match_ep_layouts_of_other_ep_sizes(ep, exact):
     dtype = torch.bfloat16
     parallel_size = 2
     layouts = {layout: _build(layout, device, dtype) for layout in (None, parallel_size)}
-    sharded = layouts[parallel_size]
+    sharded, _ = layouts[parallel_size]
     start = rank - rank % parallel_size
     assert _ranks(sharded.ep_group) == list(range(start, start + parallel_size))
     assert _ranks(sharded.tables[0].expt_dp_group) == list(
         range(rank % parallel_size, WORLD_SIZE, parallel_size)
     )
-    assert get_pg_size(layouts[None].ep_group) == ep
-    assert get_pg_size(layouts[None].tables[0].expt_dp_group) == WORLD_SIZE // ep
+    assert get_pg_size(layouts[None][0].ep_group) == ep
+    assert get_pg_size(layouts[None][0].tables[0].expt_dp_group) == WORLD_SIZE // ep
 
     results = {}
-    for layout, embedding in layouts.items():
-        outputs, main_grads = _train_microbatches(embedding, rank, device, exact, False)
+    for layout, (embedding, lookup) in layouts.items():
+        outputs, main_grads = _train_microbatches(embedding, lookup, rank, device, exact, False)
         _finish_grad_sync(embedding, main_grads)
         results[layout] = (outputs, _assemble(embedding, main_grads, device))
 
@@ -1009,7 +1458,7 @@ def test_replicated_shards_match_ep_layouts_of_other_ep_sizes(ep, exact):
 @pytest.mark.parametrize("parallel_size", (None,) + SHARDED_SIZES)
 def test_sharded_state_dict_covers_every_row_once(parallel_size):
     _, device = _distributed()
-    embedding = _build(parallel_size, device, torch.float32)
+    embedding, _ = _build(parallel_size, device, torch.float32)
     state = embedding.sharded_state_dict()
     entries = [
         (key, tensor.global_offset[0], tensor.local_shape[0], tensor.replica_id)
@@ -1055,8 +1504,8 @@ def test_checkpoint_loads_across_layouts(source, target):
     rank, device = _distributed()
     if device.type != "cuda":
         pytest.skip("dist_checkpointing save needs CUDA")
-    saved = _build(source, device, torch.float32)
-    loaded = _build(target, device, torch.float32)
+    saved, _ = _build(source, device, torch.float32)
+    loaded, _ = _build(target, device, torch.float32)
     with torch.no_grad():
         for table in loaded.tables:
             table.weight.zero_()

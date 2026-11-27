@@ -66,6 +66,7 @@ from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.models.engram import close_engram_transports
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
     is_linear_attention_variant,
@@ -1917,6 +1918,16 @@ def pretrain(
                 # (SystemExit from the exit-interval path is NOT caught here; it already
                 # flushed before sys.exit(). SIGKILL is unrecoverable regardless.)
                 _end_otel_job_spans()
+                # Abort the Engram symmetric transports, without a device barrier: the peers of
+                # this rank's row group may be spinning in a transport kernel that it will never
+                # join. An aborted communicator cannot hold this process at exit, so the launcher
+                # sees the failure and can stop them. A no-op when none is open.
+                try:
+                    close_engram_transports()
+                except Exception:  # pylint: disable=broad-except
+                    logging.getLogger(__name__).warning(
+                        "Cannot abort the Engram symmetric transports", exc_info=True
+                    )
                 raise
 
         print_datetime('after training is done')
@@ -1999,6 +2010,9 @@ def pretrain(
         # Deregister the GTP symmetric-memory pools: windows left registered when the
         # process groups are destroyed make NCCL abort.
         deregister_and_clear_gtp_symm_pools()
+    # Close the Engram symmetric transports collectively (device barrier, windows, communicator)
+    # while every rank of their row groups is here; a no-op when none is open.
+    close_engram_transports(clean=True)
 
     ft_integration.shutdown()
     one_logger_utils.finish()
@@ -5461,6 +5475,8 @@ def train(
             # Deregister the GTP symmetric-memory pools: windows left registered when the
             # process groups are destroyed make NCCL abort.
             deregister_and_clear_gtp_symm_pools()
+        # Every rank exits here together: close the Engram symmetric transports collectively.
+        close_engram_transports(clean=True)
 
         for model_module in model:
             if isinstance(model_module, DDP):

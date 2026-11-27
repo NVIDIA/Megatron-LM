@@ -1201,6 +1201,25 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "optimizer and compares them bit for bit.",
     ),
     KernelEntry(
+        name="engram_symmetric_lookup",
+        sources=(
+            "megatron/core/models/engram/symmetric_lookup.py",
+            "megatron/core/ops/engram.py",
+            "megatron/core/ops/engram_row_accumulation.py",
+        ),
+        tests=(
+            K + "test_engram_transport.py",
+            "tests/unit_tests/models/engram/test_symmetric_lookup.py",
+            "tests/unit_tests/ops/test_engram.py",
+        ),
+        kind="triton",
+        notes=(
+            "Sorted-segment FP32 Triton row accumulation without atomics; integer bincount "
+            "counts; the CuTe/NCCL exchange and lookup only copy bytes; replayed bit-exactly "
+            "under contention."
+        ),
+    ),
+    KernelEntry(
         name="dsa_dispatch",
         sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
         tests=(K + "test_fused_triton_kernels.py", R + 'test_indexer_replay.py'),

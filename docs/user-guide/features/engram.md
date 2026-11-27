@@ -30,7 +30,9 @@ always sharded by rows, and you choose the layout:
   replicated over expert-data-parallel. Lookups use NCCL all-to-alls.
 - **DP x CP layout** (`--engram-parallel-size P`). Rows are sharded over `P` consecutive ranks
   of each pipeline stage's data-parallel times context-parallel group, which contains the EP
-  group. Each shard is replicated over the remaining ranks. Lookups use NCCL all-to-alls.
+  group. Each shard is replicated over the remaining ranks. Lookups use a symmetric device
+  transport: direct NVLink loads inside an NVLink domain, and GPU-initiated networking (GIN)
+  across domains. NCCL all-to-alls remain available as a reference backend.
 
 ## Quick start
 
@@ -46,7 +48,7 @@ python pretrain_hybrid.py ... \
 DP x CP layout with every row owned by one rank of a 128-rank data-parallel group:
 
 ```bash
-python pretrain_hybrid.py ... \
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python pretrain_hybrid.py ... \
     --use-distributed-optimizer \
     --engram-vocab-sizes 129280 129280 --engram-layer-ids 2 10 \
     --engram-variant qwen --engram-eos-token-id 151643 --engram-unigram-vocab-size 151936 \
@@ -108,6 +110,8 @@ Engram is enabled by `--engram-vocab-sizes`.
 | `--engram-freeze-embedding` | off | Keep the tables fixed; the dense part still trains |
 | `--engram-parallel-size` | – | Use the DP x CP layout with row groups of this many ranks |
 | `--engram-max-parallel-size` | – | Use the DP x CP layout with row groups of at most this many ranks (see [Choosing the number of row shards](#choosing-the-number-of-row-shards)) |
+| `--engram-communication-backend` | see below | `symmetric` or `nccl` |
+| `--engram-symmetric-workspace-mb` | 64 | Workspace of the symmetric transport, per rank |
 
 Layer IDs follow `--hybrid-layer-pattern` with the pipeline separators (`|`) removed, so the
 same IDs work for any pipeline split. A selected layer must be a transformer layer (attention,
@@ -203,12 +207,52 @@ replicas. Moving a run between two job sizes changes `P`, and so reshards the ta
 both have at least `C` ranks in dp_cp; see [Checkpointing](#checkpointing) for what loads
 across a change of `--engram-parallel-size`.
 
-## Lookup
+## Lookup backends
+
+`--engram-communication-backend` defaults to `symmetric` when `--engram-parallel-size` is above
+1, and to `nccl` otherwise. The EP layout supports `nccl` only.
+
+### `nccl`
 
 The owner of each row is computed in closed form. Requests are exchanged with
 `all_to_all_single`, the owners gather their rows, and the rows return through a differentiable
 all-to-all. Backward sends gradients back to the owners, which accumulate them. In
 deterministic mode, the owner sums repeated rows with a segmented reduction instead of atomics.
+
+### `symmetric`
+
+The symmetric transport is a CuTe DSL and NCCL4Py device transport from
+[NVIDIA/Megatron-LM#7224](https://github.com/NVIDIA/Megatron-LM/pull/7224). Each row group gets
+one NCCL4Py communicator, which serves only the device API. It is created with one CTA and
+NVLS disabled, as no NCCL kernel ever runs on it. One lookup:
+
+1. finds the unique rows and their owners;
+2. exchanges one row of counts and registration flags per peer;
+3. reads the rows: owners in the same NVLink (LSA) team are read directly from their registered
+   table windows, and owners elsewhere receive the requests and send the rows back through GIN.
+
+Backward sums the gradients of duplicate rows in FP32, sends them to their owners in one
+exchange, and adds them row-sparse into DDP's `main_grad`. No dense table gradient is built.
+
+Requirements:
+
+- CUDA, Triton, `nvidia-cutlass-dsl >= 4.8.1`, and `nccl4py >= 0.6.0` with the same NCCL version
+  as the runtime library and the device bitcode (`libnccl_device.bc`) linked into the kernels;
+- `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, so the tables can be registered as NCCL
+  windows. With Transformer Engine CUDA graphs, Megatron then also requires
+  `NCCL_GRAPH_REGISTER=0`;
+- multi-node NVLink for LSA teams that span nodes (`NCCL_MNNVL_ENABLE=1`, IMEX channels), and a
+  GIN-capable network plugin for row groups that span NVLink domains;
+- no `--fake-process-group`, `--moe-use-upcycling` or `--inprocess-restart`.
+
+The transport's barrier and exchange kernels spin-wait on their peers and cannot time out.
+Every rank of a row group issues the same calls in the same order, including ranks with no
+rows. A rank that fails aborts its transports and exits, and the launcher (torchrun, or
+`srun --kill-on-bad-exit`) then stops the peers. A silent peer death needs a hang detector, such
+as the NVIDIA Resiliency Extension's, or the job's time limit.
+
+Use `--engram-communication-backend nccl` with the DP x CP layout for a numerical reference, or
+on systems without the symmetric dependencies.
 
 ## Memory
 
@@ -218,28 +262,32 @@ expert-DP 2 holds. The optimizer state is the same in both layouts. With 300B ta
 on 128 GPUs, `P = 128` takes 13.1 GiB less per GPU: 4.4 GiB of bf16 parameters and 8.7 GiB of
 FP32 gradients.
 
-The lookup takes device memory that NCCL holds outside PyTorch's allocator,
+The lookup backends differ in the device memory that NCCL holds outside PyTorch's allocator,
 per GPU, measured on GB300 after two training steps:
 
-| Row group | Device memory |
-|---|---|
-| `P = 4`, one node | About 1.1 GiB |
-| `P = 8`, two NVLink domains | About 650 MiB |
-| `P = 128`, two NVLink domains | About 2.1 GiB |
+| Row group | `symmetric` | `nccl` |
+|---|---|---|
+| `P = 4`, one node | About 125 MiB | About 1.1 GiB |
+| `P = 8`, two NVLink domains | About 205 MiB | About 650 MiB |
+| `P = 128`, two NVLink domains | About 560 MiB | About 2.1 GiB |
 
-This memory is mostly peer-to-peer buffers that the first all-to-alls set up. It
+The `symmetric` cost is all allocated at start-up: the 64 MiB workspace
+(`--engram-symmetric-workspace-mb`), a communicator of 16 to 20 MiB, and the device-API
+resources, including the GIN contexts across NVLink domains. `NCCL_MAX_CTAS` in the environment
+overrides the communicator's one-CTA configuration and brings back about 6 MiB per extra
+channel. The `nccl` cost is mostly peer-to-peer buffers that the first all-to-alls set up. It
 depends on the number of NVLink peers and on the number of channels NCCL gives each peer, which
 is smaller in larger groups. Peers in another NVLink domain use shared network pools instead.
 
 ## Known issue: cross-node all-to-all with the SPCX network plugin
 
-The lookup sends all-to-alls with uneven splits across nodes. The SPCX network plugin
+The `nccl` backend sends all-to-alls with uneven splits across nodes. The SPCX network plugin
 (`NCCL_NET_PLUGIN=spcx`) can drop part of such grouped sends. The receiver then reads stale data
 or hangs. This is reported for SPCX 1.4, as shipped in NGC PyTorch 26.07-era images. No fix has
 been confirmed for later versions. See
 [NVIDIA-NeMo/Megatron-Bridge#5462](https://github.com/NVIDIA-NeMo/Megatron-Bridge/issues/5462)
-and the Megatron Core 0.19 known issues. Engram is affected when the ranks that shard a
-table span NVLink domains. NCCL logs `Using network SPCX` when the plugin is active.
+and the Megatron Core 0.19 known issues. Engram is affected when the EP layout or the `nccl`
+backend spans NVLink domains. NCCL logs `Using network SPCX` when the plugin is active.
 
 Each of these workarounds avoids it:
 
@@ -249,7 +297,8 @@ Each of these workarounds avoids it:
 
 Under Slurm with Pyxis, variables that the image or enroot already sets keep their image values
 unless they are passed with `srun --container-env=NAME,...`. Check the NCCL INFO lines
-(`... set by environment to ...`) to confirm that a workaround applied.
+(`... set by environment to ...`) to confirm that a workaround applied. The `symmetric` backend
+issues no all-to-all.
 
 ## Optimizer
 
@@ -367,7 +416,7 @@ storage are not supported.
 The package comes from the Engram support in
 [NVIDIA/Megatron-LM#7231](https://github.com/NVIDIA/Megatron-LM/pull/7231) and
 [NVIDIA/Megatron-LM#7553](https://github.com/NVIDIA/Megatron-LM/pull/7553) by Li Tao. The
-parameter replica domains come from
+parameter replica domains and the symmetric transport come from
 [NVIDIA/Megatron-LM#7224](https://github.com/NVIDIA/Megatron-LM/pull/7224) by Hongxiao Bai.
 The fusion of the `deepseek_v41` variant follows the DeepSeek-V4.1 Engram module of the same
 pull request, by Deyu Fu and Hongxiao Bai.
