@@ -21,16 +21,30 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   rotate-schedule:
+    if: github.repository == 'NVIDIA/Megatron-LM' && github.ref == 'refs/heads/main'
+    environment: oncall-rotation
+    concurrency:
+      group: oncall-rotation
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          token: ${{ secrets.PAT }}
+          ref: refs/heads/main
+          persist-credentials: false
+
+      - name: Create schedule publishing token
+        id: publisher
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          permission-contents: write
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -39,22 +53,25 @@ jobs:
 
       - name: Rotate Schedule
         env:
-          # Token to read org team members. Needs read:org scope.
-          GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
-          # Slack token for updating the Slack usergroup
+          GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN }}
           SLACK_TOKEN: ${{ secrets.ONCALL_SLACK_TOKEN }}
         run: |
           pip install --no-cache-dir "uv<0.9.29"
           uv venv .venv
           uv cache clean
-          uv sync --no-cache 
+          uv sync --no-cache
           uv run --with slack-sdk python .github/scripts/oncall_manager.py rotate
 
-      - name: Commit and Push changes
+      - name: Publish the updated schedule
+        env:
+          GH_TOKEN: ${{ steps.publisher.outputs.token }}
+        shell: bash
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add .github/oncall_schedule.json
-          git commit -m "chore: rotate oncall schedule" || echo "No changes to commit"
-          git pull --rebase
-          git push origin HEAD:main
+          schedule=.github/oncall_schedule.json
+          if git diff --quiet HEAD -- "$schedule"; then
+            exit 0
+          fi
+          original_blob=$(git rev-parse "HEAD:$schedule")
+          jq -n --rawfile schedule "$schedule" --arg sha "$original_blob" \
+            '{branch: "main", message: "chore: rotate oncall schedule", sha: $sha, content: ($schedule | @base64)}' |
+            gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$schedule" --input - --jq '.commit.sha'
