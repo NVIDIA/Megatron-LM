@@ -1010,8 +1010,17 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
         recipe = yaml.safe_load(
             (ROOT / "tests/test_utils/recipes" / platform / "unit-tests.yaml").read_text()
         )
+        # Recipe opt-outs stay full in merge groups, which otherwise record baselines.
         assert json.loads(parsed[output]) == [
-            {"bucket": case} for product in recipe["products"] for case in product["test_case"]
+            {"bucket": case}
+            for product in recipe["products"]
+            if product.get("testmon") is not False
+            for case in product["test_case"]
+        ] + [
+            {"bucket": case, "mode": "testmon-disabled"}
+            for product in recipe["products"]
+            if product.get("testmon") is False
+            for case in product["test_case"]
         ]
     assert restore["env"]["BUCKETS"] == "${{ inputs.buckets }}"
     assert workflow[True]["workflow_call"]["inputs"]["buckets"]["required"] is True
@@ -1096,6 +1105,9 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
         pytest.param("full", "main", "", "full", id="explicit-full"),
         pytest.param("full", "", "", "full", id="merge-group-full"),
         pytest.param("enforce", "dev", "preselected", "full", id="unsupported-target"),
+        pytest.param("baseline", "main", "", "baseline", id="merge-group-baseline"),
+        pytest.param("baseline", "main", "testmon-disabled", "full", id="baseline-disabled"),
+        pytest.param("baseline", "", "", "full", id="baseline-unsupported-target"),
     ],
 )
 def test_gpu_reselection_respects_full_run_guards(

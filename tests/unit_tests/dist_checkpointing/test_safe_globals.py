@@ -180,3 +180,49 @@ class TestSafeNumpyLoad:
         assert not errors
         for i, arr in arrays.items():
             np.testing.assert_array_equal(results[i], arr)
+
+
+class TestSafeDCPMetadata:
+    def test_dcp_metadata_roundtrip_and_malicious(self, tmp_path_dist_ckpt):
+        import os
+
+        import torch.distributed.checkpoint as dcp
+
+        if Utils.world_size > 1:
+            Utils.initialize_distributed()
+        is_rank0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+        def barrier():
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+        sd = {"a": torch.randn(4, 4), "b": torch.ones(2, dtype=torch.bfloat16)}
+        ckpt = tmp_path_dist_ckpt / "dcp_meta"
+        dcp.save(sd, checkpoint_id=str(ckpt))
+
+        out = {k: torch.zeros_like(v) for k, v in sd.items()}
+        dcp.load(out, checkpoint_id=str(ckpt))  # legit metadata still loads
+        assert torch.equal(out["a"], sd["a"])
+
+        class Evil:
+            def __reduce__(self):
+                return (os.system, ("echo pwned",))
+
+        # All ranks must finish loading before rank 0 overwrites the shared file.
+        barrier()
+        if is_rank0:
+            (ckpt / ".metadata").write_bytes(pickle.dumps(Evil()))
+        barrier()
+        # DCP wraps per-rank errors in a CheckpointException whose str() only lists
+        # the failed ranks, so inspect the per-rank failures for the refusal message.
+        # CheckpointException derives from BaseException (not Exception), so catch that.
+        with pytest.raises(BaseException) as exc_info:
+            dcp.load(out, checkpoint_id=str(ckpt))
+        failures = getattr(exc_info.value, "failures", None)
+        # Each failure is an (exception, traceback) tuple; stringify the exception only.
+        details = (
+            " ".join(str(v[0] if isinstance(v, tuple) else v) for v in failures.values())
+            if failures
+            else str(exc_info.value)
+        )
+        assert "Refusing to unpickle" in details

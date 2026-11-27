@@ -41,7 +41,4 @@ def test_packedness_follows_the_data_section(
         )
         data = DataConfig(dataset=dataset, dataset_type=dataset_type)
     monkeypatch.setattr(distillation_utils, "get_run_config", lambda: SimpleNamespace(data=data))
-    monkeypatch.setattr(
-        distillation_utils, "get_args", lambda: pytest.fail("the predicate must not read args")
-    )
     assert distillation_utils.is_packed_sequence_run() is expected

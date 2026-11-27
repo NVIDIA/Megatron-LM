@@ -22,6 +22,7 @@ import pytest
 import torch
 
 import megatron.core.extensions.transformer_engine as te_ext
+import megatron.core.transformer.custom_layers.batch_invariant_kernels as bik
 from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP, mark_grouped_tensor
@@ -44,12 +45,15 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import init_method_normal
+from megatron.core.utils import init_method_normal, is_te_min_version
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     bytes_equal,
     seeded,
+)
+from tests.unit_tests.determinism.kernels.softmax_offset import (
+    assert_softmax_offset_clipping_replays,
 )
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
@@ -73,6 +77,13 @@ if HAVE_TE:
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+
+
+def test_learnable_softmax_offset_clipping_replays():
+    """Every TE-attention head shard contributes to repeatable TP norm/clipping."""
+    if not is_te_min_version("2.8.0"):
+        pytest.skip("learnable softmax requires Transformer Engine >= 2.8")
+    assert_softmax_offset_clipping_replays(TEDotProductAttention)
 
 
 @pytest.fixture
@@ -636,6 +647,71 @@ class TestTEWrappers:
             what=f"TELayerNormColumnParallelLinear[{normalization}]",
         )
 
+    @pytest.mark.parametrize("fused_norm", [False, True], ids=["linear", "layernorm-linear"])
+    def test_batch_invariant_linear_3d_input_replays(self, monkeypatch, fused_norm):
+        """The GEMM and RMSNorm replacements replay a 3-D input and match its flattened rows."""
+        seeded()
+        layer_cls = TELayerNormColumnParallelLinear if fused_norm else TEColumnParallelLinear
+        module = layer_cls(
+            HIDDEN,
+            3 * HIDDEN,
+            config=_config(normalization="RMSNorm"),
+            init_method=init_method_normal(0.02),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        # 2000 rows leave a partial row tile in the persistent GEMM.
+        x = torch.randn(1000, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        grad_output = torch.randn(1000, 2, 3 * HIDDEN, device="cuda", dtype=torch.bfloat16)
+
+        # Count TE's calls into the replacements, so a replay of native TE cannot pass for one.
+        calls = {"_te_general_gemm_patched": 0, "_te_apply_normalization_patched": 0}
+
+        def counted(name):
+            replacement = getattr(bik, name)
+
+            def wrapper(*args, **kwargs):
+                calls[name] += 1
+                return replacement(*args, **kwargs)
+
+            return wrapper
+
+        for name in calls:
+            monkeypatch.setattr(bik, name, counted(name))
+
+        replays = 3
+        with set_batch_invariant_mode(True, backend="triton"):
+            outputs, grads = assert_module_replays_bit_exact(
+                module,
+                (x,),
+                grad_output=grad_output,
+                replays=replays,
+                contention=True,
+                what=f"batch-invariant {layer_cls.__name__}[3-D]",
+            )
+            # The same rows as a 2-D input: the operands' rank must not change a bit.
+            module.zero_grad(set_to_none=True)
+            x_flat = x.detach().reshape(-1, HIDDEN).requires_grad_(True)
+            out_flat, _ = module(x_flat)
+            out_flat.backward(grad_output.reshape(-1, 3 * HIDDEN))
+
+        passes = replays + 1
+        assert calls["_te_general_gemm_patched"] >= 3 * passes  # forward, dgrad and wgrad
+        if fused_norm:
+            assert calls["_te_apply_normalization_patched"] >= passes
+        else:
+            assert calls["_te_apply_normalization_patched"] == 0
+
+        names = ("weight", "bias", "layer_norm_weight") if fused_norm else ("weight", "bias")
+        assert set(grads) == {"in[0]"} | {f"chunk0.{name}" for name in names}
+        assert outputs["out[0]"].shape == (1000, 2, 3 * HIDDEN)
+        assert bytes_equal(out_flat.detach(), outputs["out[0]"].reshape(out_flat.shape))
+        assert bytes_equal(x_flat.grad, grads["in[0]"].reshape(x_flat.shape))
+        for name in names:
+            assert bytes_equal(getattr(module, name).grad, grads[f"chunk0.{name}"]), name
+
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
     def test_te_norm_replays(self, normalization):
         seeded()
@@ -866,6 +942,39 @@ class TestTEWrappers:
             replays=4,
             what="te_fused_cross_entropy",
         )
+
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 needs Blackwell")
+    @pytest.mark.parametrize("grad_fp8_format", ["e4m3", "e5m2"])
+    def test_te_fused_cross_entropy_mxfp8_grad_replays(self, grad_fp8_format):
+        """The MXFP8 gradient of the logits (cross_entropy_mxfp8_grad) replays bit-exactly."""
+        if not getattr(te_ext, "_TE_FUSED_PARALLEL_CE_GRAD_QUANTIZER", False):
+            pytest.skip(
+                "Transformer Engine's parallel_cross_entropy does not accept grad_quantizer"
+            )
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        tokens = TOKENS // 2
+        logits = torch.randn(tokens, 1, 32768, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, 32768 * tp_group.size(), (tokens, 1), device="cuda")
+        buffers = (
+            "_rowwise_data",
+            "_rowwise_scale_inv",
+            "_columnwise_data",
+            "_columnwise_scale_inv",
+        )
+        ref = None
+        for replay in range(4):
+            x = logits.clone().requires_grad_()
+            loss = te_cross_entropy(x, target, tp_group, grad_fp8_format=grad_fp8_format)
+            (grad,) = torch.autograd.grad(loss, x, torch.ones_like(loss))
+            out = [loss.detach().clone()] + [getattr(grad, name).clone() for name in buffers]
+            if ref is None:
+                ref = out
+                continue
+            for name, a, b in zip(("loss",) + buffers, out, ref):
+                assert bytes_equal(a, b), f"replay {replay}: {name} differs"
 
     @pytest.mark.parametrize("backend", ["fused", "flash"])
     def test_te_dot_product_attention_replays(self, backend, monkeypatch):

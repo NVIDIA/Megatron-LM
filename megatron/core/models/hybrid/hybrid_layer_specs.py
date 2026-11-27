@@ -1,5 +1,5 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
-from dataclasses import replace
+from dataclasses import fields, is_dataclass, replace
 from functools import partial
 
 from megatron.core.extensions.transformer_engine import (
@@ -17,6 +17,7 @@ from megatron.core.models.gpt.moe_module_specs import (
     get_moe_module_spec,
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.ops.norm.backends import get_norm_module_spec
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
 from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention, KimiDeltaAttentionSubmodules
 from megatron.core.ssm.gated_delta_product import (
@@ -692,6 +693,44 @@ wide_residual_hybrid_inference_stack_spec = _get_wide_residual_hybrid_stack_spec
 wide_residual_gated_delta_product_inference_stack_spec = _get_wide_residual_hybrid_stack_spec(
     gated_delta_product_inference_stack_spec
 )
+
+
+def _replace_norm(spec, norm):
+    """Return ``spec`` with every ``TENorm`` slot, at any depth, naming ``norm`` instead."""
+    if spec is TENorm:
+        return norm
+    if isinstance(spec, ModuleSpec):
+        return replace(
+            spec,
+            module=_replace_norm(spec.module, norm),
+            submodules=_replace_norm(spec.submodules, norm),
+        )
+    if isinstance(spec, partial):
+        return partial(
+            spec.func,
+            *(_replace_norm(arg, norm) for arg in spec.args),
+            **{key: _replace_norm(value, norm) for key, value in spec.keywords.items()},
+        )
+    if isinstance(spec, (list, tuple)):
+        return type(spec)(_replace_norm(item, norm) for item in spec)
+    if is_dataclass(spec) and not isinstance(spec, type):
+        return replace(
+            spec,
+            **{f.name: _replace_norm(getattr(spec, f.name), norm) for f in fields(spec) if f.init},
+        )
+    return spec
+
+
+def with_norm_backend(stack_spec: ModuleSpec, norm_backend: str = "te") -> ModuleSpec:
+    """Return ``stack_spec`` with its norms built by ``norm_backend`` (a ``rmsnorm_impl`` value).
+
+    Every norm slot that names ``TENorm`` (layer, QK, MoE pre-MLP, MTP and final norms) names
+    ``get_norm_module_spec(norm_backend)`` instead; ``"te"`` returns ``stack_spec`` itself.
+    Norms fused into Transformer Engine linears are not separate slots and stay TE.
+    """
+    if norm_backend == "te":
+        return stack_spec
+    return _replace_norm(stack_spec, get_norm_module_spec(norm_backend))
 
 
 # Backward-compatible aliases

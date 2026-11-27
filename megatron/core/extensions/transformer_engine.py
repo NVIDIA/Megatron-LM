@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import enum
+import functools
 import importlib
 import inspect
 import io
@@ -2573,6 +2574,12 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+        # TE creates a head-sharded learnable softmax_offset but does not mark it TP.
+        # Mark it so clip-norm includes every rank's sink grads. The helper asserts
+        # that TE has not already set the tensor-parallel attributes.
+        if self.config.softmax_type == "learnable":
+            set_tensor_model_parallel_attributes(self.softmax_offset, True, 0, 1)
+
         if self.config.attention_cp_layout == "contiguous":
             self.fused_attention.register_forward_hook(
                 self._make_fused_cp_grad_contiguous, with_kwargs=True
@@ -2935,6 +2942,18 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             tp_size = get_pg_size(tp_group)
             tp_group_for_te = tp_group
             gtp_remat_group = pg_collection.expt_gtp_remat
+            # TE finalizes GTP-sharded weight gradients inside backward, so their GEMM cannot
+            # be deferred: TE >= 2.21 raises there, and older TE finalized unwritten buffers.
+            if (
+                self.delay_wgrad_compute
+                and gtp_remat_group is not None
+                and gtp_remat_group.size() > 1
+            ):
+                raise ValueError(
+                    "delay_wgrad_compute and overlap_dispatch_backward_with_experts_wgrad are "
+                    "not supported with GTP-sharded grouped expert weights. Disable them or "
+                    "expert GTP weight sharding."
+                )
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
@@ -4206,6 +4225,9 @@ try:
     _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX = (
         "return_argmax" in inspect.signature(parallel_cross_entropy).parameters
     )
+    _TE_FUSED_PARALLEL_CE_GRAD_QUANTIZER = (
+        "grad_quantizer" in inspect.signature(parallel_cross_entropy).parameters
+    )
     current_te_version = get_te_version()
 
     def te_parallel_cross_entropy(
@@ -4215,11 +4237,15 @@ try:
         is_cg_capturable: bool = False,
         overwrite_input: bool = True,
         return_argmax: bool = False,
+        grad_fp8_format: Optional[str] = None,
     ):
         """Wrapper function for TE's Cross Entropy Loss kernel
 
         With ``return_argmax``, returns ``(loss, argmax)``: the argmax of each row over the full
         vocabulary, found by the loss kernel, or None if this TE version cannot return it.
+
+        With ``grad_fp8_format`` ('e4m3' or 'e5m2'), backward returns the gradient of the logits
+        as an MXFP8 tensor in that format, for an MXFP8 LM head.
         """
         parallel_cross_entropy_kwargs = {
             "label_smoothing": 0.0,
@@ -4235,11 +4261,29 @@ try:
             parallel_cross_entropy_kwargs["is_cg_capturable"] = is_cg_capturable
             # According to TE CrossEntropyFunction, ignore_idx defaults to -100
             parallel_cross_entropy_kwargs["ignore_idx"] = -100
+        if grad_fp8_format is not None:
+            parallel_cross_entropy_kwargs["grad_quantizer"] = _mxfp8_grad_quantizer(grad_fp8_format)
         if return_argmax:
             if not _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX:
                 return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs), None
             parallel_cross_entropy_kwargs["return_argmax"] = True
         return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs)
+
+    @functools.lru_cache(maxsize=None)
+    def _mxfp8_grad_quantizer(grad_fp8_format: str):
+        """MXFP8 quantizer (row-wise and column-wise) for the gradient of the logits."""
+        if not _TE_FUSED_PARALLEL_CE_GRAD_QUANTIZER:
+            raise RuntimeError(
+                "An MXFP8 cross entropy gradient (cross_entropy_mxfp8_grad) requires a "
+                "Transformer Engine whose parallel_cross_entropy accepts grad_quantizer."
+            )
+        import transformer_engine_torch as tex
+        from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+        fp8_dtypes = {"e4m3": tex.DType.kFloat8E4M3, "e5m2": tex.DType.kFloat8E5M2}
+        if grad_fp8_format not in fp8_dtypes:
+            raise ValueError(f"grad_fp8_format must be 'e4m3' or 'e5m2', got {grad_fp8_format!r}")
+        return MXFP8Quantizer(fp8_dtypes[grad_fp8_format], rowwise=True, columnwise=True)
 
 except ImportError:
     te_parallel_cross_entropy = None  # type: ignore[assignment, misc]
@@ -4253,10 +4297,13 @@ def te_cross_entropy(
     cuda_graph_capturable: bool = False,
     overwrite_input: bool = True,
     return_argmax: bool = False,
+    grad_fp8_format: str | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
     """Adapt TE cross entropy to the backend target signature and required label stride.
 
     With ``return_argmax``, returns ``(loss, argmax)`` as ``te_parallel_cross_entropy`` does.
+    With ``grad_fp8_format``, backward returns an MXFP8 gradient of the logits, as
+    ``te_parallel_cross_entropy`` does.
     """
     if te_parallel_cross_entropy is None:
         raise RuntimeError("Trying to use a TE block when it's not present.")
@@ -4268,6 +4315,7 @@ def te_cross_entropy(
         cuda_graph_capturable,
         overwrite_input=overwrite_input,
         return_argmax=return_argmax,
+        grad_fp8_format=grad_fp8_format,
     )
 
 
@@ -4333,12 +4381,15 @@ if HAVE_TE and is_te_min_version("2.7.0.dev"):
         fused_topk_with_score_function,
     )
 
-    try:
-        from transformer_engine.pytorch.router import (  # pylint: disable=unused-import
-            mark_qb_bin_bounds_validated,
-        )
-    except ImportError:
-        mark_qb_bin_bounds_validated = None
+    # TE >= 2.21 no longer validates QB bin bounds and keeps this marker only as a deprecated no-op.
+    mark_qb_bin_bounds_validated = None
+    if not is_te_min_version("2.21.0"):
+        try:
+            from transformer_engine.pytorch.router import (  # pylint: disable=unused-import
+                mark_qb_bin_bounds_validated,
+            )
+        except ImportError:
+            pass
 
     try:
         _fused_topk_sig = inspect.signature(fused_topk_with_score_function)

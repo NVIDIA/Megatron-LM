@@ -110,6 +110,12 @@ A simpler alternative in [issue #5533](https://github.com/NVIDIA/Megatron-LM/iss
 all-gathers boundary-matrix inputs and duplicates orthogonalization. The
 current path avoids that redundant computation.
 
+### Optimizations
+
+**Communication-free groups.** Groups whose tensors all sit on one rank need no
+gather or scatter. They are spread evenly over the pipeline, the last one at the
+end, so their Newton–Schulz hides the transfers of the other groups.
+
 ### TensorAtomic placement
 
 **Alternative based on [MatrixFSDP](https://arxiv.org/abs/2607.05895), tracked

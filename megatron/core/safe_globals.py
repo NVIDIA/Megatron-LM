@@ -3,6 +3,7 @@
 import io
 import pickle
 import threading
+import types
 from argparse import Namespace
 from io import BytesIO
 from pathlib import PosixPath
@@ -12,6 +13,7 @@ from unittest.mock import patch
 
 import numpy
 import torch
+import torch.distributed.checkpoint.filesystem as _dcp_filesystem
 from numpy import dtype, ndarray
 from numpy.core.multiarray import _reconstruct
 from numpy.dtypes import UInt32DType
@@ -50,6 +52,37 @@ SAFE_GLOBALS = [
     torch._C.Generator,  # Needed for torch ckpt format loading after weights_only default change
 ]
 
+SAFE_OBJECTS = {
+    ("builtins", "dict"),
+    ("builtins", "list"),
+    ("builtins", "tuple"),
+    ("builtins", "int"),
+    ("builtins", "float"),
+    ("builtins", "bool"),
+    ("builtins", "bytes"),
+    ("builtins", "str"),
+    ("collections", "OrderedDict"),
+    ("torch", "Size"),
+    ("torch._utils", "_rebuild_tensor_v2"),
+    ("torch._tensor", "_rebuild_from_type_v2"),
+    ("torch.storage", "UntypedStorage"),
+    ("torch.storage", "_load_from_bytes"),
+    ("transformer_engine.common.recipe", "DelayedScaling"),
+    ("transformer_engine.common.recipe", "Float8CurrentScaling"),
+    ("transformer_engine.common.recipe", "Float8BlockScaling"),
+    ("transformer_engine.common.recipe", "MXFP8BlockScaling"),
+    ("transformer_engine.common.recipe", "NVFP4BlockScaling"),
+    ("transformer_engine.common.recipe", "Format"),
+    ("transformer_engine.common.recipe", "_FormatHelper"),
+    ("transformer_engine.common.recipe", "MMParams"),
+    ("transformer_engine.common.recipe", "QParams"),
+    ("megatron.core.extensions.transformer_engine", "TEDelayedScaling"),
+    ("megatron.core.safe_globals", "safe_load_from_bytes"),
+    ("numpy._core.multiarray", "_reconstruct"),
+    ("numpy", "ndarray"),
+    ("numpy", "dtype"),
+}
+
 _pickle_patch_lock = threading.Lock()
 
 
@@ -86,38 +119,7 @@ class SafeUnpickler(pickle.Unpickler):
     crafted checkpoint.
     """
 
-    _SAFE_CLASSES: frozenset = frozenset(
-        {
-            ("builtins", "dict"),
-            ("builtins", "list"),
-            ("builtins", "tuple"),
-            ("builtins", "int"),
-            ("builtins", "float"),
-            ("builtins", "bool"),
-            ("builtins", "bytes"),
-            ("builtins", "str"),
-            ("collections", "OrderedDict"),
-            ("torch", "Size"),
-            ("torch._utils", "_rebuild_tensor_v2"),
-            ("torch._tensor", "_rebuild_from_type_v2"),
-            ("torch.storage", "UntypedStorage"),
-            ("torch.storage", "_load_from_bytes"),
-            ("transformer_engine.common.recipe", "DelayedScaling"),
-            ("transformer_engine.common.recipe", "Float8CurrentScaling"),
-            ("transformer_engine.common.recipe", "Float8BlockScaling"),
-            ("transformer_engine.common.recipe", "MXFP8BlockScaling"),
-            ("transformer_engine.common.recipe", "NVFP4BlockScaling"),
-            ("transformer_engine.common.recipe", "Format"),
-            ("transformer_engine.common.recipe", "_FormatHelper"),
-            ("transformer_engine.common.recipe", "MMParams"),
-            ("transformer_engine.common.recipe", "QParams"),
-            ("megatron.core.extensions.transformer_engine", "TEDelayedScaling"),
-            ("megatron.core.safe_globals", "safe_load_from_bytes"),
-            ("numpy._core.multiarray", "_reconstruct"),
-            ("numpy", "ndarray"),
-            ("numpy", "dtype"),
-        }
-    )
+    _SAFE_CLASSES: frozenset = frozenset(SAFE_OBJECTS)
 
     def find_class(self, module: str, name: str):
         if (module, name) not in self._SAFE_CLASSES:
@@ -125,3 +127,83 @@ class SafeUnpickler(pickle.Unpickler):
                 f"Refusing to unpickle disallowed class '{module}.{name}' "
             )
         return super().find_class(module, name)
+
+
+class SafeDCPUnpickler(SafeUnpickler):
+    """Restricted unpickler for the torch distributed checkpoint ``.metadata`` file.
+
+    Only allows the dataclasses and primitives DCP writes into ``Metadata``.
+    Anything else raises ``pickle.UnpicklingError``, so a tampered ``.metadata``
+    cannot execute code at load time.
+    """
+
+    _SAFE_CLASSES: frozenset = frozenset(
+        {
+            *SAFE_OBJECTS,
+            ("pathlib", "PosixPath"),
+            # Newer torch versions record shard paths as ``PurePosixPath``.
+            ("pathlib", "PurePosixPath"),
+            # Multi-Storage Client writers record shard paths as ``MultiStoragePath``
+            # (a pathlib-style path) in the ``_StorageInfo`` entries of the metadata.
+            ("multistorageclient.pathlib", "MultiStoragePath"),
+            ("torch.serialization", "_get_layout"),
+            ("torch.distributed.checkpoint.filesystem", "_StorageInfo"),
+            ("torch.distributed.checkpoint.filesystem", "_StoragePrefix"),
+            ("torch.distributed.checkpoint.metadata", "Metadata"),
+            ("torch.distributed.checkpoint.metadata", "MetadataIndex"),
+            ("torch.distributed.checkpoint.metadata", "StorageMeta"),
+            ("torch.distributed.checkpoint.metadata", "TensorProperties"),
+            # Older checkpoints pickled TensorProperties from its legacy location.
+            ("torch.distributed._shard.sharded_tensor.metadata", "TensorProperties"),
+            ("torch.distributed.checkpoint.metadata", "TensorStorageMetadata"),
+            ("torch.distributed.checkpoint.metadata", "ChunkStorageMetadata"),
+            ("torch.distributed.checkpoint.metadata", "BytesStorageMetadata"),
+            ("torch.distributed.checkpoint.metadata", "_MEM_FORMAT_ENCODING"),
+            ("torch.distributed.checkpoint.metadata", "MEM_FORMAT_ENCODING"),
+            # Legacy location (and name) of the memory-format enum used by TensorProperties.
+            ("torch.distributed._shard.sharded_tensor.metadata", "MEM_FORMAT_ENCODING"),
+            ("torch.distributed._shard.sharded_tensor.metadata", "_MEM_FORMAT_ENCODING"),
+            # Recent torch versions embed the save plan (and its write items) in the
+            # metadata (e.g. under ``planner_data``); these are plain dataclasses/enums.
+            ("torch.distributed.checkpoint.planner", "SavePlan"),
+            ("torch.distributed.checkpoint.planner", "WriteItem"),
+            ("torch.distributed.checkpoint.planner", "WriteItemType"),
+            ("torch.distributed.checkpoint.planner", "TensorWriteData"),
+            # NumPy scalars (``scalar(dtype, bytes)``) stored in metadata; the legacy
+            # ``numpy.core`` path is what NumPy 1.x checkpoints reference.
+            ("numpy.core.multiarray", "scalar"),
+            ("numpy._core.multiarray", "scalar"),
+            # Empty placeholder classes used to read old MCore checkpoints' metadata.
+            ("megatron.core.dist_checkpointing.strategies.torch", "MCoreSavePlan"),
+            ("megatron.core.dist_checkpointing.strategies.torch", "MCoreMetadata"),
+        }
+    )
+
+    def find_class(self, module, name):
+        if module == "torch" and isinstance(getattr(torch, name, None), torch.dtype):
+            return getattr(torch, name)
+        return super().find_class(module, name)
+
+
+class _SafeDCPPickleModule(types.ModuleType):
+    """Stand-in for the ``pickle`` module inside ``torch.distributed.checkpoint.filesystem``.
+
+    ``load`` is restricted; everything else (e.g. ``dump``) is forwarded to real ``pickle``.
+    """
+
+    def __init__(self):
+        super().__init__("pickle")
+
+    def __getattr__(self, name):
+        return getattr(pickle, name)
+
+    @staticmethod
+    def load(file, **kwargs):
+        """ """
+        return SafeDCPUnpickler(file, **kwargs).load()
+
+
+def patch_dcp_metadata_loading():
+    """Make ``FileSystemReader.read_metadata`` use a restricted unpickler for ``.metadata``."""
+    if getattr(_dcp_filesystem, "pickle", None) is pickle:
+        _dcp_filesystem.pickle = _SafeDCPPickleModule()
