@@ -418,14 +418,13 @@ class TEGroupedMLP(MegatronModule):
             self.offload_expert_fc1 = True
             self.offload_moe_act = True
 
-        # Offload the quantized FC1 data when TE can keep its scales on device.
-        keep_fp8_input = self.config.fp8_recipe == Fp8Recipe.mxfp8
-        if self.offload_expert_fc1 and hasattr(self.linear_fc1, "bulk_offload_fp8_inputs"):
-            self.linear_fc1.bulk_offload_fp8_inputs = True
-            keep_fp8_input = keep_fp8_input or self.config.fp8_recipe == Fp8Recipe.blockwise
-        use_quantized_fp8 = self.config.fp8 and keep_fp8_input
+        # Save the quantized FC1 input for block-scaled FP8 recipes.
+        use_block_scaled_fp8 = self.config.fp8 and self.config.fp8_recipe in (
+            Fp8Recipe.blockwise,
+            Fp8Recipe.mxfp8,
+        )
         use_nvfp4 = self.config.fp4 and self.config.fp4_recipe == Fp4Recipe.nvfp4
-        if self.offload_expert_fc1 and not (use_quantized_fp8 or use_nvfp4):
+        if self.offload_expert_fc1 and not (use_block_scaled_fp8 or use_nvfp4):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.linear_fc1)
