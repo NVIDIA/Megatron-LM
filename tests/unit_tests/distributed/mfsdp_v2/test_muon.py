@@ -154,3 +154,41 @@ def test_muon_matches_reference(
     reference_losses = _train(reference, (reference_optimizer, reference_other), inputs)
     losses = _train(model, (optimizer, other_optimizer), inputs)
     torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)
+
+
+def test_muon_batches_same_shape_tensors(distributed_setup):
+    """Same-shape tensors of one FSDP group run one batched Newton-Schulz.
+
+    Batched GEMMs round differently from per-tensor ones, so the losses match the reference to
+    rounding error rather than bitwise.
+    """
+    shapes = {0: (8, 8), 1: (8, 8), 2: (1, 8), 3: (8, 8)}
+    assert muon._batches_by_shape({i: torch.empty(s) for i, s in shapes.items()}) == [
+        [0, 1, 3],
+        [2],
+    ]
+
+    world_size = distributed_setup.world_size
+    if world_size < 2 or world_size % 2:
+        pytest.skip("Requires an even number of ranks for two-rank DP meshes.")
+    mesh = init_device_mesh("cuda", (world_size // 2, 2), mesh_dim_names=("replica", "dp"))["dp"]
+    placements = Placements(
+        dp_axes=[0], parameter=[RowAtomic()], gradient=[RowAtomic()], optimizer=[RowAtomic()]
+    )
+    device = distributed_setup.device
+    torch.manual_seed(1234)
+    # Four 8x8 matrices in one FSDP group, so a rank owns more than one of them.
+    layers = [m for _ in range(4) for m in (nn.Linear(8, 8, bias=False), nn.ReLU())]
+    model = nn.Sequential(*layers, nn.Linear(8, 1, bias=False)).to(device)
+    reference = copy.deepcopy(model)
+    with fully_shard_context(FsdpContext(device=device)):
+        fully_shard(model, mesh=mesh, placements=placements)
+    kwargs = dict(lr=0.05, momentum=0.9, fp32_matmul_prec="highest")
+    optimizer = muon.FsdpMuon(list(model.parameters()), **kwargs)
+    fully_shard_optimizer(optimizer, precision_aware=True)
+    reference_optimizer = Muon(list(reference.parameters()), **kwargs)
+
+    inputs = torch.randn(5, 4, 8, device=device)
+    losses = _train(model, (optimizer,), inputs)
+    reference_losses = _train(reference, (reference_optimizer,), inputs)
+    torch.testing.assert_close(losses, reference_losses, rtol=1e-5, atol=1e-5)

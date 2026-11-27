@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import cached_property
+from importlib.metadata import version as _pkg_version
 from typing import Any, cast
 
 import torch
@@ -29,6 +30,24 @@ from .gather_scatter import gather, get_sorted_rank_ranges, scatter
 from .owner_planning import assign_owner_work
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .range import Range, intersect_ranges
+
+# Emerging-Optimizers runs a batched (3-D) Newton-Schulz from 0.3 on.
+_EO_BATCHED_NS = tuple(int(x) for x in _pkg_version('emerging-optimizers').split('.')[:2]) >= (0, 3)
+
+# Newton-Schulz temporaries grow with the batch, so a batch holds at most this much FP32 input.
+_MAX_BATCH_BYTES = 1 << 30
+
+
+def _batches_by_shape(tensors: dict[int, torch.Tensor]) -> list[list[int]]:
+    """Group the tensors' indices by shape, in batches of at most ``_MAX_BATCH_BYTES`` each."""
+    by_shape: dict[torch.Size, list[int]] = {}
+    for i, tensor in tensors.items():
+        by_shape.setdefault(tensor.shape, []).append(i)
+    batches: list[list[int]] = []
+    for shape, indices in by_shape.items():
+        size = max(1, _MAX_BATCH_BYTES // (shape.numel() * 4))
+        batches += [indices[start : start + size] for start in range(0, len(indices), size)]
+    return batches
 
 
 @dataclass(frozen=True)
@@ -273,6 +292,13 @@ class FsdpMuon(Muon):
                 f"num_groups_in_flight must be non-negative, got {num_groups_in_flight}."
             )
         self.num_groups_in_flight = num_groups_in_flight
+        # Same-shape tensors share one Newton-Schulz unless a subclass orthogonalizes differently
+        # or SYRK is on, whose kernel takes 2-D inputs only.
+        self._batch_same_shape = (
+            _EO_BATCHED_NS
+            and type(self).orthogonalize is Muon.orthogonalize
+            and not kwargs.get("use_syrk", False)
+        )
 
         # Preserve discovery order: communication must be posted identically on every rank.
         fsdp_groups: dict[FsdpParameterGroup, None] = {}
@@ -388,11 +414,25 @@ class FsdpMuon(Muon):
     def _orthogonalize_updates(
         self, assignment: _FsdpGroupAssignment, full_inputs: dict[int, torch.Tensor]
     ) -> dict[int, torch.Tensor]:
-        """Consume this rank's gathered inputs and produce its full updates."""
+        """Consume this rank's gathered inputs and produce its full updates.
+
+        Tensors of the same shape run one batched Newton-Schulz: a small matrix's Newton-Schulz is
+        dozens of short kernels, too many for the host to launch one matrix at a time. A tensor
+        alone with its shape keeps the per-tensor ``orthogonalize`` call.
+        """
         fsdp_group = assignment.fsdp_group
+        batches: list[list[int]] = (
+            _batches_by_shape(full_inputs) if self._batch_same_shape else [[i] for i in full_inputs]
+        )
         full_updates = {}
         with eo_utils.fp32_matmul_precision(self.fp32_matmul_prec):
-            for i in tuple(full_inputs):
+            for batch in batches:
+                if len(batch) > 1:
+                    inputs = torch.stack([full_inputs.pop(i).float() for i in batch])
+                    updates = self.scaled_orthogonalize_fn(inputs).contiguous()
+                    full_updates.update(zip(batch, updates.unbind()))
+                    continue
+                (i,) = batch
                 update = full_inputs.pop(i)
                 param: torch.nn.Parameter = fsdp_group.fsdp_parameters[i].sharded
                 group: dict[str, Any] = self.param_groups[
