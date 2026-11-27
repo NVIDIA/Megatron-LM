@@ -14,6 +14,7 @@ from megatron.core.inference import utils as inference_utils
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.tensor_parallel import random as tp_random
 from megatron.core.transformer import cuda_graphs, multi_token_prediction
+from megatron.core.utils import is_te_min_version
 from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
@@ -188,6 +189,11 @@ def reset_transient_process_state():
     # Built from the first model (TestMTPCudaGraphExpertParallel resets it by hand).
     inference_utils.moe_layer_cache = None
     inference_utils._moe_metadata_sync_initialized = False
+
+
+def te_reads_legacy_grouped_env() -> bool:
+    """TE before 2.21 selects single grouped parameters and CuTeDSL fusion through env vars."""
+    return not is_te_min_version("2.21.0")
 
 
 def is_nccl_ep_available():

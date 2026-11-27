@@ -259,11 +259,22 @@ below), not by an operation constructor. Say a library `foo` provides both.
   `LayerNormInterface`. Use the parameter names the existing norms use (`weight`,
   and `bias` for LayerNorm) so a checkpoint loads under either backend. The
   provider that offers it returns it from `layer_norm(rms_norm=..., for_qk=...,
-  has_residual=...)`; providers stay in `models/` and `extensions/`.
+  has_residual=...)`; providers stay in `models/` and `extensions/`. A backend that
+  `rmsnorm_impl` selects is also a branch in `get_norm_module_spec` (`norm/backends.py`),
+  which `with_norm_backend` puts in every norm slot of a HybridModel stack spec.
 - **Tests:** parity against `cross_entropy.vocab_parallel_cross_entropy` or the
   Torch norm, including backward and TP > 1 for cross entropy; a missing library
   is an `ImportError` naming the backend when it is selected; the existing values
   never import it.
+
+## Liger RMSNorm
+
+Install `liger-kernel>=0.8.5` (the dev image has it) and select `--normalization RMSNorm
+--rmsnorm-impl liger` for HybridModel; GPTModel rejects it. The Hybrid builders then build the
+stack spec with `with_norm_backend(spec, "liger")`, whose norm slots (layer, QK, MoE pre-MLP,
+MTP and final norms) name Liger's RMSNorm. Norms fused into a Transformer Engine linear, Mamba's
+gated norm and norms built outside the spec stay Transformer Engine. It is not a speedup: Liger
+is usually slower than Transformer Engine's norms.
 
 ## Dependency checks
 

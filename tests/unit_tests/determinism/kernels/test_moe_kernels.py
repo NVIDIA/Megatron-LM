@@ -68,7 +68,7 @@ from tests.unit_tests.determinism.kernels.harness import (
     run_once,
     seeded,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, te_reads_legacy_grouped_env
 from tests.unit_tests.transformer.moe.megakernel_test_utils import drop_padding_routes
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -1633,7 +1633,8 @@ class TestMoEModules:
             pytest.skip("Native BF16 grouped GEMM needs supported hardware and cuBLASLt")
         self._init()
         seeded()
-        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        if te_reads_legacy_grouped_env():
+            monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
         config = _moe_config(
             hidden_size=256,
             ffn_hidden_size=512,
@@ -1896,7 +1897,8 @@ class TestMoEModules:
             available, reason = probe(return_reason=True)
             if not available:
                 pytest.skip(reason)
-        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        if te_reads_legacy_grouped_env():
+            monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
         self._init()
         seeded()
         quant_recipe = RecipeConfig.from_config_dict(
