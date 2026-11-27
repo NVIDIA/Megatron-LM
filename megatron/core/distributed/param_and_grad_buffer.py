@@ -39,7 +39,14 @@ from ..fp8_utils import (
     modify_underlying_storage,
     post_all_gather_processing,
 )
-from ..optimizer.param_layout import pad_bucket_end, pad_param_start
+from ..optimizer.param_layout import (
+    OwnerExchangePlan,
+    OwnerExchangeSplits,
+    compute_owner_exchange_plan,
+    compute_owner_exchange_splits,
+    pad_bucket_end,
+    pad_param_start,
+)
 from ..utils import is_torch_min_version
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
@@ -146,6 +153,17 @@ class _ParamAndGradBucket:
         self.layerwise_param_flat_sizes = None
         self.layerwise_gather_list = None
 
+        # Element-granular LayerWise buffers (a layout with param_to_owner_shard): this rank's
+        # side of the slice <-> owner exchange, as send/recv ranges ("p2p") and as all-to-all
+        # split sizes ("a2a"), and the params of this bucket it owns. Set by
+        # _ParamAndGradBuffer; None / empty for every other bucket.
+        self.owner_exchange_plan: Optional[OwnerExchangePlan] = None
+        self.owner_exchange_splits: Optional[OwnerExchangeSplits] = None
+        self.owned_params: List[torch.nn.Parameter] = []
+        # "a2a" stage A^-1: the slice-sized tensor the exchange fills and the param all-gather
+        # reads. Alive from the exchange until the all-gather has been waited for.
+        self.owner_param_exchange_scratch: Optional[torch.Tensor] = None
+
     @torch.no_grad()
     def _stage_layerwise_mxfp8_params(self, local_data_view: torch.Tensor, local_rank: int) -> None:
         """Stage owner-rank LayerWise MXFP8 masters into the BF16 all-gather input.
@@ -188,6 +206,26 @@ class _ParamAndGradBucket:
                     f"master={main_param.numel()}, slot={param_slot.numel()}."
                 )
             param_slot.copy_(main_param.detach().reshape(-1))
+
+    @torch.no_grad()
+    def _stage_owned_mxfp8_params(self) -> None:
+        """Element-granular counterpart of :meth:`_stage_layerwise_mxfp8_params`.
+
+        An owned param may extend beyond this rank's slice, so the owner stages each of its
+        MXFP8 masters over the param's whole range of the BF16 all-gather input. Stage A^-1
+        then sends the pieces outside the slice to their slice holders.
+        """
+        flat_param_data = self.param_data.view(-1)
+        for param in self.owned_params:
+            if not (is_mxfp8tensor(param) or is_grouped_mxfp8tensor(param)):
+                continue
+            main_param = getattr(param, 'main_param', None)
+            if main_param is None:
+                raise RuntimeError(
+                    "The owner of a LayerWise MXFP8 parameter must have its FP32 main parameter."
+                )
+            param_start, param_end = self.param_to_index[param]
+            flat_param_data[param_start:param_end].copy_(main_param.detach().reshape(-1))
 
     def set_layerwise_params_list(self, layerwise_params_list: List[List[torch.nn.Parameter]]):
         """Set per-rank parameter lists for layer-wise async all-gather.
@@ -330,6 +368,32 @@ class _ParamAndGradBucketGroup:
         self.cached_param_buffer_shard_list = [None] * len(self.buckets)
         self.cached_grad_buffer_shard_list = [None] * len(self.buckets)
 
+        # Element-granular LayerWise buckets (layerwise_element_granular_dense): stage A sends
+        # the reduced pieces of this rank's slice to their owners after the reduce-scatter,
+        # stage A^-1 sends the owners' updated pieces back before the param all-gather. Both
+        # run on the reduce-scatter's process group, so they stay ordered with its collectives.
+        self.owner_exchange_buckets = [
+            bucket for bucket in self.buckets if bucket.owner_exchange_plan is not None
+        ]
+        # In-flight exchanges: a list of (work, bucket, scratch); bucket and scratch are None
+        # where nothing is copied once the work has completed.
+        self.owner_grad_exchange_works = None
+        self.owner_param_exchange_works = None
+        # The fp32-accumulating reduce-scatter completes its local sum only in wait(), so with
+        # it stage A is issued right after that wait() instead of right after the dispatch.
+        self.owner_grad_exchange_pending = False
+        if self.owner_exchange_buckets:
+            if not self.ddp_config.use_distributed_optimizer:
+                raise ValueError("Element-granular LayerWise buffers need the reduce-scatter path.")
+            if self.ddp_config.num_distributed_optimizer_instances > 1:
+                raise ValueError(
+                    "Element-granular LayerWise buffers do not support "
+                    "num_distributed_optimizer_instances > 1."
+                )
+            self.owner_exchange_global_ranks = torch.distributed.get_process_group_ranks(
+                collective_group
+            )
+
     def reset(self):
         """
         Reset metadata in bucket group in preparation for the next iteration of training.
@@ -342,6 +406,132 @@ class _ParamAndGradBucketGroup:
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
         self.grad_reduce_finished = False
+        self.owner_grad_exchange_pending = False
+
+    def _owner_exchange_p2p_ops(self, grads: bool) -> List[torch.distributed.P2POp]:
+        """Send/recv ops of stage A (``grads=True``) or stage A^-1 on views of the buffer.
+
+        Each peer pair posts its ops in plan (offset) order on both sides.
+        """
+        group = self.intra_distributed_optimizer_instance_group
+        global_ranks = self.owner_exchange_global_ranks
+        ops = []
+        for bucket in self.owner_exchange_buckets:
+            plan = bucket.owner_exchange_plan
+            if grads:
+                data, sends, recvs = bucket.grad_data, plan.to_owners, plan.from_slices
+            else:
+                data, sends, recvs = bucket.param_data, plan.from_slices, plan.to_owners
+            for start, end, peer in sends:
+                ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.isend, data[start:end], global_ranks[peer], group
+                    )
+                )
+            for start, end, peer in recvs:
+                ops.append(
+                    torch.distributed.P2POp(
+                        torch.distributed.irecv, data[start:end], global_ranks[peer], group
+                    )
+                )
+        return ops
+
+    def _start_owner_exchange_a2a(self, grads: bool, async_op: bool) -> list:
+        """Stage A (``grads=True``) or stage A^-1 as one all-to-all per bucket.
+
+        Stage A: the input is this rank's slice of the reduced gradient, which the owner-major
+        bucket order has already sorted by destination owner. The pieces of this rank's owner
+        segment arrive in slice order, which is the segment's element order, in a scratch
+        tensor: the piece a rank sends to itself would otherwise alias input and output. The
+        scratch is copied into the segment once the collective has completed.
+
+        Stage A^-1: the input is this rank's owner segment of the param buffer and the output
+        is a slice-sized scratch tensor, which the param all-gather then takes as its input, so
+        no copy and no wait sits between the two collectives.
+        """
+        group = self.intra_distributed_optimizer_instance_group
+        dp_size = self.intra_distributed_optimizer_instance_size
+        dp_rank = self.intra_distributed_optimizer_instance_rank
+        works = []
+        for bucket in self.owner_exchange_buckets:
+            splits = bucket.owner_exchange_splits
+            if not splits.has_remote_pieces:
+                continue
+            segment_start, segment_end = splits.segment
+            data = bucket.grad_data if grads else bucket.param_data
+            shard = data.numel() // dp_size
+            local_slice = data[dp_rank * shard : (dp_rank + 1) * shard]
+            segment = data[segment_start:segment_end]
+            if grads:
+                source, scratch = local_slice, torch.empty_like(segment)
+                input_sizes, output_sizes = (
+                    splits.slice_to_owner_sizes,
+                    splits.owner_from_slice_sizes,
+                )
+            else:
+                source, scratch = segment, torch.empty_like(local_slice)
+                input_sizes, output_sizes = (
+                    splits.owner_from_slice_sizes,
+                    splits.slice_to_owner_sizes,
+                )
+            work = torch.distributed.all_to_all_single(
+                scratch,
+                source,
+                output_split_sizes=list(output_sizes),
+                input_split_sizes=list(input_sizes),
+                group=group,
+                async_op=async_op,
+            )
+            if grads:
+                works.append((work, bucket, scratch))
+            else:
+                bucket.owner_param_exchange_scratch = scratch
+                works.append((work, None, None))
+        return works
+
+    def _start_owner_exchange(self, grads: bool, async_op: bool) -> Optional[list]:
+        """Issue stage A (``grads=True``) or stage A^-1; returns what is in flight."""
+        if self.ddp_config.layerwise_owner_exchange == "a2a":
+            works = self._start_owner_exchange_a2a(grads, async_op)
+        else:
+            ops = self._owner_exchange_p2p_ops(grads)
+            works = [
+                (work, None, None)
+                for work in (torch.distributed.batch_isend_irecv(ops) if ops else [])
+            ]
+        if not works:
+            return None
+        if async_op:
+            return works
+        self._wait_owner_exchange(works)
+        return None
+
+    @staticmethod
+    def _wait_owner_exchange(works: list) -> None:
+        """Make the current stream wait for an exchange and finish its copies."""
+        for work, bucket, scratch in works:
+            if work is not None:
+                work.wait()
+            if bucket is not None:
+                segment_start, segment_end = bucket.owner_exchange_splits.segment
+                bucket.grad_data[segment_start:segment_end].copy_(scratch)
+
+    def _finish_owner_grad_exchange(self) -> None:
+        """Make the current stream wait for this group's stage A, if one is in flight."""
+        if self.owner_grad_exchange_works is not None:
+            self._wait_owner_exchange(self.owner_grad_exchange_works)
+            self.owner_grad_exchange_works = None
+
+    def _finish_owner_param_exchange(self) -> None:
+        """Make the current stream wait for this group's stage A^-1, if one is in flight."""
+        if self.owner_param_exchange_works is not None:
+            self._wait_owner_exchange(self.owner_param_exchange_works)
+            self.owner_param_exchange_works = None
+
+    def _release_owner_param_exchange_scratch(self) -> None:
+        """Drop the all-gather inputs of stage A^-1 once the all-gather has completed."""
+        for bucket in self.owner_exchange_buckets:
+            bucket.owner_param_exchange_scratch = None
 
     def _post_param_sync(self):
         """Run post-processing after param all-gather completes."""
@@ -454,8 +644,10 @@ class _ParamAndGradBucketGroup:
 
         if force_sync:
             if self.param_gather_handle is not None:
+                self._finish_owner_param_exchange()
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+                self._release_owner_param_exchange_scratch()
                 self._post_param_sync()
                 return
         else:
@@ -560,6 +752,18 @@ class _ParamAndGradBucketGroup:
                     bucket.grad_data.zero_()
                 self.param_gather_handle = None
         else:
+            if self.owner_exchange_buckets:
+                # Element-granular LayerWise buckets, stage A^-1: the owners (MXFP8: after
+                # staging their masters into the reused grad buffer) send the updated pieces
+                # of their params that lie in other ranks' slices to those slice holders, so
+                # every rank contributes a current slice to the all-gather below, which
+                # follows the exchange on the same process group.
+                if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                    for bucket in self.owner_exchange_buckets:
+                        bucket._stage_owned_mxfp8_params()
+                self.owner_param_exchange_works = self._start_owner_exchange(
+                    grads=False, async_op=async_op
+                )
             # Standard distributed optimizer path: use _coalescing_manager.
             # all_gather_into_tensor writes directly into a contiguous output buffer and
             # does not need a copy-back step, so coalescing works correctly.
@@ -574,10 +778,16 @@ class _ParamAndGradBucketGroup:
                     local_data_view = self.cached_param_buffer_shard_list[idx][
                         self.intra_distributed_optimizer_instance_rank
                     ]
-                    if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                    if (
+                        self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                        and bucket.owner_exchange_plan is None
+                    ):
                         bucket._stage_layerwise_mxfp8_params(
                             local_data_view, self.intra_distributed_optimizer_instance_rank
                         )
+                    if bucket.owner_param_exchange_scratch is not None:
+                        # "a2a" stage A^-1 delivered this rank's current slice here.
+                        local_data_view = bucket.owner_param_exchange_scratch
                     dist_all_gather_func(
                         bucket.param_data,
                         local_data_view,
@@ -591,6 +801,7 @@ class _ParamAndGradBucketGroup:
                 # (async_op=False) is used, `cm` is not None. Manually set to None for
                 # consistency with prior code.
                 self.param_gather_handle = None
+                self._release_owner_param_exchange_scratch()
         if force_sync and self.ddp_config.overlap_param_gather:
             self._post_param_sync()
         self.param_gather_dispatched = True
@@ -618,8 +829,10 @@ class _ParamAndGradBucketGroup:
             self.start_param_sync()
 
         if self.param_gather_handle is not None:
+            self._finish_owner_param_exchange()
             self.param_gather_handle.wait()
             self.param_gather_handle = None
+            self._release_owner_param_exchange_scratch()
             # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
                 if self.next_param_gather_bucket_group.param_gather_dispatched:
@@ -686,8 +899,10 @@ class _ParamAndGradBucketGroup:
             self.previous_grad_reduce_bucket_group is not None
             and self.previous_grad_reduce_bucket_group.grad_reduce_handle is not None
         ):
+            # The predecessor's stage A (element-granular LayerWise buckets) is issued here
+            # but waited for only at the end of the step.
             self.previous_grad_reduce_bucket_group.finish_grad_sync(
-                force_all_reduce=force_all_reduce
+                force_all_reduce=force_all_reduce, wait_for_owner_exchange=False
             )
 
         assert (
@@ -846,7 +1061,23 @@ class _ParamAndGradBucketGroup:
             # None.
             self.grad_reduce_handle = None
 
-    def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
+        # Stage A (element-granular LayerWise buckets): send the reduced pieces of this rank's
+        # slice to their owners. Issued right behind the reduce-scatter on the same process
+        # group, so the compute stream does not wait. The asynchronous fp32-accumulating
+        # reduce-scatter completes its local sum only in wait(); there stage A follows that
+        # wait() (in finish_grad_sync, or in the next bucket group's drain). An all-reduce
+        # leaves every rank with the whole reduced bucket: nothing to route.
+        if self.owner_exchange_buckets and not force_all_reduce:
+            if async_op and self.ddp_config.reduce_scatter_with_fp32_accumulation:
+                self.owner_grad_exchange_pending = True
+            else:
+                self.owner_grad_exchange_works = self._start_owner_exchange(
+                    grads=True, async_op=async_op
+                )
+
+    def finish_grad_sync(
+        self, force_all_reduce: Optional[bool] = False, wait_for_owner_exchange: bool = True
+    ):
         """
         Finishes grad sync (all-reduce or reduce-scatter) communication operations
         for all buckets in the bucket group.
@@ -862,6 +1093,10 @@ class _ParamAndGradBucketGroup:
         finalize loop to call this on every bucket without double-waiting. The
         non-overlap path preserves its original per-call dispatch+wait behaviour
         because it has no predecessor draining.
+
+        Element-granular LayerWise buckets also route the reduced pieces to their owners
+        (stage A). ``wait_for_owner_exchange=False`` (the early drain) leaves that exchange
+        in flight, and a later call (the end-of-step loop) waits for it.
         """
         self.param_gather_dispatched = False
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
@@ -870,6 +1105,8 @@ class _ParamAndGradBucketGroup:
             self._copy_back_extra_main_grads()
             return
         if self.grad_reduce_finished:
+            if wait_for_owner_exchange:
+                self._finish_owner_grad_exchange()
             return
         # If first batch, start asynchronous communication here. register_grad_ready() launches
         # asynchronous communication only once self.golden_per_param_grad_ready_counts is
@@ -890,6 +1127,12 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
+        if self.owner_grad_exchange_pending:
+            # fp32-accumulating reduce-scatter: its local sum ran in the wait() above.
+            self.owner_grad_exchange_pending = False
+            self.owner_grad_exchange_works = self._start_owner_exchange(grads=True, async_op=True)
+        if wait_for_owner_exchange:
+            self._finish_owner_grad_exchange()
         self._copy_back_extra_main_grads()
         self.grad_reduce_finished = True
 
@@ -901,9 +1144,11 @@ class _ParamAndGradBucketGroup:
         reclaim them.  Called before async checkpoint saves to avoid OOM in
         the persistent checkpoint worker process.
         """
+        self._finish_owner_param_exchange()
         if self.param_gather_handle is not None:
             self.param_gather_handle.wait()
             self.param_gather_handle = None
+        self._release_owner_param_exchange_scratch()
         for bucket in self.buckets:
             bucket.layerwise_gather_list = None
 
@@ -1536,6 +1781,9 @@ class _ParamAndGradBuffer:
             self.buckets.append(
                 _create_bucket(cur_bucket_id, bucket_params, bucket_params_with_extra_main_grads)
             )
+        self.param_to_owner_shard = param_layout.param_to_owner_shard
+        if self.param_to_owner_shard is not None:
+            self._set_owner_exchange_plans(param_to_name)
         # Log buckets for all PP stages.
         if logger.isEnabledFor(logging.INFO) and self.is_buffer_log_rank:
             log_strs = []
@@ -1554,6 +1802,74 @@ class _ParamAndGradBuffer:
                 for param in bucket.params_list:
                     log_strs.append(f"\t{param_to_name[param]} ({param.main_grad.dtype=})")
             logger.info("\n".join(log_strs))
+
+    def _set_owner_exchange_plans(self, param_to_name: Dict[torch.nn.Parameter, str]) -> None:
+        """Element-granular LayerWise layout: give every bucket this rank's side of the
+        slice <-> owner exchange and its owned params.
+
+        Raises ``ValueError`` for what the exchange does not support, so that nothing falls
+        back silently to a layout whose owners do not hold their gradients.
+        """
+        if not self.ddp_config.use_distributed_optimizer:
+            raise ValueError(
+                "An element-granular LayerWise layout needs use_distributed_optimizer."
+            )
+        if self.ddp_config.num_distributed_optimizer_instances > 1:
+            raise ValueError(
+                "Element-granular LayerWise buffers do not support "
+                "num_distributed_optimizer_instances > 1."
+            )
+        if self.nccl_ub and self.ddp_config.layerwise_owner_exchange == "a2a":
+            # The all-to-all receives into scratch tensors, which lie outside the registered
+            # buffers. With user-buffer registration, an all_to_all_single with split sizes
+            # whose send buffer is registered and whose receive buffer is not never completes
+            # once its pieces exceed a few tens of KiB (reproduced with one such call on a
+            # registered tensor, without DDP; with both ends registered, or neither, it
+            # completes). "p2p" sends and receives views of the registered buffers.
+            raise ValueError(
+                "layerwise_owner_exchange='a2a' is not supported with nccl_ub: its scratch "
+                "tensors are not registered with NCCL. Use layerwise_owner_exchange='p2p'."
+            )
+        if self.has_nvfp4_params:
+            raise ValueError("Element-granular LayerWise buffers do not support NVFP4 params.")
+        for param in self.params:
+            if _param_uses_quantized_storage(param) and not (
+                is_mxfp8tensor(param) or is_grouped_mxfp8tensor(param)
+            ):
+                raise ValueError(
+                    "Element-granular LayerWise buffers support BF16/FP16 and MXFP8 "
+                    "(reuse_grad_buf_for_mxfp8_param_ag) params only."
+                )
+        dp_size = self.data_parallel_world_size
+        dp_rank = self.data_parallel_group.rank()
+        for bucket in self.buckets:
+            if bucket.params_with_extra_main_grads:
+                names = [param_to_name[param] for param in bucket.params_with_extra_main_grads]
+                raise ValueError(
+                    "param_name_patterns_for_fp32_local_accumulation matches params of an "
+                    "element-granular LayerWise buffer, which keeps no separate FP32 "
+                    f"main_grad: {names[:4]}{' ...' if len(names) > 4 else ''}."
+                )
+            ranges = [
+                (bucket.offset + start, bucket.offset + end, self.param_to_owner_shard[param])
+                for param, (start, end) in bucket.param_to_index.items()
+            ]
+            bucket_end = bucket.offset + bucket.grad_data.numel()
+            bucket.owner_exchange_plan = compute_owner_exchange_plan(
+                ranges, bucket.offset, bucket_end, dp_size, dp_rank
+            )
+            bucket.owner_exchange_splits = compute_owner_exchange_splits(
+                ranges, bucket.offset, bucket_end, dp_size, dp_rank
+            )
+            bucket.owned_params = [
+                param for param in bucket.params_list if self.param_to_owner_shard[param] == dp_rank
+            ]
+        if dp_size > 1:
+            # A batch of sends and receives may involve a subset of the group only once the
+            # group's NCCL communicator exists; create it with a collective every rank joins.
+            torch.distributed.all_reduce(
+                torch.zeros(1, device=torch.cuda.current_device()), group=self.data_parallel_group
+            )
 
     def _compute_nvfp4_packed_layout(self, params_with_names):
         """Derive packed NVFP4 index map and bucket indices from the primary layout.

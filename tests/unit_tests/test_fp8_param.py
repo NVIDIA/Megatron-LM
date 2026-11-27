@@ -900,6 +900,111 @@ class TestFP8Param:
 
     @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(
+        Version(os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")) <= Version("25.05"),
+        reason="Layer-wise optimizer is not supported on LTS",
+    )
+    @pytest.mark.parametrize("transport", ["a2a", "p2p"])
+    def test_mxfp8_muon_element_granular_dense_is_bitwise(self, tmp_path_dist_ckpt, transport):
+        """layerwise_element_granular_dense keeps every LayerWise owner, so with MXFP8 params,
+        the grad buffer reused for the param all-gather, both overlaps and the FP32-accumulating
+        reduce-scatter, six Muon steps leave the same quantized params on every rank and the
+        same FP32 masters as the shard-aligned layout."""
+        if get_device_arch_version() < 10:
+            pytest.skip("MXFP8 is supported since Blackwell architecture")
+        # TP is 2 as in the other cases of this file: with hidden_size 128 and SwiGLU the MLP
+        # output projection is (128, 320 / TP), and MXFP8 needs both dims divisible by 32.
+        tp_size = 2
+        dp_size = Utils.world_size // tp_size
+        if Utils.world_size % tp_size or dp_size < 2:
+            pytest.skip("needs TP=2 and a data-parallel size of at least 2")
+        kwargs = {
+            "overlap_param_gather": True,
+            "overlap_grad_reduce": True,
+            "optimizer": "muon",
+            "muon_tp_mode": "duplicated",
+            "ddp_reduce_scatter_with_fp32_accumulation": True,
+        }
+        layouts = {
+            "shard_aligned": {},
+            "element_granular": {
+                "layerwise_element_granular_dense": True,
+                "layerwise_dense_num_buckets": 3,
+                "layerwise_owner_exchange": transport,
+            },
+        }
+        Utils.initialize_distributed()
+        states = {}
+        for layout_name, layout_kwargs in layouts.items():
+            with TempNamedDir(tmp_path_dist_ckpt / f"eg_mxfp8_{layout_name}", sync=True) as ckpt:
+                args, model, optimizer, _ = self.setup_checkpoint_case(
+                    tp_size, "mxfp8", str(ckpt), **kwargs, **layout_kwargs
+                )
+                layerwise_buffers = [
+                    buffer
+                    for buffer in model[0].buffers
+                    if getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
+                ]
+                assert layerwise_buffers
+                uses_owner_map = [b.param_to_owner_shard is not None for b in layerwise_buffers]
+                assert any(uses_owner_map) == bool(layout_kwargs)
+                if layout_kwargs:
+                    moved = sum(
+                        end - start
+                        for buffer in layerwise_buffers
+                        for bucket in buffer.buckets
+                        for start, end, _ in bucket.owner_exchange_plan.to_owners
+                    )
+                    moved = torch.tensor([moved], device='cuda')
+                    torch.distributed.all_reduce(moved)
+                    assert moved.item() > 0, "no param crosses a slice boundary in this model"
+                self.run_train_steps(args, model, optimizer, num_steps=6)
+                force_param_sync(model, optimizer=optimizer)
+                states[layout_name] = (
+                    self.quantized_param_state(model[0]),
+                    [p.detach().clone() for p in optimizer.get_parameters()],
+                )
+                num_layers = args.num_layers
+            self.cleanup_between_runs()
+
+        ref_quantized, ref_masters = states["shard_aligned"]
+        quantized, masters = states["element_granular"]
+        assert len(ref_quantized) == 4 * num_layers, sorted(ref_quantized)
+        assert quantized.keys() == ref_quantized.keys()
+        for name, tensors in quantized.items():
+            for attr, tensor in tensors.items():
+                assert torch.equal(tensor, ref_quantized[name][attr]), f"{name}{attr} differs"
+        assert len(masters) == len(ref_masters) > 0
+        for master, ref_master in zip(masters, ref_masters):
+            assert torch.equal(master, ref_master), "FP32 main params differ"
+
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
+    @pytest.mark.skipif(
+        Version(os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")) <= Version("25.05"),
+        reason="Layer-wise optimizer is not supported on LTS",
+    )
+    def test_element_granular_dense_rejects_non_mxfp8_quantized_params(self, tmp_path_dist_ckpt):
+        """Tensorwise FP8 param gather keeps the params in a uint8 buffer with per-tensor
+        scales, which the slice <-> owner exchange does not move: the layout raises."""
+        if Utils.world_size < 4:
+            pytest.skip("needs at least 4 ranks")
+        Utils.initialize_distributed()
+        with TempNamedDir(tmp_path_dist_ckpt / "eg_tensorwise", sync=True) as ckpt:
+            with pytest.raises(ValueError, match="BF16/FP16 and MXFP8"):
+                self.setup_checkpoint_case(
+                    Utils.world_size // 2,
+                    "tensorwise",
+                    str(ckpt),
+                    overlap_param_gather=True,
+                    overlap_grad_reduce=True,
+                    optimizer="muon",
+                    muon_tp_mode="duplicated",
+                    layerwise_element_granular_dense=True,
+                )
+        self.cleanup_between_runs()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not fp8_available, reason=reason_for_no_fp8)
     @pytest.mark.skipif(not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required")
     @pytest.mark.parametrize("tp_size", [2])
     @pytest.mark.parametrize("recipe", ["mxfp8", "tensorwise", "blockwise"])

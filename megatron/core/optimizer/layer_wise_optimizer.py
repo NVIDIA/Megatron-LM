@@ -30,6 +30,7 @@ from .param_layout import (
     FullParamLayout,
     PerBufferParamLayout,
     bucket_end_divisor,
+    owner_exchange_runs,
     pad_param_start,
     pad_to_divisor,
 )
@@ -235,6 +236,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         data_parallel_world_size: int,
         ddp_config,
         param_indices: Optional[List[int]] = None,
+        log_layout: bool = True,
     ) -> 'PerBufferParamLayout':
         """Compute parameter layout with shard-aligned buckets via LPT bin-packing.
 
@@ -271,6 +273,8 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             data_parallel_world_size: Size of the data-parallel group.
             ddp_config: :class:`DistributedDataParallelConfig`.
             param_indices: Optional per-param dtype indices (passed through).
+            log_layout: Log the layout summary. Off when the layout only supplies the
+                owners of an element-granular layout.
 
         Returns:
             :class:`PerBufferParamLayout` with shard-aligned buckets.
@@ -366,15 +370,18 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     shard_compute_loads[min_shard] += _ns_compute_cost(param)
 
             padded_shard_size = pad_to_divisor(max(shard_cursors), shard_divisor)
-            # The shard is the fullest bin, so one outsized param forces every shard to
-            # its size however well the rest pack. Log the largest to tell those apart.
-            sizes = sorted((p.data.nelement() for p in chunk_params if p is not None), reverse=True)
-            log_single_rank(
-                logger,
-                logging.INFO,
-                f"Layerwise bucket {bucket_id}: shard={padded_shard_size} x dp={dp_size}, "
-                f"real={sum(sizes)}, largest={sizes[:3]}",
-            )
+            if log_layout:
+                # The shard is the fullest bin, so one outsized param forces every shard to
+                # its size however well the rest pack. Log the largest to tell those apart.
+                sizes = sorted(
+                    (p.data.nelement() for p in chunk_params if p is not None), reverse=True
+                )
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    f"Layerwise bucket {bucket_id}: shard={padded_shard_size} x dp={dp_size}, "
+                    f"real={sum(sizes)}, largest={sizes[:3]}",
+                )
             bucket_start_index = buffer_cursor
             for shard_id in range(dp_size):
                 shard_start_index = bucket_start_index + shard_id * padded_shard_size
@@ -467,17 +474,148 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
         total_buffer_numel = bucket_indices[-1][1] if bucket_indices else 0
         total_padding = total_buffer_numel - total_param_numel
+        if log_layout:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"Layerwise param layout: {len(params)} params, "
+                f"{len(bucket_indices)} buckets, "
+                f"dp_size={dp_size}, "
+                f"total_param_numel={total_param_numel}, "
+                f"total_buffer_numel={total_buffer_numel}, "
+                f"total_padding={total_padding} "
+                f"(shard_imbalance={shard_imbalance_padding_numel}), "
+                f"overhead={total_padding / max(total_param_numel, 1) * 100:.1f}%",
+            )
+
+        return PerBufferParamLayout(
+            param_index_map=param_index_map,
+            bucket_indices=bucket_indices,
+            per_bucket_numel_unpadded=per_bucket_numel_unpadded,
+            param_indices=param_indices if param_indices is not None else [],
+            num_optimizer_shards=dp_size,
+        )
+
+    @staticmethod
+    def _compute_element_granular_param_layout(
+        params: List[torch.nn.Parameter],
+        bucket_size: Optional[int],
+        element_granular_bucket_size: Optional[int],
+        data_parallel_world_size: int,
+        ddp_config,
+        param_indices: Optional[List[int]] = None,
+    ) -> 'PerBufferParamLayout':
+        """Element-granular layout for a LayerWise buffer that keeps the shard-aligned owners.
+
+        Owners: the shard each param gets from :meth:`_compute_per_buffer_param_layout` with
+        the same ``bucket_size``, so the optimizer partition, and with it the optimizer state
+        every rank holds and checkpoints, is the shard-aligned layout's.
+
+        Buffer: buckets take params in backprop order and close once they hold
+        ``element_granular_bucket_size`` elements (``None``: one bucket). Inside a bucket the
+        params are placed owner-major with 64-element starts, and the bucket end is padded to
+        ``dp_size * _shard_divisor`` so every data-parallel slice starts on a 64-element
+        boundary. A param may cross slice boundaries: after a bucket's reduce-scatter DDP
+        routes the pieces of each slice to the params' owners (stage A), and before its param
+        all-gather the owners send the updated pieces back (stage A^-1).
+
+        Args:
+            params: Parameters in model-definition (forward) order.
+            bucket_size: Bucket size of the shard-aligned layout the owners come from.
+            element_granular_bucket_size: Elements per bucket of this layout.
+            data_parallel_world_size: Size of the data-parallel group.
+            ddp_config: :class:`DistributedDataParallelConfig`.
+            param_indices: Optional per-param dtype indices (passed through).
+
+        Returns:
+            :class:`PerBufferParamLayout` with ``param_to_owner_shard`` set.
+        """
+        dp_size = data_parallel_world_size
+        for param in params:
+            if getattr(param, 'shared_embedding', False):
+                raise ValueError(
+                    "layerwise_element_granular_dense does not support a shared embedding in "
+                    "the LayerWise buffer."
+                )
+        owner_layout = LayerWiseDistributedOptimizer._compute_per_buffer_param_layout(
+            params, bucket_size, dp_size, ddp_config, param_indices, log_layout=False
+        )
+        param_to_owner_shard: Dict[torch.nn.Parameter, int] = {}
+        for param, (start_index, _, owner_bucket_id) in owner_layout.param_index_map.items():
+            owner_bucket_start, owner_bucket_end = owner_layout.bucket_indices[owner_bucket_id]
+            owner_shard_size = (owner_bucket_end - owner_bucket_start) // dp_size
+            param_to_owner_shard[param] = (start_index - owner_bucket_start) // owner_shard_size
+
+        # Bucket membership: contiguous backprop ranges closed at the bucket size.
+        buckets: List[List[torch.nn.Parameter]] = []
+        bucket_params: List[torch.nn.Parameter] = []
+        bucket_numel = 0
+        for param in reversed(params):
+            bucket_params.append(param)
+            bucket_numel = pad_param_start(bucket_numel) + param.data.nelement()
+            if (
+                element_granular_bucket_size is not None
+                and bucket_numel >= element_granular_bucket_size
+            ):
+                buckets.append(bucket_params)
+                bucket_params, bucket_numel = [], 0
+        if bucket_params:
+            buckets.append(bucket_params)
+
+        # Placement: owner-major inside each bucket. The sort is stable, so the params of one
+        # owner keep their backprop order.
+        bucket_divisor = dp_size * LayerWiseDistributedOptimizer._shard_divisor(dp_size, ddp_config)
+        param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = {}
+        bucket_indices: List[Tuple[int, int]] = []
+        per_bucket_numel_unpadded: List[int] = []
+        bucket_start_index = 0
+        for bucket_id, bucket_params in enumerate(buckets):
+            param_end_index = bucket_start_index
+            for param in sorted(bucket_params, key=lambda p: param_to_owner_shard[p]):
+                param_start_index = pad_param_start(param_end_index)
+                param_end_index = param_start_index + param.data.nelement()
+                param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+            bucket_end_index = pad_to_divisor(param_end_index, bucket_divisor)
+            bucket_indices.append((bucket_start_index, bucket_end_index))
+            bucket_start_index = bucket_end_index
+
+        # Stage-A volume per step in elements: what each slice sends to other owners and what
+        # each owner receives from other slices. Stage A^-1 moves the same ranges back.
+        sends, recvs = [0] * dp_size, [0] * dp_size
+        ranges_by_bucket: Dict[int, List[Tuple[int, int, int]]] = {}
+        for param, (start_index, end_index, bucket_id) in param_index_map.items():
+            ranges_by_bucket.setdefault(bucket_id, []).append(
+                (start_index, end_index, param_to_owner_shard[param])
+            )
+        for bucket_id, (bucket_start, bucket_end) in enumerate(bucket_indices):
+            slice_runs = owner_exchange_runs(
+                ranges_by_bucket.get(bucket_id, []), bucket_start, bucket_end, dp_size
+            )
+            for slice_rank, runs in enumerate(slice_runs):
+                for lo, hi, owner in runs:
+                    if owner != slice_rank:
+                        sends[slice_rank] += hi - lo
+                        recvs[owner] += hi - lo
+        total_param_numel = sum(p.data.nelement() for p in params)
+        total_buffer_numel = bucket_indices[-1][1] if bucket_indices else 0
+        owner_buffer_numel = (
+            owner_layout.bucket_indices[-1][1] if owner_layout.bucket_indices else 0
+        )
         log_single_rank(
             logger,
             logging.INFO,
-            f"Layerwise param layout: {len(params)} params, "
-            f"{len(bucket_indices)} buckets, "
-            f"dp_size={dp_size}, "
-            f"total_param_numel={total_param_numel}, "
+            f"Layerwise element-granular layout: {len(params)} params, "
+            f"{len(bucket_indices)} buckets (bucket_size={element_granular_bucket_size}), "
+            f"dp_size={dp_size}, total_param_numel={total_param_numel}, "
             f"total_buffer_numel={total_buffer_numel}, "
-            f"total_padding={total_padding} "
-            f"(shard_imbalance={shard_imbalance_padding_numel}), "
-            f"overhead={total_padding / max(total_param_numel, 1) * 100:.1f}%",
+            f"overhead={(total_buffer_numel / max(total_param_numel, 1) - 1) * 100:.2f}%; "
+            f"owners from the shard-aligned layout ({len(owner_layout.bucket_indices)} buckets, "
+            f"total_buffer_numel={owner_buffer_numel}, "
+            f"overhead={(owner_buffer_numel / max(total_param_numel, 1) - 1) * 100:.1f}%); "
+            f"stage-A elements per step and rank: send max={max(sends)} "
+            f"mean={sum(sends) / dp_size:.0f}, receive max={max(recvs)} "
+            f"mean={sum(recvs) / dp_size:.0f}",
         )
 
         return PerBufferParamLayout(
@@ -486,6 +624,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             per_bucket_numel_unpadded=per_bucket_numel_unpadded,
             param_indices=param_indices if param_indices is not None else [],
             num_optimizer_shards=dp_size,
+            param_to_owner_shard=param_to_owner_shard,
         )
 
     @staticmethod
@@ -569,7 +708,30 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
 
             # Dispatch per buffer: LayerWise (Muon) params get the shard-aligned
             # layout; non-LayerWise params (e.g. Adam-managed embeddings, biases)
-            # get DistOpt's byte-level layout.
+            # get DistOpt's byte-level layout. layerwise_element_granular_dense gives
+            # the dense LayerWise buffer an element-granular layout with the same
+            # owners; expert buffers keep the shard-aligned layout.
+            if (
+                buffer_key.is_managed_by_layer_wise_optimizer
+                and not buffer_key.is_expert_parallel
+                and getattr(ddp_config, 'layerwise_element_granular_dense', False)
+            ):
+                num_buckets = getattr(ddp_config, 'layerwise_dense_num_buckets', None)
+                element_granular_bucket_size = None
+                if bucket_size is not None and num_buckets is not None:
+                    total_numel = sum(p.data.nelement() for p in group_params)
+                    element_granular_bucket_size = max(1, math.ceil(total_numel / num_buckets))
+                layouts[buffer_key] = (
+                    LayerWiseDistributedOptimizer._compute_element_granular_param_layout(
+                        group_params,
+                        bucket_size,
+                        element_granular_bucket_size,
+                        dp_world_size,
+                        ddp_config,
+                        param_indices,
+                    )
+                )
+                continue
             if buffer_key.is_managed_by_layer_wise_optimizer:
                 compute_per_buffer_layout = (
                     LayerWiseDistributedOptimizer._compute_per_buffer_param_layout
@@ -891,6 +1053,11 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 # layernorms with a DistOpt byte-level layout) are managed by a
                 # separate DistributedOptimizer; LayerWise does not own them.
                 if not buffer_key.is_managed_by_layer_wise_optimizer:
+                    continue
+                if layout.param_to_owner_shard is not None:
+                    # Element-granular layout: a param may cross shard boundaries, so the
+                    # layout records its owner (the shard-aligned layout's shard).
+                    param_to_shard.update(layout.param_to_owner_shard)
                     continue
                 for param, (
                     param_start_index,

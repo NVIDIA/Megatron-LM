@@ -284,6 +284,8 @@ def setup_model_and_optimizer(
     fp8_param_gather=False,
     fp4_param_gather=False,
     reuse_grad_buf_for_mxfp8_param_ag=False,
+    layerwise_element_granular_dense=False,
+    layerwise_owner_exchange="a2a",
 ):
     optimizer_type = optimizer
     use_layer_wise = False
@@ -316,6 +318,9 @@ def setup_model_and_optimizer(
             mock_args.ddp_num_buckets = ddp_num_buckets
             mock_args.overlap_grad_reduce = True
         mock_args.ddp_pad_buckets_for_high_nccl_busbw = ddp_pad_buckets_for_high_nccl_busbw
+        mock_args.layerwise_element_granular_dense = layerwise_element_granular_dense
+        mock_args.layerwise_dense_num_buckets = 3
+        mock_args.layerwise_owner_exchange = layerwise_owner_exchange
         mock_args.context_parallel_size = cp
         mock_args.expert_model_parallel_size = ep
         mock_args.expert_tensor_parallel_size = etp

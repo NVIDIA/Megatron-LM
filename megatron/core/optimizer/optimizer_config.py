@@ -639,6 +639,22 @@ class OptimizerConfig:
                 'distributed checkpointing yet'
             )
 
+        if getattr(ddp_config, "layerwise_element_granular_dense", False):
+            # finalize_optimizer_config() turns use_distributed_optimizer into
+            # use_layer_wise_distributed_optimizer for muon-family optimizers; accept the
+            # form before it ran as well.
+            will_be_layer_wise = self.use_layer_wise_distributed_optimizer or (
+                self.optimizer not in ('sgd', 'adam')
+                and (self.use_distributed_optimizer or self.optimizer == 'dist_muon')
+            )
+            if not will_be_layer_wise or use_torch_fsdp2 or ddp_config.use_megatron_fsdp:
+                raise ValueError(
+                    "layerwise_element_granular_dense lays out the dense DDP buffer of the "
+                    "LayerWise distributed optimizer: it needs a LayerWise-managed optimizer "
+                    "(e.g. --optimizer muon --use-distributed-optimizer) on the standard "
+                    "DistributedDataParallel, not FSDP."
+                )
+
     def validate_model(
         self, *, moe_single_grouped_weight: bool, virtual_pipeline_model_parallel_size: int | None
     ) -> None:
