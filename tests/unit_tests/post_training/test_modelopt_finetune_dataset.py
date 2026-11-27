@@ -5,7 +5,8 @@
 import sys
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -20,7 +21,7 @@ _MODEL_OPT_EXAMPLE_DIR = Path(__file__).parents[3] / "examples" / "post_training
 sys.path.insert(0, str(_MODEL_OPT_EXAMPLE_DIR))
 
 import finetune
-from finetune import SFTDataset
+from finetune import SFTDataset, validate_eagle_streaming_args
 from utils import get_eos_token_id
 
 from megatron.post_training.arguments import add_modelopt_args
@@ -56,6 +57,136 @@ def test_finetune_data_files_argument_accepts_multiple_files():
 
     assert args.finetune_data_split == "chat"
     assert args.finetune_data_files == ["data/chat-00000.parquet", "data/chat-00001.parquet"]
+
+
+def test_streaming_finetune_loads_explicit_splits(tmp_path, monkeypatch, streaming_args):
+    tokenizers = pytest.importorskip("tokenizers")
+    streaming = pytest.importorskip("modelopt.torch.speculative.plugins.hf_streaming_dataset")
+    tokenizer = transformers.PreTrainedTokenizerFast(
+        tokenizer_object=tokenizers.Tokenizer(tokenizers.models.WordLevel({"[EOS]": 0})),
+        eos_token="[EOS]",
+    )
+    train_path = tmp_path / "train.jsonl"
+    valid_path = tmp_path / "valid.jsonl"
+    train_path.write_text('{"conversation_id":"train","messages":[]}\n')
+    valid_path.write_text('{"conversation_id":"valid","messages":[]}\n')
+    streaming_args.eagle_streaming_train_data = str(train_path)
+    streaming_args.eagle_streaming_valid_data = str(valid_path)
+    streaming_args.eval_iters = 1
+    validate_eagle_streaming_args(streaming_args)
+    monkeypatch.setattr("finetune.get_args", lambda: streaming_args)
+    monkeypatch.setattr("finetune.get_hf_tokenizer", lambda: tokenizer)
+
+    train, valid, test = finetune.train_valid_test_sft_datasets_provider(
+        [1, 1, 0], sequence_length=16
+    )
+
+    assert isinstance(train, streaming.MegatronEagleVllmStreamingDataset)
+    assert isinstance(valid, streaming.MegatronEagleVllmStreamingDataset)
+    assert train.entries[0]["conversation_id"] == "train"
+    assert valid.entries[0]["conversation_id"] == "valid"
+    assert test is None
+
+
+@pytest.fixture
+def streaming_args():
+    return SimpleNamespace(
+        eagle_streaming_server_urls="http://127.0.0.1:8765",
+        eagle_streaming_model="teacher",
+        eagle_streaming_train_data="train.jsonl",
+        eagle_streaming_valid_data=None,
+        eagle_streaming_test_data=None,
+        eagle_streaming_answer_only_loss=False,
+        export_offline_model=True,
+        load="checkpoint",
+        export_model_type="GPTModel",
+        offline_distillation_data=None,
+        micro_batch_size=1,
+        bf16=True,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        dynamic_context_parallel=False,
+        dataloader_type="single",
+        full_validation=False,
+        eval_iters=0,
+    )
+
+
+@pytest.mark.parametrize(
+    ("options", "error"),
+    [
+        ({"eagle_streaming_server_urls": None}, "--eagle-streaming-server-urls"),
+        ({"eagle_streaming_train_data": None}, "--eagle-streaming-train-data"),
+        ({"export_model_type": "HybridModel"}, "offline EAGLE GPTModel checkpoint"),
+        ({"offline_distillation_data": "dump"}, "--offline-distillation-data"),
+        ({"micro_batch_size": 2}, "--micro-batch-size 1"),
+        ({"context_parallel_size": 2}, "BF16 and CP=PP=1"),
+        ({"dataloader_type": "external"}, "built-in sampler"),
+        ({"eval_iters": 1}, "--eagle-streaming-valid-data"),
+    ],
+)
+def test_eagle_streaming_args_reject_unsupported_configuration(streaming_args, options, error):
+    vars(streaming_args).update(options)
+    with pytest.raises(ValueError, match=error):
+        validate_eagle_streaming_args(streaming_args)
+
+
+@pytest.mark.parametrize("source", ["streaming", "disk", "sft"])
+def test_eagle_finetune_forward_batch_alignment(monkeypatch, streaming_args, source):
+    offline = source != "sft"
+    if source != "streaming":
+        streaming_args.eagle_streaming_server_urls = None
+    streaming_args.reset_position_ids = False
+    streaming_args.reset_attention_mask = False
+    streaming_args.eod_mask_loss = False
+    monkeypatch.setattr(finetune, "get_args", lambda: streaming_args)
+    monkeypatch.setattr(
+        finetune,
+        "get_run_config",
+        lambda: SimpleNamespace(
+            model=SimpleNamespace(
+                transformer=SimpleNamespace(max_seq_length_per_sample=3),
+                transformations=SimpleNamespace(original_num_layers=4 if offline else None),
+            )
+        ),
+    )
+    monkeypatch.setattr(finetune, "get_eos_token_id", lambda: 99)
+    monkeypatch.setattr(finetune, "get_context_parallel_group", lambda: None)
+    monkeypatch.setattr(finetune.mpu, "is_pipeline_first_stage", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(
+        finetune,
+        "get_timers",
+        lambda: lambda *a, **kw: SimpleNamespace(start=lambda: None, stop=lambda: None),
+    )
+
+    sample = {
+        "input_ids": torch.tensor([[11, 23, 37, 41]]),
+        "loss_mask": torch.tensor([[0, 1, 0, 1]]),
+        "aux_hidden_states": torch.tensor([[[2, 3], [5, 7], [11, 13]]], dtype=torch.bfloat16),
+        "hidden_states": torch.tensor([[[17], [19], [29]]], dtype=torch.bfloat16),
+    }
+
+    def broadcast(keys, data, dtype):
+        result = {key: data[key] for key in keys}
+        assert all(value.dtype == dtype for value in result.values())
+        return result
+
+    monkeypatch.setattr(finetune.tensor_parallel, "broadcast_data", broadcast)
+
+    model = Mock(eagle_offline=offline)
+    _, loss_callback = finetune.forward_step(iter((sample,)), model)
+    model.assert_called_once()
+    tokens, positions, _ = model.call_args.args
+    features = model.call_args.kwargs.copy()
+    assert tokens.tolist() == [[11, 23, 37]]
+    assert positions.tolist() == [[0, 1, 2]]
+    assert features.pop("labels").tolist() == [[23, 37, 41]]
+    if offline:
+        assert features.pop("aux_hidden_states").tolist() == [[[2, 3]], [[5, 7]], [[11, 13]]]
+        assert features.pop("hidden_states").tolist() == [[[17]], [[19]], [[29]]]
+    assert features == ({"base_hidden_prenorm": True} if source == "streaming" else {})
+    assert loss_callback.args[0].tolist() == ([[1, 1, 1]] if source == "disk" else [[1, 0, 1]])
 
 
 def test_materialize_data_files_resolves_local_dataset_directory(tmp_path):
