@@ -898,6 +898,58 @@ def test_batched_matches_unbatched(ns_batch_size, n_same, n_other, home):
 
 
 @pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("layout", ["balanced", "uneven", "mixed_shapes"])
+def test_chunk_pipeline_matches_serial_bitwise(layout):
+    """Keep the serial NS batches, padding, momentum, and updates across steps."""
+    _require_multi_rank()
+    _require_batched_ns(2)
+    world_size = dist.get_world_size()
+    models = [[], []]
+    for i in range(5 * world_size):
+        width = 24 if layout == "mixed_shapes" and i == 0 else 16
+        shard = torch.randn(8, width)
+        for params in models:
+            param = _gtp_param(shard.clone())
+            param.pad_length = 1
+            params.append(param)
+
+    optimizers = []
+    for pipeline, params in zip((False, True), models):
+        optimizer = _muon(
+            params,
+            gtp_remat_group=_world(),
+            ns_batch_size=2,
+            weight_decay=0.01,
+            pipeline_chunks=pipeline,
+        )
+        optimizer.set_param_ns_homes(
+            {id(p): (0 if layout == "uneven" else i % world_size, 0) for i, p in enumerate(params)}
+        )
+        optimizers.append(optimizer)
+
+    for _ in range(3):
+        for serial, pipelined in zip(*models):
+            serial.grad = torch.randn_like(serial)
+            pipelined.grad = serial.grad.clone()
+        for optimizer in optimizers:
+            optimizer.step()
+        for serial, pipelined in zip(*models):
+            assert torch.equal(serial, pipelined)
+            assert torch.equal(
+                optimizers[0].state[serial]["momentum_buffer"],
+                optimizers[1].state[pipelined]["momentum_buffer"],
+            )
+
+    # A balanced plan must use the new branch. Both unsuitable plans must use
+    # the existing single forward exchange.
+    routes = optimizers[1]._plans[0].route_plans
+    if layout == "balanced":
+        assert ("pipeline_fwd", 4 * world_size) in routes
+    else:
+        assert "s1f" in routes
+
+
+@pytest.mark.launch_on_gb200
 def test_tp_replicated_ns_chunking_is_column_invariant():
     """nsb > 1 must not diverge the TP replicas of a GTP_remat-only param.
 

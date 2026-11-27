@@ -340,6 +340,11 @@ class OptimizerConfig:
     all groups are live at once — disable (or lower muon_ns_batch_size) if peak memory is
     tight. Only used when muon_tp_mode='layer_sharded'. Defaults to True."""
 
+    muon_pipeline_chunks: bool = False
+    """Overlap Newton-Schulz with shard exchanges within a serially scheduled
+    layer-sharded Muon group. Applies to equal-shape, evenly homed GTP-only
+    groups with multiple NS batches and SYRK disabled."""
+
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
     One of 'adam' or 'lion'. Defaults to 'adam'."""

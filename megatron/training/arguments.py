@@ -2691,6 +2691,11 @@ def _add_regularization_args(parser):
                        '--muon-tp-mode layer_sharded instead of overlapping one group\'s '
                        'Newton-Schulz with another\'s all_to_all. Bitwise-neutral; use '
                        'when the concurrent transient buffers push peak memory too high.')
+    group.add_argument('--muon-pipeline-chunks', action='store_true',
+                       help='Overlap Newton-Schulz and shard exchanges within eligible '
+                       'GTP-only groups under --muon-tp-mode layer_sharded. Applies to '
+                       'equal-shape, evenly homed groups with multiple NS batches, '
+                       'serial group scheduling and SYRK disabled.')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam',
