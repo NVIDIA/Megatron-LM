@@ -1021,6 +1021,31 @@ class TestLayerWiseOptimizer:
         for param, ref_param in zip(model.parameters(), reference_model.parameters()):
             torch.testing.assert_close(param.data, ref_param.data, rtol=1e-5, atol=1e-5)
 
+    def test_overlap_param_gather_single_owner_buckets(self):
+        """Test overlap-param-gather when every bucket holds a single parameter.
+
+        Each bucket then has exactly one owner, including buckets owned only by the last rank.
+        """
+        model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
+            bucket_size=1
+        )
+        reference_model, reference_optimizer, _ = self.create_model_and_optimizer(
+            use_layer_wise=False, copy_from=model
+        )
+
+        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
+            grad_value = torch.randn_like(param)
+            torch.distributed.broadcast(grad_value, src=0, group=pg_collection.dp_cp)
+            param.main_grad = grad_value.clone().detach()
+            ref_param.main_grad = grad_value.clone().detach()
+
+        optimizer.step()
+        model.start_param_sync(force_sync=True)
+        reference_optimizer.step()
+
+        for param, ref_param in zip(model.parameters(), reference_model.parameters()):
+            torch.testing.assert_close(param.data, ref_param.data, rtol=1e-5, atol=1e-5)
+
     def test_overlap_param_gather_broadcast_vs_allgather(self):
         """Test overlap-param-gather: allgather vs broadcast produce same results."""
         model, optimizer, pg_collection = self.create_model_and_optimizer_with_overlap_param_gather(
