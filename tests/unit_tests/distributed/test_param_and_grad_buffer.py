@@ -10,7 +10,11 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.distributed.param_and_grad_buffer import _ParamAndGradBuffer, partition_buckets
+from megatron.core.distributed.param_and_grad_buffer import (
+    _ParamAndGradBucketGroup,
+    _ParamAndGradBuffer,
+    partition_buckets,
+)
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import TestModel, Utils
@@ -458,6 +462,106 @@ def test_start_param_sync_dp_size_1():
             ), "param_gather_dispatched should be True after start_param_sync with dp_size=1"
         # No all-gather should have been called.
         assert not mock_all_gather.called, "all_gather should not be called when dp_size == 1"
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("with_experts", [False, True])
+def test_param_gather_in_forward_order(with_experts: bool):
+    """With param_gather_in_forward_order, start_param_sync dispatches the bucket groups in
+    reverse bucket order (dense groups first, then expert-parallel groups) and the gathered
+    parameters are identical to the default order."""
+    Utils.initialize_model_parallel()
+    bucket_size = 10000  # One Linear(95, 95) layer per bucket.
+
+    def run(forward_order: bool):
+        ddp_config = DistributedDataParallelConfig(
+            grad_reduce_in_fp32=True,
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=bucket_size,
+            param_gather_in_forward_order=forward_order,
+        )
+        torch.manual_seed(1234)
+        if with_experts:
+            module = TestModelWithExperts(95, 95, 4, 3, bias=True).bfloat16()
+        else:
+            module = TestModel(95, 95, 5, bias=True, shared_embedding=False).bfloat16()
+        all_params = [p for p in module.parameters() if p.requires_grad]
+        full_param_layout = DistributedOptimizer.compute_full_param_layout(
+            all_params,
+            bucket_size,
+            parallel_state.get_data_parallel_world_size(
+                with_context_parallel=True, partial_data_parallel=True
+            ),
+            ddp_config,
+        )
+        model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            ddp_config=ddp_config,
+            module=module,
+            full_param_layout=full_param_layout,
+        )
+        assert len(model.bucket_groups) > 1
+        if with_experts:
+            assert len(model.expert_parallel_bucket_groups) > 1
+        bucket_groups = model.bucket_groups + model.expert_parallel_bucket_groups
+
+        # Every rank writes its own shard of each bucket with values that depend on the
+        # position only, and garbage elsewhere, so the result depends on every rank's shard.
+        expected = []
+        for bucket_group in bucket_groups:
+            rank = bucket_group.intra_distributed_optimizer_instance_rank
+            size = bucket_group.intra_distributed_optimizer_instance_size
+            for bucket in bucket_group.buckets:
+                flat = bucket.param_data.view(-1)
+                values = (
+                    torch.arange(flat.numel(), device=flat.device, dtype=torch.float32)
+                    .remainder(251)
+                    .sub(125)
+                    .to(flat.dtype)
+                )
+                expected.append(values)
+                flat.fill_(-1000.0 - rank)
+                shard = flat.numel() // size
+                flat[rank * shard : (rank + 1) * shard].copy_(
+                    values[rank * shard : (rank + 1) * shard]
+                )
+
+        dispatched = []
+        original = _ParamAndGradBucketGroup.start_param_sync
+
+        def record(bucket_group, *args, **kwargs):
+            dispatched.append(bucket_group)
+            return original(bucket_group, *args, **kwargs)
+
+        with mock.patch.object(_ParamAndGradBucketGroup, "start_param_sync", record):
+            model.start_param_sync()
+        for bucket_group in bucket_groups:
+            bucket_group.finish_param_sync(skip_next_bucket_dispatch=True)
+        torch.cuda.synchronize()
+
+        if forward_order:
+            assert dispatched == list(reversed(model.bucket_groups)) + list(
+                reversed(model.expert_parallel_bucket_groups)
+            )
+        else:
+            assert dispatched == bucket_groups
+        gathered = [
+            bucket.param_data.view(-1).clone()
+            for bucket_group in bucket_groups
+            for bucket in bucket_group.buckets
+        ]
+        for got, want in zip(gathered, expected):
+            assert torch.equal(got, want)
+        return gathered
+
+    default_order = run(False)
+    forward_order = run(True)
+    assert len(default_order) == len(forward_order)
+    for a, b in zip(default_order, forward_order):
+        assert torch.equal(a, b)
 
     Utils.destroy_model_parallel()
 
