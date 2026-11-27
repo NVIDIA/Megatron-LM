@@ -1878,6 +1878,7 @@ class LLaVAModel(MegatronModule):
         inference_context=None,
         runtime_gather_output=None,
         packed_seq_params=None,
+        sequence_parallel_sharded=False,
     ):
         """Forward pre-combined embeddings through the language model only.
 
@@ -1893,8 +1894,11 @@ class LLaVAModel(MegatronModule):
             inference_context: Inference context (KV cache).
             runtime_gather_output: Whether to gather output across TP ranks.
             packed_seq_params: Packed sequence parameters.
+            sequence_parallel_sharded: Whether ``combined_embeddings`` is already this rank's
+                sequence-parallel shard in the language model's ``[seq_len / tp, batch, hidden]``
+                layout, which is then passed through unchanged.
         """
-        if combined_embeddings is not None:
+        if combined_embeddings is not None and not sequence_parallel_sharded:
             if self.context_parallel_lm == 1:
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
             if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
