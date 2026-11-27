@@ -65,6 +65,11 @@ from ..fp8_utils import (
 from ..full_cuda_graph import FullIterationGradCopy
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
+from .clip_grads import (
+    _gtp_pad_zero_count,
+    count_zeros_in_tensors,
+    param_grad_counts_toward_num_zeros,
+)
 from .grad_scaler import MegatronGradScaler
 from .optimizer import (
     MixedPrecisionOptimizer,
@@ -927,6 +932,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
             self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
         self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
+        # count_zeros() grad-buffer plans, keyed by the ids of the duplicate-filter groups.
+        self._num_zeros_grad_buffer_plans = {}
 
         self._word_embedding_params = []
         self._embedding_min_norm_stats = None
@@ -1115,6 +1122,130 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         with the non-distributed optimizer).
         """
         return getattr(self, 'grad_stats_parallel_group', None)
+
+    def _num_zeros_grad_buffer_plan(
+        self, groups: Tuple[Optional[torch.distributed.ProcessGroup], ...]
+    ) -> Tuple[int, int, List[Tuple[int, int, int]], List[torch.Tensor]]:
+        """Where the main grads ``count_zeros_fp32`` counts on this rank can be counted from.
+
+        A main grad whose model param's ``main_grad`` is a view into its DDP grad buffer is
+        ``.float()`` of a slice of this rank's shard of a bucket, and ``.float()`` maps zero to
+        zero and nonzero to nonzero. Such params that are adjacent in a bucket's shard, or
+        separated only by alignment padding, merge into one ``(buffer index, start, end)``
+        region. The padding is zeroed with the buffer and never written by backward, so it adds
+        no nonzeros. A param with a separate higher-precision ``main_grad`` (FP32 local
+        accumulation) is counted from its own main param, as ``count_zeros_fp32`` does, since
+        its grad-buffer slice need not hold the same values when the optimizer steps.
+
+        Returns the number of counted elements (net of structural GTP padding zeros), the
+        largest counted main grad's numel, the grad-buffer regions, and the main params
+        counted individually.
+        """
+        key = tuple(map(id, groups))
+        if key in self._num_zeros_grad_buffer_plans:
+            return self._num_zeros_grad_buffer_plans[key]
+        main_params = {}
+        for model_groups, main_groups in (
+            (self.model_float16_groups, self.shard_fp32_from_float16_groups),
+            (self.model_fp32_groups, self.shard_fp32_groups),
+        ):
+            for model_group, main_group in zip(model_groups, main_groups):
+                main_params.update(zip(model_group, main_group))
+        assert len(main_params) == len(self.get_parameters())
+
+        num_counted = 0
+        max_numel = 0
+        regions = []
+        separate_main_params = []
+        for gbuf_index, gbuf_range_map in enumerate(self.gbuf_ranges):
+            grad_storage = self.buffers[gbuf_index].grad_data.untyped_storage().data_ptr()
+            for bucket_range_maps in gbuf_range_map.values():
+                for bucket_range_map in bucket_range_maps:
+                    run = None
+                    for model_param, range_map in sorted(
+                        bucket_range_map["param_map"].items(),
+                        key=lambda item: item[1]["gbuf_world"].start,
+                    ):
+                        main_param = main_params.get(model_param)
+                        counted = main_param is not None and param_grad_counts_toward_num_zeros(
+                            main_param, *groups
+                        )
+                        in_buffer = (
+                            model_param.main_grad.untyped_storage().data_ptr() == grad_storage
+                        )
+                        if counted:
+                            num_counted += main_param.numel() - _gtp_pad_zero_count(
+                                main_param, main_param
+                            )
+                            max_numel = max(max_numel, main_param.numel())
+                        if counted and in_buffer:
+                            world_range = range_map["gbuf_world"]
+                            start = world_range.start if run is None else run[0]
+                            run = (start, world_range.end)
+                            continue
+                        if counted:
+                            separate_main_params.append(main_param)
+                        if run is not None:
+                            regions.append((gbuf_index, *run))
+                            run = None
+                    if run is not None:
+                        regions.append((gbuf_index, *run))
+        plan = (num_counted, max_numel, regions, separate_main_params)
+        self._num_zeros_grad_buffer_plans[key] = plan
+        return plan
+
+    def num_zeros_count_inputs(
+        self,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        expert_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+        expert_gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> Optional[Tuple[int, int, List[torch.Tensor]]]:
+        """What this rank's ``count_zeros_fp32`` count, before its all-reduce, is counted from.
+
+        Returns ``(num_counted, max_numel, tensors)``: the count is ``num_counted`` minus the
+        nonzero elements of ``tensors`` (the grad-buffer regions of counted main grads, then
+        the counted main grads held outside the buffer), and ``max_numel`` is the largest
+        counted main grad's numel. Returns None where the main grads are not copies of
+        grad-buffer slices (Megatron-FSDP, precision-aware optimizer, stub).
+        """
+        if not self._main_grads_are_grad_buffer_copies():
+            return None
+        num_counted, max_numel, regions, separate_main_params = self._num_zeros_grad_buffer_plan(
+            (tp_group, expert_tp_group, gtp_group, expert_gtp_group)
+        )
+        tensors = [
+            self.buffers[gbuf_index].grad_data[start:end] for gbuf_index, start, end in regions
+        ]
+        tensors += [param.grad for param in separate_main_params]
+        return num_counted, max_numel, tensors
+
+    def _main_grads_are_grad_buffer_copies(self) -> bool:
+        """Whether main grads are FP32 copies of grad-buffer slices (not Megatron-FSDP, not
+        the precision-aware optimizer, not a stub)."""
+        return not (
+            self.is_stub_optimizer
+            or self.ddp_config.use_megatron_fsdp
+            or self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+        )
+
+    @torch.no_grad()
+    def count_zeros(self) -> float:
+        """Count number of zeros in model's gradients, from the grad buffers."""
+        inputs = self.num_zeros_count_inputs(
+            tp_group=getattr(self, 'tp_group', None),
+            expert_tp_group=getattr(self, 'expert_tp_group', None),
+            gtp_group=getattr(self, 'gtp_group', None),
+            expert_gtp_group=getattr(self, 'expert_gtp_group', None),
+        )
+        if inputs is None:
+            return super().count_zeros()
+        num_counted, max_numel, tensors = inputs
+        num_zeros = count_zeros_in_tensors(num_counted, tensors, max_numel)
+        torch.distributed.all_reduce(
+            num_zeros, op=torch.distributed.ReduceOp.SUM, group=self.get_grad_stats_parallel_group()
+        )
+        return num_zeros.item()
 
     @property
     def optimizer_state_keys(self):
@@ -3183,6 +3314,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
     def _copy_model_grads_to_main_grads_eager(self):
         """Convert model gradient shards without graph capture or replay."""
 
+        # Shard grads that need an fp32 copy, collected so the casts run as one
+        # multi-tensor copy instead of one copy kernel per parameter.
+        cast_params = []
+        cast_grads = []
+
         # Utility method for copying group grads.
         def copy_group_grads(model_groups, shard_main_groups):
             for model_group, shard_main_group in zip(model_groups, shard_main_groups):
@@ -3201,8 +3337,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Note that this requires corresponding modifications in the optimizer (Let
                         # the optimizer read gradients from ".decoupled_grad" instead of ".grad").
                         shard_main_param.decoupled_grad = shard_model_grad
+                    elif shard_model_grad.dtype == torch.float32:
+                        # ".float()" of an fp32 grad is the grad itself; keep the alias.
+                        shard_main_param.grad = shard_model_grad
                     else:
-                        shard_main_param.grad = shard_model_grad.float()
+                        cast_params.append(shard_main_param)
+                        cast_grads.append(shard_model_grad)
 
         # Copy model groups to shard groups.
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -3211,6 +3351,18 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         else:
             copy_group_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
             copy_group_grads(self.model_fp32_groups, self.shard_fp32_groups)
+
+        if cast_grads:
+            # One fp32 allocation holds every main grad (the same bytes the per-parameter
+            # ".float()" copies allocated); its views receive the casts in one
+            # multi-tensor copy.
+            numels = [grad.numel() for grad in cast_grads]
+            main_grads = torch.empty(
+                sum(numels), dtype=torch.float32, device=cast_grads[0].device
+            ).split(numels)
+            torch._foreach_copy_(main_grads, cast_grads)
+            for shard_main_param, main_grad in zip(cast_params, main_grads):
+                shard_main_param.grad = main_grad
 
     def _copy_main_params_to_model_params(self):
         """
@@ -3348,6 +3500,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             raise NotImplementedError(
                 "_copy_main_params_to_param_buffer not supported for Megatron-FSDP."
             )
+        shard_param_buffers = []
+        shard_main_params = []
         for shard_main_group, model_group in zip(
             self.shard_fp32_from_float16_groups, self.model_float16_groups
         ):
@@ -3361,9 +3515,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
 
                 # Get the correct slice of param buffer
-                shard_param_buffer = param_buffer.view(-1)[world_range.start : world_range.end]
+                shard_param_buffers.append(
+                    param_buffer.view(-1)[world_range.start : world_range.end]
+                )
+                shard_main_params.append(shard_main_param)
 
-                shard_param_buffer.copy_(shard_main_param)
+        # One multi-tensor copy into the param buffer views instead of one copy per param.
+        if shard_param_buffers:
+            torch._foreach_copy_(shard_param_buffers, shard_main_params)
 
         # Staging params into the DDP param buffer invalidates any prior "already
         # dispatched" state. The next forward pre-hook must run post-sync cleanup,

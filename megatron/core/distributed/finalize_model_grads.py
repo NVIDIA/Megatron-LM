@@ -637,7 +637,21 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
     ):
         if not grads or group is None or group.size() <= 1:
             continue
-        coalesced = _flatten_dense_tensors(grads)
+        # Flatten in the promoted dtype, as torch.cat would, but with one multi-tensor copy
+        # per source dtype instead of one copy kernel per grad.
+        numels = [grad.numel() for grad in grads]
+        dtype = grads[0].dtype
+        for grad in grads[1:]:
+            dtype = torch.promote_types(dtype, grad.dtype)
+        coalesced = torch.empty(sum(numels), dtype=dtype, device=grads[0].device)
+        synced_views = [view.view_as(grad) for view, grad in zip(coalesced.split(numels), grads)]
+        grads_by_dtype = {}
+        for grad, view in zip(grads, synced_views):
+            dsts, srcs = grads_by_dtype.setdefault(grad.dtype, ([], []))
+            dsts.append(view)
+            srcs.append(grad)
+        for dsts, srcs in grads_by_dtype.values():
+            torch._foreach_copy_(dsts, srcs)
         # SUM vs AVG per the loss-normalization regime documented above.
         op = (
             torch.distributed.ReduceOp.SUM
@@ -645,8 +659,9 @@ def _allreduce_replicated_grads_over_gtp_remat_group(
             else torch.distributed.ReduceOp.AVG
         )
         torch.distributed.all_reduce(coalesced, op=op, group=group)
-        for param, buf, synced in zip(params, grads, _unflatten_dense_tensors(coalesced, grads)):
-            buf.copy_(synced)
+        for dsts, srcs in grads_by_dtype.values():
+            torch._foreach_copy_(srcs, dsts)
+        for param, buf in zip(params, grads):
             grad_attr = _get_main_grad_attr(param)
             orig_grad = getattr(param, grad_attr)
             setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
@@ -823,4 +838,9 @@ def finalize_model_grads(
         safe_num_tokens = torch.clamp(num_tokens, min=1)
         scaling = 1.0 / safe_num_tokens
         for model_chunk in model:
-            model_chunk.scale_gradients(scaling)
+            if getattr(model_chunk, 'fold_grad_scaling', False):
+                # The ChainedOptimizer folds the factor into its grad norm and clip scalar,
+                # whose pass delivers the scaled grads Adam loads: no pass over the buffers.
+                model_chunk.pending_grad_scaling = scaling
+            else:
+                model_chunk.scale_gradients(scaling)

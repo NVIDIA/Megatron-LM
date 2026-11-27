@@ -48,8 +48,14 @@ from ..dist_checkpointing.optimizer import (
 from ..dist_checkpointing.utils import add_prefix_for_sharding
 from ..optimizer_param_scheduler import ParamGroupOverride as _ParamGroupOverride
 from ..transformer.module import param_is_not_shared
-from ..utils import log_single_rank
-from .clip_grads import clip_grad_by_total_norm_fp32, count_zeros_fp32, get_grad_norm_fp32
+from ..utils import get_model_config, log_single_rank
+from .clip_grads import (
+    clip_grad_by_total_norm_fp32,
+    count_zeros_fp32,
+    count_zeros_in_tensors,
+    get_grad_norm_fp32,
+    scale_grads_fp32,
+)
 from .grad_scaler import MegatronGradScaler
 from .optimizer_config import OptimizerConfig
 
@@ -1825,6 +1831,37 @@ class ChainedOptimizer(MegatronOptimizer):
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
         self._last_dsa_split_grad_norms = None
+        if self._can_fold_grad_scaling():
+            # finalize_model_grads leaves the per-token 1/num_tokens factor in
+            # model_chunk.pending_grad_scaling instead of scaling the grad buffers;
+            # this chain folds it into the grad norm and the clip scalar.
+            for model_chunk in self.model_chunks:
+                model_chunk.fold_grad_scaling = True
+
+    def _can_fold_grad_scaling(self) -> bool:
+        """Whether --fold-per-token-grad-scale applies to this chain."""
+        from .distrib_optimizer import DistributedOptimizer
+
+        if not self.chained_optimizers or not getattr(
+            self.config, 'fold_per_token_grad_scale', False
+        ):
+            return False
+        if not all(isinstance(opt, DistributedOptimizer) for opt in self.chained_optimizers):
+            return False
+        # DSA indexer clipping computes its split norms separately.
+        if self.config.dsa_indexer_clip_grad is not None or any(
+            group.get('is_dsa_indexer', False)
+            for opt in self.chained_optimizers
+            if not opt.is_stub_optimizer
+            for group in opt.param_groups
+        ):
+            return False
+        # A full-iteration CUDA graph replays finalize_model_grads without its Python side
+        # effects, so the deferred factor would not reach later steps.
+        return all(
+            getattr(get_model_config(chunk), 'cuda_graph_impl', 'none') != 'full_iteration'
+            for chunk in self.model_chunks
+        )
 
     @property
     def optimizer(self):
@@ -2179,8 +2216,31 @@ class ChainedOptimizer(MegatronOptimizer):
         )
         return self.chained_optimizers[0].get_grad_stats_parallel_group()
 
+    def _pending_grad_scaling(self) -> Optional[torch.Tensor]:
+        """The deferred 1/num_tokens grad factor of this step, or None."""
+        scalings = [getattr(chunk, 'pending_grad_scaling', None) for chunk in self.model_chunks]
+        if not scalings:
+            return None
+        assert all(
+            scaling is scalings[0] for scaling in scalings
+        ), "Model chunks carry different deferred grad scalings"
+        return scalings[0]
+
+    def _clear_pending_grad_scaling(self) -> None:
+        for model_chunk in self.model_chunks:
+            if getattr(model_chunk, 'pending_grad_scaling', None) is not None:
+                model_chunk.pending_grad_scaling = None
+
+    def _scaled_grad_norm(self, grad_norm):
+        """`grad_norm` of the unscaled grads times the deferred grad factor."""
+        grad_scaling = self._pending_grad_scaling()
+        return grad_norm if grad_scaling is None else grad_norm * grad_scaling
+
     @torch.no_grad()
     def get_grad_norm(self):
+        return self._scaled_grad_norm(self._get_unscaled_grad_norm())
+
+    def _get_unscaled_grad_norm(self):
         if len(self.chained_optimizers) == 1:
             return self.chained_optimizers[0].get_grad_norm()
         if self.grads_states_parallel_group_is_shared():
@@ -2232,6 +2292,14 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def count_zeros(self):
         if self.grads_states_parallel_group_is_shared():
+            num_zeros = self._local_num_zeros_in_grads()
+            if num_zeros is not None:
+                torch.distributed.all_reduce(
+                    num_zeros,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=self.get_grad_stats_parallel_group(),
+                )
+                return num_zeros.item()
             params = []
             for optimizer in self.chained_optimizers:
                 params += optimizer.get_parameters()
@@ -2257,6 +2325,29 @@ class ChainedOptimizer(MegatronOptimizer):
                 )
             return num_zeros_in_grad
 
+    def _local_num_zeros_in_grads(self) -> Optional[torch.Tensor]:
+        """This rank's shared-group ``count_zeros_fp32`` count over every chained optimizer, as
+        one int64 tensor: duplicates filtered with the first optimizer's groups as that path
+        does, all optimizers' grads counted together; None unless every optimizer with
+        parameters provides its count inputs."""
+        first = self.chained_optimizers[0]
+        groups = tuple(
+            getattr(first, name, None)
+            for name in ('tp_group', 'expert_tp_group', 'gtp_group', 'expert_gtp_group')
+        )
+        optimizers = [opt for opt in self.chained_optimizers if opt.get_parameters()]
+        inputs = [
+            opt.num_zeros_count_inputs(*groups) if hasattr(opt, 'num_zeros_count_inputs') else None
+            for opt in optimizers
+        ]
+        if not optimizers or any(i is None for i in inputs):
+            return None
+        return count_zeros_in_tensors(
+            sum(num_counted for num_counted, _, _ in inputs),
+            [tensor for _, _, tensors in inputs for tensor in tensors],
+            max(max_numel for _, max_numel, _ in inputs),
+        )
+
     def has_grad_norm_group(self, grad_norm_group: str) -> bool:
         """Whether any chained optimizer owns params for a gradient-norm group.
 
@@ -2278,6 +2369,9 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def _get_grad_norm_for_group(self, grad_norm_group: str):
         """Compute gradient norm for a named parameter group."""
+        return self._scaled_grad_norm(self._get_unscaled_grad_norm_for_group(grad_norm_group))
+
+    def _get_unscaled_grad_norm_for_group(self, grad_norm_group: str):
         _validate_grad_norm_group(grad_norm_group)
         if self.grads_states_parallel_group_is_shared():
             grouped_grads = []
@@ -2316,7 +2410,9 @@ class ChainedOptimizer(MegatronOptimizer):
         """
         self.grad_norms_by_group = {}
         found_inf_flag = self.prepare_grads()
+        grad_scaling = self._pending_grad_scaling()
         if found_inf_flag:
+            self._clear_pending_grad_scaling()
             return False, None, None
 
         self._last_dsa_split_grad_norms = None
@@ -2382,17 +2478,23 @@ class ChainedOptimizer(MegatronOptimizer):
                         max_norm=optimizer.config.clip_grad,
                         total_norm=grad_norm,
                         use_decoupled_grad=use_decoupled_grad,
+                        grad_scaling=grad_scaling,
                     )
                 for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
                     group_grad_norm = self.grad_norms_by_group.get(grad_norm_group)
                     if group_grad_norm is None:
+                        if grad_scaling is not None:
+                            scale_grads_fp32(grouped_params, grad_scaling, use_decoupled_grad)
                         continue
                     clip_grad_by_total_norm_fp32(
                         grouped_params,
                         max_norm=optimizer.config.clip_grad,
                         total_norm=group_grad_norm,
                         use_decoupled_grad=use_decoupled_grad,
+                        grad_scaling=grad_scaling,
                     )
+            elif grad_scaling is not None:
+                scale_grads_fp32(parameters, grad_scaling, use_decoupled_grad)
 
             grad_norm_skip_threshold = optimizer.config.grad_norm_skip_threshold
             if (
@@ -2404,6 +2506,9 @@ class ChainedOptimizer(MegatronOptimizer):
                     logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
                 )
                 should_skip_update = True
+
+        # The grads now carry the deferred factor.
+        self._clear_pending_grad_scaling()
 
         # Count the zeros in the grads.
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None

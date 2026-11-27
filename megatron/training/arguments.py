@@ -2789,6 +2789,14 @@ def _add_training_args(parser):
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-cuda-graph', action='store_true',
                        help='Enable CUDA graph for optimizer step')
+    group.add_argument('--fold-per-token-grad-scale', action='store_true',
+                       help='With --calculate-per-token-loss and the distributed optimizer, '
+                       'apply the 1/num_tokens grad scaling in the optimizer clip pass '
+                       'instead of a separate pass over the grad buffers.')
+    group.add_argument('--use-cute-dsl-multi-tensor', action='store_true',
+                       help='Run fp32 multi-tensor Adam and L2 norm as one persistent CuTe DSL '
+                       'launch per tensor list (SM100+, needs nvidia-cutlass-dsl; falls back '
+                       'to Transformer Engine otherwise).')
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,
                           help='Ratio of optimizer state to offload to CPU')
     group.add_argument('--use-torch-optimizer-for-cpu-offload', action='store_true',

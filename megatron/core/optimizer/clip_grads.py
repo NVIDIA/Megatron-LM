@@ -46,6 +46,9 @@ except ImportError:
         multi_tensor_scale_impl = local_multi_tensor_scale
         multi_tensor_scale_tensor_impl = None
 
+from . import cute_dsl_multi_tensor
+
+l2_norm_impl = cute_dsl_multi_tensor.l2norm_impl(l2_norm_impl)
 
 from ..tensor_parallel import (
     gtp_local_pad_zero_count,
@@ -144,11 +147,59 @@ def get_grad_norm_fp32(
     return total_norm
 
 
+def _fp32_grads(
+    parameters: Union[List[torch.Tensor], torch.Tensor], use_decoupled_grad: bool
+) -> List[torch.Tensor]:
+    """The fp32 (or decoupled) gradients of `parameters`, as local tensors."""
+    grads = []
+    for param in parameters:
+        if use_decoupled_grad:
+            if hasattr(param, "decoupled_grad") and param.decoupled_grad is not None:
+                assert param.decoupled_grad.dtype in [torch.float32, torch.bfloat16]
+                grads.append(to_local_if_dtensor(param.decoupled_grad).detach())
+        else:
+            if param.grad is not None:
+                assert param.grad.dtype in [torch.float32, torch.bfloat16]
+                grads.append(to_local_if_dtensor(param.grad).detach())
+    return grads
+
+
+def scale_grads_fp32(
+    parameters: Union[List[torch.Tensor], torch.Tensor],
+    scale: torch.Tensor,
+    use_decoupled_grad: bool = False,
+) -> None:
+    """Multiply the gradients of `parameters` in place by the fp32 device scalar `scale`.
+
+    Args:
+        parameters (Union[List[torch.Tensor], torch.Tensor]): Parameters whose gradients
+            are scaled.
+        scale (torch.Tensor): One-element fp32 CUDA tensor.
+        use_decoupled_grad (bool, optional): Whether to read from the
+            '.decoupled_grad' attribute instead of the standard '.grad'.
+            Defaults to False.
+    """
+    grads = _fp32_grads(parameters, use_decoupled_grad)
+    if not grads:
+        return
+    assert (
+        multi_tensor_scale_tensor_impl is not None
+    ), "A device-scalar grad scale needs multi_tensor_scale_tensor."
+    dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+    multi_tensor_applier(
+        multi_tensor_scale_tensor_impl,
+        dummy_overflow_buf,
+        [grads, grads],
+        scale.to(torch.float32).reshape(1),
+    )
+
+
 def clip_grad_by_total_norm_fp32(
     parameters: Union[List[torch.Tensor], torch.Tensor],
     max_norm: Union[int, float],
     total_norm: float,
     use_decoupled_grad: bool = False,
+    grad_scaling: Optional[torch.Tensor] = None,
 ):
     """Clips the gradients of an iterable of parameters in FP32 by total norm.
 
@@ -163,21 +214,18 @@ def clip_grad_by_total_norm_fp32(
         use_decoupled_grad (bool, optional): Whether to read from the
             '.decoupled_grad' attribute instead of the standard '.grad'.
             Defaults to False.
+        grad_scaling (torch.Tensor, optional): A deferred fp32 factor the gradients
+            have not been multiplied by yet (``total_norm`` already includes it). It is
+            folded into the clip scalar, so the one pass applies both. Defaults to None.
     """
-    # Grads.
-    params = []
-    grads = []
-    for param in parameters:
-        if use_decoupled_grad:
-            if hasattr(param, "decoupled_grad") and param.decoupled_grad is not None:
-                assert param.decoupled_grad.dtype in [torch.float32, torch.bfloat16]
-                params.append(param)
-                grads.append(to_local_if_dtensor(param.decoupled_grad).detach())
-        else:
-            if param.grad is not None:
-                assert param.grad.dtype in [torch.float32, torch.bfloat16]
-                params.append(param)
-                grads.append(to_local_if_dtensor(param.grad).detach())
+    if grad_scaling is not None:
+        clip_coeff = torch.as_tensor(
+            max_norm / (total_norm + 1.0e-6), dtype=torch.float32, device='cuda'
+        ).clamp_max(1.0)
+        scale_grads_fp32(parameters, clip_coeff * grad_scaling, use_decoupled_grad)
+        return
+
+    grads = _fp32_grads(parameters, use_decoupled_grad)
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
@@ -218,6 +266,50 @@ def _gtp_pad_zero_count(param: torch.Tensor, grad: torch.Tensor) -> int:
         # here so later calls for this param skip straight to the getattr above.
         pad_zeros = param.gtp_pad_zeros = gtp_local_pad_zero_count(param, 0, grad.numel())
     return pad_zeros or 0
+
+
+def param_grad_counts_toward_num_zeros(
+    param: torch.Tensor,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expert_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expert_gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> bool:
+    """Whether ``param``'s grad is counted once by ``count_zeros_fp32``: not shared, and not a
+    replica due to tensor or (expert) generalized tensor parallelism."""
+    return (
+        param_is_not_shared(param)
+        and param_is_not_tensor_parallel_duplicate(
+            param, tp_group=tp_group, expert_tp_group=expert_tp_group
+        )
+        and param_is_not_gtp_duplicate(
+            param, gtp_group=gtp_group, expert_gtp_group=expert_gtp_group
+        )
+    )
+
+
+def count_zeros_in_tensors(
+    num_counted: int, tensors: List[torch.Tensor], max_chunk_numel: int
+) -> torch.Tensor:
+    """``num_counted`` minus the nonzero elements of ``tensors``, as a 0-d int64 CUDA tensor.
+
+    One persistent CuTe DSL launch per dtype where ``cute_dsl_multi_tensor`` is enabled.
+    Otherwise one ``torch.count_nonzero`` per chunk of at most ``max_chunk_numel`` elements:
+    ``torch.count_nonzero`` materializes a bool mask and an int64 copy of its input, so the
+    chunk bound caps those temporaries.
+    """
+    num_zeros = cute_dsl_multi_tensor.count_zeros(num_counted, tensors)
+    if num_zeros is not None:
+        return num_zeros
+    nonzeros = [
+        torch.count_nonzero(tensor[start : start + max_chunk_numel])
+        for tensor in tensors
+        for start in range(0, tensor.numel(), max_chunk_numel)
+    ]
+    num_zeros = torch.full((), num_counted, dtype=torch.int64, device='cuda')
+    if nonzeros:
+        num_zeros -= torch.stack(nonzeros).sum()
+    return num_zeros
 
 
 def count_zeros_fp32(
@@ -272,14 +364,9 @@ def count_zeros_fp32(
             num_zeros = grad.numel() - torch.count_nonzero(grad)
             total_num_zeros += num_zeros
             continue
-        is_not_shared = param_is_not_shared(param)
-        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(
-            param, tp_group=tp_group, expert_tp_group=expert_tp_group
-        )
-        is_not_gtp_duplicate = param_is_not_gtp_duplicate(
-            param, gtp_group=gtp_group, expert_gtp_group=expert_gtp_group
-        )
-        if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
+        if grad_not_none and param_grad_counts_toward_num_zeros(
+            param, tp_group, expert_tp_group, gtp_group, expert_gtp_group
+        ):
             grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
             grad = to_local_if_dtensor(grad_obj).detach()
