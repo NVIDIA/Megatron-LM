@@ -255,16 +255,16 @@ class _IndexReader(object):
     ) -> None:
         log_single_rank(logger, logging.INFO, f"Load the {type(self).__name__} from {idx_path}")
 
-        if sequences_per_dataset:
-            self.dtype = DType.dtype_from_code(dtype_code)
-            self.dtype_size = DType.size(self.dtype)
-            self.sequence_count = sequences_per_dataset[0]
-            self.document_count = sequences_per_dataset[1]
-            offset = 34  # 9 bytes from the header + 8 bytes from the version
-            # + 1 bytes for the dtype code + 8 bytes for the sequence count
-            # + 8 bytes for the document count = 34 bytes
-        else:
-            with open(idx_path, "rb") as stream:
+        with open(idx_path, "rb") as stream:
+            if sequences_per_dataset:
+                self.dtype = DType.dtype_from_code(dtype_code)
+                self.dtype_size = DType.size(self.dtype)
+                self.sequence_count = sequences_per_dataset[0]
+                self.document_count = sequences_per_dataset[1]
+                offset = 34  # 9 bytes from the header + 8 bytes from the version
+                # + 1 bytes for the dtype code + 8 bytes for the sequence count
+                # + 8 bytes for the document count = 34 bytes
+            else:
                 header = stream.read(9)
                 assert header == _INDEX_HEADER, f"bad header, cannot read: {idx_path}"
 
@@ -280,7 +280,8 @@ class _IndexReader(object):
 
                 offset = stream.tell()
 
-        self.bin_buffer_mmap = numpy.memmap(idx_path, mode="r", order="C")
+            # Reuse the open file to avoid a second filesystem open for the mapping.
+            self.bin_buffer_mmap = numpy.memmap(stream, mode="r", order="C")
         self.bin_buffer = memoryview(self.bin_buffer_mmap)
 
         log_single_rank(logger, logging.INFO, "\tExtract the sequence lengths")
