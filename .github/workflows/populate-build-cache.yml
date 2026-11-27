@@ -35,9 +35,26 @@ on:
   schedule:
     - cron: "17 */6 * * *"
   workflow_dispatch:
+    inputs:
+      mfsdp_isolation:
+        description: Trace the fixed MFSDP loss reproduction instead of populating caches
+        type: boolean
+        default: false
+      mfsdp_snapshot_run:
+        description: Optional prior diagnostic run whose captured GEMM should be replayed
+        type: string
+        default: ""
+      mfsdp_heuristic_scan:
+        description: Query the captured GEMM geometry across K values without training
+        type: boolean
+        default: false
+      mfsdp_baseline_only:
+        description: Run one uninstrumented 50-step reproduction and record GPU identity
+        type: boolean
+        default: false
 
 concurrency:
-  group: populate-ci-caches-main
+  group: populate-ci-caches-${{ inputs.mfsdp_isolation && github.ref || 'main' }}
   cancel-in-progress: false
 
 permissions:
@@ -47,7 +64,7 @@ permissions:
 jobs:
   validate-source:
     name: Validate cache source
-    if: github.repository == 'NVIDIA/Megatron-LM'
+    if: github.repository == 'NVIDIA/Megatron-LM' && !inputs.mfsdp_isolation
     runs-on: ubuntu-latest
     steps:
       - name: Require main
@@ -63,7 +80,7 @@ jobs:
   populate-build-cache:
     name: Populate build caches
     needs: validate-source
-    if: github.repository == 'NVIDIA/Megatron-LM'
+    if: github.repository == 'NVIDIA/Megatron-LM' && !inputs.mfsdp_isolation
     permissions:
       contents: read
       id-token: write
@@ -139,3 +156,65 @@ jobs:
           is_unit_test: "true"
           unit_testmon_mode: baseline
           unit_testmon_target_branch: main
+
+  mfsdp-isolation:
+    name: Trace MFSDP gradient reductions
+    if: github.repository == 'NVIDIA/Megatron-LM' && github.event_name == 'workflow_dispatch' && inputs.mfsdp_isolation
+    runs-on: nvidia-ci-aws-use2-gpu-x4
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    env:
+      AWS_REGION: us-east-2
+      IMAGE: 766267172432.dkr.ecr.us-east-2.amazonaws.com/megatron-lm@sha256:678b53e3ac9f655afe5b1b9df7b9980c12a32436e8598b08f7e728cb0583f66d
+    steps:
+      - name: Checkout diagnostic scripts
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Checkout unchanged training source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: bad2f84cba7f675c914049031c1422e406ad0a70
+          path: mfsdp-source
+      - name: Reuse a prior captured GEMM
+        if: inputs.mfsdp_snapshot_run != ''
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: mfsdp-collective-isolation-${{ inputs.mfsdp_snapshot_run }}
+          run-id: ${{ inputs.mfsdp_snapshot_run }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}
+      - name: Reproduce with the exact batch image
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/mfsdp-isolation-$GITHUB_RUN_ID"
+          mkdir -p "$stage"
+          nvidia-smi --query-gpu=name,uuid,driver_version,pci.bus_id --format=csv > "$stage/gpu-identity.csv"
+          cp .github/diagnostics/mfsdp/* "$stage/"
+          case_dir=mfsdp-source/tests/functional_tests/test_cases/moe/deepseek_proxy_mfsdp_v2_ep2_mb4_per_token_loss_1node
+          cp "$case_dir/model_config.yaml" "$stage/model_config.yaml"
+          cp "$case_dir/golden_values_dev_dgx_gb200.json" "$stage/reference-github.json"
+          git -C mfsdp-source rev-parse HEAD > "$stage/source-commit.txt"
+          docker pull "$IMAGE"
+          docker image inspect --format '{{json .RepoDigests}}' "$IMAGE" > "$stage/image-digests.json"
+          docker run --rm --gpus all --runtime nvidia --ipc host --shm-size 30g \
+            -e MFSDP_HEURISTIC_SCAN=${{ inputs.mfsdp_heuristic_scan }} \
+            -e MFSDP_BASELINE_ONLY=${{ inputs.mfsdp_baseline_only }} \
+            -v "$PWD/mfsdp-source:/opt/megatron-lm" \
+            -v "$stage:/workspace" \
+            -v /mnt/datadrive/TestData/megatron-lm/artifacts:/mnt/artifacts:ro \
+            -v /mnt/datadrive/TestData/nemo-fw/TestData/HF_HOME:/workspace/cache/hf:ro \
+            -w /opt/megatron-lm "$IMAGE" bash /workspace/run.sh
+      - name: Upload reduction hashes and logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mfsdp-collective-isolation-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}/results
+            ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}/image-digests.json
+            ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}/source-commit.txt
+            ${{ runner.temp }}/mfsdp-isolation-${{ github.run_id }}/gpu-identity.csv
+          retention-days: 3
