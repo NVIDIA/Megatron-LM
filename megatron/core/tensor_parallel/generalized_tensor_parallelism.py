@@ -2463,6 +2463,20 @@ class GTPShardedParam(torch.nn.Parameter):
         if nvtx_label is None:
             nvtx_label = self._debug_name + ".bwd" + (".async" if async_op else ".sync")
 
+        # The embedding's wgrad comes from autograd in the parameter's dtype. With an FP32
+        # main_grad, promote it first so that the reduce-scatter sums in FP32.
+        wgrads = list(wgrads)
+        for index, (weight, gradient) in enumerate(zip(self._weights, wgrads)):
+            main_grad = getattr(weight, "main_grad", None)
+            if (
+                main_grad is not None
+                and main_grad.dtype == torch.float32
+                and gradient.dtype in (torch.float16, torch.bfloat16)
+            ):
+                promoted = _wgrad_pool_get(tuple(gradient.shape), torch.float32, gradient.device)
+                promoted.copy_(gradient)
+                wgrads[index] = promoted
+
         # MEAN reduce-scatter: pre-scale wgrad so the SUM collective yields the gtp_remat mean.
         self._prescale_wgrads_for_mean_rs(wgrads)
 
