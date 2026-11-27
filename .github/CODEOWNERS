@@ -77,6 +77,14 @@ megatron/core/transformer/cuda_graphs.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NV
 
 megatron/training/ @NVIDIA/training
 
+# Megatron Bridge. The core HF <-> Megatron conversion code is owned by mcore-bridge;
+# everything else under megatron/bridge/ (model families, utils) needs mcore-engineers.
+# Keep the specific folders after the catch-all: the last matching rule wins.
+megatron/bridge/ @NVIDIA/mcore-engineers
+megatron/bridge/models/conversion/ @NVIDIA/mcore-bridge
+megatron/bridge/models/decorators/ @NVIDIA/mcore-bridge
+megatron/bridge/models/hf_pretrained/ @NVIDIA/mcore-bridge
+
 .gitlab/ @NVIDIA/ci
 .github/ @NVIDIA/ci
 .github/oncall_schedule.json @NVIDIA/mcore-oncall-rotation
