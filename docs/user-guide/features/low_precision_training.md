@@ -18,6 +18,21 @@ Low-precision support in Megatron Core is built on
 exposes TE recipes through `TransformerConfig` fields (and matching CLI flags)
 so you can switch recipes without touching model code.
 
+## FP32 accumulation for fused bias gradients
+
+When `gradient_accumulation_fusion` is enabled, supported fused operators can
+reduce bias gradients in FP32 and write directly into the parallel wrapper's
+FP32 gradient buffer. This avoids rounding each microbatch's bias gradient to
+the BF16 parameter dtype before accumulation.
+
+This path covers bias passed directly to native Linear, standard
+`bias_dropout_fusion`, and the GeLU, SwiGLU, GEGLU, and biased weighted
+Quick-GEGLU paths under `bias_activation_fusion`. It requires a trainable bias
+managed by the wrapper. Megatron DDP provides an FP32 buffer with
+`grad_reduce_in_fp32=True`. For Megatron FSDP v1, the buffer returned in backward
+must be FP32, including the temporary full-gradient buffer when gradients are
+sharded. Other paths use ordinary autograd.
+
 ## When to Use Low Precision
 
 Compared to a BF16 baseline, low precision delivers:

@@ -2,6 +2,7 @@
 
 import torch
 
+from megatron.core.fusions.fused_bias_grad import bias_with_main_grad
 from megatron.core.jit import jit_fuser
 
 # BIAS GELU FUSION/ NO AUTOGRAD ################
@@ -15,6 +16,7 @@ from megatron.core.jit import jit_fuser
 
 @jit_fuser
 def bias_gelu(bias, y):
+    """Add bias and apply the tanh approximation of GeLU."""
     x = bias + y
     return x * 0.5 * (1.0 + torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x)))
 
@@ -24,6 +26,7 @@ def bias_gelu(bias, y):
 # 0.5 * (1. + torch.erf(x * 0.70710678)) + 0.3989423 * x * torch.exp(-0.5 * x * x)
 @jit_fuser
 def bias_gelu_back(g, bias, y):
+    """Return the per-position gradient of the biased GeLU input."""
     x = bias + y
     tanh_out = torch.tanh(0.79788456 * x * (1 + 0.044715 * x * x))
     # sqrt(2/pi) * 3 * 0.044715 -> 0.1070322243
@@ -34,14 +37,18 @@ def bias_gelu_back(g, bias, y):
 
 
 class GeLUFunction(torch.autograd.Function):
+    """Autograd implementation of fused bias addition and GeLU."""
+
     @staticmethod
     # bias is an optional argument
     def forward(ctx, input, bias):
+        """Save the inputs needed for the activation derivative."""
         ctx.save_for_backward(input, bias)
         return bias_gelu(bias, input)
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Return input and bias gradients before broadcast reduction."""
         input, bias = ctx.saved_tensors
         tmp = bias_gelu_back(grad_output, bias, input)
         return tmp, tmp
@@ -49,7 +56,14 @@ class GeLUFunction(torch.autograd.Function):
     # This is required to make Sphinx happy :-(
     @classmethod
     def apply(cls, *args, **kwargs):
+        """Apply the custom GeLU autograd function."""
         return super().apply(*args, **kwargs)
 
 
-bias_gelu_impl = GeLUFunction.apply
+def bias_gelu_impl(
+    input: torch.Tensor, bias: torch.Tensor, *, gradient_accumulation_fusion: bool = False
+) -> torch.Tensor:
+    """Apply fused bias and GeLU with optional direct FP32 bias accumulation."""
+    if gradient_accumulation_fusion:
+        bias = bias_with_main_grad(bias, input.shape)
+    return GeLUFunction.apply(input, bias)

@@ -14,6 +14,7 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
+from megatron.core.fusions.fused_bias_grad import try_accumulate_bias_grad
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
@@ -779,6 +780,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         # checks we save the tensor in ctx.
         ctx.main_grad = main_grad
         ctx.use_bias = bias is not None
+        ctx.bias = bias
+        # FSDP gradient buckets are transient: acquire them in backward only.
+        ctx.bias_main_grad = (
+            getattr(bias, "main_grad", None)
+            if bias is not None and not hasattr(bias, "__fsdp_param__")
+            else None
+        )
+        ctx.bias_gradient_accumulation_fusion = gradient_accumulation_fusion
+        ctx.differentiable_bias_grad = False
         ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
         ctx.allreduce_dgrad = allreduce_dgrad
         ctx.sequence_parallel = sequence_parallel
@@ -959,7 +969,27 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                     torch.matmul(grad_output.t(), total_input, out=grad_weight)
             else:
                 grad_weight = grad_output.t().matmul(total_input)
-        grad_bias = grad_output.sum(dim=0) if use_bias else None
+        grad_bias = None
+        if use_bias and ctx.needs_input_grad[2]:
+            bias = ctx.bias
+            # Keep later traversals of a higher-order graph differentiable as well.
+            ctx.differentiable_bias_grad |= torch.is_grad_enabled()
+            accumulate_bias = (
+                not ctx.differentiable_bias_grad
+                and ctx.bias_gradient_accumulation_fusion
+                and hasattr(bias, "grad_added_to_main_grad")
+            )
+            # Only opt in when the owning wrapper provides an FP32 buffer and
+            # the fused-accumulation hook protocol. Ordinary autograd and
+            # low-precision communication buffers retain their existing path.
+            if accumulate_bias and try_accumulate_bias_grad(bias, grad_output, ctx.bias_main_grad):
+                # Leave .grad available for other uses of the same bias. The zero
+                # contributes only an autograd edge for the wrapper hooks.
+                grad_bias = torch.zeros_like(bias)
+            else:
+                # Keep the legacy reduction order when deferred wgrad leaves a 3-D tensor.
+                # Autograd reduces the remaining batch dimension to the bias shape.
+                grad_bias = grad_output.sum(dim=0)
 
         # GTP: reduce-scatter wgrad
         if ctx.gtp_remat_size > 1 and grad_weight is not None:

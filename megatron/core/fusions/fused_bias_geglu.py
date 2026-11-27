@@ -2,6 +2,7 @@
 
 import torch
 
+from megatron.core.fusions.fused_bias_grad import bias_with_main_grad
 from megatron.core.jit import jit_fuser
 
 ###### BIAS GELU FUSION/ NO AUTOGRAD ################
@@ -150,7 +151,7 @@ class GeGLUFunction(torch.autograd.Function):
         return tmp
 
 
-def bias_geglu_impl(input, bias):
+def bias_geglu_impl(input, bias, *, gradient_accumulation_fusion: bool = False):
     """Implementation of biased GEGLU that handles different input shapes.
 
     This function reshapes the input if necessary, applies the GEGLU activation
@@ -160,6 +161,7 @@ def bias_geglu_impl(input, bias):
         input (torch.Tensor): Input tensor to apply GEGLU activation.
         bias (torch.Tensor, optional): Bias tensor to be added to input. If None,
             uses the bias-free GEGLU variant.
+        gradient_accumulation_fusion: Allow direct FP32 accumulation of the bias gradient.
 
     Returns:
         torch.Tensor: Result of biased GEGLU activation.
@@ -171,6 +173,8 @@ def bias_geglu_impl(input, bias):
     assert len(ori_shape) in [2, 3]
     input = input.view(-1, ori_shape[-1])
     if bias is not None:
+        if gradient_accumulation_fusion:
+            bias = bias_with_main_grad(bias, input.shape)
         output = BiasGeGLUFunction.apply(input, bias)
     else:
         output = GeGLUFunction.apply(input)
@@ -415,15 +419,23 @@ class WeightedBiasQuickGeGLUFunction(torch.autograd.Function):
 
 
 def weighted_bias_quick_geglu_impl(
-    input, bias, weights, fp8_input_store=False, linear_offset=0.0, clamp_value=None
+    input,
+    bias,
+    weights,
+    fp8_input_store=False,
+    linear_offset=0.0,
+    clamp_value=None,
+    *,
+    gradient_accumulation_fusion: bool = False,
 ):
     """
     Token-wise-weighted bias quick_geglu fusion.
         input: [num_selected_experts * seq_len, hidden_size * 2]
-        bias: None
+        bias: Optional bias vector.
         weights: [num_selected_experts * seq_len, 1]
         fp8_input_store: bool
         linear_offset: float
+        gradient_accumulation_fusion: Allow direct FP32 accumulation of the bias gradient.
         output: [num_selected_experts * seq_len, hidden_size]
     """
     ori_shape = input.shape
@@ -444,6 +456,8 @@ def weighted_bias_quick_geglu_impl(
     input = propagate_te_grouped_tensor_marker(paged_stash_source, input.view(-1, ori_shape[-1]))
     linear_offset = torch.tensor(linear_offset, dtype=input.dtype, device=input.device)
     if bias is not None:
+        if gradient_accumulation_fusion:
+            bias = bias_with_main_grad(bias, input.shape)
         output = WeightedBiasQuickGeGLUFunction.apply(
             input, bias, weights, fp8_input_store, linear_offset
         )

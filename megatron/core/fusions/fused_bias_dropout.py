@@ -1,8 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from typing import TYPE_CHECKING, Optional, Tuple
+from functools import partial
+from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple
 
 import torch
+from torch import Tensor
 
+from megatron.core.fusions.fused_bias_grad import bias_with_main_grad
 from megatron.core.jit import jit_fuser
 
 if TYPE_CHECKING:
@@ -84,8 +87,12 @@ def bias_dropout_add_fused_inference(
 
 
 def get_bias_dropout_add(
-    training, fused, mhc_recompute_manager: Optional['MHCCheckpointManager'] = None
-):
+    training: bool,
+    fused: bool,
+    mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
+    *,
+    gradient_accumulation_fusion: bool = False,
+) -> Callable[..., Tensor]:
     """
     Get the bias-dropout-add function.
 
@@ -95,25 +102,40 @@ def get_bias_dropout_add(
         mhc_recompute_manager: Optional MHCCheckpointManager for checkpoint management.
             When provided, the returned function will wrap the BDA operation with
             CheckpointWithoutOutput for memory-efficient recomputation.
+        gradient_accumulation_fusion: Enable direct bias accumulation when the wrapper
+            supplies an FP32 gradient buffer.
 
     Returns:
         A callable that performs bias-dropout-add operation.
     """
     if mhc_recompute_manager is not None:
-        # Return a checkpointed version that handles tuple unpacking internally
-        return _get_checkpointed_bda(training, fused, mhc_recompute_manager)
-
-    if fused:
-        # jit scripting for a nn.module (with dropout) is not
-        # triggering the fusion kernel. For now, we use two
-        # different nn.functional routines to account for varying
-        # dropout semantics during training and inference phases.
-        if training:
-            return bias_dropout_add_fused_train
-        else:
-            return bias_dropout_add_fused_inference
+        bda = _get_checkpointed_bda(training, fused, mhc_recompute_manager)
+    elif fused:
+        bda = bias_dropout_add_fused_train if training else bias_dropout_add_fused_inference
     else:
-        return bias_dropout_add_unfused(training)
+        bda = bias_dropout_add_unfused(training)
+
+    if not (training and fused and gradient_accumulation_fusion):
+        return bda
+
+    def _bda_with_main_grad(x_with_bias, residual, prob):
+        if isinstance(x_with_bias, tuple):
+            x, bias = x_with_bias
+            if bias is not None:
+                dtype = residual.dtype if x.dtype != residual.dtype else None
+                x_with_bias = (x, bias_with_main_grad(bias, x.shape, dtype))
+        return bda(x_with_bias, residual, prob)
+
+    return _bda_with_main_grad
+
+
+def configure_bias_dropout_add(
+    factory: Callable[..., Any], gradient_accumulation_fusion: bool
+) -> Callable[..., Any]:
+    """Enable FP32 bias accumulation for the built-in BDA spec."""
+    if factory is get_bias_dropout_add and gradient_accumulation_fusion:
+        return partial(factory, gradient_accumulation_fusion=True)
+    return factory
 
 
 def _get_checkpointed_bda(training, fused, mhc_recompute_manager: 'MHCCheckpointManager'):

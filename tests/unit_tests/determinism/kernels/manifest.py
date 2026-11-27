@@ -300,6 +300,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Consumes the CUDA RNG; replayed under a restored RNG state.",
     ),
     KernelEntry(
+        name="fused_bias_fp32_accumulation",
+        sources=(
+            "megatron/core/fusions/fused_bias_grad.py",
+            "megatron/core/fusions/fused_bias_dropout.py",
+            "megatron/core/fusions/fused_bias_gelu.py",
+            "megatron/core/fusions/fused_bias_geglu.py",
+            "megatron/core/fusions/fused_bias_swiglu.py",
+        ),
+        tests=(K + "test_fused_activations.py",),
+        kind="torch.compile",
+        notes="Replays the FP32 main_grad reduction and write under side-stream contention. "
+        "Dropout replays restore the CUDA RNG state.",
+    ),
+    KernelEntry(
         name="compiled_activations",
         sources=(
             "megatron/core/activations.py",
@@ -452,7 +466,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="tensor_parallel_layers",
-        sources=("megatron/core/tensor_parallel/layers.py",),
+        sources=(
+            "megatron/core/tensor_parallel/layers.py",
+            "megatron/core/fusions/fused_bias_grad.py",
+        ),
         tests=(
             K + "test_tensor_parallel_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
