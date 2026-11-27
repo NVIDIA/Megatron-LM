@@ -34,6 +34,10 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
         # Batch-first shape of the padding_mask input reserved by the TE CUDA graph of this layer;
         # set in get_layer_static_inputs at capture, None when the graph has no such input.
         self._te_cuda_graph_padding_mask_shape: Optional[tuple[int, ...]] = None
+        # Link to the TE CUDA graph this layer shares with an adjacent Hybrid layer, set by
+        # TECudaGraphHelper with cuda_graph_pair_hybrid_layers; see _te_cuda_graph_replay_graph
+        # and _te_cuda_graph_finish_replay.
+        self._te_cuda_graph_pair_link = None
 
         # Check the compatibility of fine-grained activation offloading and cuda graph.
         if self.config.fine_grained_activation_offloading:
@@ -278,8 +282,13 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
         ):
             kwargs.pop("attention_mask", None)
         # The graph only takes padding_mask when it was captured with that input; the eager MoE
-        # steps after the graph keep using the caller's mask.
-        graph_padding_mask = self._te_cuda_graph_padding_mask(padding_mask, hidden_states.device)
+        # steps after the graph keep using the caller's mask. A pair's mask input belongs to the
+        # router of its feed-forward layer.
+        pair_link = self._te_cuda_graph_pair_link
+        mask_layer = self if pair_link is None else pair_link.pair.partner
+        graph_padding_mask = mask_layer._te_cuda_graph_padding_mask(
+            padding_mask, hidden_states.device
+        )
         if graph_padding_mask is not None:
             kwargs["padding_mask"] = graph_padding_mask
         cudagraph_args, cudagraph_kwargs = super()._get_te_cuda_graph_replay_args(
@@ -335,6 +344,14 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
         except ImportError:
             raise RuntimeError("CUDAGraph requires TransformerEngine, but not installed")
         return tuple(cudagraph_args), cudagraph_kwargs
+
+    def _te_cuda_graph_replay_graph(self, hidden_states: Tensor, *args, **kwargs):
+        """Replay this microbatch's graph, or take a paired mixer's replay outputs."""
+        pair_link = self._te_cuda_graph_pair_link
+        if pair_link is not None and pair_link.role == "partner":
+            # The mixer before this layer has replayed the graph that covers both layers.
+            return pair_link.pair.take_partner_outputs(hidden_states)
+        return super()._te_cuda_graph_replay_graph(hidden_states, *args, **kwargs)
 
     def is_graphable_for_scope(self, modules):
         """Return whether this layer contains a requested TE graph scope."""
@@ -603,6 +620,11 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
     ):
         """Finish the eager layer stages using this call's continuation inputs."""
         cuda_graph_output = list(cuda_graph_output)
+        pair_link = self._te_cuda_graph_pair_link
+        if pair_link is not None and pair_link.role == "mixer":
+            # The mixer's feed-forward branch is an identity, so its graph output is its layer
+            # output; the partner's graph outputs wait for the partner's call.
+            return pair_link.pair.stash_partner_outputs(cuda_graph_output), context
         if graph_has_context:
             context = cuda_graph_output.pop()
 

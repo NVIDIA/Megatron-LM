@@ -1027,6 +1027,157 @@ class TestMtpCommitStepMetadata:
         base = torch.ones(self.MAX_REQUESTS, dtype=torch.int64, device=DEVICE)
         self._check(16, 16, 12, 16, 8, accepted, base)
 
+    @staticmethod
+    def _reference_vectorized(
+        view, accepted, base, block_table, n, padded, slots, block_size, dummy
+    ):
+        # The same layout as `_reference`, in tensor ops so it scales to large batches.
+        device = block_table.device
+        rows = torch.arange(padded, device=device)
+        real = rows < n
+        accepted = accepted[:padded].long()
+        starts = torch.where(real, base[:padded].long() - 1 - accepted, 0)
+        slot = torch.arange(slots, device=device)
+        positions = starts[:, None] + slot[None, :]
+        writes = real[:, None] & (slot[None, :] < accepted[:, None])
+        num_cols = block_table.shape[1]
+        columns = torch.where(writes, positions // block_size, 0).clamp(0, num_cols - 1)
+        blocks = torch.gather(block_table[:padded].long(), 1, columns)
+        tokens = padded * slots
+        view.token_to_block_idx[:tokens] = torch.where(writes, blocks, dummy).flatten()
+        view.token_to_local_position_within_kv_block[:tokens] = (
+            torch.where(writes, positions % block_size, 0).flatten().to(torch.int32)
+        )
+        view.token_to_request_idx[:tokens] = rows.repeat_interleave(slots).to(torch.int32)
+        request_positions = torch.where(real[:, None], positions, 0).flatten()
+        view.token_to_position_in_request[:tokens] = request_positions.to(torch.int32)
+        view.token_to_pos_ids[:tokens] = request_positions
+        query_lengths = torch.where(real, slots, 0).to(torch.int32)
+        kv_lengths = torch.where(real, starts + slots, 0).to(torch.int32)
+        view.mha_query_lengths[:padded] = query_lengths
+        view.mha_kv_seq_lengths[:padded] = kv_lengths
+        view.mha_cu_query_seq_lengths[0] = 0
+        view.mha_cu_kv_seq_lengths[0] = 0
+        view.mha_cu_query_seq_lengths[1 : padded + 1] = torch.cumsum(query_lengths, 0)
+        view.mha_cu_kv_seq_lengths[1 : padded + 1] = torch.cumsum(kv_lengths, 0)
+        view.mha_block_table[:padded] = torch.where(
+            real[:, None], block_table[:padded].to(torch.int32), -1
+        )
+
+    @pytest.mark.parametrize("active_request_count, padded_count", [(5, 8), (64, 64)])
+    @pytest.mark.parametrize("num_slots", [1, 3, 12])
+    def test_vectorized_reference_matches_reference(
+        self, active_request_count, padded_count, num_slots
+    ):
+        # The large-shape test trusts the vectorized reference; pin it to the explicit one.
+        block_size, num_cols = 16, 33
+        torch.manual_seed(active_request_count + num_slots)
+        accepted = torch.randint(
+            0, num_slots + 1, (self.MAX_REQUESTS,), dtype=torch.int64, device=DEVICE
+        )
+        base = torch.randint(
+            num_slots + 1,
+            block_size * num_cols - num_slots,
+            (self.MAX_REQUESTS,),
+            dtype=torch.int64,
+            device=DEVICE,
+        )
+        block_table = torch.randint(
+            0, 500, (self.MAX_REQUESTS, num_cols), dtype=torch.int32, device=DEVICE
+        )
+        num_tokens = self.MAX_REQUESTS * num_slots
+        ref_view = self._make_gpu_view(num_tokens, num_cols)
+        vec_view = self._make_gpu_view(num_tokens, num_cols)
+        args = (
+            accepted,
+            base,
+            block_table,
+            active_request_count,
+            padded_count,
+            num_slots,
+            block_size,
+        )
+        self._reference(ref_view, *args)
+        self._reference_vectorized(vec_view, *args, self.DUMMY_BLOCK)
+        for name, ref in vars(ref_view).items():
+            assert torch.equal(getattr(vec_view, name), ref), name
+
+    @pytest.mark.parametrize(
+        "active_request_count, padded_count, num_slots, num_cols",
+        [
+            # Many row tiles, a partial last column tile, and a scan over several chunks.
+            (3001, 3072, 3, 130),
+            # Padding fills whole row tiles and a whole scan chunk.
+            (1000, 2048, 4, 33),
+            # Two column tiles, padded count not a power of two, a non-power-of-two slot count.
+            (37, 40, 12, 256),
+            # Widest row tiles; the scan carries its total across eight chunks.
+            (8192, 8192, 1, 8),
+        ],
+    )
+    def test_matches_reference_large(self, active_request_count, padded_count, num_slots, num_cols):
+        # Shapes the kernel splits across several programs (row and column tiles) and scans in
+        # several steps.
+        block_size = 16
+        torch.manual_seed(padded_count + num_cols + num_slots)
+        accepted = torch.randint(
+            0, num_slots + 1, (padded_count,), dtype=torch.int64, device=DEVICE
+        )
+        base = torch.randint(
+            num_slots + 1,
+            block_size * num_cols - num_slots,
+            (padded_count,),
+            dtype=torch.int64,
+            device=DEVICE,
+        )
+        block_table = torch.randint(
+            0, 50_000, (padded_count, num_cols), dtype=torch.int32, device=DEVICE
+        )
+        views = []
+        for _ in range(2):
+            view = self._make_gpu_view(padded_count * num_slots, num_cols)
+            view.mha_query_lengths = torch.full(
+                (padded_count,), self.SENTINEL, dtype=torch.int32, device=DEVICE
+            )
+            view.mha_kv_seq_lengths = torch.full(
+                (padded_count,), self.SENTINEL, dtype=torch.int32, device=DEVICE
+            )
+            view.mha_cu_query_seq_lengths = torch.full(
+                (padded_count + 1,), self.SENTINEL, dtype=torch.int32, device=DEVICE
+            )
+            view.mha_cu_kv_seq_lengths = torch.full(
+                (padded_count + 1,), self.SENTINEL, dtype=torch.int32, device=DEVICE
+            )
+            view.mha_block_table = torch.full(
+                (padded_count, num_cols), self.SENTINEL, dtype=torch.int32, device=DEVICE
+            )
+            views.append(view)
+        ref_view, tri_view = views
+        self._reference_vectorized(
+            ref_view,
+            accepted,
+            base,
+            block_table,
+            active_request_count,
+            padded_count,
+            num_slots,
+            block_size,
+            self.DUMMY_BLOCK,
+        )
+        mtp_commit_step_metadata(
+            gpu_view=tri_view,
+            accepted_counts=accepted,
+            base_positions=base,
+            block_table=block_table,
+            active_request_count=active_request_count,
+            padded_count=padded_count,
+            num_slots=num_slots,
+            block_size_tokens=block_size,
+            dummy_block_idx=self.DUMMY_BLOCK,
+        )
+        for name, ref in vars(ref_view).items():
+            assert torch.equal(getattr(tri_view, name), ref), name
+
     def test_padding_count_zero_is_noop(self):
         view = self._make_gpu_view(self.MAX_REQUESTS, 8)
         before = {k: v.clone() for k, v in vars(view).items()}

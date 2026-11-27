@@ -39,6 +39,7 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
     reset_fp8_state,
     reset_gtp_globals,
 )
+from tests.unit_tests.test_utilities import te_reads_legacy_grouped_env
 
 pytestmark = [pytest.mark.internal, pytest.mark.launch_on_gb200]
 
@@ -236,5 +237,6 @@ def _worker_mtp_bf16_numerics(rank, world_size, port, egtp_size):
 def test_mtp_bf16_override_matches_reference(monkeypatch, egtp_size: int) -> None:
     _requires_multi_gpu(4)
     _requires_mxfp8()
-    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+    if te_reads_legacy_grouped_env():
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
     _run_distributed(_worker_mtp_bf16_numerics, 4, egtp_size)

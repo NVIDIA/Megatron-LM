@@ -389,10 +389,13 @@ _CUDAGRAPH_NEEDS_GENERATOR_REGISTRATION = None
 
 def _probe_cudagraph_needs_generator_registration() -> bool:
     """Capture an RNG op on an unregistered generator and report whether capture rejects it."""
+    # cuda_graphs imports this module, so import its capture helper here.
+    from megatron.core.transformer.cuda_graphs import no_gc_during_capture
+
     generator = torch.Generator(device="cuda")
     graph = torch.cuda.CUDAGraph()
     try:
-        with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+        with no_gc_during_capture(), torch.cuda.graph(graph, capture_error_mode="thread_local"):
             torch.rand(1, device="cuda", generator=generator)
     except RuntimeError:
         # Without lazy registration, capture fails with "RNG op during graph capture but
