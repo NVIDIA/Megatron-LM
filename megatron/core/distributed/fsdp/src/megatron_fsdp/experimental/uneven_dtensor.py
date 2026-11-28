@@ -122,8 +122,7 @@ def attach_uneven_dtensor_metadata(
 ) -> None:
     """Attach Megatron-FSDP chunk metadata to the sharded DTensors DCP will save or load.
 
-    Optimizer state is allocated as ``zeros_like`` of a sharded parameter, so it shares that
-    parameter's chunk.
+    Optimizer state is sharded by its parameter's rows, so it shares that parameter's row range.
 
     Args:
         model: The sharded module tree the state dicts were taken from.
@@ -163,7 +162,10 @@ def _attach_by_fqn(
                     f"[Megatron-FSDP] No chunk metadata for DTensor {fqn!r}. Distributed "
                     "checkpointing supports DTensors sharded by Megatron-FSDP only."
                 )
-            _attach_dcp_hooks(tensor, metadata_by_fqn[fqn])
+            chunk = metadata_by_fqn[fqn]
+            _attach_dcp_hooks(
+                tensor, _build_chunk_metadata(chunk.offsets[0], chunk.sizes[0], tensor.shape)
+            )
 
 
 def _attach_dcp_hooks(dtensor: DTensor, chunk: ChunkStorageMetadata) -> None:
