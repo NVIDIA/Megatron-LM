@@ -43,6 +43,8 @@ from tests.unit_tests.test_utilities import Utils
     not te_supports_batch_invariant_attention() or not (HAVE_FA3 or HAVE_FA4),
     reason="Requires batch-invariant TE and FA3/4",
 )
+# Batch-invariant Mamba layers require the SSM kernels pinned; see assert_ssm_kernels_pinned.
+@pytest.mark.usefixtures("pinned_autotune")
 class TestBatchInvariantMambaPrefixCaching:
     def setup_method(self):
         skip_if_sequence_packing_not_available()
