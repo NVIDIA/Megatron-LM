@@ -108,6 +108,11 @@ GATED_CASES = {
         lambda x, b, w: weighted_bias_quick_geglu_impl(x, b, w, clamp_value=10.0),
         (_act((TOKENS, 2 * FFN)), None, _weights(TOKENS)),
     ),
+    # Bias is added before the clamps, so this exercises the add + clamp + kernel backward chain.
+    "weighted_clamped_quick_geglu_bias": lambda: (
+        lambda x, b, w: weighted_bias_quick_geglu_impl(x, b, w, clamp_value=10.0),
+        (_act((TOKENS, 2 * FFN)), _act((2 * FFN,)), _weights(TOKENS)),
+    ),
     "bias_gelu": lambda: (bias_gelu_impl, (_act((TOKENS, FFN)), _act((FFN,)))),
     "weighted_squared_relu": lambda: (
         weighted_squared_relu_impl,
