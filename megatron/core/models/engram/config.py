@@ -586,6 +586,11 @@ class EngramConfig:
         after the model config is assembled; pass it here when available, otherwise call
         :meth:`validate_vocabulary` from the model builder.
 
+        :meth:`from_args` passes what the arguments say about the dataset and the wrapper. The
+        hybrid model builder calls this again for every model config, one assembled without
+        :meth:`from_args` included; it leaves the dataset arguments at their defaults, which
+        skip the checks that need them.
+
         Args:
             transformer_config: The model's TransformerConfig.
             expected_tokenizer_vocab_size: Padded vocabulary size, when already known.
@@ -830,6 +835,14 @@ class EngramConfig:
             raise ValueError(
                 "Engram does not yet support use_mup: muP's learning-rate overrides conflict "
                 "with the Engram embedding learning-rate override."
+            )
+        if getattr(transformer_config, "moe_expert_rank_capacity_factor", None) is not None:
+            # The paged-stash runner that this factor selects replays overflowing microbatches
+            # through plain iterators, which bypass the Engram token prefetch.
+            raise ValueError(
+                "Engram does not support moe_expert_rank_capacity_factor: its paged-stash "
+                "runner replays the microbatches through plain iterators, which bypass the "
+                "Engram token prefetch."
             )
         # Activation recomputation is supported: the recompute path passes input_ids to the
         # Engram layers it replays, and the Engram collectives stay rank-symmetric under

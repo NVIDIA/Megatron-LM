@@ -264,7 +264,7 @@ def test_lookup_ahead_of_a_recomputed_region(tmp_path, monkeypatch, variant, ker
 class _Group:
     """A stand-in process group that only carries a size and this rank's index."""
 
-    def __init__(self, size, rank):
+    def __init__(self, size, rank) -> None:
         self.size, self.rank = size, rank
 
 
