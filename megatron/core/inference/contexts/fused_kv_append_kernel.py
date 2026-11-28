@@ -63,7 +63,9 @@ def _append_kv_cache_kernel(
     if USE_PDL:
         gdc_wait()
 
-    token_idx = tl.program_id(0)
+    # Token offsets (token_idx * stride_*_token) are formed in int64: for a fused-QKV view the
+    # token stride is the whole QKV row, so they pass 2**31 elements for large batches.
+    token_idx = tl.program_id(0).to(tl.int64)
     head_idx = tl.program_id(1)
 
     if token_idx >= n_tokens or head_idx >= num_heads:
