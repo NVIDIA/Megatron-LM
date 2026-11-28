@@ -1043,9 +1043,15 @@ def _tokenize_without_template(tokenizer, messages, media_slots):
 
 
 def _apply_bos_policy(prompt_tokens, tokenizer, add_BOS, offload_params):
-    """Strip leading BOS tokens and re-add one if requested, keeping the expanded-prefix count."""
+    """Strip leading BOS tokens and re-add one if requested, keeping the expanded-prefix count.
+
+    ``add_BOS=None`` (the request did not set it) keeps one BOS if the prompt starts with one, so
+    the model gets the chat template's BOS, as with Hugging Face's ``apply_chat_template``.
+    """
     if getattr(tokenizer, "bos", None) is None:
         return prompt_tokens
+    if add_BOS is None:
+        add_BOS = bool(prompt_tokens) and prompt_tokens[0] == tokenizer.bos
     length_before = len(prompt_tokens)
     start_idx = 0
     while start_idx < len(prompt_tokens) and prompt_tokens[start_idx] == tokenizer.bos:
@@ -1425,7 +1431,10 @@ try:
             )
             n = extras["n"]  # Number of choices to generate
             prompt_tokens = _apply_bos_policy(
-                prompt_tokens, tokenizer, sampling_params.add_BOS, offload_params
+                prompt_tokens,
+                tokenizer,
+                sampling_params.add_BOS if req.get("add_BOS") is not None else None,
+                offload_params,
             )
         except (ValueError, TypeError) as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
