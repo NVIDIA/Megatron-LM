@@ -741,8 +741,10 @@ def test_chained_optimizer_get_parameters():
     assert result == opt1.params + opt2.params + opt3.params
 
 
-def test_chained_optimizer_reports_unsuccessful_when_grad_norm_skipped():
-    """Test ChainedOptimizer reports skipped large-gradient updates as unsuccessful."""
+@pytest.mark.parametrize("dsa_indexer_clip_grad", [None, 0.5])
+def test_chained_optimizer_reports_unsuccessful_when_grad_norm_skipped(dsa_indexer_clip_grad):
+    """Test ChainedOptimizer reports skipped large-gradient updates as unsuccessful,
+    including when the DSA indexer gradients are clipped separately."""
     from megatron.core import parallel_state
 
     class MockOptimizer:
@@ -760,6 +762,12 @@ def test_chained_optimizer_reports_unsuccessful_when_grad_norm_skipped():
 
         def get_grad_norm(self):
             return 2.0
+
+        def get_dsa_split_parameters(self):
+            return [], [self.param]
+
+        def get_dsa_split_grad_norms(self):
+            return 0.0, 2.0
 
         def get_parameters(self):
             return [self.param]
@@ -779,7 +787,9 @@ def test_chained_optimizer_reports_unsuccessful_when_grad_norm_skipped():
 
     Utils.initialize_model_parallel()
     try:
-        config = OptimizerConfig(clip_grad=0.0, grad_norm_skip_threshold=1.0)
+        config = OptimizerConfig(
+            clip_grad=0.0, grad_norm_skip_threshold=1.0, dsa_indexer_clip_grad=dsa_indexer_clip_grad
+        )
         param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
         param.grad = torch.ones_like(param)
         optimizer = MockOptimizer(param, config)
