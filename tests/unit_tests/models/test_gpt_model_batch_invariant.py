@@ -26,7 +26,6 @@ from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
-from megatron.rl.rl_utils import selective_log_softmax
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -125,6 +124,10 @@ def _build_flash_attn_bik_model(seq_len: int, vocab_size: int, hidden_size: int 
 
 
 def _train_forward_logprobs(model: torch.nn.Module, tokens: torch.Tensor) -> torch.Tensor:
+    # Keep the RL stack lazy: sibling inference tests import the shared feature
+    # probes and tokenizer from this module without needing the RL server extras.
+    from megatron.rl.rl_utils import selective_log_softmax
+
     batch_size, seq_len = tokens.shape
     position_ids = (
         torch.arange(seq_len, device=tokens.device).unsqueeze(0).expand(batch_size, seq_len)

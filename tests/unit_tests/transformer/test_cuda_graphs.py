@@ -4045,6 +4045,30 @@ class TestSkipFp8WeightUpdateTensor:
             self._reset_skip_tensor()
 
 
+@pytest.mark.skipif(not fp8_available, reason="FP8 is not available on this device")
+def test_cuda_graph_runner_keeps_module_fp8_recipe(monkeypatch):
+    """Outside fp8_autocast, a runner uses its module's recipe, not TE's global default."""
+    from transformer_engine.common.recipe import DelayedScaling, Float8CurrentScaling
+
+    monkeypatch.setattr(
+        cuda_graphs_module.FP8GlobalStateManager,
+        "get_fp8_recipe",
+        classmethod(lambda cls: DelayedScaling()),
+    )
+    config = TransformerConfig(
+        num_layers=1, hidden_size=64, num_attention_heads=4, fp8="hybrid", fp8_recipe="tensorwise"
+    )
+    try:
+        TestSkipFp8WeightUpdateTensor._reset_skip_tensor()
+        runner = cuda_graphs_module._CudaGraphRunner(
+            MegatronModule(config), None, [], {}, None, need_backward=False
+        )
+    finally:
+        TestSkipFp8WeightUpdateTensor._reset_skip_tensor()
+
+    assert isinstance(runner.fp8_recipe, Float8CurrentScaling)
+
+
 if __name__ == "__main__":
 
     test = TestParallelTransformerBlockCudagraphs()

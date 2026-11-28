@@ -1170,6 +1170,29 @@ class TestMoEModules:
             what=f"TopKRouter[{balancing}, hash={hash_routing}]",
         )
 
+    def test_inference_topk1_router_preserves_route_axis(self):
+        from megatron.core.inference.utils import InferenceMode
+        from megatron.core.transformer.moe.router import InferenceTopKRouter
+
+        self._init()
+        seeded()
+        config = _moe_config(
+            moe_router_topk=1, moe_router_load_balancing_type="none", moe_router_pre_softmax=True
+        )
+        router = InferenceTopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        hidden = torch.randn(128, 1, 1024, device="cuda", dtype=torch.bfloat16)
+
+        def run(hidden):
+            with InferenceMode.active():
+                return router(hidden)
+
+        outputs, _ = assert_replays_bit_exact(
+            run, (hidden,), replays=3, backward=False, what="InferenceTopKRouter[topk=1]"
+        )
+        assert outputs["out[0]"].shape == outputs["out[1]"].shape == (128, 1)
+
     def test_topk_router_per_token_loss_replays_and_captures(self):
         """seq_aux_loss with per-token-loss scaling replays bit-exactly and its scale tensor can
         be created inside CUDA graph capture (a pageable H2D copy there fails the capture)."""

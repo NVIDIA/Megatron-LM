@@ -21,6 +21,7 @@ from .common import (
     run_inference,
     sampling_params_for_choice,
     submit_requests,
+    submit_streaming_requests,
     unwrap_batch,
     validate_offload_params,
 )
@@ -90,8 +91,8 @@ def parse_multi_modal_data(req):
 def _completions_logprobs(result, tokenizer, echo):
     """OpenAI text-completion ``logprobs`` block; with ``echo`` the prompt tokens lead.
 
-    Non-finite logprobs are clamped for JSON. The leading ``None`` matches the OpenAI format,
-    where the first token carries no logprob.
+    Non-finite logprobs are clamped for JSON. With ``echo`` the leading ``None`` is the first
+    prompt token, which carries no logprob; each generated token has its own entry.
     """
     generated_tokens = result["generated_tokens"] or []
     generated_log_probs = json_safe_logprobs(result.get("generated_log_probs") or [])
@@ -115,8 +116,8 @@ def _completions_logprobs(result, tokenizer, echo):
         )
     else:
         token_ids = generated_tokens
-        token_logprobs = [None] + generated_log_probs
-        top_logprobs = [None] + generated_top_n_logprobs if generated_top_n_logprobs else None
+        token_logprobs = generated_log_probs
+        top_logprobs = generated_top_n_logprobs if generated_top_n_logprobs else None
 
     tokens = [tokenizer.detokenize([tok]) for tok in token_ids]
     text_offset = []
@@ -245,9 +246,6 @@ try:
             except ValueError as error:
                 return str(error), 400
 
-        # TODO: streaming submissions made before a mid-loop failure are not aborted. Their
-        # handles are AsyncStreams, not ids, and they abort through openai_stream's finally,
-        # which never runs because the generator is never started.
         request_ids = []
         tasks = []
         streams = []
@@ -266,15 +264,12 @@ try:
                 for index, prompt_tokens in enumerate(prompts_as_tokens)
             ]
             if stream_requested:
-                streams = [
-                    client.add_request_streaming(
-                        prompt_tokens,
-                        per_request_params,
-                        multi_modal_data=prepared_multimodal_data,
-                        offload_params=offload_params,
-                    )
-                    for prompt_tokens, per_request_params in submissions
-                ]
+                streams = submit_streaming_requests(
+                    client,
+                    submissions,
+                    multi_modal_data=prepared_multimodal_data,
+                    offload_params=offload_params,
+                )
             else:
                 request_ids, tasks = submit_requests(
                     client,
