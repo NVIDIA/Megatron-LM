@@ -52,7 +52,7 @@ def _release_process_groups():
 class _MatrixOnlyModel(nn.Module):
     """Plain 2-D weights: every weight is Muon-eligible, biases go to the scalar optimizer."""
 
-    def __init__(self, input_size=32, hidden_size=16, output_size=8):
+    def __init__(self, input_size=32, hidden_size=16, output_size=8) -> None:
         super().__init__()
         self.fc1 = nn.Linear(input_size, hidden_size)
         self.fc2 = nn.Linear(hidden_size, output_size)
@@ -69,7 +69,7 @@ class _ExpertTableModel(_MatrixOnlyModel):
     Newton-Schulz orthogonalization.
     """
 
-    def __init__(self, table_rows=12, table_dim=8, **kwargs):
+    def __init__(self, table_rows=12, table_dim=8, **kwargs) -> None:
         super().__init__(**kwargs)
         self.table = nn.Parameter(torch.empty(table_rows, table_dim))
         nn.init.normal_(self.table, std=0.02)

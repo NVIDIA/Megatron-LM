@@ -117,7 +117,9 @@ class EngramGroupRMSNorm(torch.nn.Module):
     parity tests) keep their own precision.
     """
 
-    def __init__(self, width: int, group_size: int, eps: float, zero_centered: bool, **factory):
+    def __init__(
+        self, width: int, group_size: int, eps: float, zero_centered: bool, **factory
+    ) -> None:
         super().__init__()
         if width % group_size != 0:
             raise ValueError(f"width ({width}) must be divisible by group_size ({group_size}).")
@@ -161,12 +163,19 @@ def _gather_tokens_across_cp(input_ids: Tensor, cp_group, cu_seqlens: Tensor | N
 def _row_cu_seqlens(packed_seq_params: PackedSeqParams | None) -> Tensor | None:
     """Return the packed document boundaries for this microbatch, or None when unpacked.
 
+    The boundaries are the positions the documents occupy in the row, which is what the hash
+    windows and the context-parallel partition index: ``cu_seqlens_q_padded`` when the
+    parameters carry it, and ``cu_seqlens_q`` otherwise. The two differ for a row that pads
+    its documents and keeps their token counts in ``cu_seqlens_q``.
+
     ``get_batch`` keeps ``cu_seqlens`` as ``(1, N)`` for consistency and squeezes it to 1-D
     before building PackedSeqParams, so accept either and hand back a 1-D tensor.
     """
     if packed_seq_params is None:
         return None
-    cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
+    cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+    if cu_seqlens is None:
+        cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
     if cu_seqlens is None:
         return None
     return cu_seqlens.reshape(-1)
@@ -562,6 +571,10 @@ class Engram(MegatronModule):
         stop an n-gram window from reaching back into the previous document of the same row;
         the causal convolution deliberately still mixes across the boundary, matching both
         published reference implementations.
+
+        The residual has the dtype of the hidden states, except when they are wider than the
+        dense Engram parameters (BF16 parameters under ``fp32_residual_connection``): it then
+        has the parameter dtype, and the caller's add promotes it to that of the hidden states.
         """
         if hidden_states.ndim != 3:
             raise ValueError(f"Engram hidden_states must be [S,B,H], got {hidden_states.shape}.")
@@ -626,7 +639,15 @@ class Engram(MegatronModule):
         try:
             shared_value = self.value_projection(memory)
             key = self.key_norm(self.key_projection(memory)).view_as(streams)
-            query = self.query_norm(hidden_states).view_as(streams)
+            query = self.query_norm(hidden_states)
+            parameter_dtype = self.short_conv.weight.dtype
+            if torch.finfo(query.dtype).bits > torch.finfo(parameter_dtype).bits:
+                # Hidden states wider than the parameters (BF16 parameters under
+                # fp32_residual_connection) are normalized in their own dtype and the query is
+                # then rounded, so the gate and the convolution run in the parameter dtype.
+                # The caller adds their result to the hidden states, which keep their dtype.
+                query = query.to(parameter_dtype)
+            query = query.view_as(streams)
             score = (key * query).sum(dim=-1) / math.sqrt(self.hidden_size)
             score = score.abs().clamp_min(1e-6).sqrt() * score.sign()
             gate = score.sigmoid().unsqueeze(-1)

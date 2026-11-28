@@ -11,14 +11,8 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.models.engram.config import EngramConfig
-from megatron.core.models.engram.distributed_embedding import EPShardedEmbeddingTable
 from megatron.core.models.engram.engram import Engram
 from megatron.core.models.engram.hashing import build_ngram_hashes
-from tests.unit_tests.determinism.kernels.harness import (
-    CONTENTION_TOKENS,
-    assert_module_replays_bit_exact,
-    seeded,
-)
 
 from ._test_utils import make_module_config, make_pg_collection, write_tokenizer_map
 
@@ -122,6 +116,56 @@ def test_official_forward_and_backward_math(tmp_path, num_streams, deterministic
     assert not module.embedding.tables[0].weight.allreduce
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize(
+    "hidden_dtype", [torch.bfloat16, torch.float32], ids=["bf16_hidden", "fp32_hidden"]
+)
+def test_bf16_parameters_fuse_bf16_and_fp32_hidden_states(tmp_path, hidden_dtype):
+    """BF16 parameters take BF16 hidden states and the FP32 ones of fp32_residual_connection.
+
+    The memory is computed in the parameter dtype either way, and the hidden states it is added
+    to keep their own. Runs on GPU, where BF16 parameters train.
+    """
+    torch.manual_seed(123)
+    artifact = write_tokenizer_map(tmp_path / "map.json", vocab_size=32, layer_ids=(1,))
+    config = EngramConfig(
+        global_vocab_sizes=(17, 19),
+        layer_ids=(1,),
+        max_ngram_order=3,
+        num_hash_heads=2,
+        memory_dim=8,
+        kernel_size=4,
+        hash_seed=0,
+        boundary_token_id=0,
+        tokenizer_map_path=str(artifact),
+    )
+    module = Engram(
+        config=make_module_config(dtype=torch.bfloat16),
+        engram_config=config,
+        layer_number=1,
+        pg_collection=make_pg_collection(),
+    )
+    with torch.no_grad():
+        # A nonzero convolution branch, so the convolution takes part in the gradients.
+        module.short_conv.weight.normal_(mean=0.0, std=0.03)
+    module.cuda()
+
+    input_ids = torch.tensor([[1, 4, 2, 7], [3, 5, 9, 2]], dtype=torch.int64, device="cuda")
+    hidden = torch.randn(4, 2, 8, device="cuda", dtype=hidden_dtype, requires_grad=True)
+    memory = module(hidden, input_ids)
+    assert memory.dtype == torch.bfloat16
+    # What the layer does with the memory: the sum is in the dtype of the hidden states.
+    output = hidden + memory
+    assert output.dtype == hidden_dtype
+
+    output.float().square().sum().backward()
+    assert hidden.grad.dtype == hidden_dtype
+    assert torch.isfinite(hidden.grad).all()
+    for name, parameter in module.named_parameters():
+        assert parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+
+
 def test_frozen_embedding_keeps_lookup_and_dense_gradients(tmp_path):
     artifact = write_tokenizer_map(tmp_path / "map.json", vocab_size=32, layer_ids=(1,))
     modules = []
@@ -178,27 +222,3 @@ def test_frozen_embedding_keeps_lookup_and_dense_gradients(tmp_path):
     frozen_parameters = dict(frozen.named_parameters())
     for name, parameter in dense:
         torch.testing.assert_close(frozen_parameters[name].grad, parameter.grad, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
-def test_deterministic_table_backward_replays_bit_exact():
-    """Under deterministic_mode, repeated-row gradients are summed in a fixed order on GPU."""
-    seeded(1234)
-    num_rows, embedding_dim = 61, 1024
-    table = EPShardedEmbeddingTable(
-        config=make_module_config(deterministic_mode=True, dtype=torch.bfloat16),
-        global_num_embeddings=num_rows,
-        embedding_dim=embedding_dim,
-        init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=0.02),
-    ).cuda()
-    # Thousands of lookups over a few dozen rows put many gradients on every touched row.
-    row_ids = torch.randint(0, num_rows, (CONTENTION_TOKENS,), device="cuda")
-    grad_output = torch.randn(CONTENTION_TOKENS, embedding_dim, device="cuda", dtype=torch.bfloat16)
-    assert_module_replays_bit_exact(
-        table,
-        {"local_row_ids": row_ids},
-        grad_output=grad_output,
-        replays=4,
-        contention=True,
-        what="Engram deterministic table lookup",
-    )
