@@ -1342,6 +1342,8 @@ try:
         prompt_config = current_app.config['multimodal_prompt_config']
 
         req = await request.get_json()
+        if not isinstance(req, dict):
+            return Response("Invalid or missing JSON body", status=400)
         offload_params = req.get("offload_params")
         offload_params_error = validate_offload_params(offload_params)
         if offload_params_error is not None:
@@ -1424,6 +1426,8 @@ try:
                 return_prompt_tokens=options.return_tokenized_data or options.return_raw_text,
             )
             n = extras["n"]  # Number of choices to generate
+            if n < 1:
+                return Response("'n' must be at least 1", status=400)
             prompt_tokens = _apply_bos_policy(
                 prompt_tokens, tokenizer, sampling_params.add_BOS, offload_params
             )
