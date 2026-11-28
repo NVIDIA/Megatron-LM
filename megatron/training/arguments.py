@@ -2202,6 +2202,10 @@ def _add_inference_args(parser):
                             'collections skip it. "freeze_overlap" also runs due collections '
                             'right after each forward pass is submitted, overlapping them with '
                             'GPU work. Defaults to freeze_overlap.')
+    group.add_argument('--inference-dynamic-batching-prompt-hidden-states',
+                       action='store_true', default=False,
+                       help='Keep each forward\'s final hidden states so the server\'s '
+                            'embeddings endpoint can return the mean hidden state of a prompt.')
     group.add_argument('--inference-dynamic-batching-logprobs-mode',
                        type=str, default='raw_logprobs',
                        choices=['raw_logprobs', 'processed_logprobs'],

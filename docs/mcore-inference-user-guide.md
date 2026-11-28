@@ -687,6 +687,7 @@ coordinator mode* and raises `ValueError` otherwise. The routes are:
 |---|---|
 | `/v1/completions` | Text completions, with optional SSE streaming |
 | `/v1/chat/completions` | Chat completions, with chat templates, tool calling, reasoning parsers, image inputs, and optional SSE streaming |
+| `/v1/embeddings` | Mean final hidden state of each input, in the OpenAI embeddings format, with `skip_tokens` leading positions left out. Requires `--inference-dynamic-batching-prompt-hidden-states`; not available with prefix caching |
 | `/v1/health` | Readiness and liveness check |
 | `/v1/start_profile`, `/v1/stop_profile` | Relay `cudaProfilerStart`/`cudaProfilerStop` to every engine, to pair with `nsys --capture-range=cudaProfilerApi` |
 

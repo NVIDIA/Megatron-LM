@@ -163,6 +163,10 @@ class InferenceSetupConfig:
     setup so collections skip it. `freeze_overlap` also runs due collections right after each
     forward pass is submitted, overlapping them with GPU work. Defaults to `freeze_overlap`."""
 
+    inference_dynamic_batching_prompt_hidden_states: bool = False
+    """Keep each forward's final hidden states so the server's embeddings endpoint can return
+    the mean hidden state of a prompt."""
+
     inference_dynamic_batching_logprobs_mode: Literal["raw_logprobs", "processed_logprobs"] = (
         "raw_logprobs"
     )
@@ -499,4 +503,5 @@ class InferenceSetupConfig:
             async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),
             logprobs_mode=self.inference_dynamic_batching_logprobs_mode,
             gc_mode=self.inference_gc_mode,
+            capture_prompt_hidden_states=self.inference_dynamic_batching_prompt_hidden_states,
         )

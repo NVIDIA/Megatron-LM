@@ -891,6 +891,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 )
         sequence_parallel_override = False
 
+        if in_inference_mode:
+            self._capture_prompt_hidden_states(hidden_states, inference_context)
+
         if output_processor is not None:
             return output_processor(
                 hidden_states=hidden_states,

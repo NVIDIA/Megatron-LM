@@ -845,6 +845,10 @@ class DynamicInferenceRequest(InferenceRequest):
     payload_offloaded: bool = False
     payload_stage_metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Mean final hidden state over the prompt (see SamplingParams.return_prompt_embedding). Set
+    # when the request finishes; None when it was not asked for or could not be completed.
+    prompt_embedding: Optional[List[float]] = None
+
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
@@ -1059,6 +1063,8 @@ class DynamicInferenceRequest(InferenceRequest):
             ("skip_prompt_log_probs", torch.bool),
             ("top_n_logprobs", torch.int32),
             ("seed", torch.int64),
+            ("return_prompt_embedding", torch.bool),
+            ("prompt_embedding_skip_tokens", torch.int32),
         ]
 
     def add_event(
