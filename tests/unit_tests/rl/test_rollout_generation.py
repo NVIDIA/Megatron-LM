@@ -304,6 +304,37 @@ class TestConsumptionRelease:
             await it.aclose()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("consumption_granularity", ["G", "B"])
+    async def test_group_submission_below_one_batch_still_delivers(self, consumption_granularity):
+        """Group slots return only when a banked batch is consumed, so a negative lag
+        (fewer slots than groups per batch, e.g. from --rl-max-inflight-requests) must
+        still keep a whole batch in flight."""
+        request = GroupedRolloutRequest(
+            num_groups=4,
+            rollouts_per_group=1,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity="G",
+            consumption_granularity=consumption_granularity,
+        )
+        pipeline = RolloutPipeline(MockGenerator(), request, parallel_generation_tasks=0.5)
+        assert pipeline.gate.capacity == 4
+        async with aclosing(pipeline.run()) as groups:
+            batch = [await asyncio.wait_for(anext(groups), timeout=10) for _ in range(4)]
+        assert sorted(group.index_in_batch for group in batch) == [0, 1, 2, 3]
+
+    def test_rollout_submission_may_cap_below_one_batch(self):
+        """Rollout slots return when inference completes, so their cap stays below a batch."""
+        request = GroupedRolloutRequest(
+            num_groups=4,
+            rollouts_per_group=2,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity="R",
+            consumption_granularity="B",
+        )
+        pipeline = RolloutPipeline(MockGenerator(), request, parallel_generation_tasks=0.5)
+        assert pipeline.gate.capacity == 4
+
+    @pytest.mark.asyncio
     async def test_batch_submission_releases_once_per_batch(self):
         gen = MockGenerator()
         request = GroupedRolloutRequest(
