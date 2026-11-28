@@ -7,6 +7,7 @@ import pytest
 import torch
 from pytest_mock import mocker
 
+import megatron.core.full_cuda_graph as full_cuda_graph
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
 from megatron.core.full_cuda_graph import (
@@ -275,3 +276,48 @@ def test_forward_backward_func_with_full_cuda_graph(mocker):
         print(losses_reduced)
         assert i['loss_reduced'] == j['loss_reduced']
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "settings,expected",
+    [
+        ("", False),
+        ("expandable_segments:True", False),
+        ("expandable_segments:True,graph_capture_record_stream_reuse:True", True),
+        ("graph_capture_record_stream_reuse:False", False),
+        # The allocator takes the last occurrence.
+        ("graph_capture_record_stream_reuse:True,graph_capture_record_stream_reuse:False", False),
+        ("graph_capture_record_stream_reuse:False,graph_capture_record_stream_reuse:True", True),
+    ],
+)
+def test_allocator_reuse_setting_is_read_from_the_allocator(monkeypatch, settings, expected):
+    monkeypatch.setattr(
+        torch._C, "_accelerator_getAllocatorSettings", lambda: settings, raising=False
+    )
+    assert full_cuda_graph.allocator_reuses_marked_blocks_during_capture() is expected
+
+
+def test_allocator_reuse_setting_falls_back_to_the_environment(monkeypatch):
+    """A PyTorch build without the settings accessor still has the environment variable."""
+    monkeypatch.delattr(torch._C, "_accelerator_getAllocatorSettings", raising=False)
+    monkeypatch.delenv("PYTORCH_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "graph_capture_record_stream_reuse:True")
+    assert full_cuda_graph.allocator_reuses_marked_blocks_during_capture()
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    assert not full_cuda_graph.allocator_reuses_marked_blocks_during_capture()
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_capture_warns_once_when_the_allocator_holds_marked_blocks(monkeypatch, caplog, reuse):
+    monkeypatch.setattr(full_cuda_graph, "_warned_allocator_holds_marked_blocks", False)
+    monkeypatch.setattr(
+        full_cuda_graph, "allocator_reuses_marked_blocks_during_capture", lambda: reuse
+    )
+    with caplog.at_level("WARNING", logger=full_cuda_graph.logger.name):
+        # Training and validation each capture a graph; one warning covers both.
+        full_cuda_graph._warn_once_if_allocator_holds_marked_blocks()
+        full_cuda_graph._warn_once_if_allocator_holds_marked_blocks()
+    warnings_logged = [
+        record for record in caplog.records if "graph_capture_record_stream_reuse" in record.message
+    ]
+    assert len(warnings_logged) == (0 if reuse else 1)
