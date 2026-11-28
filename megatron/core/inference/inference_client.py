@@ -122,6 +122,8 @@ class InferenceClient:
         # Cancellation and local shutdown do not prove remote transfers safe.
         # Only a terminal reply or explicit source-safe acknowledgement removes an ID.
         self._pending_source_requests: set[int] = set()
+        # Set by stop(), whose cleanup must never read as a source-safety acknowledgement.
+        self._stopped = False
         # Resolves when abort cleanup makes transferred state safe to reuse.
         self.abort_futures: dict[int, asyncio.Future] = {}
         # Background socket receiver for request, stream, and abort replies.
@@ -432,6 +434,8 @@ class InferenceClient:
         request_id = int(request_id)
         if not 0 <= request_id < self.next_request_id:
             raise ValueError(f"Unknown request ID: {request_id}")
+        if self._stopped:
+            raise RuntimeError("Inference client stopped before source safety could be confirmed")
         existing = self.abort_futures.get(request_id)
         if existing is not None:
             return existing
@@ -758,6 +762,7 @@ class InferenceClient:
         and terminates the ZMQ context. It should be called when the client is
         no longer needed to ensure a graceful shutdown.
         """
+        self._stopped = True
         if self.listener_task is not None and not self.listener_task.done():
             self.listener_task.cancel()
         # Wake up any listeners.
@@ -765,14 +770,18 @@ class InferenceClient:
             if not future.done():
                 future.cancel()
         self.completion_futures.clear()
-        # Terminate any open streaming iterators.
+        # A local transport shutdown is not a successful request completion.
+        # Surface it to consumers rather than letting public streaming layers
+        # fabricate an empty successful terminal response.
         for stream in self.streams.values():
-            stream.finish()
+            stream.finish(exception=InferenceRequestAborted("Inference client stopped"))
         self.streams.clear()
         for future in self.abort_futures.values():
             if not future.done():
                 future.cancel()
         self.abort_futures.clear()
         self.aborted_request_ids.clear()
+        self.request_submission_times.clear()
+        self._pending_source_requests.clear()
         self.socket.close(linger=0)
         self.context.term()
