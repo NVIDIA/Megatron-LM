@@ -30,7 +30,7 @@ from megatron.core.inference.disaggregation.inference_state_handoff import (
     InferenceStateHandoffMixin,
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
-from megatron.core.inference.engines.dynamic.loop import _get_decode_only_log_state
+from megatron.core.inference.engines.dynamic.loop import StepRecord, _get_decode_only_log_state
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
@@ -303,6 +303,9 @@ def test_async_forward_routes_one_controller_iteration(
     engine.state = EngineState.RUNNING
     engine.logging_step_interval = 0
     engine.metrics_writer = None
+    engine.track_generated_token_events = False
+    engine.stop_word_being_finished_ids = {11}
+    engine._pending_record = None
     engine.schedule_waiting_requests = mock.Mock()
     engine._should_run_async_sched_overlap = mock.Mock(return_value=run_async_overlap)
     engine.context = SimpleNamespace(
@@ -312,6 +315,7 @@ def test_async_forward_routes_one_controller_iteration(
         active_token_count=2,
         num_prefill_requests=1 if expected_nvtx_range == "Prefill" else 0,
         chunked_prefill_request_id=17,
+        enable_prefix_caching=False,
         is_decode_only=mock.Mock(return_value=decode_only.launched),
         dynamo_helper=DynamoHelper(),
     )
@@ -330,8 +334,13 @@ def test_async_forward_routes_one_controller_iteration(
         ) as nvtx_range_push,
         mock.patch("megatron.core.inference.engines.dynamic.loop.nvtx_range_pop") as nvtx_range_pop,
     ):
-        result, context_state, _ = asyncio.run(engine.async_forward())
+        record = asyncio.run(engine.async_forward())
 
+    # The step is left pending with what its bookkeeping reads; the live force set starts over.
+    assert record is engine._pending_record
+    result, context_state = record.step_result, record.context_state
+    assert record.stop_word_being_finished_ids == {11}
+    assert engine.stop_word_being_finished_ids == set()
     assert result is output
     assert context_state["decode_only"] == decode_only
     assert context_state["chunked_prefill_request_id"] == 17
@@ -344,10 +353,13 @@ def test_async_forward_routes_one_controller_iteration(
     nvtx_range_pop.assert_called_once_with(expected_nvtx_range)
     if mode == AsyncScheduleMode.LEGACY:
         engine._should_run_async_sched_overlap.assert_not_called()
-        engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with()
+        engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with(
+            after_launch=engine.drain_bookkeeping
+        )
     else:
         engine._should_run_async_sched_overlap.assert_called_once_with()
         engine.controller.async_generate_output_tokens_dynamic_batch.assert_awaited_once_with(
+            after_launch=engine.drain_bookkeeping,
             run_async_overlap=run_async_overlap,
             schedule_waiting_requests=(
                 None if run_async_overlap else engine.schedule_waiting_requests
@@ -357,8 +369,9 @@ def test_async_forward_routes_one_controller_iteration(
 
 
 @pytest.mark.parametrize("track_paused_request_events", [False, True])
-def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(track_paused_request_events):
-    """Bookkeeping uses consumed-forward state and records requested pause events."""
+def test_bookkeeping_reads_the_steps_record(track_paused_request_events):
+    """Bookkeeping uses the record's consumed-forward state, force set and time, not the
+    engine's live state, which later steps have moved on; it records requested pause events."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.track_paused_request_events = track_paused_request_events
     engine.post_process_requests = mock.Mock(return_value=([10], []))
@@ -367,7 +380,7 @@ def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(track_paused_re
     engine.failed_request_ids = set()
     engine.requests = {}
     engine.use_coordinator = False
-    engine.context = SimpleNamespace(enable_prefix_caching=False, step_count=1)
+    engine.context = SimpleNamespace(step_count=1, chunked_prefill_request_id=13)
     engine.logging_step_interval = 0
     engine.num_speculative_tokens = 0
     step_result = {
@@ -384,19 +397,29 @@ def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(track_paused_re
         "step_count": 0,
         "chunked_prefill_request_id": 10,
         "kv_stats": None,
+        "log_this_step": False,
     }
+    record = StepRecord(
+        step_result=step_result,
+        context_state=context_state,
+        time=1234.5,
+        stop_word_being_finished_ids={11},
+        block_stats=None,
+        prefix_cache_deltas=None,
+    )
 
     with (
         mock.patch("megatron.core.inference.engines.dynamic.loop.nvtx_range_push"),
         mock.patch("megatron.core.inference.engines.dynamic.loop.nvtx_range_pop"),
     ):
-        asyncio.run(engine.async_bookkeep(step_result, context_state, 0.0))
+        engine._bookkeep(record)
 
-    assert (
-        engine.post_process_requests.call_args.kwargs["consumed_chunked_prefill_request_id"] == 10
-    )
-    assert [event.type for event in paused_request.events] == (
-        [DynamicInferenceEventType.PAUSE] if track_paused_request_events else []
+    kwargs = engine.post_process_requests.call_args.kwargs
+    assert kwargs["consumed_chunked_prefill_request_id"] == 10
+    assert kwargs["stop_word_being_finished_ids"] == {11}
+    assert kwargs["event_timestamp"] == 1234.5
+    assert [(event.type, event.timestamp) for event in paused_request.events] == (
+        [(DynamicInferenceEventType.PAUSE, 1234.5)] if track_paused_request_events else []
     )
 
 
@@ -2125,6 +2148,7 @@ def test_async_suspend_pending_logits_lifecycle(mode, preserve_pending):
         static_kv_memory_pointers=True,
     )
     engine.state = EngineState.RUNNING
+    engine._pending_record = None
     engine.unified_memory_level = 0
     engine.waiting_request_ids = deque()
     engine.requests = {}

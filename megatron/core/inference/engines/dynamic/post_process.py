@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from itertools import repeat
-from typing import Dict, List, Optional, Sequence, Tuple, Union
+from typing import AbstractSet, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -173,6 +173,24 @@ class StepPostProcessingMixin:
             return min(num_speculative_tokens, terminal_token_position + 1)
         return num_speculative_tokens
 
+    def _snapshot_block_stats(self) -> Dict[str, Optional[int]]:
+        """Capture the allocator counters that generated-token events report."""
+        block_allocator = self.context.kv_block_allocator
+        blocks_allocated = block_allocator.pool_size - block_allocator.pool_avail
+        if block_allocator.enable_prefix_caching:
+            block_ref_counts = block_allocator.pc_state.block_ref_counts
+            blocks_hashed_active = int((block_ref_counts > 0).sum().item())
+            blocks_ref_count = block_ref_counts.sum().item()
+        else:
+            blocks_hashed_active = blocks_allocated
+            blocks_ref_count = None
+        return {
+            "blocks_total": block_allocator.pool_size,
+            "blocks_hashed_total": blocks_allocated,
+            "blocks_hashed_active": blocks_hashed_active,
+            "blocks_ref_count": blocks_ref_count,
+        }
+
     def _process_request_outputs(
         self,
         request_ids: torch.Tensor,
@@ -189,6 +207,9 @@ class StepPostProcessingMixin:
         finished_handoff_ssm_slots: Optional[Dict[int, int]] = None,
         finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
         record_step_latency: bool = False,
+        stop_word_being_finished_ids: AbstractSet[int] = frozenset(),
+        block_stats: Optional[Dict[str, Optional[int]]] = None,
+        event_timestamp: Optional[float] = None,
     ) -> Tuple[List[int], List[DynamicInferenceRequest], Dict[int, Tuple[int, int]]]:
         """
         Apply sampled output and assemble results while request storage is valid.
@@ -213,6 +234,12 @@ class StepPostProcessingMixin:
             finished_handoff_decode_tokens: First sampled token and optional MTP proposals
                 needed to resume directly from imported prefill state on decode.
             record_step_latency: Reserve this step's latency entries before stop-word trimming.
+            stop_word_being_finished_ids: The rows the step's stop-word callback finished;
+                their tokens are not appended.
+            block_stats: Allocator counters snapshotted right after the step; computed
+                here when omitted.
+            event_timestamp: Time for the events recorded here, when bookkeeping runs later
+                than the step.
 
         Returns:
             Active request IDs, completed requests, and latency-entry starting
@@ -224,18 +251,10 @@ class StepPostProcessingMixin:
         tpot_updates = {}
 
         log_probs_iter = log_probs if log_probs else repeat(None)
-        block_allocator = self.context.kv_block_allocator
 
-        # Pre-compute step-level block stats (before the per-request loop)
-        if self.track_generated_token_events:
-            blocks_allocated = block_allocator.pool_size - block_allocator.pool_avail
-            if block_allocator.enable_prefix_caching:
-                block_ref_counts = block_allocator.pc_state.block_ref_counts
-                blocks_hashed_active = int((block_ref_counts > 0).sum().item())
-                blocks_ref_count = block_ref_counts.sum().item()
-            else:
-                blocks_hashed_active = blocks_allocated
-                blocks_ref_count = None
+        # Step-level block stats for the generated-token events (before the per-request loop).
+        if self.track_generated_token_events and block_stats is None:
+            block_stats = self._snapshot_block_stats()
 
         # When accepted_tokens is None (no speculative decoding), use repeat([]) to provide
         # empty lists for each request, so the zip produces the correct number of iterations
@@ -318,10 +337,10 @@ class StepPostProcessingMixin:
                     if stop_match is not None:
                         boundaries.append(stop_match[0])
                 semantic_terminal_position = min(boundaries) if boundaries else None
-                if request_id in self.stop_word_being_finished_ids:
+                if request_id in stop_word_being_finished_ids:
                     semantic_terminal_position = -1
             if request_id != consumed_chunked_prefill_request_id:
-                being_finished = request_id in self.stop_word_being_finished_ids
+                being_finished = request_id in stop_word_being_finished_ids
                 if being_finished:
                     deferred_finish = None
                     eos_mid_block_hit = False
@@ -344,25 +363,13 @@ class StepPostProcessingMixin:
                     first_token_event = None
                     if self.track_generated_token_events:
                         for token in tokens:
-                            if block_allocator.enable_prefix_caching:
-                                event = request.add_event_generated_token(
-                                    token,
-                                    blocks_total=block_allocator.pool_size,
-                                    blocks_hashed_total=blocks_allocated,
-                                    blocks_hashed_active=blocks_hashed_active,
-                                    blocks_ref_count=blocks_ref_count,
-                                    pre_fwd_active_token_count=pre_fwd_active_token_count,
-                                    pre_fwd_step_count=pre_fwd_step_count,
-                                )
-                            else:
-                                event = request.add_event_generated_token(
-                                    token,
-                                    blocks_total=block_allocator.pool_size,
-                                    blocks_hashed_total=blocks_allocated,
-                                    blocks_hashed_active=blocks_hashed_active,
-                                    pre_fwd_active_token_count=pre_fwd_active_token_count,
-                                    pre_fwd_step_count=pre_fwd_step_count,
-                                )
+                            event = request.add_event_generated_token(
+                                token,
+                                **block_stats,
+                                pre_fwd_active_token_count=pre_fwd_active_token_count,
+                                pre_fwd_step_count=pre_fwd_step_count,
+                                timestamp=event_timestamp,
+                            )
                             if first_token_event is None:
                                 first_token_event = event
                     if is_first_token and tokens:
@@ -370,6 +377,7 @@ class StepPostProcessingMixin:
                             first_token_event = DynamicInferenceEvent(
                                 type=DynamicInferenceEventType.GENERATED_TOKEN,
                                 payload={"token_id": tokens[0]},
+                                timestamp=event_timestamp,
                             )
                         request.ttft = (
                             first_token_event.timestamp - request.event_add_engine.timestamp
@@ -403,7 +411,7 @@ class StepPostProcessingMixin:
                 if (
                     self.num_speculative_tokens > 0
                     and request_id != consumed_chunked_prefill_request_id
-                    and request_id not in self.stop_word_being_finished_ids
+                    and request_id not in stop_word_being_finished_ids
                 ):
                     emitted = len(tokens) - num_stop_word_trim
                     if emitted > 0:
@@ -446,7 +454,7 @@ class StepPostProcessingMixin:
                     request.finish_reason = "stop"
 
                 if request_id in finished_request_ids:
-                    self._set_finish_reason(request)
+                    self._set_finish_reason(request, being_finished)
                     # The routing views cover every routed token;
                     # the stop-word trim may have dropped the last ones.
                     if finished_routing_parts and request_id in finished_routing_parts:
@@ -505,7 +513,7 @@ class StepPostProcessingMixin:
             # the two lists in sync.
             if (
                 request.sampling_params.return_log_probs
-                and request_id not in self.stop_word_being_finished_ids
+                and request_id not in stop_word_being_finished_ids
             ):
                 assert (
                     request_log_probs is not None
@@ -547,7 +555,7 @@ class StepPostProcessingMixin:
             if (
                 top_n_logprobs is not None
                 and req_idx in top_n_logprobs
-                and request_id not in self.stop_word_being_finished_ids
+                and request_id not in stop_word_being_finished_ids
                 and not (
                     request_id == consumed_chunked_prefill_request_id
                     and request.sampling_params.skip_prompt_log_probs
@@ -624,6 +632,9 @@ class StepPostProcessingMixin:
         finished_handoff_block_ids: Optional[Dict[int, list[int]]] = None,
         finished_handoff_ssm_slots: Optional[Dict[int, int]] = None,
         finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
+        stop_word_being_finished_ids: Optional[set[int]] = None,
+        block_stats: Optional[Dict[str, Optional[int]]] = None,
+        event_timestamp: Optional[float] = None,
     ) -> Tuple[List[int], List[DynamicInferenceRequest]]:
         """Process survivors and publish completed results after a controller step.
 
@@ -643,10 +654,18 @@ class StepPostProcessingMixin:
             finished_handoff_block_ids: Retained handoff KV blocks.
             finished_handoff_ssm_slots: Detached handoff SSM slots.
             finished_handoff_decode_tokens: Tokens for resuming the handed-off request.
+            stop_word_being_finished_ids: The rows the step's stop-word callback finished;
+                the live set when omitted.
+            block_stats: Allocator counters snapshotted right after the step; computed
+                when omitted.
+            event_timestamp: Time for the events recorded here, when bookkeeping runs later
+                than the step.
 
         Returns:
             Active request IDs and completed requests.
         """
+        if stop_word_being_finished_ids is None:
+            stop_word_being_finished_ids = self.stop_word_being_finished_ids
         finished_ids = finished_request_ids.tolist()
         if evict_request_ids is not None:
             self.evicted_request_count += evict_request_ids.numel()
@@ -668,6 +687,9 @@ class StepPostProcessingMixin:
             finished_handoff_ssm_slots,
             finished_handoff_decode_tokens,
             record_step_latency=step_time > 0,
+            stop_word_being_finished_ids=stop_word_being_finished_ids,
+            block_stats=block_stats,
+            event_timestamp=event_timestamp,
         )
         finished_by_id = {request.request_id: request for request in finished_requests}
         finished_requests = [finished_by_id[request_id] for request_id in finished_ids]
@@ -682,6 +704,8 @@ class StepPostProcessingMixin:
             retained = max(0, len(request.tpot) - start)
             request.tpot[start:] = [step_time / count] * retained if step_time > 0 else []
         for request in finished_requests:
+            # A stop reported for a row finished meanwhile would never be taken.
+            self.stop_word_finished_request_ids.discard(request.request_id)
             self._complete_request(self.requests.pop(request.request_id), request)
 
         # Handle evicted requests.
@@ -699,10 +723,10 @@ class StepPostProcessingMixin:
             # Checkpoint requests (i.e., prompt += generations) + add eviction event.
             for request_id in evict_request_ids:
                 self.requests[request_id].record.checkpoint()
-                self.get_request(request_id).add_event_evict()
+                self.get_request(request_id).add_event_evict(timestamp=event_timestamp)
 
         # Clear the stop word being finished set after processing
-        self.stop_word_being_finished_ids.clear()
+        stop_word_being_finished_ids.clear()
 
         return active_request_ids, finished_requests
 
@@ -718,11 +742,12 @@ class StepPostProcessingMixin:
         Returns:
             Set of request IDs from active_request_ids that should be marked as finished.
         """
-        if not self.stop_word_finished_request_ids:
-            return set()
-
+        active_request_ids = set(active_request_ids)
         # Find which stop word finished IDs are in the current active requests
-        result = self.stop_word_finished_request_ids & set(active_request_ids)
+        result = self.stop_word_finished_request_ids & active_request_ids
+        # The pending step's bookkeeping runs behind this step's launch;
+        # the rows its tokens end are found here first, so this step finishes them.
+        result |= self._rows_ended_by_pending_step(active_request_ids)
         # Partial prefill cannot finish; preserve its stop until the final chunk.
         result.discard(self.context.chunked_prefill_request_id)
         # Move to "being finished" set so post_process_requests can skip the extra token
@@ -731,11 +756,41 @@ class StepPostProcessingMixin:
         self.stop_word_finished_request_ids -= result
         return result
 
-    def _set_finish_reason(self, request: DynamicInferenceRequest) -> None:
-        """Record final termination semantics without re-inferring them in clients."""
+    def _rows_ended_by_pending_step(self, active_request_ids: set[int]) -> set[int]:
+        """Active rows whose tokens in the pending step's record end them."""
+        record = self._pending_record
+        if record is None:
+            return set()
+        ended = set()
+        for request_id, tokens in record.appended_tokens().items():
+            if request_id not in active_request_ids:
+                continue
+            request_record = self.requests[request_id].record
+            request = request_record[-1]
+            if (
+                len(tokens) == 1
+                and not request.stop_word_ids
+                and not request.sampling_params.stop_token_ids
+            ):
+                # One token, no stop words, no explicit stop ids: nothing here can end the
+                # row (the controller checked the model EOS and the length).
+                continue
+            if self.detect_deferred_finish(request, request_record, tokens).finishes:
+                ended.add(request_id)
+        return ended
+
+    def _set_finish_reason(
+        self, request: DynamicInferenceRequest, being_finished: bool = False
+    ) -> None:
+        """Record final termination semantics without re-inferring them in clients.
+
+        Args:
+            request (DynamicInferenceRequest): The finished request.
+            being_finished (bool): Whether the step's stop-word callback finished it.
+        """
         if request.finish_reason is not None or request.sampling_params.do_kv_handoff:
             return
-        is_stop = request.request_id in self.stop_word_being_finished_ids or (
+        is_stop = being_finished or (
             bool(request.generated_tokens)
             and request.generated_tokens[-1] in self._terminating_token_ids(request)
         )
@@ -829,7 +884,7 @@ class StepPostProcessingMixin:
         Returns:
             Optional[int]: Index of the first EOS in `tokens`, or None if there is none.
         """
-        if not tokens or request.request_id in self.stop_word_being_finished_ids:
+        if not tokens:
             return None
         if len(tokens) == 1:
             # Model EOS was checked by the controller. Explicit request stops

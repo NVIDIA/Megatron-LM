@@ -181,16 +181,13 @@ class TestChunkedPrefillTransitions(DynamicInferenceEngineTestBase):
         )
         _, progress = self._assert_partial_primer(env, request, forward_states)
         consumed_boundary = progress
-        step_result, consumed_state, step_time = env.engine._run_coroutine_sync(
-            env.engine.async_forward()
-        )
+        record = env.engine._run_coroutine_sync(env.engine.async_forward())
+        step_result, consumed_state = record.step_result, record.context_state
         assert consumed_state["chunked_prefill_request_id"] == request.request_id
         assert request.finished_chunk_token_count > consumed_boundary
         assert step_result["sample"].tolist() == [request.prompt_tokens[consumed_boundary].item()]
         env.engine.context.chunked_prefill_request_id = request.request_id + 1000
-        result = env.engine._run_coroutine_sync(
-            env.engine.async_bookkeep(step_result, consumed_state, step_time)
-        )
+        result = env.engine.drain_bookkeeping()
 
         assert (
             env.engine.context.chunked_prefill_request_id

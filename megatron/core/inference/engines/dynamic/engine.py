@@ -45,6 +45,7 @@ from .loop import (
     EngineLoopMixin,
     EngineState,
     EngineSuspendedError,
+    StepRecord,
 )
 from .multimodal import MultimodalRequestMixin, _VisionCacheEntry
 from .post_process import StepPostProcessingMixin
@@ -496,6 +497,8 @@ class DynamicInferenceEngine(
         self.stop_word_finished_request_ids: set[int] = set()
         # Track requests currently being finished due to stop words (to skip extra token)
         self.stop_word_being_finished_ids: set[int] = set()
+        # The last step's record, bookkept behind the next forward launch (`drain_bookkeeping`).
+        self._pending_record: Optional[StepRecord] = None
 
         # Timing and logging variables.
         self.rank = torch.distributed.get_rank()
@@ -882,6 +885,9 @@ class DynamicInferenceEngine(
         # Skip if already suspended or in the process of suspending.
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
+
+        # Finish the pending step's bookkeeping before the requests are checkpointed.
+        self.drain_bookkeeping()
 
         # A suspend may be followed by an in-place weight refit. Invalidate
         # shared and request-local projected media unless explicitly permitted.

@@ -2126,6 +2126,7 @@ def test_post_process_zero_token_handoff_keeps_resume_log_prob():
     engine.track_generated_token_events = False
     engine.num_speculative_tokens = 0
     engine.stop_word_being_finished_ids = set()
+    engine.stop_word_finished_request_ids = set()
     engine._prepare_handoff_metadata_batch = mock.Mock(return_value={request.request_id: "meta"})
     engine._capture_handoff_meta = mock.Mock()
 
@@ -2265,6 +2266,7 @@ def test_recompute_suspend_resume_readds_prefix_cached_request_with_fresh_hashes
     partial_prefill.prompt_log_probs = [-0.4]
     partial_prefill.prompt_top_n_logprobs = [{"<2>": -0.4}]
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._pending_record = None
     engine.context = types.SimpleNamespace(
         chunked_prefill_request_id=-1,
         kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
@@ -2345,6 +2347,7 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
     engine.requests = {}
     engine.waiting_request_ids = deque()
     engine.state = EngineState.RUNNING
+    engine._pending_record = None
     engine.unified_memory_level = 0
     engine.use_coordinator = False
     engine.allow_stale_multimodal_embeddings = True
@@ -2460,6 +2463,7 @@ def test_first_resume_reencodes_media_queued_before_the_weights():
     context_media = {7: stale}
     encoder = mock.Mock(return_value=fresh)
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._pending_record = None
     engine.context = types.SimpleNamespace(
         chunked_prefill_request_id=-1,
         kv_cache_management_mode=KVCacheManagementMode.PERSIST,
@@ -2542,6 +2546,7 @@ def test_collect_gc_while_idle_freezes_only_after_a_drained_step():
 def test_shutdown_exits_custom_gc_mode_once():
     """A stopped engine restores process-wide GC even if it was never suspended."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._pending_record = None
     engine._staging_tasks = set()
     engine.requests = {}
     engine.zmq_context = types.SimpleNamespace(closed=True)
@@ -4917,7 +4922,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             request.sampling_params.streaming = True
             engine._add_request(request)
 
-        # Mirror the coordinator branch of `async_bookkeep`: drop finished
+        # Mirror the coordinator branch of `_bookkeep`: drop finished
         # requests' offsets, then stream deltas for the remaining requests.
         engine._partial_emit_lengths = {}
         engine.socket_for_receiving_requests = mock.Mock()
@@ -5218,6 +5223,161 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 )
 
             engine_task.cancel()
+
+    @pytest.mark.internal
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    async def test_run_engine_with_deferred_bookkeeping(self):
+        """Length termination, stop words, eviction, failed-request cleanup and log-prob
+        accumulation all complete through `run_engine`, whose steps are bookkept behind the
+        next step's launch."""
+        with torch.inference_mode():
+            num_tokens_to_generate = 16
+            prompt_length = 4
+            block_size_tokens = 16
+            pool_blocks = 6
+            max_requests = 8
+            # The KV pool is sized in whole blocks and tight: five usable blocks, no paused
+            # budget, and a request capacity that never pauses a row by count. The six 4-token
+            # prompts take one block each, so five are admitted at step 1 and the last stop-word
+            # request when the first release makes room. The stop-word rows ([8, 9] completed
+            # after 5, 4 and 3 tokens) are forced one step after their stop completes and have
+            # released their blocks by step 9. The length-terminated rows store their twelfth
+            # generated token at the last offset of their block in step 13 and each need a
+            # second block there, with two blocks free: `update_requests` resumes two and, with
+            # no paused budget, evicts the third, whose 17 tokens are requeued as a checkpointed
+            # prompt (two blocks) and re-admitted once the survivors finish at step 16. The mock
+            # forward is a function of the input token, so the evicted row's tokens are
+            # unchanged. Every request fits the pool (two blocks at most). Prompt log probs
+            # need all-token logits.
+            probe_env = self._build_test_env(
+                DynamicEngineTestConfig(context_block_size_tokens=block_size_tokens)
+            )
+            block_size_bytes = probe_env.engine.context.block_size_bytes
+            test_config = DynamicEngineTestConfig(
+                num_requests=0,
+                min_prompt_length=prompt_length,
+                max_prompt_length=prompt_length,
+                num_tokens_to_generate=num_tokens_to_generate,
+                context_block_size_tokens=block_size_tokens,
+                context_buffer_size_gb=(pool_blocks * block_size_bytes + 1) / 1024**3,
+                context_paused_buffer_size_gb=0.0,
+                context_max_requests=max_requests,
+                model_provider="gpt",
+                materialize_only_last_token_logits=False,
+            )
+            env = self._build_test_env(test_config)
+            vocab_size = test_config.vocab_size
+            allocator = env.engine.context.kv_block_allocator
+            # Fail loudly if the sizing did not land where the derivation assumes.
+            assert allocator.pool_size == pool_blocks
+            assert allocator.paused_limit == 0
+            assert env.engine.context.max_requests == max_requests
+
+            def mock_deterministic_forward(*args, **kwargs):
+                # Token N produces token N+1.
+                tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+                logits = torch.zeros(
+                    *tokens.shape, vocab_size, device=tokens.device, dtype=torch.bfloat16
+                )
+                next_tokens = (tokens + 1).clamp(max=vocab_size - 1)
+                logits.scatter_(2, next_tokens.unsqueeze(-1), 100.0)
+                return logits
+
+            env.engine.controller.inference_wrapped_model.model.forward = mock_deterministic_forward
+
+            engine_task = asyncio.create_task(env.engine.run_engine())
+            try:
+                futures: Dict[int, asyncio.Future] = {}
+                expected_tokens: Dict[int, List[int]] = {}
+
+                # Length-terminated requests; prompts start above the stop word [8, 9].
+                for rid in range(3):
+                    start = 20 + rid * 5
+                    prompt = torch.tensor(
+                        [start + i for i in range(prompt_length)], device='cuda', dtype=torch.int64
+                    )
+                    futures[rid] = env.engine.add_request(
+                        request_id=rid,
+                        prompt=prompt,
+                        sampling_params=SamplingParams(
+                            num_tokens_to_generate=num_tokens_to_generate,
+                            termination_id=-1,
+                            return_log_probs=True,
+                        ),
+                    )
+                    last_prompt_token = start + prompt_length - 1
+                    expected_tokens[rid] = [
+                        min(last_prompt_token + 1 + i, vocab_size - 1)
+                        for i in range(num_tokens_to_generate)
+                    ]
+
+                # Stop-word requests hitting [8, 9] at different offsets.
+                stop_word_expected = {100: [5, 6, 7, 8, 9], 101: [6, 7, 8, 9], 102: [7, 8, 9]}
+                for rid, start in [(100, 1), (101, 2), (102, 3)]:
+                    prompt = torch.tensor(
+                        [start + i for i in range(prompt_length)], device='cuda', dtype=torch.int64
+                    )
+                    futures[rid] = env.engine.add_request(
+                        request_id=rid,
+                        prompt=prompt,
+                        sampling_params=SamplingParams(
+                            num_tokens_to_generate=num_tokens_to_generate,
+                            termination_id=-1,
+                            return_log_probs=True,
+                            detokenize_stop_sequence=True,
+                        ),
+                    )
+                    env.engine.get_request(rid).stop_word_ids = [[8, 9]]
+                    expected_tokens[rid] = stop_word_expected[rid]
+
+                # A prompt longer than `max_sequence_length` fails at admission: the future is
+                # resolved inside `add_request`, before any step runs.
+                failed_rid = 9999
+                failed_future = env.engine.add_request(
+                    request_id=failed_rid,
+                    prompt=torch.ones(
+                        env.engine.context.max_sequence_length + 1, device='cuda', dtype=torch.int64
+                    ),
+                    sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+                )
+                assert failed_future.done()
+                failed_request = failed_future.result()
+                assert failed_request.status == Status.FAILED
+                assert any(
+                    isinstance(event.payload, MaxSequenceLengthOverflowError)
+                    for event in failed_request.events
+                    if event.type == DynamicInferenceEventType.ERROR_NONTRANSIENT
+                )
+
+                requests = await asyncio.wait_for(asyncio.gather(*futures.values()), timeout=120.0)
+                for rid, request in zip(futures.keys(), requests):
+                    assert request.status == Status.COMPLETED, rid
+                    # An evicted row's result is its record merged: the first segment's prompt
+                    # and prompt scores, the generated tokens and scores of every segment.
+                    assert request.generated_tokens == expected_tokens[rid], rid
+                    assert len(request.prompt_tokens) == prompt_length, rid
+                    assert len(request.prompt_log_probs) == len(request.prompt_tokens) - 1, rid
+                    assert len(request.generated_log_probs) == len(request.generated_tokens), rid
+                    for log_prob in request.prompt_log_probs + request.generated_log_probs:
+                        assert math.isfinite(log_prob) and -50.0 <= log_prob <= 0.0, rid
+
+                # The last results came from the pass the idle loop ran; nothing is pending.
+                assert env.engine._pending_record is None
+                assert env.engine.evicted_request_count > 0
+                assert failed_rid not in env.engine.requests
+                # The eviction, the re-admission and the six completions released every block.
+                assert allocator.get_total_used() == 0
+                assert allocator.pool_avail == allocator.pool_size - 1
+                assert env.engine.context.total_request_count == 0
+            finally:
+                engine_task.cancel()
+                try:
+                    await engine_task
+                except asyncio.CancelledError:
+                    pass
 
     @pytest.mark.internal
     @pytest.mark.asyncio

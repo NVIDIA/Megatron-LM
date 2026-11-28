@@ -501,12 +501,6 @@ class TestMidSpeculativeBlockEos:
         engine = self._engine(eos_token_id=[2, 11])
         assert engine._find_mid_block_eos(self._request(termination_id=-1), [50, 2, 52]) is None
 
-    def test_request_already_being_finished_is_skipped(self):
-        # Its tokens are not appended this step, so there is nothing to truncate.
-        engine = self._engine(eos_token_id=[2, 11])
-        engine.stop_word_being_finished_ids = {7}
-        assert engine._find_mid_block_eos(self._request(request_id=7), [50, 2, 52]) is None
-
     def test_single_eos_model_still_truncates_mid_block(self):
         # The mid-block gap is independent of multi-EOS: a model declaring one eos
         # also over-generated when that eos landed on an accepted draft position.
@@ -576,6 +570,7 @@ def _stop_metadata_engine():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.controller = controller
     engine.stop_word_being_finished_ids = set()
+    engine._pending_record = None
     return engine
 
 

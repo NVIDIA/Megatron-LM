@@ -3114,7 +3114,10 @@ class TextGenerationController(MTPControllerMixin):
         )
 
     async def _run_async_sched_step_no_overlap(
-        self, *, schedule_waiting_requests: Optional[Callable[[], None]]
+        self,
+        *,
+        schedule_waiting_requests: Optional[Callable[[], None]],
+        after_launch: Optional[Callable[[], None]] = None,
     ) -> DynamicBatchControllerStepResult:
         """Run ``sample/MTP -> update -> admit -> forward``.
 
@@ -3124,6 +3127,7 @@ class TextGenerationController(MTPControllerMixin):
         Args:
             schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
                 that admits eligible non-chunked prefill requests.
+            after_launch (Optional[Callable[[], None]]): Engine callback run after the forward.
 
         Returns:
             DynamicBatchControllerStepResult: Primer-only state or sampled output.
@@ -3191,6 +3195,8 @@ class TextGenerationController(MTPControllerMixin):
                     self._synchronize_async_sched_event(bookkeeping_done_event)
             elif had_pending_forward and self._moe_dispatch_spans_ranks():
                 self._run_dummy_async_sched_base_step()
+            if after_launch is not None:
+                after_launch()
 
         decode_only = DecodeOnly(consumed=consumed_decode_only, launched=launched_decode_only)
         if not had_pending_forward:
@@ -3214,10 +3220,14 @@ class TextGenerationController(MTPControllerMixin):
         await asyncio.sleep(0)
         return result
 
-    async def _run_async_sched_step_overlap(self) -> DynamicBatchControllerStepResult:
+    async def _run_async_sched_step_overlap(
+        self, *, after_launch: Optional[Callable[[], None]] = None
+    ) -> DynamicBatchControllerStepResult:
         """Run ``prepare -> sample -> forward -> resolve`` with one token per request.
 
         Args:
+            after_launch (Optional[Callable[[], None]]): Engine callback run once the
+                forward is launched, before the resolve waits.
 
         Returns:
             DynamicBatchControllerStepResult: Completed sampled-step result.
@@ -3270,6 +3280,8 @@ class TextGenerationController(MTPControllerMixin):
             range_push("async_sched_forward_pass")
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
             range_pop()
+            if after_launch is not None:
+                after_launch()
 
             # -------------------------------------------------------------------------
             # Resolve
@@ -3303,10 +3315,14 @@ class TextGenerationController(MTPControllerMixin):
         await asyncio.sleep(0)
         return result
 
-    async def _run_async_sched_step_overlap_mtp(self) -> DynamicBatchControllerStepResult:
+    async def _run_async_sched_step_overlap_mtp(
+        self, *, after_launch: Optional[Callable[[], None]] = None
+    ) -> DynamicBatchControllerStepResult:
         """Run ``sample/MTP -> prepare -> forward -> resolve`` with MTP.
 
         Args:
+            after_launch (Optional[Callable[[], None]]): Engine callback run once the
+                forward is launched, before the resolve waits.
 
         Returns:
             DynamicBatchControllerStepResult: Completed sampled-step result.
@@ -3357,6 +3373,8 @@ class TextGenerationController(MTPControllerMixin):
             range_push("async_sched_forward_pass")
             self._run_async_sched_forward(input_ids_gpu_view, position_ids_gpu_view)
             range_pop()
+            if after_launch is not None:
+                after_launch()
 
             # -------------------------------------------------------------------------
             # Resolve
@@ -3398,12 +3416,17 @@ class TextGenerationController(MTPControllerMixin):
     # -------------------------------------------------------------------------
 
     async def _run_legacy_step(
-        self, skip_bookkeeping: Optional[bool] = False
+        self,
+        skip_bookkeeping: Optional[bool] = False,
+        *,
+        after_launch: Optional[Callable[[], None]] = None,
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
 
         Args:
             skip_bookkeeping (Optional[bool]): If true, skip the context bookkeeping step.
+            after_launch (Optional[Callable[[], None]]): Engine callback run once the
+                forward is launched, before sampling waits for it.
 
         Returns:
             DynamicBatchControllerStepResult: Legacy sampled-step output and its
@@ -3440,6 +3463,8 @@ class TextGenerationController(MTPControllerMixin):
             # active, MTP logits are computed serially after verification.
             range_push("forward_pass")
             self._dynamic_step_forward_logits(input_ids, position_ids)
+            if after_launch is not None:
+                after_launch()
 
             # Commit Mamba intermediate states before update_requests, which
             # may swap request indices. The Python lists tracking EOS block IDs
@@ -3572,6 +3597,7 @@ class TextGenerationController(MTPControllerMixin):
         *,
         run_async_overlap: bool = True,
         schedule_waiting_requests: Optional[Callable[[], None]] = None,
+        after_launch: Optional[Callable[[], None]] = None,
     ) -> DynamicBatchControllerStepResult:
         """Forward step the model and update the inference context.
 
@@ -3581,6 +3607,8 @@ class TextGenerationController(MTPControllerMixin):
             run_async_overlap (bool): Whether to run the overlap ordering.
             schedule_waiting_requests (Optional[Callable[[], None]]): Engine callback
                 used by the no-overlap path to admit eligible prefill requests.
+            after_launch (Optional[Callable[[], None]]): Engine callback run once the
+                step's forward is launched, before the step waits for the GPU.
 
         Returns:
             DynamicBatchControllerStepResult: One controller-step result.
@@ -3589,7 +3617,7 @@ class TextGenerationController(MTPControllerMixin):
         mode = context.config.async_sched_mode
 
         if mode == AsyncScheduleMode.LEGACY:
-            return await self._run_legacy_step(skip_bookkeeping)
+            return await self._run_legacy_step(skip_bookkeeping, after_launch=after_launch)
         if mode != AsyncScheduleMode.ASYNC:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
@@ -3609,11 +3637,11 @@ class TextGenerationController(MTPControllerMixin):
 
         if not run_async_overlap or not self._async_sched_forward.is_valid:
             return await self._run_async_sched_step_no_overlap(
-                schedule_waiting_requests=schedule_waiting_requests
+                schedule_waiting_requests=schedule_waiting_requests, after_launch=after_launch
             )
         if self.num_speculative_tokens > 0:
-            return await self._run_async_sched_step_overlap_mtp()
-        return await self._run_async_sched_step_overlap()
+            return await self._run_async_sched_step_overlap_mtp(after_launch=after_launch)
+        return await self._run_async_sched_step_overlap(after_launch=after_launch)
 
     @torch.inference_mode()
     def generate_output_tokens_dynamic_batch(

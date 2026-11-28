@@ -2566,6 +2566,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         engine.track_generated_token_events = False
         engine.num_speculative_tokens = 0
         engine.stop_word_being_finished_ids = set()
+        engine.stop_word_finished_request_ids = set()
         active_ids, finished_requests = engine.post_process_requests(
             request_ids=torch.tensor([request.request_id]),
             finished_request_ids=torch.tensor([request.request_id]),

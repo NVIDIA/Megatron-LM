@@ -3,9 +3,12 @@
 import asyncio
 import concurrent.futures
 import logging
+import time
 import warnings
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
+from itertools import repeat
 from typing import Dict, List, Optional, Tuple, TypedDict
 
 import torch
@@ -110,6 +113,41 @@ class DynamicInferenceEngineStepResult(TypedDict):
     cuda_graph_request_count: int | None
 
 
+@dataclass
+class StepRecord:
+    """What a step's bookkeeping reads, taken when the step returns."""
+
+    step_result: Optional[Dict]
+    context_state: Dict
+    time: float
+    stop_word_being_finished_ids: set[int]
+    block_stats: Optional[Dict[str, Optional[int]]]
+    prefix_cache_deltas: Optional[Tuple[int, int, int, int]]
+
+    def appended_tokens(self) -> Dict[int, List[int]]:
+        """The tokens this record's bookkeeping appends, by request id."""
+        if self.step_result is None:
+            return {}
+        request_ids = self.step_result["active_request_ids"]
+        request_ids = request_ids.tolist() if torch.is_tensor(request_ids) else list(request_ids)
+        sample = self.step_result["sample"]
+        samples = sample.tolist() if torch.is_tensor(sample) else list(sample)
+        accepted_tokens = self.step_result["accepted_tokens"]
+        accepted_iter = repeat([]) if accepted_tokens is None else accepted_tokens.tolist()
+        # Forced rows and the partial prefill chunk sample tokens that are never appended.
+        skipped = self.stop_word_being_finished_ids | {
+            self.context_state["chunked_prefill_request_id"]
+        }
+        appended = {}
+        for request_id, tokens, accepted in zip(request_ids, samples, accepted_iter):
+            if request_id in skipped:
+                continue
+            if not isinstance(tokens, list):
+                tokens = [tokens]
+            appended[request_id] = [token for token in accepted if token != -1] + tokens
+        return appended
+
+
 @internal_api
 # pylint: disable=line-too-long
 class EngineLoopMixin:
@@ -142,16 +180,14 @@ class EngineLoopMixin:
         async with self._cond:
             self._cond.notify_all()
 
-    async def async_forward(self) -> Tuple[Optional[Dict], Dict, float]:
+    async def async_forward(self) -> StepRecord:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
 
+        `drain_bookkeeping` runs bookkeeping, behind the next step's forward launch.
+
         Returns:
-            A tuple comprised of:
-                step_result (Optional[Dict]): The result of the step.
-                context_state (Dict): Decode-only state, total/paused request
-                    count, and active token count.
-                step_time (float): How long this step took.
+            StepRecord: The result of the step and what its bookkeeping reads.
         """
 
         # If suspended, no stepping.
@@ -181,7 +217,7 @@ class EngineLoopMixin:
         else:
             raise AssertionError(f"Unexpected async scheduling mode: {mode}")
 
-        # The print block (async_bookkeep) and metrics block both fire on this
+        # The print block (_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we
         # can skip the GPU-timing sync and the context_state dict builds that
         # only exist to feed those logging/metrics blocks.
@@ -209,26 +245,30 @@ class EngineLoopMixin:
         pre_step_context_state["chunked_prefill_request_id"] = (
             self.context.chunked_prefill_request_id
         )
+        pre_step_context_state["log_this_step"] = will_log_this_step
 
         # Generate tokens.
         nvtx_range_push(step_nvtx_range)
 
         if will_log_this_step:
-            self.step_start_event.record()
+            # Fresh events per logged step: bookkeeping reads them after later steps started.
+            step_start_event = torch.cuda.Event(enable_timing=True)
+            step_end_event = torch.cuda.Event(enable_timing=True)
+            step_start_event.record()
         controller_result: DynamicBatchControllerStepResult = (
-            await self.controller.async_generate_output_tokens_dynamic_batch(**controller_kwargs)
+            await self.controller.async_generate_output_tokens_dynamic_batch(
+                after_launch=self.drain_bookkeeping, **controller_kwargs
+            )
         )
+        # A step that launched no forward ran no hook.
+        self.drain_bookkeeping()
         self.decode_only = controller_result.decode_only
         pre_step_context_state["decode_only"] = self.decode_only
         result = controller_result.output
         if dynamo_helper is not None:
             dynamo_helper.publish_pending_kv_stored_events()
         if will_log_this_step:
-            self.step_end_event.record()
-            self.step_end_event.synchronize()
-            step_time = self.step_start_event.elapsed_time(self.step_end_event) / 1e3
-        else:
-            step_time = 0.0
+            step_end_event.record()
         self.context.step_count += 1
         self.context.prefix_cache_lru_clock += 1
 
@@ -241,6 +281,12 @@ class EngineLoopMixin:
                 else None
             )
             post_step_context_state = {
+                "step_timing_events": (step_start_event, step_end_event),
+                "post_forward_step_count": self.context.step_count,
+                "batch_dimensions": self.context.batch_dimensions,
+                "padded_batch_dimensions": self.context.padded_batch_dimensions,
+                "using_cuda_graph_this_step": self.context.using_cuda_graph_this_step(),
+                "requests_dict_size": len(self.requests),
                 "waiting_request_count": len(self.waiting_request_ids),
                 "finished_request_count": self.finished_request_count,
                 "evicted_request_count": self.evicted_request_count,
@@ -254,22 +300,64 @@ class EngineLoopMixin:
             }
             context_state = {**pre_step_context_state, **post_step_context_state}
         else:
-            # Keep kv_stats=None so the metrics-block gate at `async_bookkeep`
+            # Keep kv_stats=None so the metrics-block gate at `_bookkeep`
             # (`if context_state["kv_stats"] is not None`) remains well-typed.
             context_state = {**pre_step_context_state, "kv_stats": None}
 
-        return result, context_state, step_time
+        # Snapshot what bookkeeping reads that the next step changes.
+        prefix_cache_deltas = None
+        if self.context.enable_prefix_caching:
+            prefix_cache_deltas = (
+                self.context.prefix_cache_hits,
+                self.context.prefix_cache_blocks_matched,
+                self.context.prefix_cache_prefill_computed_tokens,
+                self.context.prefix_cache_prefill_skipped_tokens,
+            )
+            self.context.prefix_cache_hits = 0
+            self.context.prefix_cache_blocks_matched = 0
+            self.context.prefix_cache_prefill_computed_tokens = 0
+            self.context.prefix_cache_prefill_skipped_tokens = 0
+        self._pending_record = StepRecord(
+            step_result=result,
+            context_state=context_state,
+            time=time.time(),
+            stop_word_being_finished_ids=self.stop_word_being_finished_ids,
+            block_stats=(
+                self._snapshot_block_stats()
+                if result is not None and self.track_generated_token_events
+                else None
+            ),
+            prefix_cache_deltas=prefix_cache_deltas,
+        )
+        self.stop_word_being_finished_ids = set()
+        return self._pending_record
 
-    async def async_bookkeep(
-        self, step_result: Optional[Dict], context_state: Dict, step_time: float
-    ) -> DynamicInferenceEngineStepResult:
-        """Uses `asyncio` for continuous bookkeeping.
+    def drain_bookkeeping(self) -> Optional[DynamicInferenceEngineStepResult]:
+        """Run the pending step's bookkeeping, if a step is pending.
+
+        Returns:
+            The pending step's bookkeeping result, or None when no step was pending.
+        """
+        record, self._pending_record = self._pending_record, None
+        if record is None:
+            return None
+        return self._bookkeep(record)
+
+    @staticmethod
+    def _deferred_step_time(context_state: Dict) -> float:
+        """Step time of a logged step; 0.0 when the step was not timed."""
+        timing_events = context_state.get("step_timing_events")
+        if timing_events is None:
+            return 0.0
+        step_start_event, step_end_event = timing_events
+        step_end_event.synchronize()
+        return step_start_event.elapsed_time(step_end_event) / 1e3
+
+    def _bookkeep(self, record: StepRecord) -> DynamicInferenceEngineStepResult:
+        """Bookkeeping of one step: results, replies, counters and logging, all host work.
 
         Args:
-            step_result (Optional[Dict]): The result of the step.
-            context_state (Dict): Decode-only state, total/paused request count,
-                and active token count.
-            step_time (float): How long this step took.
+            record (StepRecord): The step's record, from `async_forward`.
 
         Returns:
             A dictionary containing:
@@ -278,6 +366,10 @@ class EngineLoopMixin:
                 step_time (float): The step time in seconds.
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
+        step_result = record.step_result
+        context_state = record.context_state
+        step_time = self._deferred_step_time(context_state)
+
         nvtx_range_push("bookkeeping")
         cuda_graph_request_count = None
 
@@ -298,8 +390,8 @@ class EngineLoopMixin:
 
             # Add paused events.
             if newly_paused_request_ids is not None and self.track_paused_request_events:
-                newly_paused_request_ids = newly_paused_request_ids.tolist()
-                [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
+                for request_id in newly_paused_request_ids.tolist():
+                    self.get_request(request_id).add_event_pause(timestamp=record.time)
 
             # Process finished requests after applying all final-step metadata.
             active_request_ids, finished_requests = self.post_process_requests(
@@ -318,6 +410,9 @@ class EngineLoopMixin:
                 finished_handoff_block_ids=finished_handoff_block_ids,
                 finished_handoff_ssm_slots=finished_handoff_ssm_slots,
                 finished_handoff_decode_tokens=finished_handoff_decode_tokens,
+                stop_word_being_finished_ids=record.stop_word_being_finished_ids,
+                block_stats=record.block_stats,
+                event_timestamp=record.time,
             )
 
         else:
@@ -348,16 +443,13 @@ class EngineLoopMixin:
                 self._partial_emit_lengths.pop(request.request_id, None)
             self._try_send_streaming_partials()
 
-        # Drain prefix cache hit counters from context into engine accumulators.
-        if self.context.enable_prefix_caching:
-            self._prefix_cache_hits += self.context.prefix_cache_hits
-            self._prefix_cache_blocks_matched += self.context.prefix_cache_blocks_matched
-            self._prefill_tokens_computed += self.context.prefix_cache_prefill_computed_tokens
-            self._prefill_tokens_skipped += self.context.prefix_cache_prefill_skipped_tokens
-            self.context.prefix_cache_hits = 0
-            self.context.prefix_cache_blocks_matched = 0
-            self.context.prefix_cache_prefill_computed_tokens = 0
-            self.context.prefix_cache_prefill_skipped_tokens = 0
+        # Prefix cache hit counters, taken from the context when the step returned.
+        if record.prefix_cache_deltas is not None:
+            hits, blocks_matched, prefill_computed, prefill_skipped = record.prefix_cache_deltas
+            self._prefix_cache_hits += hits
+            self._prefix_cache_blocks_matched += blocks_matched
+            self._prefill_tokens_computed += prefill_computed
+            self._prefill_tokens_skipped += prefill_skipped
 
         # Log KV cache utilization stats to W&B
         nvtx_range_push("wandb_logging")
@@ -366,11 +458,11 @@ class EngineLoopMixin:
             # Use 'inference/' prefix for all metrics to separate from training metrics
             metrics = {
                 'inference/inference_step': int(
-                    self.inference_step_offset + int(self.context.step_count)
+                    self.inference_step_offset + int(context_state["post_forward_step_count"])
                 ),
                 'inference/step_time_s': float(step_time),
-                'inference/waiting_queue_len': int(len(self.waiting_request_ids)),
-                'inference/total_requests_dict_size': int(len(self.requests)),
+                'inference/waiting_queue_len': int(context_state["waiting_request_count"]),
+                'inference/total_requests_dict_size': int(context_state["requests_dict_size"]),
             }
             # Add KV stats with inference/ prefix
             # Convert utilization metrics from 0-1 range to 0-100 percentage range for better visualization
@@ -415,10 +507,7 @@ class EngineLoopMixin:
 
         # Print context state.
         nvtx_range_push("console_logging")
-        if (
-            self.logging_step_interval > 0
-            and self.context.step_count % self.logging_step_interval == 0
-        ):
+        if context_state["log_this_step"]:
             nvtx_range_push("cuda_memory_stats")
             mem = torch.cuda.memory_stats()
             nvtx_range_pop("cuda_memory_stats")
@@ -434,18 +523,18 @@ class EngineLoopMixin:
                 "mem: tensors %d, alloc %.1f gb, res %.1f gb."
                 % (
                     self.rank,
-                    self.context.step_count,
-                    datetime.now().strftime("%H:%M:%S"),
+                    context_state["post_forward_step_count"],
+                    datetime.fromtimestamp(record.time).strftime("%H:%M:%S"),
                     step_time * 1000,
                     (
                         " [%s + real config %s + cuda graph %s]"
                         % (
                             step_type,
-                            self.context.batch_dimensions,
+                            context_state["batch_dimensions"],
                             (
                                 "OFF"
-                                if not self.context.using_cuda_graph_this_step()
-                                else self.context.padded_batch_dimensions
+                                if not context_state["using_cuda_graph_this_step"]
+                                else context_state["padded_batch_dimensions"]
                             ),
                         )
                     ),
@@ -531,6 +620,14 @@ class EngineLoopMixin:
 
         nvtx_range_pop("console_logging")
 
+        # The coordinator loop freezes once every EP rank is idle instead.
+        if (
+            self._gc_freeze_pending
+            and not self.use_coordinator
+            and not self.has_unfinished_requests()
+        ):
+            self._freeze_gc_after_first_request_drain()
+
         return {
             "active_request_ids": active_request_ids,
             "finished_requests": finished_requests,
@@ -544,20 +641,13 @@ class EngineLoopMixin:
         match vLLM API. Uses `asyncio` for continuous generation which allows this
         method to sleep and wake up when new requests are available.
 
+        The step's bookkeeping runs here; the engine loops leave it to the next step.
+
         Returns:
             Active request IDs, finished requests, and step metadata.
         """
-        last_step_data = await self.async_forward()
-        ret = await self.async_bookkeep(*last_step_data)
-        # The coordinator loop freezes once every EP rank is idle instead.
-        if (
-            self._gc_freeze_pending
-            and not self.use_coordinator
-            and not self.has_unfinished_requests()
-        ):
-            self._freeze_gc_after_first_request_drain()
-        # Keep for compatibility with current test suite.
-        return ret
+        await self.async_forward()
+        return self.drain_bookkeeping()
 
     def _run_coroutine_sync(self, coro):
         """Run a coroutine synchronously, handling the case when already in an event loop.
@@ -629,6 +719,7 @@ class EngineLoopMixin:
 
         Called from the engine loop's finally block after the loop exits.
         """
+        self.drain_bookkeeping()
         # Send staged replies still in flight before the socket closes. NeMo RL never calls
         # this (it kills the worker instead), so the unbounded wait only affects a clean shutdown.
         await self._drain_staging_tasks()
@@ -668,6 +759,10 @@ class EngineLoopMixin:
         self.use_coordinator = False
         try:
             while True:
+                if not (self.context.get_active_request_count() > 0 or self.waiting_request_ids):
+                    # No forward follows the last step: bookkeep it now.
+                    # Requests it evicts are waiting requests for the wait below.
+                    self.drain_bookkeeping()
                 # Wait until there are active requests before proceeding.
                 async with self._cond:
                     await self._cond.wait_for(
@@ -688,7 +783,7 @@ class EngineLoopMixin:
                     or self.waiting_request_ids
                     or self.has_admittable_kv_import
                 ):
-                    await self.async_step()
+                    await self.async_forward()
                 else:
                     # Reached when there is no model work to step but a handoff transfer is
                     # still pending. Handles expose polling rather than an async completion
@@ -697,6 +792,8 @@ class EngineLoopMixin:
                     await asyncio.sleep(0.001)
         except asyncio.CancelledError:
             pass
+        finally:
+            self.drain_bookkeeping()
 
     @trace_async_exceptions
     async def run_engine_with_coordinator(
@@ -753,18 +850,20 @@ class EngineLoopMixin:
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.
+                        self.drain_bookkeeping()
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
                         if local_schedulable > 0:
-                            await self.async_step()
+                            await self.async_forward()
                         else:
                             # Dummy forward to participate in the EP collective.
                             self.step_start_event.record()
                             nvtx_range_push("EP-dummy-forward")
                             self.controller.dummy_forward()
+                            self.drain_bookkeeping()
                             self.step_end_event.record()
                             self.step_end_event.synchronize()
                             nvtx_range_pop("EP-dummy-forward")
@@ -772,6 +871,7 @@ class EngineLoopMixin:
                             self.context.prefix_cache_lru_clock += 1
                     else:
                         # No work, but not all pausing means the engine has drained.
+                        self.drain_bookkeeping()
                         self._collect_gc_while_idle(drained=True)
                         await asyncio.sleep(0.001 if local_pending_transfers > 0 else 0.02)
 
@@ -791,6 +891,7 @@ class EngineLoopMixin:
                     self._last_ep_consensus = (0, False)
 
                 elif self.state == EngineState.SUSPENDING:
+                    self.drain_bookkeeping()
                     await self._world_barrier()
                     self.state = EngineState.SUSPENDED
                     self._state_events[EngineState.SUSPENDED].set()
@@ -804,6 +905,7 @@ class EngineLoopMixin:
                     self._state_events[EngineState.RESUMED].set()
 
                 elif self.state == EngineState.STOPPING:
+                    self.drain_bookkeeping()
                     await self._world_barrier()
                     if self.rank == 0:
                         logger.info("Stopping engine.")
