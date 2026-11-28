@@ -240,6 +240,16 @@ class TEQuantizationRecipe:
     """
     If cast the initialized parameters to fp4 precision and all-gather weights in FP4.
     """
+    param_storage_follows_model_init: bool = False
+    """
+    With ``fp8_param`` or ``fp4_param``: store the parameters in this recipe's format only when
+    the enclosing model-init context stores quantized parameters, and in high precision
+    otherwise. A global policy that keeps some layers' parameters in high precision (such as
+    ``first_last_layers_bf16``) then stays in control of whether a module stores quantized
+    parameters, while this recipe chooses their format. For example, the non-expert linears of
+    an FP4 model can store MXFP8 parameters without giving the BF16 first and last layers MXFP8
+    parameters.
+    """
 
     @classmethod
     def parse_from_config(
@@ -249,10 +259,12 @@ class TEQuantizationRecipe:
         Parse config from quantization dictionary.
         """
         if quant_config.get("inherit_model_init_context", False) and any(
-            field in quant_config for field in ("fp8_param", "fp4_param")
+            field in quant_config
+            for field in ("fp8_param", "fp4_param", "param_storage_follows_model_init")
         ):
             raise ValueError(
-                "inherit_model_init_context cannot be combined with fp8_param or fp4_param."
+                "inherit_model_init_context cannot be combined with fp8_param, fp4_param or "
+                "param_storage_follows_model_init."
             )
         kwargs = {}
         class_keys = cls.get_config_keys()
@@ -276,6 +288,8 @@ class TEQuantizationRecipe:
         instance = TEQuantizationRecipe(**kwargs)
         if not isinstance(instance.fp8_param, bool):
             raise ValueError("fp8_param must be a bool (true or false).")
+        if not isinstance(instance.param_storage_follows_model_init, bool):
+            raise ValueError("param_storage_follows_model_init must be a bool (true or false).")
         if instance.fp8_quantization_recipe == Fp8Recipe.delayed:
             raise ValueError("Delayed scaling not in scope of te per-module quantization config.")
         if (
@@ -407,6 +421,10 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         for key, val in qrecipe.recipe_attrs.items():
             setattr(quant_recipe, key, val)
 
+    if qrecipe.param_storage_follows_model_init and not FP8GlobalStateManager.with_fp8_parameters():
+        # Evaluated while the module is constructed, inside the enclosing model-init context.
+        enabled = False
+
     return fp8_model_init(
         enabled=enabled,
         recipe=quant_recipe,
@@ -498,6 +516,34 @@ def _get_fp8_autocast_recipe_for_quant_params(
     if FP8GlobalStateManager.is_fp8_enabled():
         return recipe if recipe.override_quantized_autocast else None
     return recipe if recipe.override_nonquantized_autocast else None
+
+
+def _get_fused_linears_quant_recipe(linear_fc1, linear_fc2, what: str):
+    """Precision override recipe (or None) for a fused op sequence running linear_fc1 and
+    linear_fc2.
+
+    Op-fuser paths call the TE ops directly, so they must apply the linears' quant_recipe
+    override themselves. Resolve it from the linears' current train/eval mode; the whole sequence
+    runs under one recipe, so both linears must resolve to the same override.
+    """
+    fc1_recipe = _get_fp8_autocast_recipe_for_quant_params(
+        getattr(linear_fc1, "te_quant_params", None), linear_fc1.training
+    )
+    fc2_recipe = _get_fp8_autocast_recipe_for_quant_params(
+        getattr(linear_fc2, "te_quant_params", None), linear_fc2.training
+    )
+    if fc1_recipe != fc2_recipe:
+        raise ValueError(
+            f"{what} requires the same precision override for linear_fc1 and linear_fc2. "
+            "Apply the override to both linears."
+        )
+    return fc1_recipe
+
+
+def _get_fused_linears_quant_context(linear_fc1, linear_fc2, what: str):
+    """Context applying :func:`_get_fused_linears_quant_recipe` (nullcontext without one)."""
+    recipe = _get_fused_linears_quant_recipe(linear_fc1, linear_fc2, what)
+    return nullcontext() if recipe is None else _get_fp8_autocast_for_quant_recipe(recipe)
 
 
 def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
@@ -3626,8 +3672,15 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward."""
 
+            # The fused ops bypass the linear wrappers' forward, which would apply a quant_recipe
+            # override; apply it here for the whole sequence (it must match for both linears).
+            quant_context = _get_fused_linears_quant_context(
+                self.linear_fc1, self.linear_fc2, f"{self.__class__.__name__}"
+            )
+
             # Apply fused impl
-            out = self._get_fused_impl()(hidden_states)
+            with quant_context:
+                out = self._get_fused_impl()(hidden_states)
 
             # Return bias tensor if requested
             bias = None
@@ -3848,6 +3901,19 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             if get_tensor_model_parallel_world_size() > 1:
                 return super().forward(hidden_states, **kwargs)
+
+            # This path picks its own recipe below and bypasses the linear wrappers, so it
+            # cannot apply a quant_recipe precision override.
+            if (
+                _get_fused_linears_quant_recipe(
+                    self.linear_fc1, self.linear_fc2, self.__class__.__name__
+                )
+                is not None
+            ):
+                raise ValueError(
+                    f"{self.__class__.__name__} does not support a quant_recipe precision "
+                    "override on linear_fc1/linear_fc2; use TEFusedMLP or the unfused MLP."
+                )
 
             orig_shape = hidden_states.shape
             hidden_size = hidden_states.size(-1)

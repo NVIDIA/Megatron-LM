@@ -15,6 +15,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
     TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+    _get_fp8_autocast_recipe_for_quant_params,
 )
 from megatron.core.fp4_utils import get_fp4_recipe
 from megatron.core.fp8_utils import get_fp8_recipe
@@ -477,6 +478,22 @@ class FusedSharedExpertMLP(SharedExpertMLP):
     def _get_fused_grouped_swiglu_recipe(self):
         """Create the TE recipe used to select the fused grouped MLP kernel."""
         if self._fused_grouped_swiglu_recipe is None:
+            # The fused ops run under the global recipe and bypass the linear wrappers, which
+            # would apply a quant_recipe override. Resolved on first forward, after GPTModel's
+            # finish_init sweep.
+            for linear in (self.linear_fc1, self.linear_fc2):
+                if (
+                    _get_fp8_autocast_recipe_for_quant_params(
+                        getattr(linear, "te_quant_params", None), linear.training
+                    )
+                    is not None
+                ):
+                    raise ValueError(
+                        f"{self.__class__.__name__} (use_grouped_gemm_for_shared_expert) does not "
+                        "support a quant_recipe precision override on the shared expert linears; "
+                        "disable use_grouped_gemm_for_shared_expert or route the shared expert "
+                        "to the global recipe."
+                    )
             if self.config.fp8:
                 self._fused_grouped_swiglu_recipe = get_fp8_recipe(self.config)
             elif self.config.fp4:

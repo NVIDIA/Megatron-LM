@@ -390,7 +390,10 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         module = TEFusedMLPWithGroupedLinear.__new__(TEFusedMLPWithGroupedLinear)
         module._fused_impl = None
         module._norm_seq = (lambda hidden_states: hidden_states,)
-        module.linear_fc2 = SimpleNamespace(te_return_bias=True, bias=torch.empty(0))
+        module.linear_fc1 = SimpleNamespace(te_quant_params=None, training=True)
+        module.linear_fc2 = SimpleNamespace(
+            te_return_bias=True, bias=torch.empty(0), te_quant_params=None, training=True
+        )
         object.__setattr__(module, "_make_fused_impl", lambda: fused_impl)
         registration_calls = []
         object.__setattr__(
@@ -437,6 +440,20 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         assert module._recipe is recipe
         assert recipe_calls == [recipe_name]
         assert registration_calls == [fused_impl]
+
+    def test_forward_rejects_quant_recipe_override(self, monkeypatch):
+        """This path picks its own recipe, so it cannot apply a quant_recipe override."""
+        import megatron.core.extensions.transformer_engine as te_ext
+
+        module = TEFusedMLPWithGroupedLinear.__new__(TEFusedMLPWithGroupedLinear)
+        module.linear_fc1 = SimpleNamespace(te_quant_params="mxfp8", training=True)
+        module.linear_fc2 = SimpleNamespace(te_quant_params="mxfp8", training=True)
+        monkeypatch.setattr(te_ext, "get_tensor_model_parallel_world_size", lambda: 1)
+        monkeypatch.setattr(
+            te_ext, "_get_fp8_autocast_recipe_for_quant_params", lambda qparams, training: qparams
+        )
+        with pytest.raises(ValueError, match="does not support a quant_recipe precision override"):
+            TEFusedMLPWithGroupedLinear.forward(module, torch.ones(2, 128, 4))
 
     def test_dense_grouped_spec_selected_only_with_te_op_fuser(self):
         grouped_spec = gpt_layer_specs.get_mlp_module_spec_for_backend(

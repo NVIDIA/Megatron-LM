@@ -113,8 +113,10 @@ class DistributedDataParallel(_BaseDataParallel):
     ) -> None:
         """Validate resolved buffer policy and model settings before wrapper setup."""
         if ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            # With fp4_param_gather, the MXFP8 params are linears that the quant_recipe gives
+            # MXFP8 params in an FP4 model.
             assert (
-                ddp_config.fp8_param_gather
+                ddp_config.fp8_param_gather or ddp_config.fp4_param_gather
             ), "Reuse grad buffer only when keeping params in MXFP8."
             if ddp_config.grad_buffer_offload:
                 raise ValueError(

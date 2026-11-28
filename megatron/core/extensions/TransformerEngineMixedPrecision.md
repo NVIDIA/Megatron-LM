@@ -31,6 +31,16 @@ Training retains this BF16 storage default. Set `inherit_model_init_context: tru
 to inherit the enclosing storage policy, including `first_last_layers_bf16`,
 instead of specifying `fp8_param` or `fp4_param` in that recipe.
 
+To store a module's parameters in the recipe's own format (for example MXFP8 in an
+FP4 model) while the enclosing policy still decides *whether* they are quantized,
+combine `fp8_param: true` (or `fp4_param: true`) with
+`param_storage_follows_model_init: true`: the parameters are quantized only when
+the enclosing model-init context stores quantized parameters, so layers that
+`first_last_layers_bf16` keeps in BF16 keep BF16 parameters. It cannot be combined
+with `inherit_model_init_context`. See
+`examples/quantization/fp4_experts_mxfp8_other_linears.yaml`, which keeps the routed
+experts of an FP4 MoE model in FP4 and runs the other linears in MXFP8.
+
 With `transformer_impl="inference_optimized"`, a matching MXFP8 recipe inherits
 automatically when global MXFP8 parameter storage is enabled and the recipe omits
 all three options: `fp8_param`, `fp4_param`, and `inherit_model_init_context`.
