@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
 import builtins
 import json
 from types import SimpleNamespace
@@ -330,6 +331,24 @@ def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
         )
         == "tool_calls"
     )
+    # Reaching the token limit is reported as "length" even after streaming tool calls.
+    assert (
+        parser.finish_reason(
+            {"generated_tokens": [1, 2], "sampling_params": {"num_tokens_to_generate": 2}}
+        )
+        == "length"
+    )
+
+
+def test_streaming_chat_parser_propagates_parser_failures():
+    def parse(_text, *, finished=False):
+        del finished
+        raise RuntimeError("parser failed")
+
+    parser = StreamingChatParser(parse)
+
+    with pytest.raises(RuntimeError, match="parser failed"):
+        parser.parse("generated text", finished=True)
 
 
 def test_streaming_chat_parser_handles_single_multi_turn_tool_call_request():
@@ -503,6 +522,87 @@ def test_huggingface_fast_incremental_detokenizer_drops_eos_and_special_map_toke
     assert streamed_text == "<think>x</think>ab"
 
 
+@pytest.mark.asyncio
+async def test_openai_stream_rejects_clean_termination_without_a_final_record():
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.finish()
+
+    records = [
+        record
+        async for record in openai_stream(
+            [stream], _Tokenizer(), [_IncrementalDetokenizer()], chat=False
+        )
+    ]
+
+    assert records[-1] != "data: [DONE]\n\n"
+    assert "error" in json.loads(records[-1].removeprefix("data: "))
+
+
+@pytest.mark.asyncio
+async def test_short_choice_gets_terminal_before_longer_choice_finishes():
+    short = AsyncStream(request_id=1, cancel=lambda: None)
+    long = AsyncStream(request_id=2, cancel=lambda: None)
+    short.put(
+        {
+            "final": {
+                "prompt_tokens": [9],
+                "generated_tokens": [1],
+                "sampling_params": {"num_tokens_to_generate": 4},
+            }
+        }
+    )
+    short.finish()
+    long.put({"partial": {"request_id": 2, "new_tokens": [2]}})
+    terminal_seen = asyncio.Event()
+    records = []
+
+    async def collect():
+        async for record in openai_stream(
+            [short, long],
+            _Tokenizer(),
+            [_IncrementalDetokenizer(), _IncrementalDetokenizer()],
+            chat=False,
+        ):
+            records.append(record)
+            if record == "data: [DONE]\n\n":
+                continue
+            payload = json.loads(record.removeprefix("data: "))
+            if any(
+                choice["index"] == 0 and choice["finish_reason"] is not None
+                for choice in payload.get("choices", [])
+            ):
+                terminal_seen.set()
+
+    collector = asyncio.create_task(collect())
+    try:
+        await asyncio.wait_for(terminal_seen.wait(), timeout=2)
+        assert not long.finished
+    finally:
+        long.put(
+            {
+                "final": {
+                    "prompt_tokens": [9],
+                    "generated_tokens": [2, 3],
+                    "sampling_params": {"num_tokens_to_generate": 4},
+                }
+            }
+        )
+        long.finish()
+        await collector
+
+    terminal_indices = []
+    for record in records:
+        if record == "data: [DONE]\n\n":
+            continue
+        payload = json.loads(record.removeprefix("data: "))
+        terminal_indices.extend(
+            choice["index"]
+            for choice in payload.get("choices", [])
+            if choice["finish_reason"] is not None
+        )
+    assert terminal_indices == [0, 1]
+
+
 def test_incremental_detokenizer_rejects_unsupported_tokenizer():
     with pytest.raises(
         ValueError, match="Streaming is currently supported only for Hugging Face fast tokenizers"
@@ -601,3 +701,27 @@ async def test_stream_preserves_engine_finish_reason_at_budget(reason):
     ]
     payloads = [json.loads(record.removeprefix("data: ")) for record in records[:-1]]
     assert payloads[-1]["choices"][0]["finish_reason"] == reason
+
+
+@pytest.mark.asyncio
+async def test_closing_the_stream_waits_for_its_reader_tasks(monkeypatch):
+    """Closing the SSE generator must not leave its per-choice reader tasks pending."""
+    created = []
+    real_create_task = asyncio.create_task
+
+    def recording_create_task(coro, **kwargs):
+        task = real_create_task(coro, **kwargs)
+        created.append(task)
+        return task
+
+    monkeypatch.setattr(asyncio, "create_task", recording_create_task)
+    stream = AsyncStream(request_id=1, cancel=lambda: None)
+    stream.put({"partial": {"request_id": 1, "new_tokens": [2]}})
+    generator = openai_stream([stream], _Tokenizer(), [_IncrementalDetokenizer()], chat=False)
+
+    await anext(generator)
+    await generator.aclose()
+
+    readers = [task for task in created if task.get_coro().__name__ == "pump"]
+    assert len(readers) == 1
+    assert all(task.done() for task in readers)
