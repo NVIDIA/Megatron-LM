@@ -1684,10 +1684,6 @@ def test_router_gating_linear(router_dtype):
     assert output.dtype == router_dtype
     assert ref_inp.grad.dtype == ref_inp.dtype
     assert ref_weight.grad.dtype == ref_weight.dtype
-    # Relax atol for float32: TE general_gemm produces results ~6.5e-3 away from
-    # torch.nn.functional.linear, which exceeds the default 1e-3 atol.
-    if router_dtype == torch.float32:
-        tols = dict(rtol=2.0e-2, atol=1.0e-2)
     assert torch.allclose(output, ref_output, **tols)
     assert torch.allclose(inp.grad, ref_inp.grad, **tols)
     assert torch.allclose(weight.grad, ref_weight.grad, **tols)
@@ -2168,3 +2164,85 @@ def test_moe_router_aux_loss_fusion_defaults_to_router_fusion():
     parent = TransformerConfig(moe_router_fusion=False, **kwargs)
     child = dataclasses.replace(parent, moe_router_fusion=True)
     assert child.moe_router_aux_loss_fusion is False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    moe_utils.te_general_gemm is None,
+    reason="requires Transformer Engine: without it the pre-fix code also falls back "
+    "to torch.mm, so this test cannot catch the regression",
+)
+def test_router_gating_linear_fp32_contract():
+    """FP32 routers use true-FP32 GEMMs when PyTorch TF32 is disabled.
+
+    On GB200 with TE 2.16.0, general_gemm computes TF32 even with FP32 operands in both the
+    forward and grad paths. Measured relative errors against an FP64 reference were 4.4e-6 /
+    2.1e-4 / 2.1e-4 for TE, versus 0.0 / 3.1e-7 / 8.1e-7 for torch.mm. See #8126.
+    """
+    torch.manual_seed(1234)
+    seq_len, hidden, num_experts = 2048, 4096, 288
+    inp = torch.randn(seq_len, hidden, device="cuda")
+    weight = torch.randn(num_experts, hidden, device="cuda") * 0.02
+
+    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        # Forward: bf16 operands with an fp32 router dtype (the common router setup). The
+        # fixed path is bitwise the fp32 mm over the upcast operands.
+        inp_bf16, weight_bf16 = inp.to(torch.bfloat16), weight.to(torch.bfloat16)
+        logits = router_gating_linear(inp_bf16, weight_bf16, None, torch.float32)
+        ref_fwd = torch.mm(inp_bf16.float(), weight_bf16.float().t())
+        rel_fwd = ((logits - ref_fwd).norm() / ref_fwd.norm()).item()
+        assert rel_fwd < 1e-6, f"forward rel={rel_fwd:.2e} (TF32-grade? expect 0.0 via torch.mm)"
+
+        bias = torch.randn(num_experts, device="cuda")
+        biased_logits = router_gating_linear(inp, weight, bias, torch.float32)
+        ref_biased = torch.addmm(bias.double(), inp.double(), weight.double().t())
+        rel_biased = ((biased_logits.double() - ref_biased).norm() / ref_biased.norm()).item()
+        assert rel_biased < 1e-6, f"biased forward rel={rel_biased:.2e}"
+
+        # Backward: fp32 operands (fp32 router parameters, the #8126 setup) so the gradients
+        # themselves are fp32 and the comparison is not limited by bf16 rounding.
+        inp_g = inp.clone().requires_grad_(True)
+        weight_g = weight.clone().requires_grad_(True)
+        grad_out = torch.randn(seq_len, num_experts, device="cuda")
+        router_gating_linear(inp_g, weight_g, None, torch.float32).backward(grad_out)
+
+        ref_gi = torch.mm(grad_out.double(), weight.double())
+        ref_gw = torch.mm(grad_out.double().t(), inp.double())
+        rel_gi = ((inp_g.grad.double() - ref_gi).norm() / ref_gi.norm()).item()
+        rel_gw = ((weight_g.grad.double() - ref_gw).norm() / ref_gw.norm()).item()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+
+    assert rel_gi < 1e-5, f"grad_input rel={rel_gi:.2e} (TF32-grade? expect ~3e-7 via torch.mm)"
+    assert rel_gw < 1e-5, f"grad_weight rel={rel_gw:.2e} (TF32-grade? expect ~8e-7 via torch.mm)"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(moe_utils.te_general_gemm is None, reason="requires Transformer Engine")
+def test_router_gating_linear_fp32_respects_tf32_setting():
+    """FP32 router GEMMs follow PyTorch when TF32 is explicitly enabled."""
+    torch.manual_seed(1234)
+    inp = torch.randn(128, 512, device="cuda", requires_grad=True)
+    weight = torch.randn(64, 512, device="cuda", requires_grad=True)
+    bias = torch.randn(64, device="cuda", requires_grad=True)
+    grad_out = torch.randn(128, 64, device="cuda")
+
+    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        output = router_gating_linear(inp, weight, bias, torch.float32)
+        ref_inp = inp.detach().requires_grad_(True)
+        ref_weight = weight.detach().requires_grad_(True)
+        ref_bias = bias.detach().requires_grad_(True)
+        reference = torch.nn.functional.linear(ref_inp, ref_weight, ref_bias)
+        assert torch.equal(output, reference)
+
+        output.backward(grad_out)
+        reference.backward(grad_out)
+        assert torch.equal(inp.grad, ref_inp.grad)
+        assert torch.equal(weight.grad, ref_weight.grad)
+        assert torch.equal(bias.grad, ref_bias.grad)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
