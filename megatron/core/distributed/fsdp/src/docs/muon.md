@@ -106,6 +106,12 @@ their Newton–Schulz. Each group in flight holds its momentum inputs, full tens
 and received updates, so `num_groups_in_flight` trades memory for overlap; zero
 gives the non-overlapped order.
 
+With `use_copy_engine=True`, owners move the data with peer memcpys on the
+[copy engines](../megatron_fsdp/experimental/copy_engine.py) instead of NCCL
+kernels, so Newton–Schulz keeps every SM. The sharded buffers of the groups in
+flight live in symmetric memory, and ranks signal each other with stream memory
+operations.
+
 A simpler alternative in [issue #5533](https://github.com/NVIDIA/Megatron-LM/issues/5533)
 all-gathers boundary-matrix inputs and duplicates orthogonalization. The
 current path avoids that redundant computation.

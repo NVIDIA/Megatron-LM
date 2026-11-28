@@ -24,6 +24,7 @@ except ImportError as error:
 from emerging_optimizers import utils as eo_utils
 from emerging_optimizers.orthogonalized_optimizers.muon import Muon
 
+from .copy_engine import CopyEngineP2P, CopyEngineWork
 from .dbuffer import DBuffer
 from .gather_scatter import gather, get_sorted_rank_ranges, scatter
 from .owner_planning import assign_owner_work
@@ -87,22 +88,29 @@ class _GroupPipeline:
     """
 
     assignment: _FsdpGroupAssignment
+    # Moves this group's gathers and scatters on the copy engines; None for NCCL P2P.
+    _copy_engine: CopyEngineP2P | None
     _stage: _PipelineStage
-    # Gather input: sharded momentum, released by wait_for_gather().
+    # Gather input: sharded momentum, released by wait_for_gather(). A copy-engine slot is kept
+    # until scatter(), which receives the updates into it.
     _momentum_inputs: DBuffer | None
     # Gather output -> orthogonalize input: full matrices on their owners, consumed by ortho.
     _full_inputs: dict[int, torch.Tensor]
     # Gather output -> wait_for_gather(): completion handles.
-    _gather_works: list[dist.Work]
+    _gather_works: list[dist.Work] | list[CopyEngineWork]
     # Orthogonalize output -> scatter input; also supplies owner-local shards in apply_updates().
     _full_updates: dict[int, torch.Tensor]
     # Scatter output -> apply_updates input: received shards of remotely owned matrices.
     _local_updates: DBuffer | None
     # Scatter output -> wait_for_scatter(): completion handles.
-    _scatter_works: list[dist.Work]
+    _scatter_works: list[dist.Work] | list[CopyEngineWork]
 
-    def __init__(self, assignment: _FsdpGroupAssignment) -> None:
+    def __init__(
+        self, assignment: _FsdpGroupAssignment, copy_engine: CopyEngineP2P | None = None
+    ) -> None:
         self.assignment = assignment
+        # A group without communication transfers nothing.
+        self._copy_engine = copy_engine if assignment.requires_communication else None
         self._stage = _PipelineStage.IDLE
         self._momentum_inputs = None
         self._full_inputs = {}
@@ -140,13 +148,20 @@ class _GroupPipeline:
         owners = self._active_owners()
         assert owners
         active = {i: self.assignment.tensor_to_optimizer_group_index[i] for i in owners}
-        self._momentum_inputs = optimizer._compute_momentum_inputs(group, active)
         buffer = group.main_weight
+        self._momentum_inputs = (
+            DBuffer(buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device)
+            if self._copy_engine is None
+            else self._copy_engine.empty(buffer)
+        )
+        optimizer._compute_momentum_inputs(group, active, self._momentum_inputs)
         owned = [i for i, owner in owners.items() if owner == group.mesh.get_rank()]
         if self.assignment.requires_communication:
             self._full_inputs = {
                 i: torch.empty(
-                    buffer.layout.tensor_shapes[i], dtype=buffer.dtype, device=buffer.device
+                    buffer.layout.tensor_shapes[i],
+                    dtype=self._momentum_inputs.dtype,
+                    device=buffer.device,
                 )
                 for i in owned
             }
@@ -155,6 +170,7 @@ class _GroupPipeline:
                 self._full_inputs,
                 tensor_to_owner=owners,
                 rank_ranges=self.assignment.rank_ranges,
+                transport=self._copy_engine,
             )
         else:
             self._full_inputs = {i: self._momentum_inputs.get_tensor_view(i) for i in owned}
@@ -166,7 +182,8 @@ class _GroupPipeline:
         for work in self._gather_works:
             work.wait()
         self._gather_works.clear()
-        self._momentum_inputs = None
+        if self._copy_engine is None:
+            self._momentum_inputs = None
 
     def orthogonalize(self, optimizer: "FsdpMuon") -> None:
         """Consume gathered full inputs and produce orthogonalized full updates."""
@@ -182,14 +199,19 @@ class _GroupPipeline:
         assert self._stage is _PipelineStage.ORTHO_POSTED
         if self.assignment.requires_communication:
             buffer = self.assignment.fsdp_group.main_weight
-            self._local_updates = DBuffer(
-                buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
-            )
+            if self._copy_engine is None:
+                self._local_updates = DBuffer(
+                    buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
+                )
+            else:
+                # The owners have read the momentum inputs, so their slot receives the updates.
+                self._local_updates, self._momentum_inputs = self._momentum_inputs, None
             self._scatter_works = scatter(
                 self._full_updates,
                 self._local_updates,
                 tensor_to_owner=self._active_owners(),
                 rank_ranges=self.assignment.rank_ranges,
+                transport=self._copy_engine,
             )
         self._stage = _PipelineStage.SCATTER_POSTED
 
@@ -261,12 +283,21 @@ class FsdpMuon(Muon):
             orthogonalized, and whose scatters are posted before a buffer's updates are applied.
             Each buffer in flight adds its momentum inputs, full tensors, and received updates to
             the peak memory. Zero gives the non-overlapped order.
+        use_copy_engine: Move gathers and scatters with peer memcpys on the copy engines instead
+            of NCCL kernels, leaving every SM to the Newton-Schulz; see ``copy_engine``. The
+            sharded buffers of the groups in flight then stay allocated in symmetric memory.
         **kwargs: Keyword arguments passed unchanged to EO's ``Muon``.
     """
 
     _fsdp_group_assignments: list[_FsdpGroupAssignment]
 
-    def __init__(self, *args: Any, num_groups_in_flight: int = 8, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        num_groups_in_flight: int = 8,
+        use_copy_engine: bool = False,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         if num_groups_in_flight < 0:
             raise ValueError(
@@ -304,8 +335,25 @@ class FsdpMuon(Muon):
                 )
             )
         self._validate_parameter_groups()
+        copy_engine: CopyEngineP2P | None = None
+        if use_copy_engine:
+            # A group holds a slot from its gather to its apply: at most the groups in flight
+            # before, during, and after the one being orthogonalized.
+            copy_engine = CopyEngineP2P(
+                num_slots=2 * num_groups_in_flight + 1,
+                slot_numel=max(
+                    (
+                        rank_range.numel
+                        for assignment in self._fsdp_group_assignments
+                        if assignment.requires_communication
+                        for rank_range in assignment.rank_ranges.values()
+                    ),
+                    default=1,
+                ),
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
         self._group_pipelines = [
-            _GroupPipeline(assignment) for assignment in self._fsdp_group_assignments
+            _GroupPipeline(assignment, copy_engine) for assignment in self._fsdp_group_assignments
         ]
 
     def _validate_parameter_groups(self) -> None:
@@ -344,13 +392,12 @@ class FsdpMuon(Muon):
             pipeline.apply_updates(self)
 
     def _compute_momentum_inputs(
-        self, fsdp_group: FsdpParameterGroup, tensor_to_optimizer_group_index: dict[int, int]
-    ) -> DBuffer:
-        """Apply local weight decay, update momentum, and build inputs for orthogonalization."""
-        buffer: DBuffer = fsdp_group.main_weight
-        momentum_inputs: DBuffer = DBuffer(
-            buffer.mesh, buffer.placements, buffer.layout, buffer.dtype, buffer.device
-        )
+        self,
+        fsdp_group: FsdpParameterGroup,
+        tensor_to_optimizer_group_index: dict[int, int],
+        momentum_inputs: DBuffer,
+    ) -> None:
+        """Apply local weight decay, update momentum, and write inputs for orthogonalization."""
         for i, group_index in tensor_to_optimizer_group_index.items():
             group: dict[str, Any] = self.param_groups[group_index]
             param: DTensor = cast(DTensor, fsdp_group.fsdp_parameters[i].sharded)
@@ -383,7 +430,6 @@ class FsdpMuon(Muon):
                 torch.lerp(grad, momentum, group["momentum"], out=local_input.view_as(momentum))
             else:
                 local_input.copy_(momentum.reshape(local_input.shape))
-        return momentum_inputs
 
     def _orthogonalize_updates(
         self, assignment: _FsdpGroupAssignment, full_inputs: dict[int, torch.Tensor]
