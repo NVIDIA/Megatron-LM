@@ -203,6 +203,7 @@ class GatedDeltaNet2(_GDNBase):
 
         cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
         cp_size = get_pg_size(cp_group)
+        self._validate_chunkwise_cp_size(cp_size)
 
         seq_len, batch, _ = hidden_states.shape
         seq_len = seq_len * self.sp_size * cp_size

@@ -103,6 +103,16 @@ def test_runtime_cp_gdn_module_replays(variant):
             hidden = torch.randn(
                 128, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
             )
+            if size > 1:
+                original_cp_mode = module.config.linear_cp_mode
+                module.config.linear_cp_mode = "chunkwise"
+                try:
+                    with pytest.raises(ValueError, match="linear_cp_layout='zigzag'"):
+                        module.forward_pre_attn_and_core_attn(
+                            hidden, None, packed_seq_params=packed
+                        )
+                finally:
+                    module.config.linear_cp_mode = original_cp_mode
             with deterministic_algorithms(True):
                 result = assert_module_replays_bit_exact(
                     module,
