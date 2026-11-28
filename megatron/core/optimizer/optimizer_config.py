@@ -318,6 +318,13 @@ class OptimizerConfig:
     muon_use_syrk: bool = False
     """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
 
+    muon_ns_cuda_graphs: bool = False
+    """Replay eligible local TensorParallelMuon Newton-Schulz calls in bounded CUDA graphs.
+    Retains precision, coefficients and iteration count. Unsupported tensor layouts,
+    dtypes, TP>1 partitions and distributed NS fall back to the original callable.
+    Not supported for adaptive or layer-sharded Muon.
+    """
+
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
