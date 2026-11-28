@@ -10,7 +10,8 @@ import pickle
 import warnings
 from collections import ChainMap, defaultdict
 from contextlib import contextmanager
-from itertools import product
+from dataclasses import replace
+from itertools import chain, product
 from logging import getLogger
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union, cast
@@ -25,6 +26,7 @@ from torch.distributed._shard.sharded_tensor import ShardedTensor as TorchSharde
 from torch.distributed._shard.sharded_tensor import ShardedTensorMetadata, TensorProperties
 from torch.distributed.checkpoint import (
     BytesStorageMetadata,
+    ChunkStorageMetadata,
     DefaultLoadPlanner,
     DefaultSavePlanner,
     FileSystemReader,
@@ -38,10 +40,16 @@ from torch.distributed.checkpoint import (
 )
 from torch.distributed.checkpoint._nested_dict import FLATTEN_MAPPING, unflatten_state_dict
 from torch.distributed.checkpoint._traverse import OBJ_PATH, traverse_state_dict
-from torch.distributed.checkpoint.default_planner import create_default_global_save_plan
-from torch.distributed.checkpoint.metadata import Metadata
+from torch.distributed.checkpoint.default_planner import (
+    create_default_global_save_plan,
+    create_default_local_load_plan,
+)
+from torch.distributed.checkpoint.metadata import Metadata, MetadataIndex
 from torch.distributed.checkpoint.planner import WriteItemType
-from torch.distributed.checkpoint.planner_helpers import _create_write_items
+from torch.distributed.checkpoint.planner_helpers import (
+    _create_write_items,
+    create_read_items_for_chunk_list,
+)
 
 from ..core import CheckpointingException
 from ..dict_utils import nested_values
@@ -412,6 +420,52 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
             _restore_dict_types(x_val, templ_val)
 
 
+def _create_read_items_per_chunk_group(
+    fqn: str, md: TensorStorageMetadata, local_chunks: List[ChunkStorageMetadata]
+) -> List[ReadItem]:
+    """Creates the read items of `create_read_items_for_chunk_list` one chunk group at a time.
+
+    MCore stacks layers and experts along prepended axes, where every chunk has extent one, so
+    chunks can only overlap if their offsets along those axes are equal. DCP plans a key as a
+    whole, which for such keys compares every local chunk with every saved chunk of all layers
+    and experts. Grouped read items are ordered by local chunk, then by saved chunk.
+    """
+    saved_chunks = md.chunks
+    unit_axes = [
+        axis
+        for axis in range(len(md.size))
+        if all(chunk.sizes[axis] == 1 for chunk in chain(local_chunks, saved_chunks))
+    ]
+    if not unit_axes:
+        return create_read_items_for_chunk_list(fqn, md, local_chunks)
+
+    saved_groups = defaultdict(list)
+    for storage_idx, chunk in enumerate(saved_chunks):
+        saved_groups[tuple(chunk.offsets[axis] for axis in unit_axes)].append(storage_idx)
+    local_groups = defaultdict(list)
+    for local_idx, chunk in enumerate(local_chunks):
+        local_groups[tuple(chunk.offsets[axis] for axis in unit_axes)].append(local_idx)
+
+    read_items = []
+    for group, local_idxs in local_groups.items():
+        storage_idxs = saved_groups.get(group, [])
+        group_md = replace(md, chunks=[saved_chunks[idx] for idx in storage_idxs])
+        group_chunks = [local_chunks[idx] for idx in local_idxs]
+        for item in create_read_items_for_chunk_list(fqn, group_md, group_chunks):
+            # Index hints refer to positions in the full chunk lists.
+            dest_idx = local_idxs[item.dest_index.index]
+            storage_idx = storage_idxs[item.storage_index.index]
+            read_items.append(
+                replace(
+                    item,
+                    dest_index=MetadataIndex(fqn, item.dest_index.offset, dest_idx),
+                    storage_index=MetadataIndex(fqn, item.storage_index.offset, storage_idx),
+                )
+            )
+    read_items.sort(key=lambda item: (item.dest_index.index, item.storage_index.index))
+    return read_items
+
+
 class MCoreSavePlanner(DefaultSavePlanner):
     """Differs with the default planner by saving BytesIO objects on all ranks.
 
@@ -613,13 +667,34 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
                 md.size = size
 
     def create_local_plan(self) -> LoadPlan:
-        """Runs additional shapes validation."""
+        """Runs additional shapes validation and plans MCore shards per chunk group.
+
+        See `_create_read_items_per_chunk_group`. Other values, missing keys and shape
+        mismatches are handled by the default plan.
+        """
         self._validate_global_shapes(self.metadata, self.shapes_validation_sharded_tensors)
 
         with self._temporarily_bypass_shape_validation():
-            local_plan = super().create_local_plan()
+            if self.flatten_state_dict:
+                return super().create_local_plan()
 
-        return local_plan
+            read_items = []
+            for fqn, obj in self.state_dict.items():
+                md = self.metadata.state_dict_metadata.get(fqn)
+                if (
+                    isinstance(obj, (CheckpointableShardedTensor, LocalShardsContainer))
+                    and isinstance(md, TensorStorageMetadata)
+                    and md.size == obj.size()
+                ):
+                    chunks = obj.__create_chunk_list__()
+                    read_items += _create_read_items_per_chunk_group(fqn, md, chunks)
+                else:
+                    strict = not self.allow_partial_load
+                    read_items += create_default_local_load_plan(
+                        {fqn: obj}, self.metadata, strict
+                    ).items
+
+        return LoadPlan(read_items)
 
     def finish_plan(self, new_plan: LoadPlan) -> LoadPlan:
         """Counts the read items per destination of the plan this rank will execute.
