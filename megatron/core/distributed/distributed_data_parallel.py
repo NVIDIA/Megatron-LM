@@ -27,6 +27,46 @@ from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers
 logger = logging.getLogger(__name__)
 
 
+def relink_param_gather_bucket_groups(
+    bucket_groups: list,
+    observed_order: list[int],
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> bool:
+    """Relink ``next_param_gather_bucket_group`` pointers to match an observed forward order.
+
+    Returns ``True`` when every rank in ``process_group`` (or the local rank when not
+    distributed) agrees on a complete permutation of ``range(len(bucket_groups))``.
+    Otherwise leaves all existing pointers unchanged and returns ``False``.
+    """
+    num_groups = len(bucket_groups)
+    local_order: Optional[list[int]] = list(observed_order)
+    if len(local_order) != num_groups or set(local_order) != set(range(num_groups)):
+        local_order = None
+
+    if (
+        process_group is not None
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+    ):
+        world_size = torch.distributed.get_world_size(process_group)
+        if world_size > 1:
+            gathered: list[Optional[list[int]]] = [None] * world_size
+            torch.distributed.all_gather_object(gathered, local_order, group=process_group)
+            if any(order is None or order != local_order for order in gathered):
+                return False
+
+    if local_order is None:
+        return False
+
+    for pos in range(num_groups - 1):
+        bucket_groups[local_order[pos]].next_param_gather_bucket_group = bucket_groups[
+            local_order[pos + 1]
+        ]
+    if num_groups > 0:
+        bucket_groups[local_order[-1]].next_param_gather_bucket_group = None
+    return True
+
+
 class _BucketParamReadyCallback:
     """Publishes one bucket group's parameters on demand.
 
@@ -436,11 +476,9 @@ class DistributedDataParallel(_BaseDataParallel):
         # without use_distributed_optimizer.
         if self.ddp_config.overlap_param_gather:
             for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
-                num_bucket_groups = len(bucket_groups)
-                for i in range(1, num_bucket_groups):
-                    bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
-                        bucket_groups[num_bucket_groups - i - 1]
-                    )
+                relink_param_gather_bucket_groups(
+                    bucket_groups, list(reversed(range(len(bucket_groups))))
+                )
 
         # Set `previous_grad_reduce_bucket_group` so each bucket group can drain its predecessor's
         # reduce-scatter at dispatch time. Only needed for reduce_scatter_with_fp32_accumulation,
@@ -860,3 +898,98 @@ class DistributedDataParallel(_BaseDataParallel):
 
         if synchronize:
             torch.cuda.synchronize()
+
+    def align_param_gather_order_on_next_forward(self) -> None:
+        """Observe one forward pass and relink ``next_param_gather_bucket_group`` to match.
+
+        Some models consume parameters in an order different from reverse parameter-registration
+        order (for example, absorbed MLA weights accessed via ``ensure_params_ready`` ahead of
+        their owning linear module). Calling this opt-in hook before a forward step records both
+        owning-module pre-hooks and ``PARAM_READY_CALLBACK_ATTR`` accesses for that single pass,
+        cleans up all temporary hooks even if forward raises, and updates each bucket group's
+        prefetch link when all ranks agree on a complete permutation.
+        """
+        if not self.ddp_config.overlap_param_gather:
+            return
+        if getattr(self, "_param_gather_order_probe_active", False):
+            return
+
+        dense_groups = list(getattr(self, "bucket_groups", ()))
+        expert_groups = list(getattr(self, "expert_parallel_bucket_groups", ()))
+        dense_pos = {id(bg): idx for idx, bg in enumerate(dense_groups)}
+        expert_pos = {id(bg): idx for idx, bg in enumerate(expert_groups)}
+        dense_seen: dict[int, None] = {}
+        expert_seen: dict[int, None] = {}
+
+        def _record_group(bucket_group) -> None:
+            group_id = id(bucket_group)
+            if group_id in dense_pos:
+                dense_seen.setdefault(dense_pos[group_id], None)
+            elif group_id in expert_pos:
+                expert_seen.setdefault(expert_pos[group_id], None)
+
+        hooks = []
+
+        def _pre_hook(module, *_args) -> None:
+            for param in module.parameters(recurse=False):
+                bg = self.param_to_bucket_group.get(param)
+                if bg is not None:
+                    _record_group(bg)
+
+        for submodule in self.module.modules():
+            if any(
+                param in self.param_to_bucket_group
+                for param in submodule.parameters(recurse=False)
+            ):
+                hooks.append(submodule.register_forward_pre_hook(_pre_hook))
+
+        borrowed_callbacks: dict[torch.nn.Parameter, object] = {}
+        wrapped_callbacks: dict[tuple[int, int], object] = {}
+        for param, bg in self.param_to_bucket_group.items():
+            orig = getattr(param, PARAM_READY_CALLBACK_ATTR, None)
+            if orig is None:
+                continue
+            borrowed_callbacks[param] = orig
+            cache_key = (id(orig), id(bg))
+            wrapped = wrapped_callbacks.get(cache_key)
+            if wrapped is None:
+
+                def _make_wrapped(fn=orig, group=bg):
+                    def _wrapped_ready():
+                        _record_group(group)
+                        return fn()
+
+                    return _wrapped_ready
+
+                wrapped = _make_wrapped()
+                wrapped_callbacks[cache_key] = wrapped
+            setattr(param, PARAM_READY_CALLBACK_ATTR, wrapped)
+
+        def _relink_on_success(_module, _args, _output) -> None:
+            dense_order = list(dense_seen)
+            expert_order = list(expert_seen)
+            dense_ok = relink_param_gather_bucket_groups(
+                dense_groups, dense_order, getattr(self, "intra_dp_cp_group", None)
+            )
+            expert_ok = relink_param_gather_bucket_groups(
+                expert_groups, expert_order, getattr(self, "intra_expt_dp_group", None)
+            )
+            self.last_param_gather_order_alignment = {
+                "dense": {"observed_order": dense_order, "applied": dense_ok},
+                "expert": {"observed_order": expert_order, "applied": expert_ok},
+            }
+
+        def _cleanup(*_args) -> None:
+            for handle in hooks:
+                handle.remove()
+            hooks.clear()
+            for param, orig in borrowed_callbacks.items():
+                setattr(param, PARAM_READY_CALLBACK_ATTR, orig)
+            borrowed_callbacks.clear()
+            self._param_gather_order_probe_active = False
+
+        self._param_gather_order_probe_active = True
+        # Register relinking first (always_call=False) and cleanup second (always_call=True)
+        # so successful forwards relink then clean up, while raised errors only clean up.
+        hooks.append(self.module.register_forward_hook(_relink_on_success))
+        hooks.append(self.module.register_forward_hook(_cleanup, always_call=True))
