@@ -30,7 +30,7 @@ from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import ensure_params_ready, nvtx_range_pop, nvtx_range_push
 
 from .csa_utils import cp_utils, packed_layout
 from .csa_utils.fused_sparse_attention import (
@@ -654,6 +654,8 @@ class Compressor(MegatronModule):
         ratio = self.compress_ratio
         kv, score = self._project(x)
         kv = kv.reshape(total_comp, ratio, 1, -1)
+        # forward_packed is called directly, bypassing this module's forward pre-hook.
+        ensure_params_ready([self.ape])
         score = score.reshape(total_comp, ratio, 1, -1) + self.ape.view(1, ratio, 1, -1)
         if self.overlap:
             is_first = compressed_group_ids == 0
@@ -1125,6 +1127,7 @@ class CompressedSparseAttention(MegatronModule):
                 sparse_loss=self.config.dsa_indexer_use_sparse_loss,
                 kv_offset=compressed_offset,
                 calculate_per_token_loss=self.config.calculate_per_token_loss,
+                deterministic=self.config.deterministic_mode,
                 out_rope=out_rope,
             )
             nvtx_range_pop("sparse_attn_kernel")
@@ -1147,12 +1150,21 @@ class CompressedSparseAttention(MegatronModule):
                 self.indexer.index_topk,
                 self.compress_ratio,
                 indexer_softmax_scale=self.indexer.softmax_scale,
+                deterministic=self.config.deterministic_mode,
             )
             compressed_indices = torch.where(
                 compressed_indices >= 0, compressed_indices + compressed_offset, -1
             )
+            # Match the training forward's key order: FlashMLA's online softmax
+            # accumulates in slot order, even when the selected key set is equal.
+            # Preserve the existing window-first order outside deterministic mode.
+            index_groups = (
+                (compressed_indices, window_indices)
+                if self.config.deterministic_mode
+                else (window_indices, compressed_indices)
+            )
             flat_indices, flat_topk_length = build_flat_topk_idxs(
-                window_indices, compressed_indices, batch_size=batch, compact=True
+                *index_groups, batch_size=batch, compact=True
             )
             nvtx_range_pop("compressed_indices")
 
@@ -1164,6 +1176,7 @@ class CompressedSparseAttention(MegatronModule):
                 flat_indices,
                 self.softmax_scale,
                 topk_length=flat_topk_length,
+                deterministic=self.config.deterministic_mode,
                 out_rope=out_rope,
             )
             nvtx_range_pop("sparse_attn_kernel")
@@ -1187,6 +1200,7 @@ class CompressedSparseAttention(MegatronModule):
                 self.attn_sink.float(),
                 flat_indices,
                 self.softmax_scale,
+                deterministic=self.config.deterministic_mode,
                 out_rope=out_rope,
             )
             nvtx_range_pop("sparse_attn_kernel")

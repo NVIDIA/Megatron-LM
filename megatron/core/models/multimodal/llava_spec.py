@@ -27,7 +27,7 @@ _local = get_backend("local")
 
 
 def decoder_model_with_transformer_engine_default_spec(
-    num_experts: Optional[int] = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
+    num_experts: Optional[int] = None, moe_grouped_gemm: bool = True, qk_layernorm: bool = False
 ) -> ModuleSpec:
     """LLava decoder TE spec (uses Transformer Engine components)."""
     mlp = get_mlp_module_spec(
@@ -55,7 +55,7 @@ def decoder_model_with_transformer_engine_default_spec(
 
 
 def decoder_model_with_local_default_spec(
-    num_experts: Optional[int] = None, moe_grouped_gemm: bool = False, qk_layernorm: bool = False
+    num_experts: Optional[int] = None, moe_grouped_gemm: bool = True, qk_layernorm: bool = False
 ) -> ModuleSpec:
     """LLava decoder local spec."""
     mlp = get_mlp_module_spec(

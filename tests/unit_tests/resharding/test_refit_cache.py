@@ -8,8 +8,8 @@ Covers:
   parallel sizes used to silently share a plan).
 - ``_PlanCacheKey`` separation across execution batch limits.
 - ``get_refit_tensor_dict`` / ``invalidate_refit_tensor_cache`` (module-level
-  named_refit_tensors cache + invalidation when ``_harmonize_buffer_dtypes``
-  replaces a buffer).
+  named_refit_tensors cache + invalidation when dtype preparation replaces a
+  buffer).
 """
 
 from unittest.mock import MagicMock, call
@@ -589,7 +589,7 @@ class TestRefitTensorCache:
         assert d1 is not d2
 
     def test_invalidate_picks_up_replaced_buffer(self):
-        """Mirrors _harmonize_buffer_dtypes: replace _buffers entry, invalidate, re-read."""
+        """Mirrors dtype preparation: replace _buffers entry, invalidate, re-read."""
         model = nn.Module()
         model.register_buffer("buf", torch.zeros(4, dtype=torch.bfloat16))
         d1 = get_refit_tensor_dict(model)

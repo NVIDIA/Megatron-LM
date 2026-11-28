@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Storage helpers for cached-logit tar shards.
 
@@ -22,6 +22,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -47,9 +48,12 @@ except ImportError:
 
 from megatron.core import parallel_state as mpu
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
-from megatron.training import get_args, get_train_state
+from megatron.training import get_train_state
 from megatron.training.global_vars import get_run_config
-from megatron.training.utils import get_blend_and_blend_per_split
+
+if TYPE_CHECKING:
+    from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+    from megatron.training.config import DataConfig, PretrainConfigContainer
 
 logger = logging.getLogger(__name__)
 
@@ -229,38 +233,35 @@ def get_current_iteration() -> int:
     return get_train_state().iteration
 
 
-def is_packed_sequence_run() -> bool:
+def is_packed_sequence_run(data: "DataConfig | None" = None) -> bool:
     """Return whether the current run packs multiple documents per sequence.
 
-    Mirrors ``training.py``'s ``has_cu_seqlens`` formula
-    (``training.py:3059``): packing is active under ``--sft`` or
-    ``--dataloader-inter-document-masking``. Shared by the saver
-    (``LogitsSaverHooks``, to know whether to capture/persist
-    ``cu_seqlens_padded``) and the loader (``TeacherTarDataset``'s
-    document-aware CP reslicing requirement, and ``CachedLogitsKDLoss``'s
-    sequence-length-trim safety check) so the two can't drift out of sync.
+    ``get_batch``'s ``has_cu_seqlens``, read from the same source: the data section of the
+    registered run config (the SFT family, or inter-document masking). Shared by the saver
+    (``LogitsSaverHooks``, to know whether to capture/persist ``cu_seqlens_padded``) and the
+    loader (``TeacherTarDataset``'s document-aware CP reslicing requirement, and
+    ``CachedLogitsKDLoss``'s sequence-length-trim safety check) so the two can't drift out of
+    sync with the batch path.
     """
-    args = get_args()
-    return bool(
-        getattr(args, 'sft', False) or getattr(args, 'dataloader_inter_document_masking', False)
-    )
+    data = get_run_config().data if data is None else data
+    return bool(data.has_cu_seqlens())
 
 
 def get_consumed_train_samples() -> int:
     """Return the cumulative global sample count consumed so far.
 
-    ``training.py`` only updates ``args.consumed_train_samples`` **after**
+    ``training.py`` only updates ``TrainState.consumed_train_samples`` **after**
     ``train_step()`` returns, so at forward-hook time (inside
     ``train_step``) this value is exactly the global sample count *before*
     the in-flight iteration's batch -- i.e. the v2 tar naming scheme's
     ``start_sample``, for free.
     """
-    return get_args().consumed_train_samples
+    return get_train_state().consumed_train_samples
 
 
-def _blend_identifiers(args: Any) -> Dict[str, Any]:
+def _blend_identifiers(dataset: "GPTDatasetConfig") -> Dict[str, Any]:
     """Build a path-agnostic representation of the training data blend."""
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
+    blend, blend_per_split = dataset.blend, dataset.blend_per_split
 
     def _normalise(blend_tuple) -> Optional[List[List[Any]]]:
         if blend_tuple is None:
@@ -281,15 +282,16 @@ def _blend_identifiers(args: Any) -> Dict[str, Any]:
     return {"kind": "mock", "mock": True}
 
 
-def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
+def compute_dataset_hash(
+    cfg: "PretrainConfigContainer | None" = None,
+) -> Tuple[str, Dict[str, Any]]:
     """Compute the dataset-identity hash for the current training run.
 
     The fields included are exactly those that determine the global sample
     stream itself: ``seed``, ``train_samples`` (with a fall-back to
     ``train_iters * global_batch_size``), and the data ``blend``.
     """
-    cfg = get_run_config()
-    args = get_args()
+    cfg = get_run_config() if cfg is None else cfg
     train_samples = cfg.train.train_samples
     if train_samples is None:
         train_iters = cfg.train.train_iters
@@ -300,7 +302,7 @@ def compute_dataset_hash() -> Tuple[str, Dict[str, Any]]:
     identifiers = OrderedDict()
     identifiers["seed"] = cfg.rng.seed
     identifiers["train_samples"] = train_samples
-    identifiers["blend"] = _blend_identifiers(args)
+    identifiers["blend"] = _blend_identifiers(cfg.data.dataset)
 
     description = json.dumps(identifiers, sort_keys=False, separators=(',', ':'))
     md5_hex = hashlib.md5(description.encode("utf-8"), usedforsecurity=False).hexdigest()
@@ -413,10 +415,7 @@ def pad_and_stack_cu_seqlens(cu_seqlens_list: List[torch.Tensor]) -> torch.Tenso
 
 
 def slice_tensor_for_cp_rank(
-    tensor: torch.Tensor,
-    cp_rank: int,
-    cp_size: int,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    tensor: torch.Tensor, cp_rank: int, cp_size: int, cu_seqlens: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """Return this CP rank's zigzag sequence slice from a full sequence tensor.
 

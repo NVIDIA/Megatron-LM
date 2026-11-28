@@ -599,6 +599,67 @@ class TestTritonHPostBDABwdE2EDebug:
 
 class TestTritonSinkhorn:
     @_require_triton
+    @pytest.mark.parametrize("hc", [4, 8])
+    @pytest.mark.parametrize("num_warps", [1, 2, 4, 8])
+    def test_bwd_reads_scratch_after_all_warps_store(self, monkeypatch, hc, num_warps):
+        """Backward must not read Sinkhorn scratch before every warp has stored it.
+
+        Deterministic algorithms fill uninitialized scratch with NaN, so a read that races
+        ahead of another warp's store shows up as nonfinite input gradients. Without the
+        CTA barrier, HC8 fails this way at two or more warps.
+        """
+        import triton
+
+        from megatron.core.fusions import fused_mhc_kernels as kernels
+
+        generator = torch.Generator().manual_seed(193)
+        data = (torch.rand((3, 1, hc, hc), generator=generator) * 0.2 - 0.1).cuda()
+        grad_out = (torch.rand((3, 1, hc, hc), generator=generator) * 0.2 - 0.1).cuda()
+        reference_input = data.cpu().double().requires_grad_()
+        reference_output = _ref_sinkhorn(reference_input, 5)
+        reference_output.backward(grad_out.cpu().double())
+
+        def run():
+            inp = data.clone().requires_grad_()
+            out = kernels.triton_fused_sinkhorn(inp, 5)
+            out.backward(grad_out)
+            return out.detach(), inp.grad
+
+        was_deterministic = torch.are_deterministic_algorithms_enabled()
+        was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        was_fill_uninitialized = torch.utils.deterministic.fill_uninitialized_memory
+        try:
+            torch.use_deterministic_algorithms(True)
+            torch.utils.deterministic.fill_uninitialized_memory = True
+            with monkeypatch.context() as patch:
+                # A single candidate launches at this warp count without benchmarking.
+                config = triton.Config({}, num_warps=num_warps)
+                for tuner in (
+                    kernels._triton_sinkhorn_fwd_kernel,
+                    kernels._triton_sinkhorn_bwd_kernel,
+                ):
+                    for name in ("best_config", "configs_timings", "bench_time", "nargs"):
+                        patch.setattr(tuner, name, getattr(tuner, name, None), raising=False)
+                    patch.setattr(tuner, "configs", [config])
+                    patch.setattr(tuner, "cache", {})
+                    patch.setattr(tuner, "cache_results", False, raising=False)
+                results = [run(), run()]
+        finally:
+            torch.use_deterministic_algorithms(was_deterministic, warn_only=was_warn_only)
+            torch.utils.deterministic.fill_uninitialized_memory = was_fill_uninitialized
+
+        for name, first, second, reference in zip(
+            ("output", "input gradient"), *results, (reference_output, reference_input.grad)
+        ):
+            assert torch.isfinite(first).all() and torch.isfinite(second).all(), name
+            assert torch.equal(
+                first.contiguous().view(torch.uint8), second.contiguous().view(torch.uint8)
+            ), name
+            torch.testing.assert_close(
+                first.cpu().double(), reference, atol=2e-6, rtol=2e-5, msg=name
+            )
+
+    @_require_triton
     @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10), (8, 4, 4, 20)])
     def test_fwd_bwd_vs_reference(self, s, b, n, iters):
         from megatron.core.fusions.fused_mhc_kernels import triton_fused_sinkhorn

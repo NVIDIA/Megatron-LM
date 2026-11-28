@@ -946,6 +946,44 @@ class TestGroupedRollouts:
         )
 
     @pytest.mark.asyncio
+    async def test_completed_groups_build_concurrently(self):
+        """One group's build_rollout calls do not hold back the groups that complete meanwhile."""
+        num_groups, rollouts_per_group = 4, 2
+        building = 0
+        all_building = asyncio.Event()
+
+        class GatedBuildGenerator(MockGenerator):
+            """No build finishes until every group's builds are in flight."""
+
+            async def prepare_group_rollout(self, request):
+                params = await super().prepare_group_rollout(request)
+
+                async def build_rollout(episode):
+                    nonlocal building
+                    building += 1
+                    if building == num_groups * rollouts_per_group:
+                        all_building.set()
+                    await all_building.wait()
+                    return await params.build_rollout(episode)
+
+                return GroupRolloutParams(
+                    run_episode=params.run_episode, build_rollout=build_rollout
+                )
+
+        request = GroupedRolloutRequest(
+            num_groups=num_groups,
+            rollouts_per_group=rollouts_per_group,
+            inference_interface=MockInferenceInterface(),
+            submission_granularity="B",
+            consumption_granularity="B",
+        )
+        pipeline = RolloutPipeline(GatedBuildGenerator(), request, parallel_generation_tasks=1)
+        async with aclosing(pipeline.run()) as it:
+            # Building one group at a time never opens the gate, and the pull times out.
+            groups = [await asyncio.wait_for(anext(it), timeout=5) for _ in range(num_groups)]
+        assert [group.index_in_batch for group in groups] == list(range(num_groups))
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         (
             "submission_granularity, consumption_granularity, num_slow_calls, "

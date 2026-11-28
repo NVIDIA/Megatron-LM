@@ -107,6 +107,9 @@ class ProfilingConfig:
 class DistributedInitConfig:
     """Configuration settings for distributed training initialization."""
 
+    external_gpu_device_mapping: bool = False
+    """Use device zero when an external launcher exposes exactly one GPU per process."""
+
     distributed_backend: Literal["nccl", "gloo"] = "nccl"
     """Which backend to use for distributed training."""
 
@@ -129,11 +132,6 @@ class DistributedInitConfig:
     lazy_mpu_init: bool = False
     """If set to True, initialize_megatron() skips DDP initialization and returns function to complete it instead.
     Also turns on --use-cpu-initialization flag. This is for external DDP manager."""
-
-    use_torch_fsdp2: bool = False
-    """Use the torch FSDP2 implementation. FSDP2 is not currently working with Pipeline Parallel.
-    It is still not in a stable release stage, and may therefore contain bugs or other
-    potential issues."""
 
     nccl_communicator_config_path: str | None = None
     """Path to the yaml file with NCCL communicator configurations. The number of min/max thread

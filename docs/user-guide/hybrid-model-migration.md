@@ -1,11 +1,11 @@
-<!---
+{/*
    Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
    and proprietary rights in and to this software, related documentation
    and any modifications thereto. Any use, reproduction, disclosure or
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
--->
+*/}
 
 # Migrate from GPTModel to HybridModel
 
@@ -178,11 +178,11 @@ the loader rejects a pattern that:
 The checkpoint's `num_layers` must equal the number of `*` positions in the
 pattern; a mismatch is rejected.
 
-```{warning}
+<Warning>
 Optimizer translation covers the Adam moments and fp32 master params. Pass
 `--no-load-optim` for a weights-only load. Use `--finetune` when iteration,
 scheduler, RNG, and rerun state should restart instead of resume.
-```
+</Warning>
 
 ### Option B: Convert offline with `gpt_hybrid_conversion.py`
 
@@ -221,13 +221,13 @@ gathers full logical tensors on CPU, so the host must have enough memory for the
 unsharded source and target model state dicts. Always use a target directory
 that is different from the source directory.
 
-```{warning}
+<Warning>
 This is a weights conversion, not a resumable full training-state conversion.
 Sharded optimizer, RNG, rerun, and Transformer Engine `_extra_state` tensors are
 not converted. Some non-tensor entries can remain in `common.pt`, but they do
 not constitute a converted optimizer or RNG state. Start the converted model
 with a fresh optimizer and RNG state.
-```
+</Warning>
 
 #### Run the conversion
 
@@ -318,11 +318,11 @@ Keep the existing architecture, optimizer, precision, data, and basic
 TP/DP/EP/CP arguments unless this guide identifies a required change. Review
 pattern-driven pipeline layout and GPT-specific dataset features separately.
 
-```{warning}
+<Warning>
 `pretrain_hybrid.py` does not select `GPTFIMDataset` when `--fim-data` is set.
 A GPT training workflow that uses fill-in-the-middle data needs a custom dataset
 path or equivalent Hybrid entry-point support before migration.
-```
+</Warning>
 
 With an empty `--load` directory, `--pretrained-checkpoint` loads the pretrained
 weights with finetuning semantics: iteration starts at zero and RNG state is not

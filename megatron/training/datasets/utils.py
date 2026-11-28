@@ -4,7 +4,37 @@
 
 import json
 import os
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
+
+if TYPE_CHECKING:
+    from megatron.training.config import PretrainConfigContainer
+
+
+def get_dataset_input_length(dataset: BlendedMegatronDatasetConfig) -> int:
+    """Return a dataset's output row width, using the derived physical pack width for SFT."""
+    from megatron.training.datasets.sft_dataset import SFTDatasetConfig
+
+    if isinstance(dataset, SFTDatasetConfig):
+        return dataset.packed_sequence_length or dataset.sequence_length
+    return dataset.sequence_length
+
+
+def get_training_data_sequence_length(cfg: "PretrainConfigContainer") -> int | None:
+    """Return the data width for token accounting and batch-size schedules.
+
+    Prefer the dataset's row/pack width. Callback datasets have no dataset config:
+    use T5's encoder width, or the model's training width for the other callbacks.
+    This is not the expanded model input width used for pipeline buffers.
+    """
+    from megatron.training.models import T5ModelConfig
+
+    if cfg.data.dataset is not None:
+        return get_dataset_input_length(cfg.data.dataset)
+    if isinstance(cfg.model, T5ModelConfig):
+        return cfg.model.encoder_seq_length
+    return cfg.model.transformer.max_seq_length_per_sample
 
 
 def load_json_arg(spec: Optional[str]) -> Optional[Any]:

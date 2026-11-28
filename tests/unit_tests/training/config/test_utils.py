@@ -50,6 +50,22 @@ class NestedDataclassWithInitFalse:
 class TestBackwardCompatibility:
     """Test suite for backward compatibility functions."""
 
+    def test_generic_serialization_exclusions(self):
+        from megatron.training.config.utils import serialize_dataclass
+
+        config = NestedDataclassWithInitFalse(
+            inner=DataclassWithInitFalse(),
+            metadata={"items": (DataclassWithInitFalse(name="nested"),)},
+        )
+        result = serialize_dataclass(
+            config, skip_fields=frozenset({"computed_field", "cached_result"})
+        )
+        assert "cached_result" not in result
+        assert "computed_field" not in result["inner"]
+        assert "computed_field" not in result["metadata"]["items"][0]
+        assert result["metadata"]["items"][0]["name"] == "nested"
+        assert config.inner.computed_field == "computed_test"
+
     def test_get_init_false_fields_with_init_false(self):
         """Test _get_init_false_fields correctly identifies init=False fields."""
         from megatron.training.config.utils import _get_init_false_fields

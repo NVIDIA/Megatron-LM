@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 from types import SimpleNamespace
@@ -20,12 +20,12 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.global_vars import set_args
+from megatron.training.global_vars import get_args, set_args
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.dist_checkpointing.models.common import (
     common_test_parallel_reconfiguration_e2e,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 try:
     from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (
@@ -357,6 +357,7 @@ def test_save_and_load_checkpoint_vpp(
             ) as ckpt_dir_B,
         ):
             set_ckpt_path(ckpt_dir_A)
+            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 model,
@@ -383,10 +384,12 @@ def test_save_and_load_checkpoint_vpp(
             )
             new_model = new_model if isinstance(new_model, list) else [new_model]
 
+            sync_checkpoint_config(get_args())
             load_checkpoint(
                 new_model, optimizer, opt_param_scheduler, strict=False, restore_training_state=True
             )
             set_ckpt_path(ckpt_dir_B)
+            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 new_model,
@@ -409,6 +412,7 @@ def test_save_and_load_checkpoint_vpp(
                 pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
                 is_moe=is_moe,
             )
+            sync_checkpoint_config(get_args())
             load_checkpoint(
                 [model_A], optimizer, opt_param_scheduler, strict=False, restore_training_state=True
             )
@@ -426,6 +430,7 @@ def test_save_and_load_checkpoint_vpp(
                 pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
                 is_moe=is_moe,
             )
+            sync_checkpoint_config(get_args())
             load_checkpoint(
                 [model_B], optimizer, opt_param_scheduler, strict=False, restore_training_state=True
             )

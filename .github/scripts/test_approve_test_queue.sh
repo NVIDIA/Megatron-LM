@@ -11,7 +11,7 @@ readonly SERIALIZED_RUNS='  cancel-in-progress: false'
 readonly INTERNAL_SERVICE_ACCOUNT='          INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}'
 readonly INTERNAL_SERVICE_ACCOUNT_CHECK='              return login in INTERNAL_SERVICE_ACCOUNTS or any('
 readonly RUN_ALL_TESTS_VARIABLE='          ALLOW_PR_RUN_ALL_TESTS: ${{ vars.ALLOW_PR_RUN_ALL_TESTS }}'
-readonly RUN_ALL_TESTS_LABELS='          RUN_ALL_TESTS_LABELS = {FUNCTIONAL_TEST_LABEL, RUN_TESTS_LABEL}'
+readonly RUN_ALL_TESTS_LABELS='          RUN_ALL_TESTS_LABELS = FUNCTIONAL_TEST_LABELS | {RUN_TESTS_LABEL}'
 readonly RUN_ALL_TESTS_GUARD='              if not ALLOW_PR_RUN_ALL_TESTS and workflow_labels & RUN_ALL_TESTS_LABELS:'
 
 if [[ $(/usr/bin/grep -c -F "$EXTERNAL_QUEUE" "$WORKFLOW") -ne 1 ]]; then
@@ -127,6 +127,9 @@ workflow = Path(sys.argv[1]).read_text()
 start = workflow.index('          # Headers for GitHub API')
 end = workflow.index('          # Get current running and queued workflows', start)
 helpers_code = compile(textwrap.dedent(workflow[start:end]), sys.argv[1], "exec")
+start = workflow.index('          FUNCTIONAL_TEST_LABEL =')
+end = workflow.index('          ALLOW_PR_RUN_ALL_TESTS =', start)
+labels_code = compile(textwrap.dedent(workflow[start:end]), sys.argv[1], "exec")
 
 
 class RequestException(Exception):
@@ -153,25 +156,30 @@ class Response:
 
 def load(responses):
     """Run the workflow helpers against a scripted sequence of API responses."""
-    state = SimpleNamespace(requests=[], sleeps=[])
+    state = SimpleNamespace(requests=[], sleeps=[], tokens=[])
 
-    def send(*args, **kwargs):
-        state.requests.append(args[0])
-        return responses.pop(0)
+    def sender(method):
+        def send(*args, **kwargs):
+            state.requests.append(args[0])
+            state.tokens.append((method, kwargs["headers"]["Authorization"]))
+            return responses.pop(0)
+
+        return send
 
     def fail_exit(code=0):
         raise SystemExit(code)
 
     fake_requests = SimpleNamespace(
-        get=send,
-        post=send,
+        get=sender("GET"),
+        post=sender("POST"),
         exceptions=SimpleNamespace(
             ConnectionError=ConnectionError, Timeout=TimeoutError, RequestException=RequestException
         ),
     )
     fake_time = SimpleNamespace(time=lambda: 1000, sleep=state.sleeps.append)
     state.ns = {
-        "GITHUB_TOKEN": "token",
+        "READ_TOKEN": "read-token",
+        "APPROVAL_TOKEN": "approval-token",
         "API_BASE": "https://api.example",
         "INTERNAL_SERVICE_ACCOUNTS": set(),
         "sso_users": {},
@@ -180,6 +188,7 @@ def load(responses):
         "time": fake_time,
         "exit": fail_exit,
     }
+    exec(labels_code, state.ns)
     exec(helpers_code, state.ns)
     return state
 
@@ -220,6 +229,12 @@ response = Response(200, body={"ok": True})
 assert load([response]).ns["make_request"]("x", return_response=True) is response
 assert load([Response(200, body=[1])]).ns["make_request"]("x", method="POST", data={}) == [1]
 
+# Reads use the job token; only the approval POST uses the PAT.
+state = load([Response(200, body={}), Response(200, body=[1])])
+state.ns["make_request"]("x")
+state.ns["make_request"]("x", method="POST", data={})
+assert state.tokens == [("GET", "token read-token"), ("POST", "token approval-token")]
+
 
 def pr(number, base="main", labels=()):
     return Response(
@@ -239,6 +254,12 @@ for _ in range(3):
 assert len(state.requests) == 1
 assert state.ns["get_pr_base_branch"](run_2)[0] == "dev"
 assert len(state.requests) == 2
+
+for label in ("Run functional tests", "Run Merge-Queue jobs"):
+    state = load([pr(1, labels=(label,))])
+    assert state.ns["has_functional_test_label"](run_1)
+    assert label in state.ns["RUN_ALL_TESTS_LABELS"]
+assert not load([pr(1, labels=("Run tests",))]).ns["has_functional_test_label"](run_1)
 
 # A failed lookup is not cached, and non-PR runs make no request.
 state = load([Response(404), pr(1)])
@@ -267,7 +288,8 @@ source = Path(sys.argv[1]).read_text()
 source = textwrap.dedent(source.split('        shell: python\n        run: |\n', 1)[1].split('\n  notify:', 1)[0])
 
 
-def approvals(prs, queued=(), running=(), waiting=(), branch="main", contributor="internal", limit=20):
+def approvals(prs, queued=(), running=(), waiting=(), branch="main", contributor="internal", limit=20,
+              labels=None, allow_full=True):
     runs = {}
     approved = []
     by_status = {}
@@ -284,27 +306,30 @@ def approvals(prs, queued=(), running=(), waiting=(), branch="main", contributor
         return SimpleNamespace(status_code=200, links={}, json=lambda: data, raise_for_status=lambda: None)
 
     def get(url, **kwargs):
+        assert kwargs["headers"]["Authorization"] == "token read", url
         if "actions/runs?" in url:
             status = re.search(r"status=([^&]+)", url).group(1)
             return response({"workflow_runs": by_status[status]})
         if "/pulls/" in url:
             number = int(url.rsplit("/", 1)[1])
             author, base = prs[number]
-            return response({"number": number, "user": {"login": author}, "base": {"ref": base}, "labels": []})
+            pr_labels = [{"name": label} for label in (labels or {}).get(number, ())]
+            return response({"number": number, "user": {"login": author}, "base": {"ref": base}, "labels": pr_labels})
         if url.endswith("/pending_deployments"):
             return response([{"id": 1, "environment": {"id": 1}}])
         raise AssertionError(url)
 
     def post(url, **kwargs):
+        assert kwargs["headers"]["Authorization"] == "token pat", url
         approved.append(runs[int(url.split("/runs/")[1].split("/")[0])])
         return response([{"state": "approved"}])
 
     sso = {author: {"org_roles": ["NVIDIA:Member"]} for author, _ in prs.values()} if contributor == "internal" else {}
-    env = {"GITHUB_TOKEN": "test", "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
+    env = {"APPROVAL_TOKEN": "pat", "READ_TOKEN": "read", "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
            "CONTRIBUTOR_TYPE": contributor, "MAX_CONCURRENCY": str(limit * 2),
            "MAX_CONCURRENCY_EXTERNAL": str(limit), "SSO_USERS_FILE": "sso.json",
            "TARGET_BRANCH": branch,
-           "ALLOW_PR_RUN_ALL_TESTS": "true"}
+           "ALLOW_PR_RUN_ALL_TESTS": str(allow_full).lower()}
     with patch.dict(os.environ, env), patch.dict(sys.modules, {"requests": SimpleNamespace(get=get, post=post)}), \
          patch("builtins.open", mock_open(read_data=json.dumps(sso))), contextlib.redirect_stdout(io.StringIO()):
         try:
@@ -330,5 +355,12 @@ release_prs = {n: (author, "release/a" if base == "main" else "release/b")
 assert approvals(release_prs, running=[1, 2], waiting=[3, 4, 5], branch="others") == [4, 5]
 # The existing queue-wide limit still applies.
 assert approvals(prs, waiting=[1, 2, 4], limit=2) == [1, 2]
+for label in ("Run functional tests", "Run Merge-Queue jobs"):
+    assert approvals(prs, waiting=[1, 4], labels={1: [label], 4: [label]}) == [1]
+    assert approvals(prs, waiting=[1, 4], labels={1: [label]}, allow_full=False) == [4]
+    for other_label in ("Run functional tests", "Run Merge-Queue jobs"):
+        labels = {5: [label], 4: [other_label]}
+        assert approvals(prs, queued=[5], waiting=[4], labels=labels) == []
+        assert approvals(prs, running=[5], waiting=[4], labels=labels) == []
 print("Approve Test Queue limits each author to two active PRs per base branch")
 PY

@@ -113,7 +113,7 @@ def _assert_dataset_indices(
     expected_iterations: int,
 ) -> None:
     args = SimpleNamespace(micro_batch_size=mbs_load, global_batch_size=gbs_load)
-    monkeypatch.setattr(cached_logits_loss, "get_args", lambda: args)
+    monkeypatch.setattr(cached_logits_loss, "get_run_config", lambda: SimpleNamespace(train=args))
 
     num_mb_load = gbs_load // (mbs_load * dp_load)
     for dp_rank in range(dp_load):
@@ -364,9 +364,7 @@ def test_call_defaults_to_consumed_train_samples(monkeypatch):
 
 def test_init_dataloader_rejects_partial_global_batch(monkeypatch):
     loss = _bare_kd_loss([])
-    monkeypatch.setattr(
-        cached_logits_loss, "get_args", lambda: SimpleNamespace(global_batch_size=8)
-    )
+    loss._global_batch_size = 8
 
     with pytest.raises(RuntimeError, match="not a multiple of the global batch"):
         loss._init_dataloader(12)
@@ -380,7 +378,7 @@ def test_dataset_yields_global_start_sample_when_resuming(tmp_path, monkeypatch,
     else:
         _write_v2_cache(tmp_path, mbs=1, dp=2, gbs=gbs, iterations=3)
     args = SimpleNamespace(micro_batch_size=1, global_batch_size=gbs)
-    monkeypatch.setattr(cached_logits_loss, "get_args", lambda: args)
+    monkeypatch.setattr(cached_logits_loss, "get_run_config", lambda: SimpleNamespace(train=args))
 
     dataset = make_teacher_tar_dataset(
         str(tmp_path),

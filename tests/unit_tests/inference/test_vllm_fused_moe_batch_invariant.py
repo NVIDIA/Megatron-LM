@@ -554,7 +554,7 @@ class TestTeNativeBackend:
             # te_native must NOT reroute aten::mm — native kernels stay
             a = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
             b = torch.randn(64, 64, device="cuda", dtype=torch.bfloat16)
-            torch.mm(a, b)  # should not raise / not require DeepGEMM
+            torch.mm(a, b)  # should not raise
         finally:
             disable_batch_invariant_mode()
         assert not is_batch_invariant_mode_enabled()

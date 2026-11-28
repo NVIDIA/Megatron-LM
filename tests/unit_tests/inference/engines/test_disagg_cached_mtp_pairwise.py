@@ -132,6 +132,10 @@ def test_cached_prefix_and_mtp_handoff(transport_world, mode):
                     with ForwardWitness(engine) as witness:
                         actual = run_to_completion(engine, future)
                     assert actual.generated_tokens == expected
+                    if depth:
+                        # The imported first token counts as the prefill engine's step.
+                        steps = actual.acceptance_step_lengths
+                        assert steps[0] == 1 and sum(steps) == len(actual.generated_tokens)
                     assert witness.steps and all(not step[2] for step in witness.steps)
                     assert witness.steps[0][0] == len(tokens)
                     assert_released(engine)

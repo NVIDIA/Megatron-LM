@@ -4,7 +4,8 @@ import atexit
 import csv
 import math
 from collections import Counter
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import numpy as np
 import torch
@@ -12,9 +13,29 @@ import torch
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split
-from megatron.training.datasets.utils import load_json_arg
+from megatron.training.datasets.utils import get_dataset_input_length, load_json_arg
 
 IGNORE_INDEX = -100
+
+
+@dataclass
+class SFTDatasetConfig(GPTDatasetConfig):
+    """SFT dataset settings and physical pack width."""
+
+    packed_sequence_length: Optional[int] = None
+    """Physical output width, including alignment padding. The training container derives this
+    from the model execution bound, falling back to ``sequence_length`` when unset.
+    Both real and mock SFT retain their existing pack-level truncation behavior."""
+
+    sft_loss_log_mode: Literal["token-weighted", "microbatch"] = "token-weighted"
+    """Report loss over all trainable tokens or average valid per-microbatch losses.
+    This does not change gradient normalization."""
+
+    def validate_without_tokenizer(self) -> None:
+        """Validate SFT settings without requiring a tokenizer."""
+        super().validate_without_tokenizer()
+        if self.sft_loss_log_mode not in ("token-weighted", "microbatch"):
+            raise ValueError("sft_loss_log_mode must be 'token-weighted' or 'microbatch'")
 
 
 class SFTLowLevelDataset:
@@ -72,7 +93,7 @@ class SFTDataset(MegatronDataset):
         return len(low_level_dataset)
 
     @staticmethod
-    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
+    def build_low_level_dataset(dataset_path: str, config: SFTDatasetConfig) -> LowLevelDataset:
         return SFTLowLevelDataset(dataset_path)
 
     def __len__(self) -> int:
@@ -116,7 +137,7 @@ class SFTDataset(MegatronDataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
 
         tokenizer = self.config.tokenizer
-        pack_length = self.config.sequence_length
+        pack_length = get_dataset_input_length(self.config)
 
         merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
         split_conversations = self._split_conversations(merged_conversations)
@@ -309,7 +330,7 @@ class MockSFTDataset(SFTDataset):
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
 
     @staticmethod
-    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
+    def build_low_level_dataset(dataset_path: str, config: SFTDatasetConfig) -> LowLevelDataset:
         if config.sft_mock_dataset_config_json is None:
             mock_config = {
                 "mode": "distribution",
@@ -329,7 +350,7 @@ class MockSFTDataset(SFTDataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
 
         tokenizer = self.config.tokenizer
-        pack_length = self.config.sequence_length
+        pack_length = get_dataset_input_length(self.config)
         eod = tokenizer.eod
         pad = tokenizer.pad
 

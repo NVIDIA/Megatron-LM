@@ -61,6 +61,27 @@ def test_checkpoint_detection(checkpoint_keys):
         vlm._mimo_checkpoint_prefix_map(args)
 
 
+@pytest.mark.parametrize(
+    ("balancing", "scope", "expected"),
+    [
+        ("quantile_balancing", "global_batch", False),
+        (["quantile_balancing"], "global_batch", False),
+        ("quantile_balancing", "micro_batch", True),
+        ("aux_loss", None, True),
+    ],
+)
+def test_checkpoint_expert_bias_with_balancing(checkpoint_keys, balancing, scope, expected):
+    """Global-batch quantile balancing applies expert_bias without the flag."""
+    checkpoint_keys.append("language_model.module.module.decoder.layers.1.mlp.router.expert_bias")
+    args = SimpleNamespace(
+        moe_router_enable_expert_bias=False,
+        moe_router_load_balancing_type=balancing,
+        moe_router_quantile_balancing_estimation_scope=scope,
+    )
+    vlm._enable_checkpoint_expert_bias(args)
+    assert args.moe_router_enable_expert_bias is expected
+
+
 @pytest.mark.parametrize("vision", [False, True], ids=["text", "vision"])
 def test_checkpoint_without_saved_args_uses_cli_vision_args(tmp_path, monkeypatch, vision):
     """Without saved args (e.g. Megatron-Bridge), --vision-model-type selects the VLM."""
@@ -176,8 +197,11 @@ def test_check_mimo_checkpoint_fully_loaded(monkeypatch, checkpoint_keys):
         vlm._check_mimo_checkpoint_fully_loaded(args, model)
 
 
-def test_mimo_vision_configs():
-    language_config = TransformerConfig(num_layers=1, hidden_size=32, num_attention_heads=4)
+@pytest.mark.parametrize("tp", [1, 2])
+def test_mimo_vision_configs(tp):
+    language_config = TransformerConfig(
+        num_layers=1, hidden_size=32, num_attention_heads=4, tensor_model_parallel_size=tp
+    )
     args = SimpleNamespace(
         vision_model_type='pixtral-vit-large',
         vision_num_layers=2,
@@ -196,6 +220,8 @@ def test_mimo_vision_configs():
 
     projection = vision_projection_config(args, language_config, config.add_bias_linear)
     assert (projection.hidden_size, projection.ffn_hidden_size) == (32, 32)
+    # The attention-free projection must build at any TP size the language model uses.
+    assert projection.tensor_model_parallel_size == tp
     assert projection.activation_func is _unfused_fast_gelu
     # Native mcore ViTs have no class tokens.
     assert get_num_image_embeddings(1540, 1540, 14, 'pixtral-vit-large', False, 1, False) == 110**2

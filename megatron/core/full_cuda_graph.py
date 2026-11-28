@@ -16,7 +16,7 @@ from megatron.core.tensor_parallel.random import (
     get_all_rng_states,
     prime_cuda_rng_states_for_graph_capture,
 )
-from megatron.core.transformer.cuda_graphs import capture_constants
+from megatron.core.transformer.cuda_graphs import capture_constants, no_gc_during_capture
 
 logger = logging.getLogger(__name__)
 
@@ -137,8 +137,11 @@ class FullIterationGradCopy:
         ]
         if self.graph is None:
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(
-                graph, pool=fb_graph.pool(), stream=stream, capture_error_mode="thread_local"
+            with (
+                no_gc_during_capture(),
+                torch.cuda.graph(
+                    graph, pool=fb_graph.pool(), stream=stream, capture_error_mode="thread_local"
+                ),
             ):
                 copy_fn()
             self.outputs = [(main_param, main_param.grad) for _, main_param in pairs]
@@ -326,6 +329,7 @@ class FullCudaGraphWrapper:
             symmetric_wgrad_pool.reset_completed_reuse_events()
             rerun_state_machine = get_rerun_state_machine()
             with (
+                no_gc_during_capture(),
                 capture_constants(FullCudaGraphWrapper.cuda_graph[training_str]),
                 torch.cuda.graph(
                     FullCudaGraphWrapper.cuda_graph[training_str],

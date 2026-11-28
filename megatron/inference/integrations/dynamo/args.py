@@ -36,6 +36,7 @@ class Config:
     parent_event_port: int | None = None
     endpoint_types: str = "chat,completions"
     handoff_owner: str | None = None
+    streaming_interval: int = 1
 
 
 def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -102,6 +103,19 @@ def parse_args(argv: list[str] | None = None) -> Config:
         help="Supervisor-assigned unique launch-attempt ID; never reuse across restarts.",
     )
     parser.add_argument(
+        "--streaming-interval",
+        type=int,
+        default=1,
+        help=(
+            "Minimum new tokens per partial reply the engine streams back to this worker. "
+            "After every step the engine slices and sends a partial for each streaming "
+            "request, in the same process as the forward pass, so 1 grows the step time "
+            "with the batch. Raise it when the consumer only needs whole responses (an RL "
+            "rollout, say); a decode worker then releases the prefill worker's KV after "
+            "its first partial rather than its first token."
+        ),
+    )
+    parser.add_argument(
         "--parent-event-host",
         default="127.0.0.1",
         help="Interface or hostname for the parent-owned engine event socket.",
@@ -128,6 +142,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         parser.error("--engine-start-timeout must be positive")
     if args.engine_shutdown_timeout <= 0:
         parser.error("--engine-shutdown-timeout must be positive")
+    if args.streaming_interval < 1:
+        parser.error("--streaming-interval must be at least 1")
     if not megatron_argv:
         parser.error("Megatron arguments are required after '--'")
     if args.role in ("prefill", "decode") and not args.coordinator_host:
@@ -160,4 +176,5 @@ def parse_args(argv: list[str] | None = None) -> Config:
         parent_event_port=args.parent_event_port,
         endpoint_types=args.endpoint_types,
         handoff_owner=args.handoff_owner,
+        streaming_interval=args.streaming_interval,
     )

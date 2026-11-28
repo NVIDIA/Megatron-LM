@@ -101,7 +101,6 @@ class MoETokenDispatcher:
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_modules contains moe_preprocess.
         self.cudagraph_attrs = []
-        self.valid_cudagraph_attrs = None
 
     @abstractmethod
     def dispatch_preprocess(
@@ -912,6 +911,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             fused=self.config.moe_permute_fusion,
             drop_and_pad=self.drop_and_pad,
             batch_invariant_inverse_map=self.batch_invariant_inverse_permutation_mapping,
+            ep_invariant_combine=self.config.moe_ep_invariant_combine,
         )
 
         # Reshape the output tensor

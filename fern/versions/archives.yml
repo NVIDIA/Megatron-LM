@@ -1,0 +1,4 @@
+navigation:
+  - page: Archives
+    path: ./archives.mdx
+    slug: /

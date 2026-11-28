@@ -969,9 +969,10 @@ class TestMtpChunkBoundaryCarry:
     def test_take_raises_on_a_position_mismatch(self):
         """A carry-holding continuation chunk takes no prefix skip, so its seam lands here.
 
-        `_compute_prefix_match` gives up that chunk's ENTIRE match to guarantee it. A mismatch
-        therefore means the back-off stopped holding, not that the carry is merely stale, and
-        declining would leave a committed position unwritten.
+        `_compute_prefix_match` guarantees it: the chunk takes no prefix skip, and may inherit
+        only matched blocks contiguous with its inherited run (a match after a gap is declined).
+        A mismatch therefore means the back-off stopped holding, not that the carry is merely
+        stale, and declining would leave a committed position unwritten.
         """
         meta = self._meta()
         meta.carry_chunk_boundary(hidden=self._hidden(meta, 1.0), req_id=42, position=3)

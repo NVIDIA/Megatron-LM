@@ -13,6 +13,21 @@ from torch._subclasses.fake_tensor import unset_fake_temporarily
 from megatron.core.jit import jit_fuser
 from megatron.core.utils import nvtx_decorator
 
+try:
+    import triton  # noqa: F401  # pylint: disable=unused-import
+
+    HAVE_TRITON = True
+except ImportError:
+    HAVE_TRITON = False
+
+
+def _use_triton_swiglu(input, gate_clamp_scale, linear_clamp_scale) -> bool:
+    """Whether the bias-free SwiGLU runs through the Triton kernels in fused_swiglu_triton.
+
+    SiTU-GLU (gate/linear tanh clamp) keeps the torch.compile path.
+    """
+    return HAVE_TRITON and input.is_cuda and gate_clamp_scale is None and linear_clamp_scale is None
+
 
 @cache
 def _probe_clamp_boundaries():
@@ -507,6 +522,10 @@ def bias_swiglu_impl(
             gate_clamp_scale,
             linear_clamp_scale,
         )
+    elif _use_triton_swiglu(input, gate_clamp_scale, linear_clamp_scale):
+        from megatron.core.fusions.fused_swiglu_triton import TritonSwiGLUFunction
+
+        output = TritonSwiGLUFunction.apply(input, fp8_input_store, cpu_offload_input, clamp_value)
     else:
         output = SwiGLUFunction.apply(
             input,
@@ -551,6 +570,10 @@ def weighted_bias_swiglu_impl(
     input = propagate_te_grouped_tensor_marker(input, input.view(-1, ori_shape[-1]))
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
+    elif _use_triton_swiglu(input, gate_clamp_scale, linear_clamp_scale):
+        from megatron.core.fusions.fused_swiglu_triton import TritonWeightedSwiGLUFunction
+
+        output = TritonWeightedSwiGLUFunction.apply(input, weights, fp8_input_store, clamp_value)
     else:
         output = WeightedSwiGLUFunction.apply(
             input, weights, fp8_input_store, clamp_value, gate_clamp_scale, linear_clamp_scale

@@ -237,6 +237,7 @@ class RolloutPipeline:
         self.num_infer_workers = self.gate.capacity * (
             rollouts_per_batch // self.gran_policy.units_per_batch()
         )
+        self.num_assemble_workers = max(1, self.num_infer_workers // request.rollouts_per_group)
 
         # Core queues.
         self.infer_queue = asyncio_Queue()
@@ -457,52 +458,62 @@ class RolloutPipeline:
         )
 
     async def stage_assemble(self) -> None:
+        """Run a persistent pool of assemble workers, spawned once per pipeline."""
+        workers = [
+            asyncio.create_task(self._assemble_worker()) for _ in range(self.num_assemble_workers)
+        ]
+        try:
+            await asyncio.gather(*workers)
+        finally:
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
+            self.output_queue.shutdown()
+
+    async def _assemble_worker(self) -> None:
         """Build complete rollout groups, and regenerate dropped groups."""
         pending = self._assemble_pending
-        try:
-            while True:
-                try:
-                    inferred = await self.assemble_queue.get()
-                except asyncio_QueueShutDown:
-                    break
-                dequeued_at = time.monotonic()
-                if inferred.inferred_at:
-                    self.assemble_queue_dwell.append(dequeued_at - inferred.inferred_at)
-                bucket = pending.setdefault(inferred.item.group_id, [])
-                bucket.append(inferred)
-                if len(bucket) < self.request.rollouts_per_group:
-                    continue
-                completed = pending.pop(inferred.item.group_id)
-                completed.sort(key=lambda item: item.item.rollout_idx)
-                rollouts = await asyncio.gather(
-                    *[item.item.params.build_rollout(item.episode) for item in completed]
+        while True:
+            try:
+                inferred = await self.assemble_queue.get()
+            except asyncio_QueueShutDown:
+                return
+            dequeued_at = time.monotonic()
+            if inferred.inferred_at:
+                self.assemble_queue_dwell.append(dequeued_at - inferred.inferred_at)
+            bucket = pending.setdefault(inferred.item.group_id, [])
+            bucket.append(inferred)
+            if len(bucket) < self.request.rollouts_per_group:
+                continue
+            completed = pending.pop(inferred.item.group_id)
+            completed.sort(key=lambda item: item.item.rollout_idx)
+            rollouts = await asyncio.gather(
+                *[item.item.params.build_rollout(item.episode) for item in completed]
+            )
+            first = completed[0]
+            self.assembled_count += 1
+            self.assembled_groups_per_env[first.item.env_index] += 1
+            group = RolloutGroup(
+                rollouts=rollouts,
+                batch_id=first.item.batch_id,
+                index_in_batch=first.item.index_in_batch,
+            )
+            if self._decide_drop(group):
+                self.dropped_count += 1
+                task = asyncio.create_task(
+                    self._regenerate_group(group.batch_id, group.index_in_batch)
                 )
-                first = completed[0]
-                self.assembled_count += 1
-                self.assembled_groups_per_env[first.item.env_index] += 1
-                group = RolloutGroup(
-                    rollouts=rollouts,
-                    batch_id=first.item.batch_id,
-                    index_in_batch=first.item.index_in_batch,
-                )
-                if self._decide_drop(group):
-                    self.dropped_count += 1
-                    task = asyncio.create_task(
-                        self._regenerate_group(group.batch_id, group.index_in_batch)
-                    )
-                    self._regen_tasks.add(task)
-                    task.add_done_callback(self._regen_tasks.discard)
-                    continue
-                if self.bank is not None:
-                    group.uid = self.bank.append(group)
-                self._output_enqueued_at[(group.batch_id, group.index_in_batch)] = (
-                    time.monotonic()
-                )
-                await self.output_queue.put(group)
-                self._groups_in_flight -= 1
-                self._maybe_close_intake()
-        finally:
-            self.output_queue.shutdown()
+                self._regen_tasks.add(task)
+                task.add_done_callback(self._regen_tasks.discard)
+                continue
+            if self.bank is not None:
+                group.uid = self.bank.append(group)
+            self._output_enqueued_at[(group.batch_id, group.index_in_batch)] = (
+                time.monotonic()
+            )
+            await self.output_queue.put(group)
+            self._groups_in_flight -= 1
+            self._maybe_close_intake()
 
     @staticmethod
     def _is_refillable_placeholder(rollout: "Rollout | TokenRollout") -> bool:

@@ -356,6 +356,7 @@ def test_vllm_mxfp8_layer_dispatches_to_mcore_path():
     expected = (object(), None)
     grouped_mlp = SimpleNamespace(
         _concatenated_weights_built=True,
+        build_inference_weights=lambda: None,
         _uses_mxfp8_weights=True,
         _fc1_weight=_mxfp8_weight(),
         _fc2_weight=_mxfp8_weight(),

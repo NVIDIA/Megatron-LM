@@ -17,7 +17,7 @@ MODEL_ARGS:
   --micro-batch-size: 4
   --global-batch-size: 32
   --seq-length: 1024
-  --max-position-embeddings: 1024
+  --max-position-embeddings: 1601
   --train-iters: 50
   --timing-log-level: 0
   --lr-decay-iters: 320000

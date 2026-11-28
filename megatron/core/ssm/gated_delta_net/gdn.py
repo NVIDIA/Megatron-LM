@@ -38,6 +38,7 @@ from megatron.core.ssm.ops.gdp import (
     fused_recurrent_gated_delta_rule_update,
 )
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_size,
@@ -77,6 +78,17 @@ def get_parameter_local_cp_headwise(
 
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
     # pylint: disable=missing-class-docstring
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward projection, convolution, and gated-delta-rule FLOPs."""
+        return cls._estimate_flops(config, total_real_tokens_in_batch, use_gdn2=False)
+
     def _setup_variant_attrs(self):
         """Set the GDN in_proj sizing, split tables, gate parameter dims, and kernel."""
         self.gdn_pre_gated_delta_rule_fusion = self.config.gdn_pre_gated_delta_rule_fusion
@@ -438,6 +450,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         batch_indices: torch.Tensor,
         intermediate_conv_state: torch.Tensor | None = None,
         intermediate_ssm_state: torch.Tensor | None = None,
+        replay_context: DynamicInferenceContext | None = None,
     ) -> torch.Tensor:
         """Run one CUDA-graph-compatible GDN decode token per request.
 
@@ -449,6 +462,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         assert (
             intermediate_conv_state is None and intermediate_ssm_state is None
         ), "GDN speculative decoding state capture is not supported."
+        assert replay_context is None, "ReplaySSM supports only Mamba-2 mixers."
 
         qkv, gate, beta, alpha = self._split_projection(projected, batch, seq_len, cp_size=1)
         qkv = causal_conv1d_update(

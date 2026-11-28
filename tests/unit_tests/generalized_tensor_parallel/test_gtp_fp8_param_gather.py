@@ -46,7 +46,7 @@ from megatron.training.utils import get_device_arch_version
 # world/DP config + global-state pollution); reused by composition only.
 from tests.unit_tests.test_fp8_param import TestFP8Param as _FP8ParamHarness
 from tests.unit_tests.test_fp8_param import fp8_available, reason_for_no_fp8
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, te_reads_legacy_grouped_env
 
 HAVE_FLA_SEQUENCE_PACKING, FLA_SEQUENCE_PACKING_REASON = check_fla_sequence_packing_support()
 HAVE_GDP_DEPS = all(
@@ -595,7 +595,8 @@ class TestGTPFp8ParamGather:
         if Utils.world_size != 4:
             pytest.skip("Requires exactly 4 torchrun ranks for EP2 x EDP2")
 
-        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        if te_reads_legacy_grouped_env():
+            monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
 
         harness = _FP8ParamHarness()
         harness.setup_method(None)

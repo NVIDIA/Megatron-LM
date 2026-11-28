@@ -24,25 +24,27 @@ import torch
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualRead
 from megatron.core.typed_torch import apply_module
+from megatron.core.utils import get_pg_size
 
-# Layer symbols that may precede a shortcut MoE
-SUPPORTED_SHORTCUT_PREDECESSORS = frozenset(
-    {LayerSymbols.MAMBA, LayerSymbols.GDN}
-    | {
-        symbol
-        for symbol, layer_config in LayerSymbols.LAYER_CONFIG_MAP.items()
-        if layer_config in LayerSymbols.ATTENTION_LAYER_CONFIGS
-    }
+# Built-in config types that may precede a shortcut MoE.
+SUPPORTED_SHORTCUT_PREDECESSOR_CONFIGS = frozenset(
+    {MambaLayerConfig, GDNLayerConfig} | LayerSymbols.ATTENTION_LAYER_CONFIGS
 )
 
 
@@ -57,7 +59,7 @@ def _get_offloading_interface():
 
 def group_layers_into_shortcut_blocks(
     layers: torch.nn.ModuleList,
-    layer_type_list: Sequence[str],
+    layer_config_list: Sequence[TransformerConfig],
     config: TransformerConfig,
     pp_layer_offset: int = 0,
 ) -> torch.nn.ModuleList:
@@ -68,7 +70,7 @@ def group_layers_into_shortcut_blocks(
 
     Args:
         layers: Physical layers in execution order.
-        layer_type_list: Physical layer symbols in execution order.
+        layer_config_list: Physical layer configs in execution order.
         config: Transformer configuration controlling shortcut scheduling.
         pp_layer_offset: Global offset of this pipeline stage's first physical layer.
 
@@ -80,7 +82,7 @@ def group_layers_into_shortcut_blocks(
             pipeline-stage boundary.
     """
 
-    if pp_layer_offset > 0 and layer_type_list and layer_type_list[0] == LayerSymbols.MOE:
+    if pp_layer_offset > 0 and layer_config_list and type(layer_config_list[0]) is MoELayerConfig:
         raise ValueError(
             "Shortcut MoE pairs cannot cross pipeline-stage boundaries; this pipeline stage "
             f"begins with an MoE layer (global layer {pp_layer_offset + 1}). Move the stage "
@@ -92,7 +94,7 @@ def group_layers_into_shortcut_blocks(
     while physical_index < len(layers):
         next_is_moe = (
             physical_index + 1 < len(layers)
-            and layer_type_list[physical_index + 1] == LayerSymbols.MOE
+            and type(layer_config_list[physical_index + 1]) is MoELayerConfig
         )
         if not next_is_moe:
             grouped_layers.append(layers[physical_index])
@@ -100,8 +102,8 @@ def group_layers_into_shortcut_blocks(
             continue
 
         compute_layer = layers[physical_index]
-        paired_type = layer_type_list[physical_index]
-        if paired_type not in SUPPORTED_SHORTCUT_PREDECESSORS:
+        paired_type = type(layer_config_list[physical_index])
+        if paired_type not in SUPPORTED_SHORTCUT_PREDECESSOR_CONFIGS:
             raise ValueError(
                 "Shortcut MoE must be preceded by a Mamba, GDN, or supported attention layer"
             )
@@ -112,7 +114,7 @@ def group_layers_into_shortcut_blocks(
         )
         if not supports_two_stage:
             raise ValueError(
-                f"Shortcut attention layer {paired_type!r} does not support two-stage attention"
+                f"Shortcut layer {paired_type.__name__} does not support two-stage attention"
             )
         moe_layer = layers[physical_index + 1]
         grouped_layers.append(
@@ -140,6 +142,10 @@ class ShortcutMoEBlock(MegatronModule):
         if cls._parallel_stream is None:
             cls._parallel_stream = torch.cuda.Stream(priority=-1)
         return cls._parallel_stream
+
+    # Inference reuses this stream only for routed expert compute; its collectives stay on
+    # the calling stream.
+    _get_moe_overlap_stream = _get_a2a_overlap_stream
 
     def __init__(
         self,
@@ -233,6 +239,24 @@ class ShortcutMoEBlock(MegatronModule):
             else IdentityOp()
         )
         self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
+
+    def setup_inference_overlap(self) -> None:
+        """Create synchronization state and check stream ownership before graph capture.
+
+        The shortcut stream must not issue any collective (see `_forward_inference_overlap`).
+        It runs only the routed experts. At TP>1 require the inference grouped experts, which
+        communicate only through the NVLS dispatcher on the main stream, rather than trusting
+        a custom spec.
+        """
+        if self.route_ready_event is None:
+            self.route_ready_event = torch.cuda.Event()
+        if get_pg_size(self.tp_group) > 1 and not isinstance(
+            getattr(self.moe_layer.mlp, "experts", None), InferenceGroupedMLP
+        ):
+            raise RuntimeError(
+                "Shortcut MoE inference overlap at TP>1 requires InferenceGroupedMLP experts, "
+                "which issue no TP-group collectives"
+            )
 
     def _read_shortcut_hidden(
         self,
@@ -446,6 +470,109 @@ class ShortcutMoEBlock(MegatronModule):
         )
         return hidden_states
 
+    def _forward_inference_overlap(
+        self,
+        hidden_states,
+        *,
+        attention_mask,
+        inference_context,
+        rotary_pos_emb,
+        sequence_len_offset,
+        packed_seq_params,
+        padding_mask,
+        quant_context_factory,
+        attn_recompute_context,
+        moe_recompute_context,
+    ):
+        """Run the routed experts on a side stream while the mixer runs on the main stream.
+
+        Every collective stays on the main stream, in the same program order on every rank:
+        the predecessor's and the shared expert's TP / sequence-parallel collectives, and the
+        NVLS dispatcher's metadata exchange, AllGather-V and ReduceScatter-V. These kernels
+        spin-wait on their peers, so if two streams could each have one in flight, two GPUs
+        that schedule them in different orders would wait on each other forever. Only local
+        compute forks to the shortcut stream: the routed experts' grouped GEMMs.
+
+        Main stream: shortcut read, norm, router and latent projection, then dispatch. Fork the
+        experts, then run the mixer and the shared expert. Join, combine, residual write.
+        The experts read the AllGather-V buffers and may write the ReduceScatter-V buffer; no
+        main-stream work between fork and join touches either, and the next dispatch or
+        combine on them runs after the join.
+        """
+        if attn_recompute_context is not None or moe_recompute_context is not None:
+            raise RuntimeError("Shortcut MoE inference cannot use residual-stream recomputation")
+        if inference_context is None or not inference_context.is_dynamic_batching():
+            raise RuntimeError("Shortcut MoE inference overlap requires dynamic batching")
+        if inference_context.num_speculative_tokens:
+            raise RuntimeError(
+                "Shortcut MoE overlap with speculative decoding requires further testing"
+            )
+        shortcut_hidden = hidden_states
+        if not isinstance(self.compute_layer, (MambaLayer, TransformerLayer)):
+            raise RuntimeError(
+                "Shortcut MoE inference overlap requires a Mamba or Transformer layer"
+            )
+        if not isinstance(self.moe_layer.mlp.token_dispatcher, NVLSAllGatherVDispatcher):
+            raise RuntimeError("Shortcut MoE inference overlap requires the active NVLS dispatcher")
+
+        main_stream = torch.cuda.current_stream()
+        shortcut_stream = self._get_moe_overlap_stream()
+        with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
+            shortcut_hidden = self._read_shortcut_hidden(shortcut_hidden, recompute_context=None)
+            route_input, route_probs = self._moe_router_preprocess(
+                shortcut_hidden=shortcut_hidden,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
+                recompute_context=None,
+            )
+            # Dispatch runs on the calling (main) stream, like every other collective.
+            dispatched_input, dispatched_probs = self.moe_layer.mlp.dispatch(
+                route_input, route_probs
+            )
+
+        # Fork after the dispatch: only the experts' local compute runs on the shortcut stream.
+        self.route_ready_event.record(main_stream)
+        shortcut_stream.wait_event(self.route_ready_event)
+        dispatched_input.record_stream(shortcut_stream)
+        dispatched_probs.record_stream(shortcut_stream)
+        with torch.cuda.stream(shortcut_stream):
+            with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
+                routed_output, _ = self.moe_layer.mlp.routed_experts_compute(
+                    dispatched_input, dispatched_probs
+                )
+
+        with quant_context_factory(self.compute_layer.config, self.attn_layer_idx):
+            compute_output = self._forward_compute_atomic(
+                hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+            )
+
+        with quant_context_factory(self.moe_layer.config, self.moe_layer_idx):
+            shared_expert_output, moe_unflatten_mbs, residual, mlp_state = self._moe_shared_experts(
+                hidden_states=compute_output,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
+                recompute_context=None,
+            )
+            # Join the routed experts' compute back onto the main stream, then combine there.
+            main_stream.wait_stream(shortcut_stream)
+            routed_output.record_stream(main_stream)
+            combined_output = self.moe_layer.mlp.combine(routed_output)
+            return self._postprocess(
+                residual=residual,
+                combined_output=combined_output,
+                shared_expert_output=shared_expert_output,
+                mlp_state=mlp_state,
+                packed_seq_params=packed_seq_params,
+                moe_unflatten_mbs=moe_unflatten_mbs,
+                recompute_context=None,
+            )
+
     def forward(
         self,
         hidden_states,
@@ -480,6 +607,23 @@ class ShortcutMoEBlock(MegatronModule):
             assert inference_context is None, (
                 "Shortcut-MoE received an inference context outside inference mode; the two-stage "
                 "schedule does not update KV-cache or recurrent inference state."
+            )
+        if (
+            inference
+            and inference_context is not None
+            and inference_context.config.inference_shortcut_moe_overlap
+        ):
+            return self._forward_inference_overlap(
+                hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                quant_context_factory=quant_context_factory,
+                attn_recompute_context=attn_recompute_context,
+                moe_recompute_context=moe_recompute_context,
             )
         overlap = self.overlap_mode and not inference
 

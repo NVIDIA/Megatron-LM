@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import gc
 import os
 from argparse import Namespace
 from datetime import timedelta
@@ -13,6 +14,7 @@ from megatron.core.inference import utils as inference_utils
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.tensor_parallel import random as tp_random
 from megatron.core.transformer import cuda_graphs, multi_token_prediction
+from megatron.core.utils import is_te_min_version
 from megatron.training.argument_utils import (
     gpt_config_from_args,
     hybrid_config_from_args,
@@ -75,6 +77,9 @@ def reset_cuda_graph_global_state():
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         cuda_graphs.delete_cuda_graphs()
+    # The first CudaGraphManager switches to the capture stream; clear it so the next test's
+    # first manager does so again (the previous capture returned to the default stream).
+    cuda_graphs.CudaGraphManager.global_capture_stream = None
 
 
 def _snapshot_torch_settings():
@@ -137,6 +142,10 @@ def snapshot_process_state():
     state = {
         # Set by every engine, cleared only by suspend(); breaks TestInferenceTopKRouter.
         "inference_mode": (InferenceMode._is_active, InferenceMode._use_bounded_mxfp8_rows),
+        # Engines freeze the heap in the freeze gc modes and disable automatic collection in
+        # freeze_overlap; only suspend() or shutdown() undoes it, so a test that stops short
+        # leaves gc disabled and its frozen garbage unreclaimable for every later test.
+        "gc": (gc.isenabled(), gc.get_freeze_count()),
         # The first init fixes the tracker type;
         # TestPartialCudaGraph forces TE, TestMTPCudaGraphInference the no-op one.
         "rng_tracker": (
@@ -157,6 +166,13 @@ def snapshot_process_state():
 def restore_process_state(state):
     """Return every item captured by `snapshot_process_state` to its captured value."""
     InferenceMode._is_active, InferenceMode._use_bounded_mxfp8_rows = state["inference_mode"]
+    gc_enabled, frozen = state["gc"]
+    (gc.enable if gc_enabled else gc.disable)()
+    if gc.get_freeze_count() != frozen:
+        # Unfrozen garbage is only reclaimed by a collection; run it now rather than leave it
+        # for CPython's deferred full collection.
+        gc.unfreeze()
+        gc.collect()
     tp_random._CUDA_RNG_STATE_TRACKER, tp_random._CUDA_RNG_STATE_TRACKER_INITIALIZED = state[
         "rng_tracker"
     ]
@@ -173,6 +189,11 @@ def reset_transient_process_state():
     # Built from the first model (TestMTPCudaGraphExpertParallel resets it by hand).
     inference_utils.moe_layer_cache = None
     inference_utils._moe_metadata_sync_initialized = False
+
+
+def te_reads_legacy_grouped_env() -> bool:
+    """TE before 2.21 selects single grouped parameters and CuTeDSL fusion through env vars."""
+    return not is_te_min_version("2.21.0")
 
 
 def is_nccl_ep_available():
@@ -386,3 +407,18 @@ class Utils:
         ps.set_virtual_pipeline_model_parallel_rank(0)
 
         ps.set_pipeline_model_parallel_world_size(pipeline_model_parallel_size)
+
+
+def sync_checkpoint_config(args):
+    """Give the registered run config the checkpoint section these arguments describe.
+
+    Checkpoint settings are owned by the run config's ``CheckpointConfig``, not by the argument
+    namespace. Tests that still describe them on a namespace call this right before saving or
+    loading, after their last write to ``args``; the section is returned for further edits.
+    """
+    from megatron.training.argument_utils import checkpoint_config_from_args
+    from megatron.training.global_vars import get_run_config
+
+    run_config = get_run_config()
+    run_config.checkpoint = checkpoint_config_from_args(args)
+    return run_config.checkpoint

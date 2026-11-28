@@ -72,14 +72,25 @@ def test_forward_video_accounts_for_native_merging(
             token_count = int(patch_hw.prod(dim=-1).sum())
             return torch.ones(1, token_count, 2)
 
-    def gather(local_embeddings, num_padded_ranks):
-        gathered_padding.append(num_padded_ranks)
+    cp_group = object()
+
+    def gather(local_embeddings, num_padded_imgs=0, cp_group=None):
+        assert cp_group is model.pg_collection.cp
+        gathered_padding.append(num_padded_imgs)
         assert local_embeddings.shape[0] == (1 if cp_size > num_frames else tokens_per_frame)
         return torch.ones(total_tokens, 1, 2)
 
-    monkeypatch.setattr(context_parallel, "get_context_parallel_world_size", lambda: cp_size)
-    # For CP=4, the last rank owns a dummy image; for CP=2 it owns a real frame.
-    monkeypatch.setattr(context_parallel, "get_context_parallel_rank", lambda: cp_size - 1)
+    def group_size(group):
+        assert group is cp_group
+        return cp_size
+
+    def group_rank(group):
+        assert group is cp_group
+        # For CP=4, the last rank owns a dummy image; for CP=2 it owns a real frame.
+        return cp_size - 1
+
+    monkeypatch.setattr(context_parallel, "get_pg_size", group_size)
+    monkeypatch.setattr(context_parallel, "get_pg_rank", group_rank)
     monkeypatch.setattr(llava_model, "gather_from_context_parallel_ranks_dynamic_res", gather)
 
     model = object.__new__(LLaVAModel)
@@ -105,6 +116,7 @@ def test_forward_video_accounts_for_native_merging(
     model._vision_projection_fp8 = False
     model._balance_vision_context_parallel_by_tokens = balance_by_tokens
     model._profile_vision_context_parallel_partition = False
+    model.pg_collection = SimpleNamespace(cp=cp_group)
     captured = {}
 
     def preprocess(image_embeddings, *args, **kwargs):

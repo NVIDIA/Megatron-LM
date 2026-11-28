@@ -30,7 +30,10 @@ from megatron.core.models.common.embeddings import (
     apply_rotary_pos_emb,
 )
 from megatron.core.packed_seq_params import resolve_cp_group
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
@@ -141,6 +144,32 @@ class AbsorbedMLASelfAttention(Attention):
     computation which can be more efficient for certain attention variants.
     """
 
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: MLATransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward absorbed DSA attention, excluding its separately counted indexer."""
+        from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+        from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import (
+            DSALayerConfig,
+        )
+        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+
+        estimator = (
+            DSAttention
+            if isinstance(config, DSALayerConfig) or config.experimental_attention_variant == "dsa"
+            else MLASelfAttention
+        )
+        return estimator.estimate_flops(
+            config,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+        )
+
     def _mla_projection_context(self, *, is_init: bool = False):
         """Use high precision for MLA projections only when explicitly requested."""
         if not self.config.mla_proj_use_quantization:
@@ -160,6 +189,7 @@ class AbsorbedMLASelfAttention(Attention):
         is_mtp_layer: bool = False,
     ):
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         super().__init__(

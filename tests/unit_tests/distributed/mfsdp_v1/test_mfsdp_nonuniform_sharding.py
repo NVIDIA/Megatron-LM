@@ -94,13 +94,16 @@ def build_replicated_models(seed: int = 1234):
     return reference_model, model
 
 
-def assert_loss_curve_matches_reference(fsdp_model, fsdp_optimizer, reference_model):
+def assert_loss_curve_matches_reference(
+    fsdp_model, fsdp_optimizer, reference_model, after_step=None
+):
     """
     Train the sharded model against a replicated reference and compare their loss curves.
 
     The reference is an unwrapped replica whose gradients are averaged by hand, so any
     sharding scheme that assembles the wrong weights or applies the wrong gradient scaling
-    diverges from it on the step after the error is introduced.
+    diverges from it on the step after the error is introduced. `after_step`, if given, is
+    called after every optimizer step.
     """
     reference_optimizer = torch.optim.SGD(reference_model.parameters(), lr=LEARNING_RATE)
 
@@ -131,6 +134,8 @@ def assert_loss_curve_matches_reference(fsdp_model, fsdp_optimizer, reference_mo
         fsdp_optimizer.step()
         reference_optimizer.zero_grad()
         fsdp_optimizer.zero_grad()
+        if after_step is not None:
+            after_step()
 
     torch.testing.assert_close(torch.stack(losses), torch.stack(reference_losses))
 

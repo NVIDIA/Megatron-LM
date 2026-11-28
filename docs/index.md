@@ -1,11 +1,11 @@
-<!---
+{/*
    Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
    and proprietary rights in and to this software, related documentation
    and any modifications thereto. Any use, reproduction, disclosure or
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
--->
+*/}
 
 # Megatron Core User Guide
 
@@ -23,109 +23,3 @@ Megatron Core offers a flexible, reusable foundation for building large-scale tr
 * High-performance dataloaders and dataset utilities
 * Model architectures (LLaMA, Qwen, DeepSeek, GPT, Mamba)
 
-
-```{toctree}
-:maxdepth: 2
-:hidden:
-:caption: About Megatron Core
-
-get-started/overview
-get-started/releasenotes
-```
-
-```{toctree}
-:maxdepth: 2
-:hidden:
-:caption: Get Started
-
-get-started/install
-get-started/quickstart
-```
-
-```{toctree}
-:maxdepth: 2
-:hidden:
-:caption: Basic Usage
-
-user-guide/data-preparation
-user-guide/training-examples
-user-guide/parallelism-guide
-```
-
-```{toctree}
-:maxdepth: 2
-:hidden:
-:caption: Supported Models
-
-models/index
-```
-
-```{toctree}
-:maxdepth: 2
-:hidden:
-:caption: Advanced Features
-
-user-guide/deterministic-training
-user-guide/features/moe
-user-guide/features/megatron_fsdp
-user-guide/features/dist_optimizer
-user-guide/features/checkpoint-merge
-user-guide/features/optimizer_cpu_offload
-user-guide/features/fine_grained_activation_offloading
-user-guide/data-loading
-user-guide/features/megatron_energon
-user-guide/features/megatron_rl
-user-guide/features/tokenizers
-developer/gdn_ew_fusion
-```
-
-```{toctree}
-:maxdepth: 2
-:hidden:
-:caption: Inference
-
-mcore-inference-user-guide
-```
-
-```{toctree}
-:maxdepth: 2
-:hidden:
-:caption: Observability
-
-user-guide/observability/index
-user-guide/observability/configuration
-user-guide/observability/span-groups
-user-guide/observability/metrics
-user-guide/observability/pipeline-parallel
-user-guide/observability/extending
-```
-
-```{toctree}
-:maxdepth: 1
-:hidden:
-:caption: Developer Guide
-
-developer/contribute
-developer/parallel-state-deprecation
-developer/submit
-developer/oncall
-developer/generate_docs
-```
-
-```{toctree}
-:maxdepth: 2
-:hidden:
-:caption: API Reference
-
-api-guide/index
-apidocs/index.rst
-```
-
-```{toctree}
-:maxdepth: 2
-:hidden:
-:caption: Resources
-
-user-guide/hybrid-model-migration
-advanced/index
-```

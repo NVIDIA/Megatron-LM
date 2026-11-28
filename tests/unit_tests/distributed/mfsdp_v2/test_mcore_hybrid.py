@@ -49,7 +49,7 @@ def _config() -> TransformerConfig:
 
 
 def _build_model_and_optimizer(
-    config, outer_size, outer_strategy, inner_strategy="optim_grads_params"
+    config, outer_size, outer_strategy, inner_strategy="optim_grads_params", optimizer_name="sgd"
 ):
     """Build a model and optimizer over the already-initialized DP topology.
 
@@ -75,13 +75,14 @@ def _build_model_and_optimizer(
     )
     optimizer = get_megatron_optimizer(
         OptimizerConfig(
-            optimizer="sgd",
+            optimizer=optimizer_name,
             lr=1.0e-2,
             weight_decay=0.0,
             bf16=True,
             params_dtype=torch.bfloat16,
             use_distributed_optimizer=False,
             clip_grad=0.0,
+            muon_split_qkv=False,
         ),
         [model],
     )
@@ -170,11 +171,12 @@ def test_hybrid_placements(model_parallel_cleanup, outer_strategy, inner_strateg
         assert parameter.grad.placements == (expected_outer, Shard(0))
 
 
+@pytest.mark.parametrize("optimizer_name", ["sgd", "muon"])
 @pytest.mark.parametrize("microbatches", [1, 2])
 @pytest.mark.parametrize("outer_strategy", ["no_shard", "optim"])
 @pytest.mark.parametrize("inner_strategy", ["optim_grads", "optim_grads_params"])
 def test_hybrid_matches_zero3_reference(
-    model_parallel_cleanup, outer_strategy, inner_strategy, microbatches
+    model_parallel_cleanup, outer_strategy, inner_strategy, microbatches, optimizer_name
 ):
     """Compare losses against ZeRO-3 sharded across all DP ranks.
 
@@ -184,7 +186,9 @@ def test_hybrid_matches_zero3_reference(
     """
     config = _config()
     Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=1)
-    model, optimizer = _build_model_and_optimizer(config, 1, "no_shard")
+    model, optimizer = _build_model_and_optimizer(
+        config, 1, "no_shard", optimizer_name=optimizer_name
+    )
     reference = _train(model, optimizer, microbatches=microbatches)
     del model, optimizer
     destroy_model_parallel()
@@ -192,27 +196,44 @@ def test_hybrid_matches_zero3_reference(
     outer_size = 2
     Utils.initialize_model_parallel(1, 1, num_distributed_optimizer_instances=outer_size)
     model, optimizer = _build_model_and_optimizer(
-        config, outer_size, outer_strategy, inner_strategy
+        config, outer_size, outer_strategy, inner_strategy, optimizer_name
     )
     actual = _train(model, optimizer, microbatches=microbatches)
     assert torch.isfinite(reference).all()
     torch.testing.assert_close(actual, reference, rtol=1e-2, atol=0)
 
 
+@pytest.mark.flaky_in_dev
+@pytest.mark.parametrize("optimizer_name", ["sgd", "muon"])
 @pytest.mark.parametrize("ep_size", [1, 2])
 @pytest.mark.parametrize("dense_outer_strategy", ["optim", "no_shard"])
 @pytest.mark.parametrize("expert_outer_strategy", ["optim", "no_shard"])
+@pytest.mark.parametrize("dense_outer_size,expert_outer_size", [(2, 2), (2, 1), (1, 2), (4, 2)])
 def test_moe_with_independent_hybrid_placements(
-    model_parallel_cleanup, dense_outer_strategy, expert_outer_strategy, ep_size
+    model_parallel_cleanup,
+    dense_outer_strategy,
+    expert_outer_strategy,
+    ep_size,
+    dense_outer_size,
+    expert_outer_size,
+    optimizer_name,
 ):
     """Check dense/expert placements and finite losses across accumulated optimizer steps."""
-    outer_size = 2
+    outer_size = max(dense_outer_size, expert_outer_size)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size % (outer_size * ep_size):
-        pytest.skip("MoE + hybrid needs a world size divisible by EP * 2 (outer DP size).")
+        pytest.skip("MoE + hybrid needs a world size divisible by EP * the larger outer DP size.")
+    if (dense_outer_size == 1 and dense_outer_strategy != "no_shard") or (
+        expert_outer_size == 1 and expert_outer_strategy != "no_shard"
+    ):
+        pytest.skip("An outer sharding strategy other than no_shard needs an outer DP axis.")
 
     Utils.initialize_model_parallel(
-        1, 1, expert_model_parallel_size=ep_size, num_distributed_optimizer_instances=outer_size
+        1,
+        1,
+        expert_model_parallel_size=ep_size,
+        num_distributed_optimizer_instances=dense_outer_size,
+        expert_num_distributed_optimizer_instances=expert_outer_size,
     )
     process_group_collection = ProcessGroupCollection.use_mpu_process_groups()
     torch.manual_seed(123)
@@ -244,7 +265,8 @@ def test_moe_with_independent_hybrid_placements(
             use_distributed_optimizer=False,
             data_parallel_sharding_strategy="optim_grads",
             expert_data_parallel_sharding_strategy="optim_grads_params",
-            num_distributed_optimizer_instances=outer_size,
+            num_distributed_optimizer_instances=dense_outer_size,
+            expert_num_distributed_optimizer_instances=expert_outer_size,
             outer_dp_sharding_strategy=dense_outer_strategy,
             expert_outer_dp_sharding_strategy=expert_outer_strategy,
         ),
@@ -260,20 +282,24 @@ def test_moe_with_independent_hybrid_placements(
     )
     optimizer = get_megatron_optimizer(
         OptimizerConfig(
-            optimizer="sgd",
+            optimizer=optimizer_name,
             lr=1.0e-3,
             weight_decay=0.0,
             use_distributed_optimizer=False,
             clip_grad=0.0,
+            muon_split_qkv=False,
         ),
         [model],
     )
 
+    outer_sizes = {False: dense_outer_size, True: expert_outer_size}  # keyed by is_expert
     for name, submodule in model.named_modules():
         if isinstance(submodule, FsdpModule):
-            inner = RowAtomic() if "experts" in name else Replicate()
+            is_expert = "experts" in name
+            inner = RowAtomic() if is_expert else Replicate()
+            expected = (Replicate(), inner) if outer_sizes[is_expert] > 1 else (inner,)
             for group in submodule.parameter_groups:
-                assert group.model_weight.placements == (Replicate(), inner), name
+                assert group.model_weight.placements == expected, name
 
     for _ in range(3):
         optimizer.zero_grad(set_to_none=True)
@@ -302,6 +328,9 @@ def test_moe_with_independent_hybrid_placements(
             is_expert = "experts" in name
             seen_expert.add(is_expert)
             outer = expert_outer if is_expert else dense_outer
-            assert parameter.grad.device_mesh.mesh_dim_names == ("dp_outer", "dp_shard")
-            assert parameter.grad.placements == (outer, Shard(0)), name
+            if outer_sizes[is_expert] > 1:
+                assert parameter.grad.device_mesh.mesh_dim_names == ("dp_outer", "dp_shard")
+                assert parameter.grad.placements == (outer, Shard(0)), name
+            else:
+                assert parameter.grad.placements == (Shard(0),), name
     assert seen_expert == {False, True}

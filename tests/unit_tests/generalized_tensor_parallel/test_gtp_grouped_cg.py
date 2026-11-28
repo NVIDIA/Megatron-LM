@@ -40,6 +40,7 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
     reset_fp8_state,
     reset_gtp_globals,
 )
+from tests.unit_tests.test_utilities import te_reads_legacy_grouped_env
 
 
 @pytest.fixture
@@ -185,19 +186,24 @@ def _native_model(group, recipe):
     return model
 
 
+@pytest.mark.parametrize("registered", [False, True], ids=["default-chains", "registered-chains"])
 @pytest.mark.parametrize("mxfp8", [False, True], ids=["bf16", "native-mxfp8"])
-def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8):
+def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8, registered):
     if mxfp8:
         _requires_mxfp8()
-        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")
+        if te_reads_legacy_grouped_env():
+            monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")
     recipe = MXFP8BlockScaling() if mxfp8 else None
     model = (
         _native_model(expert_group, recipe)
         if mxfp8
         else torch.nn.Sequential(*[_Block(expert_group) for _ in range(4)]).cuda()
     )
-    gtp.set_cuda_graph_modules([], cuda_graph_impl="full_iteration")
-    gtp.classify_gtp_chains(model)
+    if registered:
+        for role in ("linear_fc1", "linear_fc2"):
+            gtp.register_prefetch_chain(role, [getattr(b.mlp.experts, role).weight0 for b in model])
+    gtp.classify_gtp_remat_chains(model, cuda_graph_impl="full_iteration")
+    assert all(hasattr(p, "_gtp_prefetch_chain_name") for p in model.parameters())
     params = _initialize_grads(model)
     assert len(params) == 16
     if mxfp8:
@@ -248,7 +254,10 @@ def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8):
         ]
         assert roles[0][0].chain_id != roles[1][0].chain_id
         for leaders in roles:
-            assert all("grouped" in p.chain_id and p.chain_id.endswith("_graphed") for p in leaders)
+            assert all(
+                gtp._chain_is_grouped(p.chain_id) and gtp._chain_is_graphed(p.chain_id)
+                for p in leaders
+            )
             for previous, current in zip(leaders, leaders[1:]):
                 assert previous.next_w is current and current.prev_w is previous
         if mxfp8:
@@ -276,7 +285,8 @@ def test_grouped_full_iteration_replay(expert_group, monkeypatch, mxfp8):
             torch.cuda.synchronize()
 
 
-def test_grouped_local_graph_replay(expert_group):
+@pytest.mark.parametrize("registered", [False, True], ids=["default-chains", "registered-chains"])
+def test_grouped_local_graph_replay(expert_group, registered):
     group = expert_group
     config = TransformerConfig(
         num_layers=4,
@@ -307,8 +317,12 @@ def test_grouped_local_graph_replay(expert_group):
             return self.compute(hidden_states=hidden_states)
 
     model = torch.nn.Sequential(*[LocalBlock(i) for i in range(4)]).cuda()
-    gtp.set_cuda_graph_modules(["moe"], cuda_graph_impl="local")
-    gtp.classify_gtp_chains(model)
+    if registered:
+        for role in ("linear_fc1", "linear_fc2"):
+            gtp.register_prefetch_chain(
+                role, [getattr(b.unit.mlp.experts, role).weight0 for b in model]
+            )
+    gtp.classify_gtp_remat_chains(model, cuda_graph_modules=["moe"], cuda_graph_impl="local")
     params = _initialize_grads(model)
     inputs = [torch.randn(64, 128, device="cuda", dtype=torch.bfloat16) for _ in range(6)]
     initial = [p.detach().clone() for p in params]

@@ -717,9 +717,11 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         else:
             for start, layer in enumerate(decoder_layers[:num_layers]):
                 add_segment([layer], start)
-        # MTP is one segment per depth under both methods. overlap_moe_expert_parallel_comm
-        # only supports mtp_num_layers == 1, so the MTP side of the config is identical
-        # either way. MultiTokenPredictionLayer._checkpointed_forward leaves MTP eager
+        # MTP is one segment per depth under both methods. TransformerConfig rejects full
+        # recompute with mtp_num_layers > 1 under overlap_moe_expert_parallel_comm, so the
+        # MTP side of the config is identical either way. A later depth's replay would read
+        # the earlier depths' no-grad outputs from the chunk state and drop their loss
+        # gradients. MultiTokenPredictionLayer._checkpointed_forward leaves MTP eager
         # under 'block' (its own TODO), which is safe there because the decoder block goes
         # through tensor_parallel.checkpoint and keeps an autograd edge into MTP. This
         # path's replay has no such edge, so an eager MTP would strand the hand-off.
@@ -844,8 +846,15 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_schedule_plan.record_current_stream()
             assert b_grad is not None
             if pre_backward is not None:
-                pre_backward(b_schedule_plan.vp_stage)
-                b_schedule_plan.record_current_stream()
+                # The received gradient only gates the backward chunk, whose first layer op
+                # (combine backward) runs on the comm stream. Wait for it there, so the paired
+                # forward layer's pre-dispatch computation is not held behind it. Comm-stream
+                # work queued after this wait (including the paired forward dispatch, which
+                # follows combine backward) still waits for the receive.
+                with torch.cuda.stream(get_comm_stream()):
+                    b_schedule_plan.wait_current_stream()
+                    pre_backward(b_schedule_plan.vp_stage)
+                    b_schedule_plan.record_current_stream()
 
             # Before any layer backward: post_process keeps its own graph and detaches
             # its input, and releasing it first avoids co-materializing a large vocab
