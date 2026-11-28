@@ -1,6 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 
+import dataclasses
+
 import pytest
 import torch
 
@@ -162,3 +164,77 @@ class TestSquaredReluClampDispatch:
         fused_out, _ = fused_mlp(hidden_states)
         unfused_out, _ = unfused_mlp(hidden_states)
         torch.testing.assert_close(fused_out, unfused_out, rtol=1e-5, atol=1e-5)
+
+
+class _ScaledActivation(torch.nn.Module):
+    """An activation module with a learnable parameter, such as xIELU."""
+
+    def __init__(self, config: TransformerConfig) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(2.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.scale * x
+
+
+class TestMLPActivationModule:
+    """MLP builds submodules.activation_func without use_te_activation_func, except a TE op."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            gated_linear_unit=False,
+            bias_activation_fusion=False,
+            use_te_activation_func=False,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _submodules(activation_func):
+        submodules = get_submodules(get_gpt_layer_local_submodules().mlp)
+        assert isinstance(submodules, MLPSubmodules)
+        return dataclasses.replace(submodules, activation_func=activation_func)
+
+    def test_module_activation_is_built(self):
+        mlp = MLP(self.config, self._submodules(_ScaledActivation))
+
+        assert isinstance(mlp.activation_func, _ScaledActivation)
+        # Its parameter belongs to the MLP, so it is trained and checkpointed with it.
+        assert "activation_func.scale" in dict(mlp.named_parameters())
+
+    def test_without_activation_module_uses_config_function(self):
+        mlp = MLP(self.config, self._submodules(None))
+
+        assert mlp.activation_func is self.config.activation_func
+
+    def test_te_activation_op_needs_use_te_activation_func(self):
+        from megatron.core.extensions.transformer_engine import TEActivationOp
+
+        if TEActivationOp is None:
+            pytest.skip("Transformer Engine >= 1.13 is not available")
+        # The MoE spec passes TEActivationOp to shared experts whatever the config says.
+        mlp = MLP(self.config, self._submodules(TEActivationOp))
+
+        assert mlp.activation_func is self.config.activation_func
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_module_activation_is_applied_and_trained(self):
+        mlp = MLP(self.config, self._submodules(_ScaledActivation)).cuda()
+        reference = MLP(self.config, self._submodules(None)).cuda()
+        reference.load_state_dict(mlp.state_dict(), strict=False)
+        reference.activation_func = lambda x: 2.0 * x
+        hidden_states = torch.randn(8, 2, self.config.hidden_size, device="cuda")
+
+        output, _ = mlp(hidden_states)
+        expected, _ = reference(hidden_states)
+        torch.testing.assert_close(output, expected)
+
+        output.sum().backward()
+        assert mlp.activation_func.scale.grad is not None
