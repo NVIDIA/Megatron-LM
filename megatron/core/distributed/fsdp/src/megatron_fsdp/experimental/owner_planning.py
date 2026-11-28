@@ -74,7 +74,7 @@ def assign_owner_work(buffers: Iterable[DBuffer]) -> list[dict[int, int]]:
     work_items: list[_OwnerWork] = []
     for buffer_index, buffer in enumerate(buffers):
         mesh = buffer.mesh
-        ranks = tuple(get_shard_ranks(buffer))
+        ranks = tuple(get_shard_ranks(buffer.mesh, buffer.placements))
         buffer_key = _BufferKey(ranks, sum(key.shard_group == ranks for key in buffer_indices))
         buffer_indices[buffer_key] = buffer_index
         # One holder reports each buffer, rotating over its shard ranks to spread the metadata.

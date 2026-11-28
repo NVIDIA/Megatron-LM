@@ -62,6 +62,9 @@ class RowAtomic(Shard):
         # PyTorch Shard.__eq__ compares only dim; DBuffer placements compare by type.
         return isinstance(other, RowAtomic)
 
+    def __hash__(self) -> int:
+        return hash(RowAtomic)
+
 
 class BlockAtomic(Shard):
     """Flattened dim-0 shard placement that keeps ``block_size`` rows together."""
@@ -75,6 +78,9 @@ class BlockAtomic(Shard):
     def __eq__(self, other: object) -> bool:
         # PyTorch Shard.__eq__ compares only dim, so preserve the block size as well.
         return isinstance(other, BlockAtomic) and self.block_size == other.block_size
+
+    def __hash__(self) -> int:
+        return hash((BlockAtomic, self.block_size))
 
     def __repr__(self) -> str:
         return f"BlockAtomic(block_size={self.block_size})"
@@ -95,6 +101,9 @@ class TensorAtomic(Shard):
 
     def __eq__(self, other: object) -> bool:
         return isinstance(other, TensorAtomic)
+
+    def __hash__(self) -> int:
+        return hash(TensorAtomic)
 
     def __repr__(self) -> str:
         return "TensorAtomic()"
