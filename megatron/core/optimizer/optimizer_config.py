@@ -1,8 +1,10 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 import fnmatch
 import logging
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
 
@@ -198,6 +200,18 @@ class OptimizerConfig:
     bf16: bool = False
     """If true, train with bf16 mixed precision training. Defaults to False."""
 
+    _fp8_param_gather: Optional[bool] = field(default=None, init=False)
+    """Whether model parameters are stored (and all-gathered) as FP8 tensors, read through the
+       resolved_fp8_param_gather property. Not user settable: it is a property of the model, so
+       get_megatron_optimizer takes it from ddp_config.fp8_param_gather (resolve_fp8_param_gather).
+    """
+
+    _fp4_param_gather: Optional[bool] = field(default=None, init=False)
+    """Whether model parameters are stored (and all-gathered) as FP4 tensors, read through the
+       resolved_fp4_param_gather property. Not user settable: it is a property of the model, so
+       get_megatron_optimizer takes it from ddp_config.fp4_param_gather (resolve_fp4_param_gather).
+    """
+
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
        set to True only when fp8_recipe is mxfp8 and fp8_param_gather is True."""
@@ -210,9 +224,22 @@ class OptimizerConfig:
     to be set to lower precision. Defaults to False.
     """
 
-    store_param_remainders: bool = True
-    """If true, store the 16-bit FP32 parameter remainders in the optimizer state, excluding the
-        16 bits shared with the BF16 parameters. This lowers GPU memory usage. Defaults to True.
+    store_param_remainders: Optional[bool] = None
+    """If true, the optimizer state keeps only the 16 low bits of each FP32 master weight, the
+        int16 remainder of the 16 bits the BF16 parameter holds. This lowers GPU memory usage, and
+        the optimizer checkpoint then holds int16 remainders instead of FP32 master weights.
+        Requires use_precision_aware_optimizer.
+
+        None (default) resolves to True, except when:
+            - FP32 main params and
+            - a non-delayed FP8 recipe
+        where it resolves to False.
+
+        This keeps checkpoints compatible with legacy ones with this configuration, which hold
+        MCore-managed FP32 main weights. Explicitly setting this flag to True
+        makes those legacy optimizer checkpoints incompatible.
+        Only takes effect with BF16 model params and FP32 main params owned by TE FusedAdam
+        and never with optimizer_cpu_offload, optimizer_cuda_graph or Megatron-FSDP.
     """
 
     main_grads_dtype: torch.dtype = torch.float32
@@ -451,6 +478,95 @@ class OptimizerConfig:
     optimizer_cuda_graph: bool = False
     """If true, enables CUDA graph for optimizer step."""
 
+    # Megatron-Bridge sets attributes named fp8_param_gather / fp4_param_gather on this config.
+    @property
+    def resolved_fp8_param_gather(self) -> Optional[bool]:
+        """fp8_param_gather of the model's DDP config, or None if not resolved for a model."""
+        return self._fp8_param_gather
+
+    @property
+    def resolved_fp4_param_gather(self) -> Optional[bool]:
+        """fp4_param_gather of the model's DDP config, or None if not resolved for a model."""
+        return self._fp4_param_gather
+
+    def _te_fused_adam_main_weight_and_decoupled_grad(
+        self, fp8_param_gather: Optional[bool], fp4_param_gather: Optional[bool] = None
+    ) -> bool:
+        """Whether TE FusedAdam (the precision-aware optimizer) owns the main weights and consumes
+        decoupled grads (param.decoupled_grad), for FP8 params (fp8_param_gather True, or None:
+        unresolved), FP4 params (fp4_param_gather True) or BF16 params (both False)."""
+        return bool(
+            self.use_precision_aware_optimizer
+            and (
+                # Non-FP32 main params are always owned by TE. Dtypes may still be strings.
+                self.main_params_dtype not in (torch.float32, 'fp32')
+                # Any compute recipe works with BF16 model weights, and the Adam kernel handles
+                # FP8 delayed-scaling weights. Other quantized weights (e.g. MXFP8, NVFP4) need
+                # MCore-managed main params.
+                or (
+                    fp4_param_gather is not True
+                    and (self.fp8_recipe in (None, "delayed") or fp8_param_gather is False)
+                )
+                # The hybrid-device optimizer has its own decoupled-grad support.
+                or self.optimizer_cpu_offload
+            )
+        )
+
+    @property
+    def use_precision_aware_optimizer_no_fp8_or_ds_fp8(self) -> bool:
+        """See _te_fused_adam_main_weight_and_decoupled_grad. Also selects param.grad vs
+        param.decoupled_grad."""
+        return self._te_fused_adam_main_weight_and_decoupled_grad(
+            self.resolved_fp8_param_gather, self.resolved_fp4_param_gather
+        )
+
+    def _use_te_precision_aware_optimizer_legacy(self) -> bool:
+        """The precision-aware optimizer gate before BF16 model weights could use it.
+
+        The goal is to ensure we remain compatible with checkpoints produced by previous versions
+        of Megatron. Such versions did not allow precision-aware optimizer with
+        BF16 model weights + FP8 (non-delayed) recipes. Checkpoints produced with that code
+        stored MCore-managed FP32 main weights despite the store_param_remainders=True default,
+        since precision-aware optimizer is required.
+        This case is now supported, but we ensure we don't silently load FP32 main weights using
+        the store_param_remainders=True format.
+        """
+        return self._te_fused_adam_main_weight_and_decoupled_grad(fp8_param_gather=True)
+
+    def _param_remainders_supported(self) -> bool:
+        """Whether store_param_remainders can take effect: TE FusedAdam ignores it without BF16
+        params and FP32 main weights, and the CPU-offloaded optimizer keeps FP32 main weights."""
+        return (
+            self.bf16
+            and self.main_params_dtype in (torch.float32, 'fp32')
+            and not self.optimizer_cpu_offload
+            and is_te_min_version("2.1.0")
+        )
+
+    @property
+    def resolved_store_param_remainders(self) -> bool:
+        """The store_param_remainders value in effect (see the field's docstring)."""
+        if self.store_param_remainders is not None:
+            requested = self.store_param_remainders
+        else:
+            # Default to the legacy behavior: param remainders wherever the precision-aware
+            # optimizer was used, so that checkpoints stay compatible with the legacy ones.
+            requested = self._use_te_precision_aware_optimizer_legacy()
+        # TE FusedAdam's capturable (CUDA graph) mode cannot store param remainders.
+        return requested and self._param_remainders_supported() and not self.optimizer_cuda_graph
+
+    def resolve_fp8_param_gather(self, ddp_fp8_param_gather: bool) -> "OptimizerConfig":
+        """Return a copy of this config with fp8_param_gather from the model's DDP config."""
+        resolved = copy.copy(self)
+        resolved._fp8_param_gather = ddp_fp8_param_gather
+        return resolved
+
+    def resolve_fp4_param_gather(self, ddp_fp4_param_gather: bool) -> "OptimizerConfig":
+        """Return a copy of this config with fp4_param_gather from the model's DDP config."""
+        resolved = copy.copy(self)
+        resolved._fp4_param_gather = ddp_fp4_param_gather
+        return resolved
+
     def validate(self) -> None:
         """Check optimizer-local settings without modifying the config."""
 
@@ -485,8 +601,6 @@ class OptimizerConfig:
 
         if self.fp8_recipe == "mxfp8":
             if not self.reuse_grad_buf_for_mxfp8_param_ag:
-                import warnings
-
                 warnings.warn(
                     "mxfp8 without using reuse_grad_buf_for_mxfp8_param_ag and fp8_param_gather"
                     "will use significant amount additional GPU memory."
@@ -538,6 +652,11 @@ class OptimizerConfig:
             assert (
                 self.optimizer == 'adam'
             ), '--use-precision-aware-optimizer only supported with adam'
+            if self.optimizer_cuda_graph and self.store_param_remainders:
+                warnings.warn(
+                    "--optimizer-cuda-graph is incompatible with store_param_remainders; "
+                    "disabling it."
+                )
 
             # Only the FusedAdam in TE and HybridDeviceOptimizer supports
             # --use-precision-aware-optimizer.
@@ -658,27 +777,6 @@ class OptimizerConfig:
                 '--overlap-param-gather-with-optimizer-step only supported with '
                 'interleaved pipeline parallelism'
             )
-
-    @property
-    def use_precision_aware_optimizer_no_fp8_or_ds_fp8(self) -> bool:
-        """Whether decoupled grads / precision-aware handling applies outside FP8 (except delayed).
-
-        The following condition is used to avoid repetition in distrib_optimizer.py.
-        This is because in distrib_optimizer.py, the process to handle parameters are
-        different for different training precision settings. FP8 cases require different
-        handling while FP8 delayed scaling is an exception because the Adam optimizer in
-        TransformerEngine supports it in the kernel computation.
-        This is also the flag to determine the usage of param.grad or param.decoupled_grad
-        Derived on access so configs built directly (without finalize_optimizer_config) work.
-        """
-        return bool(
-            self.use_precision_aware_optimizer
-            and (
-                self.main_params_dtype not in (torch.float32, 'fp32')
-                or (self.fp8_recipe is None or self.fp8_recipe == "delayed")
-                or self.optimizer_cpu_offload
-            )
-        )
 
     def finalize_optimizer_config(self) -> None:
         """Resolve dtypes, derived flags and optimizer aliases once the config is validated."""

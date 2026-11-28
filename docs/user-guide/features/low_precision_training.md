@@ -223,6 +223,19 @@ Once a recipe is stable, the following options reduce memory further:
   - `--main-grads-dtype {fp32, bf16}`
   - `--exp-avg-dtype {fp32, fp16, bf16, fp8}`
   - `--exp-avg-sq-dtype {fp32, fp16, bf16, fp8}`
+  - `--[no-]store-param-remainders` — requires `--use-precision-aware-optimizer`.
+    With BF16 params and FP32 main params, store only the 16 low bits of each
+    FP32 master weight that the BF16 param does not already hold. Enabled by
+    default, except when both of the following hold:
+
+    - a non-delayed `--fp8-recipe` (`tensorwise`, `mxfp8`, `blockwise`, `custom`), and
+    - FP32 main params.
+
+    In that case it is off for backward compatibility with checkpoints produced
+    without this feature. Explicitly pass `--store-param-remainders` to enable it
+    if you do not require loading such checkpoints. Always off with
+    `--optimizer-cuda-graph`, `--optimizer-cpu-offload` and Megatron-FSDP, and
+    has no effect with `--fp8-param-gather` and a non-delayed `--fp8-recipe`.
 
 ## Configuration Cookbook
 
