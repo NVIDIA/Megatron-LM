@@ -679,6 +679,19 @@ class CheckpointWithoutOutput:
         self._region, self._released_region = None, weakref.ref(region)
         return region
 
+    def release_outputs(self) -> None:
+        """Release output storage when replay hooks are installed at a separate boundary."""
+        if self.ckpt_manager is None:
+            self._release_outputs()
+
+    def register_recompute_hook(self, tensor: torch.Tensor) -> None:
+        """Register a rebuild trigger before or after output storage is released."""
+        region = self._region
+        if region is None and self._released_region is not None:
+            region = self._released_region()
+        if region is not None and self.ckpt_manager is None:
+            _register_rebuild_hook(tensor, region.rebuild)
+
     def discard_output_and_register_recompute(self, hook_tensor):
         """
         Release the output tensor storages and register the recompute function as a grad hook of

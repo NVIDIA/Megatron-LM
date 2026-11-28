@@ -1939,6 +1939,12 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
+    def recompute_selected(self, module_name: str) -> bool:
+        """Whether ``module_name`` is selected for selective recompute."""
+        return self.recompute_granularity == "selective" and module_name in (
+            self.recompute_modules or []
+        )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
@@ -3482,6 +3488,13 @@ class TransformerConfig(ModelParallelConfig):
             )
         if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
             raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
+
+        if self.inference_fuse_tp_communication and self.recompute_selected("mlp"):
+            # The fused fc2 kernel consumes the residual set on the layer as call state.
+            raise ValueError(
+                "inference_fuse_tp_communication is incompatible with selective 'mlp' recompute; "
+                "remove 'mlp' from recompute_modules or disable inference_fuse_tp_communication."
+            )
 
         if self.enable_mhc_connections and self.inference_fuse_tp_communication:
             raise NotImplementedError(

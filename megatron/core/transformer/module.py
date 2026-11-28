@@ -2,6 +2,8 @@
 
 """Megatron Module."""
 
+import functools
+from abc import ABCMeta
 from typing import Any, Optional, Tuple
 
 import torch
@@ -9,6 +11,7 @@ from torch.autograd import Variable
 from torch.nn.parameter import Parameter
 
 from megatron.core import parallel_state
+from megatron.core.activation_policy.runtime import install_activation_strategies
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -62,7 +65,23 @@ def is_first_microbatch_tracked(config) -> bool:
     )
 
 
-class MegatronModule(torch.nn.Module):
+class _MegatronModuleMeta(ABCMeta):
+    """Install declared strategies after the most-derived constructor has returned."""
+
+    def __call__(cls, *args, **kwargs):
+        module = super().__call__(*args, **kwargs)
+        strategies = vars(module).get("_declared_activation_strategies")
+        if strategies is not None:
+            try:
+                module.activation_strategies()
+            finally:
+                del module._declared_activation_strategies
+            if strategies:
+                install_activation_strategies(module, strategies)
+        return module
+
+
+class MegatronModule(torch.nn.Module, metaclass=_MegatronModuleMeta):
     """Base Megatron module inhertied by all Models.
 
     Megatron specific extensions of torch Module with support
@@ -76,6 +95,20 @@ class MegatronModule(torch.nn.Module):
     def __init__(self, config: TransformerConfig):
         super().__init__()
         self.config = config
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if "activation_strategies" in vars(cls):
+            init = cls.__init__
+
+            @functools.wraps(init)
+            def __init__(self, *args, **kwargs):
+                init(self, *args, **kwargs)
+                # Stand-ins that bypass this constructor never declare policies for its children.
+                if type(self).activation_strategies is cls.activation_strategies:
+                    self._declared_activation_strategies = []
+
+            cls.__init__ = __init__
 
     @classmethod
     def estimate_flops(
@@ -97,6 +130,18 @@ class MegatronModule(torch.nn.Module):
         raise NotImplementedError(
             f"{cls.__name__} must implement estimate_flops for layer FLOP accounting."
         )
+
+    def activation_strategies(self) -> None:
+        """Declare policies for this module with ``register_activation_strategy``.
+
+        Called once after construction. Subclasses can call super().activation_strategies()
+        and amend inherited strategies before the runtime installs them.
+        """
+
+    def register_activation_strategy(self, strategy):
+        """Register a policy during activation_strategies() and return it for later amendment."""
+        self._declared_activation_strategies.append(strategy)
+        return strategy
 
     def refresh_cache(self) -> None:
         """Refresh state derived from parameters after an in-place weight refit.

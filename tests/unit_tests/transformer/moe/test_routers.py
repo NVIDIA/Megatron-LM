@@ -286,7 +286,6 @@ def test_fine_grained_router_receives_runtime_cp(monkeypatch):
         _forward_attention=Mock(return_value=(hidden, None)),
         _forward_mlp=lambda hidden_states: hidden_states,
         offload_mlp_norm=False,
-        recompute_pre_mlp_layernorm=False,
         _pre_mlp_layernorm_returns_residual=False,
         pre_mlp_layernorm=torch.nn.Identity(),
         init_backward_dw_wrapper=Mock(),

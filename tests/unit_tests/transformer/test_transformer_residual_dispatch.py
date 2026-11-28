@@ -12,6 +12,11 @@ import pytest
 import torch
 from torch import nn
 
+from megatron.core.activation_policy import (
+    CheckpointWithoutOutputStrategy,
+    install_activation_strategies,
+)
+from megatron.core.activation_policy.runtime import fire_boundary
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutputManager,
     model_parallel_cuda_manual_seed,
@@ -73,7 +78,6 @@ class _DispatchLayer(TransformerLayer):
         self.pre_mlp_layernorm = nn.LayerNorm(4)
         self._input_layernorm_returns_residual = False
         self._pre_mlp_layernorm_returns_residual = False
-        self.recompute_input_layernorm = self.recompute_pre_mlp_layernorm = False
         self.mhc_checkpoint_input_layernorm = self.mhc_checkpoint_pre_mlp_layernorm = False
         self.offload_attn_norm = self.offload_mlp_norm = False
         self.off_interface = lambda enabled, value, name: _OffloadContext(value)
@@ -113,6 +117,10 @@ def _read(layer, value, is_mlp, context=None):
 def _write(layer, value, residual, state, is_mlp, context=None):
     method = layer._apply_mlp_bda_step if is_mlp else layer._apply_self_attn_bda_step
     return method(value, residual, state, residual_stream_recompute_context=context)
+
+
+def _bda_point(layer, is_mlp):
+    return layer._mlp_bda if is_mlp else layer._self_attn_bda
 
 
 def _checkpoint(layer, is_mlp):
@@ -243,7 +251,16 @@ def test_ordinary_tuple_norm_preserves_selected_residual_and_gradients(
     norm = _TupleNorm().to(next(actual.parameters()).device)
     setattr(actual, name, norm)
     setattr(actual, f"_{name}_returns_residual", True)
-    setattr(actual, f"recompute_{name}", recompute)
+    if recompute:
+        # As TransformerLayer installs it for "layernorm" recompute.
+        install_activation_strategies(
+            actual,
+            [
+                CheckpointWithoutOutputStrategy(
+                    region=norm, release_event=_bda_point(actual, is_mlp), retain_input_tensors=True
+                )
+            ],
+        )
     value = torch.randn(2, 1, 4, device=norm.weight.device, requires_grad=True)
     saved_value = value.detach().clone()
     expected_branch = saved_value.square()
@@ -255,10 +272,9 @@ def test_ordinary_tuple_norm_preserves_selected_residual_and_gradients(
     boundary = (branch + residual).square().sum()
     torch.testing.assert_close(boundary, expected_sum.square().sum())
     if recompute:
-        checkpoint = _checkpoint(actual, is_mlp)
-        assert checkpoint.retain_input_tensors
         input_bytes = value.untyped_storage().nbytes()
-        checkpoint.discard_output_and_register_recompute(boundary)
+        # Exiting the residual add releases the norm output and hooks its rebuild on boundary.
+        fire_boundary(actual, _bda_point(actual, is_mlp), "exit", boundary)
         assert branch.untyped_storage().nbytes() == 0
         assert (
             value.untyped_storage().nbytes() == residual.untyped_storage().nbytes() == input_bytes
