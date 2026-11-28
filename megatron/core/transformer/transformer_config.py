@@ -1231,6 +1231,36 @@ class TransformerConfig(ModelParallelConfig):
     ``__post_init__``.
     """
 
+    moe_router_defer_global_aux_loss: bool = False
+    """Overlap the global aux loss all-reduce with the rest of the forward pass.
+    ``global_aux_loss`` all-reduces the tokens-per-expert counts over the TPxDPxCP group in every
+    MoE layer and micro-batch, and the router waits for the result before returning. With this
+    flag the all-reduce is launched asynchronously in the router and waited for at the start of
+    the MoE layer's backward, where the loss is computed, logged and differentiated. The loss
+    changes no forward activation, so the all-reduce overlaps dispatch, expert computation,
+    combine and the remaining layers' forward. Backward adds the reduced counts to the running
+    sum in the order the micro-batches were launched, with the same ops on the same buffers as
+    the synchronous path, so each micro-batch's loss reads the same running average, and its
+    value and gradients match the synchronous path (bitwise with deterministic kernels), whatever
+    order backward visits the micro-batches in. A synchronous call made within a step of
+    deferred calls first waits for the deferred all-reduces launched before it and adds their
+    counts, so the running sum stays as on the synchronous path (Megatron's training loop does
+    not mix them: CUDA-graph warmup and capture run between steps). A training forward whose
+    backward never runs records no global aux loss, but its counts still enter the later
+    micro-batches' averages, as on the synchronous path. The backward of a MoE layer may run
+    only once, and only before ``reset_global_aux_loss_tracker`` (called by
+    ``finalize_model_grads``) ends the step.
+    Applies to training forwards of ``MoELayer.forward`` that run route through combine in one
+    call and are not being captured into a CUDA graph; other paths (e.g.
+    ``overlap_moe_expert_parallel_comm``) keep the synchronous all-reduce.
+    Recomputation that includes the router (full recompute, or the ``moe`` recompute module)
+    runs the first forward without grad, which computes no aux loss; the recomputed forward
+    launches the all-reduce and the same layer's backward waits for it, so the overlap is limited
+    to the recomputed layer, and the counts accumulate in the order backward recomputes the
+    micro-batches, as on the synchronous path. The gain is largest when the router is not
+    recomputed.
+    """
+
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
@@ -3186,6 +3216,23 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_expert_capacity_factor only works with aux_loss, "
                     "seq_aux_loss, global_aux_loss or none load balancing"
+                )
+
+        if self.moe_router_defer_global_aux_loss:
+            load_balancing_types = (
+                self.moe_router_load_balancing_type
+                if isinstance(self.moe_router_load_balancing_type, list)
+                else [self.moe_router_load_balancing_type]
+            )
+            if "global_aux_loss" not in load_balancing_types:
+                raise ValueError(
+                    "moe_router_defer_global_aux_loss requires the global_aux_loss load balancing"
+                )
+            if self.overlap_moe_expert_parallel_comm or self.moe_megakernel_backend is not None:
+                warnings.warn(
+                    "moe_router_defer_global_aux_loss has no effect with "
+                    "overlap_moe_expert_parallel_comm or moe_megakernel_backend; the global aux "
+                    "loss all-reduce stays synchronous"
                 )
 
         if self.moe_pad_expert_input_to_capacity:

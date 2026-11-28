@@ -2,7 +2,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
@@ -14,6 +14,7 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
+from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
@@ -179,6 +180,52 @@ class Router(ABC, MegatronModule):
             self.router_replay.layer_number = layer_number
 
 
+class _GlobalAuxLossInBackward(torch.autograd.Function):
+    """Identity on the MoE layer output whose backward waits for the global aux loss all-reduce,
+    computes the loss and returns its gradient for the router scores.
+
+    The global aux loss changes no forward activation; only its gradient is needed, and only in
+    this layer's backward. Deferring the wait and the loss to the backward lets the token-count
+    all-reduce overlap the rest of the forward pass. The loss is computed by the same code as the
+    synchronous path. The backward waits for the all-reduces of this and any earlier micro-batch
+    whose counts are not yet added and adds them in forward order, so the average this loss
+    reads, its value and its gradient do not depend on the order in which backward visits the
+    micro-batches.
+    """
+
+    @staticmethod
+    def forward(ctx, activation, scores_for_aux_loss, router, pending):
+        """Return ``activation`` and keep the pending all-reduce for the backward."""
+        ctx.router = router
+        ctx.pending = pending
+        ctx.save_for_backward(scores_for_aux_loss)
+        return activation
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Wait for the all-reduce and return the aux loss gradient for the router scores."""
+        if ctx.pending is None:
+            raise RuntimeError(
+                "moe_router_defer_global_aux_loss does not support running the backward of a "
+                "MoE layer more than once (retain_graph)"
+            )
+        (scores_for_aux_loss,) = ctx.saved_tensors
+        work, *pending = ctx.pending
+        ctx.pending = None
+        if work is not None:
+            work.wait()
+        with torch.enable_grad():
+            scores = scores_for_aux_loss.detach().requires_grad_(True)
+            # The loss is attached to a scalar stand-in for the activation; its autograd node
+            # supplies the aux loss gradient scale regardless of the incoming gradient.
+            stand_in = torch.zeros((), device=scores.device, requires_grad=True)
+            attached = ctx.router._attach_finished_global_aux_loss(stand_in, scores, *pending)
+            (scores_grad,) = torch.autograd.grad(
+                attached, scores, grad_outputs=torch.zeros_like(attached)
+            )
+        return grad_output, scores_grad, None, None
+
+
 class TopKRouter(Router):
     """Route each token to the top-k experts.
 
@@ -274,6 +321,15 @@ class TopKRouter(Router):
         else:
             self.global_tokens_per_expert = None
             self.ga_steps = None
+        # moe_router_defer_global_aux_loss: set by MoELayer.forward around the router call
+        # (defer_global_aux_loss), and the global aux loss inputs whose all-reduce is in flight.
+        self._defer_global_aux_loss = False
+        self._pending_global_aux_loss = None
+        # The deferred global aux losses launched since the last reset, in launch order, as
+        # [all-reduce, global counts, average], and how many of them have been added to
+        # global_tokens_per_expert (see _fold_deferred_global_counts).
+        self._deferred_global_counts = []
+        self._num_folded_global_counts = 0
 
         if self.routing_type == "quantile_balancing" and self.qb_estimation_scope == "global_batch":
             assert not self.is_aux_loss_enabled(), (
@@ -752,6 +808,50 @@ class TopKRouter(Router):
         if global_aux_loss_coeff == 0:
             return probs
 
+        if (
+            self._defer_global_aux_loss
+            and self.training
+            and torch.is_grad_enabled()
+            and not (
+                torch.cuda.is_current_stream_capturing()
+                or is_graph_capturing()
+                or is_graph_warmup()
+            )
+        ):
+            # Launch the all-reduce now; finish_deferred_global_aux_loss, called on the MoE layer
+            # output after combine, has the layer's backward wait for it and compute the loss.
+            if self._pending_global_aux_loss is not None:
+                raise RuntimeError("the previous deferred global aux loss was not finished")
+            local_tokens_per_expert = routing_map.sum(dim=0)
+            # The all-reduce runs in place on this new tensor.
+            counts = local_tokens_per_expert.clone()
+            work = None
+            if self.tp_dp_cp_group.size() > 1:
+                work = torch.distributed.all_reduce(
+                    counts, group=self.tp_dp_cp_group, async_op=True
+                )
+            if with_padding_mask:
+                local_num_tokens = local_tokens_per_expert.sum() // self.topk
+            else:
+                local_num_tokens = routing_map.shape[0]
+            # The backward adds the counts in launch order (see _fold_deferred_global_counts).
+            self._deferred_global_counts.append([work, counts, None])
+            self._pending_global_aux_loss = (
+                work,
+                scores_for_aux_loss,
+                self._deferred_global_counts,
+                len(self._deferred_global_counts) - 1,
+                local_num_tokens,
+                with_padding_mask,
+            )
+            return probs
+
+        # Add any deferred counts launched earlier in this step first, so the synchronous call
+        # sees the same running sum as on the synchronous path (waits for their all-reduces).
+        # Megatron's training loop does not mix the two paths within a step (CUDA-graph warmup
+        # and capture run after the reset); this keeps the running sum right if a caller does.
+        # No-op when nothing is deferred.
+        self._fold_deferred_global_counts(len(self._deferred_global_counts) - 1)
         # Use unified function to compute tokens_per_expert and num_tokens
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
             get_tokens_per_expert_and_token_count(
@@ -761,14 +861,114 @@ class TopKRouter(Router):
                 topk=self.topk,
             )
         )
+        return self._attach_global_aux_loss(
+            probs, scores_for_aux_loss, global_tokens_per_expert, local_num_tokens, total_num_tokens
+        )
 
-        self.global_tokens_per_expert += global_tokens_per_expert
-        self.ga_steps += 1
-        averated_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
+    @contextmanager
+    def defer_global_aux_loss(self):
+        """Within this context, the global aux loss of a training forward launches its
+        all-reduce asynchronously and returns the probs without the loss attached; the caller
+        passes the MoE layer output to ``finish_deferred_global_aux_loss`` before leaving it.
+        If the context exits with an exception, the pending all-reduce is waited for and the
+        loss dropped. No-op unless ``moe_router_defer_global_aux_loss`` is set."""
+        self._defer_global_aux_loss = self.config.moe_router_defer_global_aux_loss
+        try:
+            yield
+        except BaseException:
+            if self._pending_global_aux_loss is not None:
+                work = self._pending_global_aux_loss[0]
+                self._pending_global_aux_loss = None
+                if work is not None:
+                    work.wait()
+            raise
+        finally:
+            self._defer_global_aux_loss = False
+
+    def finish_deferred_global_aux_loss(self, activation: torch.Tensor) -> torch.Tensor:
+        """Finish the global aux loss launched under ``defer_global_aux_loss``. Returns
+        ``activation`` wrapped so that its backward waits for the all-reduce and adds the loss
+        gradient, or, for a router without gradients, waits now and attaches the loss. Returns
+        ``activation`` unchanged when nothing is pending."""
+        if self._pending_global_aux_loss is None:
+            return activation
+        work, scores_for_aux_loss, *pending = self._pending_global_aux_loss
+        self._pending_global_aux_loss = None
+        # The loss only feeds the backward pass, so wait for the all-reduce there.
+        if scores_for_aux_loss.requires_grad:
+            return _GlobalAuxLossInBackward.apply(
+                activation, scores_for_aux_loss, self, (work, *pending)
+            )
+        if work is not None:
+            work.wait()
+        return self._attach_finished_global_aux_loss(activation, scores_for_aux_loss, *pending)
+
+    def _fold_deferred_global_counts(self, index: int):
+        """Add the global counts of the deferred global aux losses up to ``index`` that have not
+        been added yet, in launch order, with the same ops on the same buffers (in their dtype,
+        bf16 under Float16Module) as the synchronous path, and keep each one's running average.
+        Waits for the all-reduces it adds."""
+        entries = self._deferred_global_counts
+        while self._num_folded_global_counts <= index:
+            entry = entries[self._num_folded_global_counts]
+            if entry[0] is not None:
+                entry[0].wait()
+            self.global_tokens_per_expert += entry[1]
+            self.ga_steps += 1
+            entry[2] = self.global_tokens_per_expert / self.ga_steps
+            self._num_folded_global_counts += 1
+
+    def _attach_finished_global_aux_loss(
+        self,
+        activation: torch.Tensor,
+        scores_for_aux_loss: torch.Tensor,
+        entries: list,
+        index: int,
+        local_num_tokens: Union[int, torch.Tensor],
+        with_padding_mask: bool,
+    ) -> torch.Tensor:
+        """Attach the deferred global aux loss launched as entry ``index`` of ``entries`` once its
+        all-reduce has completed, with the running average after its counts were added."""
+        if entries is not self._deferred_global_counts:
+            raise RuntimeError(
+                "the global aux loss tracker was reset before a deferred global aux loss finished"
+            )
+        self._fold_deferred_global_counts(index)
+        _, global_tokens_per_expert, averaged_tokens_per_expert = entries[index]
+        if with_padding_mask:
+            total_num_tokens = global_tokens_per_expert.sum() // self.topk
+        else:
+            total_num_tokens = local_num_tokens * self.tp_dp_cp_group.size()
+        return self._attach_global_aux_loss(
+            activation,
+            scores_for_aux_loss,
+            global_tokens_per_expert,
+            local_num_tokens,
+            total_num_tokens,
+            averaged_tokens_per_expert=averaged_tokens_per_expert,
+        )
+
+    def _attach_global_aux_loss(
+        self,
+        activation: torch.Tensor,
+        scores_for_aux_loss: torch.Tensor,
+        global_tokens_per_expert: torch.Tensor,
+        local_num_tokens: Union[int, torch.Tensor],
+        total_num_tokens: Union[int, torch.Tensor],
+        averaged_tokens_per_expert: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Compute the global aux loss and attach it to ``activation``. A deferred loss passes
+        ``averaged_tokens_per_expert``, whose counts were already accumulated; otherwise the
+        global token counts are accumulated here and the loss uses their running average."""
+        global_aux_loss_coeff = self.get_aux_loss_coeff("global_aux_loss")
+        if averaged_tokens_per_expert is None:
+            self.global_tokens_per_expert += global_tokens_per_expert
+            self.ga_steps += 1
+            averaged_tokens_per_expert = self.global_tokens_per_expert / self.ga_steps
 
         global_aux_loss = switch_load_balancing_loss_func(
             probs=scores_for_aux_loss,
-            tokens_per_expert=averated_tokens_per_expert,
+            tokens_per_expert=averaged_tokens_per_expert,
             total_num_tokens=total_num_tokens,
             topk=self.topk,
             num_experts=self.config.num_moe_experts,
@@ -776,8 +976,8 @@ class TopKRouter(Router):
             fused=self.config.moe_router_aux_loss_fusion,
             deterministic=self.config.deterministic_mode,
         )
-        probs = self.attach_and_log_load_balancing_loss(
-            probs,
+        return self.attach_and_log_load_balancing_loss(
+            activation,
             global_aux_loss_coeff,
             global_aux_loss,
             "global_load_balancing_loss",
@@ -786,7 +986,6 @@ class TopKRouter(Router):
             valid_token_count=local_num_tokens,
             aux_loss_scale_reduce_groups=(self.tp_cp_group,),
         )
-        return probs
 
     def _get_aux_loss_groups(
         self, packed_seq_params: Optional[PackedSeqParams] = None
@@ -1321,6 +1520,14 @@ class TopKRouter(Router):
         if self.global_tokens_per_expert is not None:
             self.global_tokens_per_expert.zero_()
             self.ga_steps.zero_()
+        for work, _, _ in self._deferred_global_counts[self._num_folded_global_counts :]:
+            if work is not None:
+                work.wait()
+        # Replace the list rather than clearing it: a deferred backward still holding the old
+        # list detects the reset (see _attach_finished_global_aux_loss). The reset also frees
+        # the recorded counts, so it must run every step.
+        self._deferred_global_counts = []
+        self._num_folded_global_counts = 0
 
     def forward(
         self,
