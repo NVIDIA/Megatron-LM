@@ -1178,6 +1178,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         name="engram_embedding",
         sources=("megatron/core/models/engram/distributed_embedding.py",),
         tests=(
+            K + "test_engram_kernels.py",
             "tests/unit_tests/models/engram/test_engram_numerics.py",
             "tests/unit_tests/models/engram/test_ownership_and_optimizer.py",
             "tests/unit_tests/models/engram/test_distributed_lookup.py",
@@ -1188,12 +1189,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="EP-sharded Engram tables: F.embedding lookup, or under deterministic_mode a "
         "sorted segment_reduce backward that writes each touched row once; torch.bincount counts "
         "the integer per-(peer, table) requests of the multi-rank all-to-all. "
+        "test_engram_kernels replays deterministic_mode bit-exactly on GPU under stream "
+        "contention: the single-rank table backward, and the EP2 all-to-all lookup of two tables "
+        "with its owner-side gradients, where the ranks send different numbers of requests for "
+        "repeated rows and one rank sends none to the other. "
         "test_engram_numerics checks the single-rank lookup in both modes against an independent "
-        "FP64 F.embedding reference on CPU, and replays the deterministic backward bit-exactly on "
-        "GPU under stream contention. test_ownership_and_optimizer checks the deterministic "
+        "FP64 F.embedding reference on CPU. test_ownership_and_optimizer checks the deterministic "
         "backward's sum over repeated rows exactly on CPU, and test_distributed_lookup checks the "
         "EP2 and EP4 all-to-all lookup, its owner-side gradients and an Adam step against a "
-        "full-table FP64 reference on GPU; the multi-rank routing has no bit-exact replay yet. "
+        "full-table FP64 reference on GPU. "
         "test_table_sharding checks the lookup and owner-side gradients with the rows sharded "
         "over DP x CP against the EP layout and a full-table FP32 reference, bit for bit with "
         "integer gradients, and that the source stays byte-identical to PR 8225's; "

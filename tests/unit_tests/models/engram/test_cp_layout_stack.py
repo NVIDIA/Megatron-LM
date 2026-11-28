@@ -40,7 +40,7 @@ _PATTERN = "*E-*"
 
 
 class _Group:
-    def __init__(self, size, rank):
+    def __init__(self, size, rank) -> None:
         self._size, self._rank = size, rank
 
     def size(self):

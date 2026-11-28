@@ -134,7 +134,7 @@ def _dyadic(shape, seed, scale=8.0):
 class _TableModel(torch.nn.Module):
     """Engram tables plus a replicated dense projection; the loss is linear in both."""
 
-    def __init__(self, parallel_size, pg_collection, backend="nccl"):
+    def __init__(self, parallel_size, pg_collection, backend="nccl") -> None:
         super().__init__()
         config = SimpleNamespace(
             use_cpu_initialization=False,

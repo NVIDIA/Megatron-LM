@@ -146,7 +146,7 @@ class _TableModel(torch.nn.Module):
     without one it is a dense parameter holding every row: the reference.
     """
 
-    def __init__(self, shard_group=None, with_table=True, with_expert=False):
+    def __init__(self, shard_group=None, with_table=True, with_expert=False) -> None:
         super().__init__()
         self.shard_group = shard_group
         self.proj = torch.nn.Linear(_IN, _OUT, bias=False, dtype=torch.bfloat16, device='cuda')
@@ -732,7 +732,7 @@ class TestGradSync:
         monkeypatch.delenv('PYTORCH_CUDA_ALLOC_CONF', raising=False)
 
         class RecordingBuffer(_ParamAndGradBuffer):
-            def __init__(self, *args, **kwargs):
+            def __init__(self, *args, **kwargs) -> None:
                 arguments = signature.bind(*args, **kwargs).arguments
                 nccl_ub = arguments['nccl_ub']
                 arguments['nccl_ub'] = False
@@ -1275,7 +1275,7 @@ class TestTrainingWrappers:
         from megatron.training import training
 
         class FakeDDP:
-            def __init__(self, **kwargs):
+            def __init__(self, **kwargs) -> None:
                 self.kwargs = kwargs
 
         class FakeFSDP(FakeDDP):
@@ -1331,7 +1331,7 @@ _skip_on_lts = pytest.mark.skipif(
 class _LayerWiseModel(torch.nn.Module):
     """Muon matrices with Adam biases, an expert-parallel table and a domain table."""
 
-    def __init__(self, shard_group):
+    def __init__(self, shard_group) -> None:
         super().__init__()
         self.shard_group = shard_group
         self.fc1 = torch.nn.Linear(_IN, 16, dtype=torch.bfloat16, device='cuda')

@@ -876,7 +876,7 @@ def test_expandable_segments_follow_the_variable_pytorch_reads(environ, enabled)
 class _ClosingTransport:
     """Records how it was closed; a failing one raises from a clean close."""
 
-    def __init__(self, fail=False):
+    def __init__(self, fail=False) -> None:
         self.calls, self.fail = [], fail
 
     def close(self, clean=False):
