@@ -65,6 +65,30 @@ def segment_starts_from_cu_seqlens(
     return starts.unsqueeze(0).expand(batch_size, -1)
 
 
+def valid_positions_from_cu_seqlens(
+    cu_seqlens: Tensor, sequence_length: int, document_lengths: Tensor | None = None
+) -> Tensor:
+    """Return which positions of a packed row hold a token of a document.
+
+    ``cu_seqlens`` brackets the positions each document occupies in the row, and the positions
+    beyond the last boundary belong to no document. ``document_lengths`` holds the token count
+    of each document for a row that pads its documents: the positions a document occupies
+    beyond its own tokens hold no token either.
+    """
+    if cu_seqlens.ndim != 1:
+        raise ValueError(f"Engram expects a 1-D cu_seqlens, got shape {tuple(cu_seqlens.shape)}.")
+    positions = torch.arange(sequence_length, device=cu_seqlens.device, dtype=torch.int64)
+    boundaries = cu_seqlens.to(torch.int64)
+    valid = positions < boundaries[-1]
+    if document_lengths is None or document_lengths.numel() == 0:
+        return valid
+    lengths = document_lengths.to(device=positions.device, dtype=torch.int64)
+    # The last boundary <= position is the start of the document the position falls in.
+    index = torch.searchsorted(boundaries, positions, right=True) - 1
+    index = index.clamp(0, lengths.numel() - 1)
+    return valid & (positions - boundaries.index_select(0, index) < lengths.index_select(0, index))
+
+
 def shift_right_within_segments(
     token_ids: Tensor, shift: int, fill_token_id: int, segment_starts: Tensor
 ) -> Tensor:

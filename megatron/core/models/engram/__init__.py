@@ -3,7 +3,7 @@
 """Hashed n-gram memory modules for Megatron Core (DeepSeek Engram and Qwen PLE)."""
 
 from .config import EngramConfig
-from .engram import Engram
+from .engram import Engram, EngramLookupResult
 from .layer_specs import apply_engram_to_hybrid_stack_spec
 from .variants import ENGRAM_VARIANTS, EngramVariant, resolve_variant
 
@@ -11,6 +11,7 @@ __all__ = [
     "ENGRAM_VARIANTS",
     "Engram",
     "EngramConfig",
+    "EngramLookupResult",
     "EngramVariant",
     "apply_engram_to_hybrid_stack_spec",
     "resolve_variant",

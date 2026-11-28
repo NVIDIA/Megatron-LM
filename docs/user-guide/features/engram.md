@@ -59,8 +59,10 @@ parameter names (`wkv`, `q_weight`, `k_weight`). It ignores `--engram-kernel-siz
 parameters it adds the memory to the hidden states in FP32 and rounds once. Its tables remain one
 per hash head, whereas the DeepSeek-V4.1 module stores one fused table per layer.
 
-The positions of a packed row that hold no token are those after the last document boundary.
-The `--sft` path counts the padding at the
+The positions of a packed row that hold no token are those after the last document boundary
+and, when the row says how many tokens each document holds, the padding of every document. Only
+a context-parallel row in the contiguous layout says so: its `cu_seqlens_q` counts the tokens
+and its `cu_seqlens_q_padded` holds the positions. The `--sft` path counts the padding at the
 end of a row as part of the last document, so its rows have no such position and their padding
 is gated like every position.
 
@@ -172,22 +174,56 @@ The tables' optimizer state follows the checkpoint format:
 - Sequence parallelism: hashing runs on the full sequence before the sequence-parallel split,
   and the short convolution, in the variants that have it, fetches its left context from the
   previous tensor-parallel rank.
-- Context parallelism: the memory follows the zigzag layout, which all layers must run in
+- Context parallelism: the memory follows the layout its layer runs in, zigzag or contiguous
   (`--attention-cp-layout`, `--linear-cp-layout`). It restores the token
   row from the shards of the context-parallel ranks, hashes it, and keeps the rows of its own
   positions. The short convolution takes its left context from the neighboring ranks, so the
   rows of a memory layer must be long enough to hold that context: in one zigzag chunk of an
-  unpacked row.
+  unpacked row for a zigzag layer, and in one contiguous slice for a contiguous layer.
 - Packed sequences (THD) are supported through the `--sft` path. Under context parallelism a
-  packed row is split per document. With pipeline parallelism packed rows require
+  packed row is split per document in the zigzag layout and like an unpacked row in the
+  contiguous one, where documents straddle ranks. With `--linear-cp-layout` and
+  `--attention-cp-layout` set to different layouts the memory must then sit on contiguous
+  layers: a zigzag layer of such a stack gets a packed row in a padded per-sequence zigzag,
+  which the memory does not follow. With pipeline parallelism packed rows require
   `--pad-packed-seq-alignment max` and `--max-seqlen-per-dp-cp-rank` equal to the packed row
   width (`--max-seq-length-per-sample` when it is set, `--seq-length` otherwise).
   `--dataloader-inter-document-masking` with context parallelism requires `--sft`.
 - Activation recomputation replays the memory from the token IDs, on every rank of the EP group
-  together.
+  together. A model that calls the module itself can replay the fusion alone, see
+  [Lookup ahead of the fusion](#lookup-ahead-of-the-fusion).
 - CUDA graphs: only Transformer Engine per-layer capture restricted to the MoE scopes
   (`--cuda-graph-modules moe`, `moe_router` or `moe_preprocess`) is supported, and the memory
   must then sit on a non-MoE layer. The lookup has data-dependent shapes and always runs eagerly.
+
+## Lookup ahead of the fusion
+
+The layers call the module once:
+`engram(hidden_states, input_ids, packed_seq_params, add_to_hidden_states=True)` hashes the
+token IDs, looks the rows up and fuses them into the hidden states. A model that drives the
+module itself can run the first two ahead of the third:
+
+```python
+result = engram.lookup(input_ids, packed_seq_params)
+...
+hidden_states = engram(hidden_states, add_to_hidden_states=True, lookup=result)
+```
+
+`lookup` returns an `EngramLookupResult`, which holds all the fusion needs from the row: the
+rows of this rank's positions (`memory`, `[S, B, memory width]`, which carries the gradient edge
+to the tables), the positions that hold a token (`valid`, see [Variants](#variants)) and the
+positions of the documents of a packed row (`cu_seqlens`). The two calls compute what the
+single call computes, bit for bit. `input_ids` and `packed_seq_params` are those of the layer,
+in its context-parallel layout.
+
+- The lookup is a collective over the ranks that share the tables, and so is the return of its
+  gradient. Make every result with gradients enabled when the tables train, and consume it in
+  exactly one call, the same one on every rank, with the calls in the same order on every rank.
+- To recompute a region that holds the fusion, pass `result.memory` to the region as one of its
+  tensor arguments and rebuild the result inside it, as
+  `EngramLookupResult(memory, result.valid, result.cu_seqlens)`. The region then replays the
+  fusion only, and returns the gradient of the rows to the one lookup made outside it.
+- The lookup has data-dependent shapes and must not run while a CUDA graph is captured.
 
 ## Limitations
 
@@ -206,6 +242,8 @@ Rejected at startup, unless noted:
 - whole-layer and full-iteration CUDA graphs;
 - sequence-packing schedulers (including the one `--use-varlen-dataset` selects) and dynamic
   context parallelism;
+- packed sequences under context parallelism with the memory on a zigzag layer of a stack whose
+  `--linear-cp-layout` and `--attention-cp-layout` differ;
 - `--overlap-moe-expert-parallel-comm`, `--moe-shortcut-connection`,
   `--moe-expert-rank-capacity-factor`, wide residuals and muP;
 - hash-routed MoE layers together with sequence parallelism.

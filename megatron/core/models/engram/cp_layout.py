@@ -2,15 +2,21 @@
 
 """Context-parallel sequence layout helpers for the n-gram memory.
 
-Megatron's causal context parallelism splits a sequence into ``2 * cp_size`` chunks and gives
-rank ``r`` the pair ``(chunk[r], chunk[2 * cp_size - 1 - r])``, so every rank carries a similar
-amount of causal work. The n-gram memory is the one part of the layer that is *not* position
-local: a hash window and the causal convolution both read positions that may live on another
-CP rank. These helpers restore the global sequence and re-select a rank's own chunks, which is
-enough to make the memory correct under CP.
+The n-gram memory is the one part of the layer that is *not* position local: a hash window and
+the causal convolution both read positions that may live on another CP rank. These helpers
+restore the global sequence and re-select a rank's own positions, which is enough to make the
+memory correct under CP, in the two layouts a layer's hidden states can be in:
 
-The layout is the standard one, so the helpers deliberately mirror
-``megatron/core/utils.py``'s partitioning rather than inventing a second convention.
+* ``zigzag``: Megatron's causal context parallelism splits a sequence into ``2 * cp_size``
+  chunks and gives rank ``r`` the pair ``(chunk[r], chunk[2 * cp_size - 1 - r])``, so every rank
+  carries a similar amount of causal work. A packed row applies the same split inside each
+  document.
+* ``contiguous``: rank ``r`` owns the ``r``-th of ``cp_size`` equal consecutive slices of the
+  row, packed or not, so a document may straddle ranks.
+
+Both are the standard layouts, so the helpers deliberately mirror the partitioning of
+``megatron/core/utils.py`` and ``megatron/core/context_parallel`` rather than inventing
+another convention.
 """
 
 from __future__ import annotations
@@ -19,6 +25,54 @@ import torch
 from torch import Tensor
 
 from megatron.core.utils import get_pg_rank, get_pg_size
+
+ZIGZAG_CP_LAYOUT = "zigzag"
+CONTIGUOUS_CP_LAYOUT = "contiguous"
+
+
+def cp_layout_of_layer_type(config, layer_config_type: type) -> str:
+    """Return the context-parallel layout of the hidden states a layer of a given type receives.
+
+    The rule is HybridStack's: the attention-type layers run in ``attention_cp_layout`` and
+    every other layer type in ``linear_cp_layout``. A config that carries
+    ``_linear_cp_layout_explicit`` and leaves ``linear_cp_layout`` implicit runs the whole stack
+    in its ``cp_partition_mode`` instead; a config without that field always follows the first
+    rule. A missing layout field reads as zigzag.
+    """
+    if getattr(config, "_linear_cp_layout_explicit", True):
+        # Imported here: the hybrid layer table imports every layer config.
+        from megatron.core.models.hybrid.layers.utils import Symbols
+
+        name = (
+            "attention_cp_layout"
+            if layer_config_type in Symbols.ATTENTION_LAYER_CONFIGS
+            else "linear_cp_layout"
+        )
+    else:
+        name = "cp_partition_mode"
+    return getattr(config, name, None) or ZIGZAG_CP_LAYOUT
+
+
+def resolve_layer_cp_layout(config) -> str:
+    """Return the context-parallel layout of a layer from the layer's own config."""
+    return cp_layout_of_layer_type(config, type(config))
+
+
+def stack_cp_layouts(config) -> frozenset[str]:
+    """Return the context-parallel layouts the layers of the stack run in.
+
+    The stack-wide counterpart of :func:`resolve_layer_cp_layout`.
+    """
+    if getattr(config, "_linear_cp_layout_explicit", True):
+        names = ("attention_cp_layout", "linear_cp_layout")
+    else:
+        names = ("cp_partition_mode",)
+    return frozenset(getattr(config, name, None) or ZIGZAG_CP_LAYOUT for name in names)
+
+
+def stack_mixes_cp_layouts(config) -> bool:
+    """Whether the stack converts hidden states between zigzag and contiguous layers."""
+    return len(stack_cp_layouts(config)) > 1
 
 
 class _DifferentiableCPAllGather(torch.autograd.Function):
@@ -72,6 +126,23 @@ def select_zigzag(tensor: Tensor, cp_size: int, cp_rank: int, sequence_dim: int)
         return tensor
     chunks = tensor.chunk(2 * cp_size, dim=sequence_dim)
     return torch.cat((chunks[cp_rank], chunks[2 * cp_size - cp_rank - 1]), dim=sequence_dim)
+
+
+def select_contiguous(tensor: Tensor, cp_size: int, cp_rank: int, sequence_dim: int) -> Tensor:
+    """Take this rank's slice out of a global-order sequence in the contiguous layout.
+
+    The inverse needs no helper: a rank-major all-gather of the slices is the global sequence.
+    """
+    if cp_size == 1:
+        return tensor
+    sequence_length = tensor.shape[sequence_dim]
+    if sequence_length % cp_size != 0:
+        raise ValueError(
+            "Engram contiguous context parallelism requires the sequence length to be "
+            f"divisible by cp_size ({cp_size}); got {sequence_length}."
+        )
+    local_length = sequence_length // cp_size
+    return tensor.narrow(sequence_dim, cp_rank * local_length, local_length)
 
 
 def thd_partition_index(cu_seqlens: Tensor, cp_size: int, cp_rank: int) -> Tensor:

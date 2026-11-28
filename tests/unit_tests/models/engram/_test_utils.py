@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import torch
 
 from megatron.core.models.engram.config import TOKENIZER_MAP_FORMAT, TOKENIZER_MAP_VERSION
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 
 
@@ -67,6 +68,19 @@ def make_module_config(
         sequence_parallel=sequence_parallel,
         deterministic_mode=deterministic_mode,
     )
+
+
+def packed_seq_params(*, cp_partition_mode: str | None = None, **fields) -> PackedSeqParams:
+    """Build PackedSeqParams, tagged with the CP partition mode of its row when one is given.
+
+    PackedSeqParams records that mode only on branches whose data path sets it. The memory
+    reads it when present, so the tag is set as an attribute, which works with or without the
+    field.
+    """
+    params = PackedSeqParams(**fields)
+    if cp_partition_mode is not None:
+        params.cp_partition_mode = cp_partition_mode
+    return params
 
 
 def make_pg_collection(ep=None, tp=None, expt_dp=None, cp=None) -> ProcessGroupCollection:
