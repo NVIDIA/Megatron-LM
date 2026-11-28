@@ -2,7 +2,6 @@
 
 import asyncio
 import concurrent.futures
-import functools
 import logging
 import warnings
 from datetime import datetime
@@ -214,13 +213,6 @@ class EngineLoopMixin:
         # Generate tokens.
         nvtx_range_push(step_nvtx_range)
 
-        completed_requests = {}
-        controller_kwargs["finalize_requests"] = functools.partial(
-            self._finalize_finished_requests,
-            completed_requests,
-            pre_step_context_state,
-            will_log_this_step,
-        )
         if will_log_this_step:
             self.step_start_event.record()
         controller_result: DynamicBatchControllerStepResult = (
@@ -229,8 +221,6 @@ class EngineLoopMixin:
         self.decode_only = controller_result.decode_only
         pre_step_context_state["decode_only"] = self.decode_only
         result = controller_result.output
-        if result is not None:
-            result["completed_requests"] = completed_requests
         if dynamo_helper is not None:
             dynamo_helper.publish_pending_kv_stored_events()
         if will_log_this_step:
@@ -300,7 +290,7 @@ class EngineLoopMixin:
             accepted_tokens = step_result["accepted_tokens"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
-            finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
+            finished_routing_parts = step_result.get("finished_routing_parts", None)
             finished_handoff_block_ids = step_result.get("finished_handoff_block_ids", None)
             finished_handoff_ssm_slots = step_result.get("finished_handoff_ssm_slots", None)
             finished_handoff_decode_tokens = step_result.get("finished_handoff_decode_tokens", None)
@@ -324,11 +314,10 @@ class EngineLoopMixin:
                 top_n_logprobs=top_n_logprobs,
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
-                finished_routing_block_ids=finished_routing_block_ids,
+                finished_routing_parts=finished_routing_parts,
                 finished_handoff_block_ids=finished_handoff_block_ids,
                 finished_handoff_ssm_slots=finished_handoff_ssm_slots,
                 finished_handoff_decode_tokens=finished_handoff_decode_tokens,
-                completed_requests=step_result.get("completed_requests"),
             )
 
         else:

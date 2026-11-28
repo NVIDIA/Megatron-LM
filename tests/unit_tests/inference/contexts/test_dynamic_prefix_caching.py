@@ -2575,7 +2575,11 @@ class TestPerBlockRouting(PrefixCachingTestBase):
             accepted_tokens=None,
             log_probs=[[-0.4]],
             consumed_chunked_prefill_request_id=-1,
-            finished_routing_block_ids={request.request_id: block_ids},
+            finished_routing_parts={
+                request.request_id: ctx.kv_block_allocator.routing_replay.collect_block_routing(
+                    block_ids, 2 * bs + 3
+                )
+            },
         )
 
         expected = routing[: 2 * bs + 3]

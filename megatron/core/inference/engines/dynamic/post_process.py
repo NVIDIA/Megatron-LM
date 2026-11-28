@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from itertools import repeat
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 
 from megatron.core.inference.inference_request import (
@@ -183,11 +184,10 @@ class StepPostProcessingMixin:
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
-        finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
+        finished_routing_parts: Optional[Dict[int, List[np.ndarray]]] = None,
         finished_handoff_block_ids: Optional[Dict[int, list[int]]] = None,
         finished_handoff_ssm_slots: Optional[Dict[int, int]] = None,
         finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
-        process_request_ids: Optional[set[int]] = None,
         record_step_latency: bool = False,
     ) -> Tuple[List[int], List[DynamicInferenceRequest], Dict[int, Tuple[int, int]]]:
         """
@@ -206,14 +206,12 @@ class StepPostProcessingMixin:
             pre_fwd_active_token_count (Optional[int]): Active token count for the
                 consumed forward.
             pre_fwd_step_count (Optional[int]): Step count for the consumed forward.
-            finished_routing_block_ids: (Dict[int, List[int]]): Block IDs for
-                finished requests, saved before update_requests released them.
-                Used for per-block routing reconstruction.
+            finished_routing_parts: Per-block views of the finished requests' routing, by
+                request ID, taken before their blocks were released; concatenated here.
             finished_handoff_block_ids: Prompt KV block IDs retained for state handoff.
             finished_handoff_ssm_slots: Live SSM slots detached for state handoff.
             finished_handoff_decode_tokens: First sampled token and optional MTP proposals
                 needed to resume directly from imported prefill state on decode.
-            process_request_ids: Requests to process in this phase, or None for the full batch.
             record_step_latency: Reserve this step's latency entries before stop-word trimming.
 
         Returns:
@@ -263,7 +261,6 @@ class StepPostProcessingMixin:
                 )
                 for request_id in request_id_list
                 if request_id in finished_request_ids
-                and (process_request_ids is None or request_id in process_request_ids)
             ],
             finished_handoff_decode_tokens or {},
             handoff_log_probs_by_request,
@@ -272,8 +269,6 @@ class StepPostProcessingMixin:
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
             zip(request_id_list, sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
-            if process_request_ids is not None and request_id not in process_request_ids:
-                continue
             finished_entry = None
 
             # Ensure tokens is always a list for consistent handling
@@ -452,14 +447,13 @@ class StepPostProcessingMixin:
 
                 if request_id in finished_request_ids:
                     self._set_finish_reason(request)
-                    # Reconstruct routing from per-block storage before popping.
-                    if finished_routing_block_ids and request_id in finished_routing_block_ids:
-                        block_ids = finished_routing_block_ids[request_id]
+                    # The routing views cover every routed token;
+                    # the stop-word trim may have dropped the last ones.
+                    if finished_routing_parts and request_id in finished_routing_parts:
                         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-                        routing_replay = self.context.kv_block_allocator.routing_replay
-                        request.routing_indices = routing_replay.reconstruct_routing_from_blocks(
-                            block_ids, total_tokens - 1
-                        )
+                        request.routing_indices = np.concatenate(
+                            finished_routing_parts[request_id], axis=0
+                        )[: total_tokens - 1]
 
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
@@ -613,35 +607,6 @@ class StepPostProcessingMixin:
 
         return active_request_ids, finished_requests, tpot_updates
 
-    def _finalize_finished_requests(
-        self,
-        completed_requests: Dict[int, Tuple[DynamicInferenceRequest, Optional[Tuple[int, int]]]],
-        context_state: Dict,
-        record_step_latency: bool,
-        **output,
-    ) -> None:
-        """Finalize only completed rows before their context storage is released.
-
-        Args:
-            completed_requests: Step-owned results and pending latency entries.
-            context_state: Metadata describing the consumed forward.
-            record_step_latency: Whether this step will have a measured latency.
-            **output: Sampled tokens, scores, finished IDs, and retained handoff state.
-        """
-        finished_ids = set(output["finished_request_ids"].tolist())
-        if not finished_ids:
-            return
-        _, finished, tpot_updates = self._process_request_outputs(
-            **output,
-            consumed_chunked_prefill_request_id=context_state["chunked_prefill_request_id"],
-            pre_fwd_active_token_count=context_state["active_token_count"],
-            pre_fwd_step_count=context_state["step_count"],
-            process_request_ids=finished_ids,
-            record_step_latency=record_step_latency,
-        )
-        for request in finished:
-            completed_requests[request.request_id] = (request, tpot_updates.get(request.request_id))
-
     def post_process_requests(
         self,
         request_ids: torch.Tensor,
@@ -655,13 +620,10 @@ class StepPostProcessingMixin:
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
-        finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
+        finished_routing_parts: Optional[Dict[int, List[np.ndarray]]] = None,
         finished_handoff_block_ids: Optional[Dict[int, list[int]]] = None,
         finished_handoff_ssm_slots: Optional[Dict[int, int]] = None,
         finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
-        completed_requests: Optional[
-            Dict[int, Tuple[DynamicInferenceRequest, Optional[Tuple[int, int]]]]
-        ] = None,
     ) -> Tuple[List[int], List[DynamicInferenceRequest]]:
         """Process survivors and publish completed results after a controller step.
 
@@ -677,12 +639,10 @@ class StepPostProcessingMixin:
             top_n_logprobs: Optional top-n scores by consumed row.
             pre_fwd_active_token_count: Consumed forward's token count.
             pre_fwd_step_count: Consumed forward's step count.
-            finished_routing_block_ids: Block lists for results not finalized early.
+            finished_routing_parts: Per-block views of the finished requests' routing.
             finished_handoff_block_ids: Retained handoff KV blocks.
             finished_handoff_ssm_slots: Detached handoff SSM slots.
             finished_handoff_decode_tokens: Tokens for resuming the handed-off request.
-            completed_requests: Results assembled by the pre-release callback and
-                pending latency entries. Futures are published here, not in the callback.
 
         Returns:
             Active request IDs and completed requests.
@@ -693,8 +653,6 @@ class StepPostProcessingMixin:
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
             self._spec_steps += 1
 
-        # Completed rows were already processed before lifecycle cleanup.
-        completed_requests = completed_requests or {}
         active_request_ids, finished_requests, tpot_updates = self._process_request_outputs(
             request_ids,
             finished_request_ids,
@@ -705,21 +663,12 @@ class StepPostProcessingMixin:
             top_n_logprobs,
             pre_fwd_active_token_count,
             pre_fwd_step_count,
-            finished_routing_block_ids,
+            finished_routing_parts,
             finished_handoff_block_ids,
             finished_handoff_ssm_slots,
             finished_handoff_decode_tokens,
-            process_request_ids=(
-                set(request_ids.tolist()) - completed_requests.keys()
-                if completed_requests
-                else None
-            ),
             record_step_latency=step_time > 0,
         )
-        for request_id, (request, timing_update) in completed_requests.items():
-            finished_requests.append(request)
-            if timing_update is not None:
-                tpot_updates[request_id] = timing_update
         finished_by_id = {request.request_id: request for request in finished_requests}
         finished_requests = [finished_by_id[request_id] for request_id in finished_ids]
 
