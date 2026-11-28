@@ -20,4 +20,5 @@ Guides for using Megatron Core and Megatron-LM.
 - [Training Examples](training-examples.md)
 - [Parallelism Strategies Guide](parallelism-guide.md)
 - [Deterministic Training](deterministic-training.md)
+- [Determinism Tracing](determinism-tracing.md)
 - [Advanced Features](features/index.md)

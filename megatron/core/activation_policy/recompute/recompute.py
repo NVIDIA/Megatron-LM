@@ -5,6 +5,8 @@ from typing import List, Optional, Set, Tuple, Union
 from torch import Tensor
 
 from megatron.core.context_parallel import ContextParallelLayoutState, CPLayout
+from megatron.core.determinism.te import bind_layer_trace_context
+from megatron.core.determinism.trace import get_determinism_trace
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.hybrid.layers import utils as hybrid_layer_utils
@@ -209,13 +211,18 @@ def checkpointed_forward(
             return hidden_states, context
 
         if dsa_index_share_carrier_scope is None:
-            return custom_forward
+            forward = custom_forward
+        else:
 
-        def carrier_scoped_forward(*args):
-            with dsa_index_share_carrier_scope(dsa_index_share_carrier):
-                return custom_forward(*args)
+            def carrier_scoped_forward(*args):
+                with dsa_index_share_carrier_scope(dsa_index_share_carrier):
+                    return custom_forward(*args)
 
-        return carrier_scoped_forward
+            forward = carrier_scoped_forward
+
+        if get_determinism_trace() is None:
+            return forward
+        return bind_layer_trace_context(forward)
 
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states, context

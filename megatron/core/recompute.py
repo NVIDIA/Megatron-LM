@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+﻿# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Alias of the module moved to
 ``megatron.core.activation_policy.recompute.recompute``."""
 

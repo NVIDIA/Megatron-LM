@@ -69,6 +69,13 @@ class TransformerConfig(ModelParallelConfig):
     # model architecture
     ####################
 
+    determinism_trace_layers: bool = False
+    """Record L1 layer tensors/gradients when a rank-local trace is active.
+
+    Uses the recorder's capture mode (metadata by default). Python observers do
+    not execute on CUDA graph replay; metadata has host-side overhead.
+    """
+
     num_layers: int = field(default=0, metadata={"argparse_meta": {"default": None}})
     """Number of transformer layers in a transformer block."""
 
