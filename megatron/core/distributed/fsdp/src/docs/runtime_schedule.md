@@ -64,6 +64,10 @@ with a record-and-replay mechanism.
 
 ![MFSDP backward runtime schedule with fused weight gradients][mfsdp-fused-wgrad-backward-schedule]
 
+Reduce-scatter inputs are pre-allocated one module ahead for both fused and unfused
+groups. Fused groups also zero the buffer before backward writes into it; unfused
+groups fill it by copying gradients after backward.
+
 Transformer Engine modules built with `fuse_wgrad_accumulation=True` accumulate weight
 gradients into `weight.main_grad` during Bwd\_i instead of returning them to autograd, so the
 reduce-scatter input must exist before Bwd\_i starts. Compared with the backward schedule above

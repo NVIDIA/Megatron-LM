@@ -490,16 +490,18 @@ def _fused_linear_stack(
 @pytest.mark.parametrize(
     "backward_prefetch_size", [None, 0, 1 << 30], ids=["default", "disabled", "unbounded"]
 )
-def test_fused_wgrad_buffer_is_allocated_by_the_previous_module(
-    distributed_setup, backward_prefetch_size
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fused"])
+def test_partial_grad_buffer_is_allocated_by_the_previous_module(
+    distributed_setup, backward_prefetch_size, fuse
 ):
-    """Each backward allocates the next module's fused buffer and no further one.
+    """Each backward allocates the next module's reduce-scatter input and no further one.
 
     The parameterless root allocates the last layer's buffer, and each layer allocates its
     predecessor's whatever the all-gather prefetch budget, so at most two are alive.
     """
     model, _context = _fused_linear_stack(
         distributed_setup,
+        fuse=fuse,
         schedule_policy=SchedulePolicy(backward_prefetch_size=backward_prefetch_size),
     )
 
@@ -523,9 +525,12 @@ def test_fused_wgrad_buffer_is_allocated_by_the_previous_module(
     assert allocated() == []
 
 
-def test_fused_wgrad_buffer_is_freed_after_its_reduce_scatter(distributed_setup, monkeypatch):
-    """A fused buffer is dropped once its reduce-scatter is launched, like the copy path's."""
-    model, _context = _fused_linear_stack(distributed_setup)
+@pytest.mark.parametrize("fuse", [False, True], ids=["unfused", "fused"])
+def test_partial_grad_buffer_is_freed_after_its_reduce_scatter(
+    distributed_setup, monkeypatch, fuse
+):
+    """A prepared buffer is dropped once its reduce-scatter is launched."""
+    model, _context = _fused_linear_stack(distributed_setup, fuse=fuse)
     allocated = []
     original = FsdpParameterGroup.allocate_partial_grad_buffer
 

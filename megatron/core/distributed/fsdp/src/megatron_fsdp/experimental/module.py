@@ -52,8 +52,8 @@ class FsdpModule:
     _trainable_parameter_countdown: Countdown
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
-    # Recorded on the inner reduction stream after a partial_grad was last allocated and zeroed.
-    _partial_grad_allocated: torch.cuda.Event | None
+    # Recorded after allocating partial_grad and zeroing it when fusion requires it.
+    _partial_grad_allocated: torch.cuda.Event
     # ``phase`` is FORWARD between pre_forward() and post_forward(), BACKWARD
     # between pre_backward() and post_backward(), and RESTING otherwise. The only
     # exception is non-reentrant activation recomputation: it runs between pre_backward()
@@ -80,7 +80,7 @@ class FsdpModule:
                 See ``fully_shard``.
         """
         self._context = context
-        self._partial_grad_allocated = None
+        self._partial_grad_allocated = torch.cuda.Event()
         self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
@@ -364,17 +364,17 @@ class FsdpModule:
                 group.unshard_parameters(phase)
 
     def _preallocate_partial_grads(self) -> None:
-        """Allocate and zero the partial_grads that TE writes fused wgrads into, if not done yet."""
+        """Prepare this module's reduce-scatter inputs on the inner reduction stream."""
         inner_reduction_stream = self.context.inner_reduction_stream
         for group in self._parameter_groups:
             if (
-                group.fuse_wgrad_accumulation
+                group.requires_grad
                 and group.requires_inner_reduction
                 and group.partial_grad is None
             ):
                 with torch.cuda.stream(inner_reduction_stream):
                     group.allocate_partial_grad_buffer()
-                    self._partial_grad_allocated = inner_reduction_stream.record_event()
+                    inner_reduction_stream.record_event(self._partial_grad_allocated)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
@@ -454,8 +454,8 @@ class FsdpModule:
         # module allocates its own. Wait for them even so: when that module is this one's parent,
         # none of its reductions has run yet.
         self._preallocate_partial_grads()
-        if self._partial_grad_allocated is not None:
-            current_stream.wait_event(self._partial_grad_allocated)
+        # With no reduce-scatter inputs, the event stays unrecorded and the wait is a no-op.
+        current_stream.wait_event(self._partial_grad_allocated)
         for group in self._parameter_groups:
             if group.fuse_wgrad_accumulation:
                 group.bind_main_grad()
@@ -525,9 +525,9 @@ class FsdpModule:
     def _reduce_inner_gradients(self, group: FsdpParameterGroup) -> None:
         """Pack on compute and enqueue reduction on the inner reduction stream.
 
-        Allocate the packing buffer on the inner stream, unless pre_backward() did for fused
-        wgrads. On return, that stream contains the queued reduction and accumulation into
-        main_grad.
+        pre_backward() normally prepares the packing buffer. An external scheduler can skip
+        that hook, so allocate on demand in that case. On return, the inner stream contains
+        the queued reduction and accumulation into main_grad.
         """
         current_stream = self.context.current_stream()
         inner_reduction_stream = self.context.inner_reduction_stream
