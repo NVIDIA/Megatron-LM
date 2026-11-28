@@ -1188,7 +1188,7 @@ def test_mhc_context_is_cleared_before_deferred_cuda_graph_runner_call(has_mlp):
     with patch("torch.cuda.Event"):
         runner = _CudaGraphRunner(
             base_module=layer,
-            mempool=0,
+            manager=Mock(),
             fwd_graph_input_args=list(base_call.call_args.args),
             fwd_graph_input_kwargs=base_call.call_args.kwargs,
             func=None,
