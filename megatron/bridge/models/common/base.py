@@ -22,7 +22,7 @@ from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
 from typing import Any, ClassVar
 
-from megatron.bridge.models.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.training.config.instantiate_utils import _resolve_target, instantiate
 from megatron.training.models.base import ModelConfig as _MegatronModelConfig
 
@@ -60,6 +60,10 @@ def deserialize_model_config(data: dict[str, Any]) -> _MegatronModelConfig:
         config_cls = _resolve_target(target, full_key=full_key, check_callable=False)
         if not isinstance(config_cls, type) or not is_dataclass(config_cls):
             return instantiate(subdata)
+
+        upgrade = getattr(config_cls, "upgrade_cfg_dict", None)
+        if upgrade is not None:
+            subdata = upgrade(subdata)
 
         # Constructor-only (InitVar) arguments are accepted too, so the constructor can check them.
         valid_fields = {f.name for f in dataclass_fields(config_cls) if f.init} | set(

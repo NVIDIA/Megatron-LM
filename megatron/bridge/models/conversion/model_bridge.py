@@ -85,7 +85,6 @@ from megatron.bridge.models.conversion.utils import (
 )
 from megatron.bridge.models.decorators.dispatch import dispatch
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
-from megatron.bridge.models.transformer_config import TransformerConfig as BridgeTransformerConfig
 from megatron.bridge.utils import fusions
 from megatron.bridge.utils.activation_map import ACTIVATION_FUNC_MAP
 from megatron.core import parallel_state
@@ -771,7 +770,7 @@ class MegatronModelBridge(MegatronQuantizationBridge, Generic[HFPreTrained, Mega
                 if mla_params:
                     provider_kwargs["_mla_rope_params"] = mla_params
             else:
-                # Non-MLA models use yarn_ prefixed transformer-config fields.
+                # Non-MLA models own yarn_ prefixed fields on the outer model config.
                 provider_kwargs["position_embedding_type"] = "yarn"
                 for hf_key, megatron_key in self.YARN_ROPE_SCALING_MAPPING:
                     value = rope_scaling.get(hf_key)
@@ -844,7 +843,7 @@ class MegatronModelBridge(MegatronQuantizationBridge, Generic[HFPreTrained, Mega
     def _partition_model_config_kwargs(
         config_kwargs: Mapping[str, Any],
         model_config_class: type[ModelConfig],
-        transformer_config_class: type[BridgeTransformerConfig],
+        transformer_config_class: type[TransformerConfig],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Partition flat kwargs between outer and nested config dataclasses."""
         if not is_dataclass(model_config_class):
@@ -913,11 +912,11 @@ class MegatronModelBridge(MegatronQuantizationBridge, Generic[HFPreTrained, Mega
         model_config_with_overrides = cast(type[ModelConfigOverrideMixin], model_config_class)
         transformer_config_class = model_config_with_overrides.transformer_config_class
         if not isinstance(transformer_config_class, type) or not issubclass(
-            transformer_config_class, BridgeTransformerConfig
+            transformer_config_class, TransformerConfig
         ):
             raise TypeError(
                 f"{model_config_class.__name__}.transformer_config_class must be a "
-                f"{BridgeTransformerConfig.__name__} subclass."
+                f"{TransformerConfig.__name__} subclass."
             )
         model_kwargs, transformer_kwargs = self._partition_model_config_kwargs(
             config_kwargs, model_config_class, transformer_config_class

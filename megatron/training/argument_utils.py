@@ -538,6 +538,10 @@ def core_transformer_config_from_args(args, config_class=None):
     _apply_yarn_config_from_args(config, args)
     _model_rng_config(args).finalize_model_config(config)
 
+    # Legacy CLI adapters return a ready-to-use Core config. Native recipes leave
+    # construction deferred and let container startup finalize after overrides.
+    config.finalize()
+
     # Return config.
     return config
 

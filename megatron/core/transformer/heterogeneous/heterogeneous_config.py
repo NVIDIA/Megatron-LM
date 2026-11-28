@@ -194,12 +194,12 @@ class HeterogeneousTransformerConfig(TransformerConfig):
     """The contents of the json file containing the heterogeneous block specs. It will be read from 
     heterogeneous_layers_config_path at first, then saved forever inside the model checkpoint."""
 
-    per_block_parameters: list[TransformerBlockConfig] = field(init=False)
+    per_block_parameters: list[TransformerBlockConfig] = field(default_factory=list, init=False)
     """Configuration parameters for each of the transformer blocks in a 
     heterogeneous transformer."""
 
-    def __post_init__(self):
-        super().__post_init__()
+    def _finalize(self):
+        super()._finalize()
 
         self.heterogeneous_block_specs = True
 
@@ -257,11 +257,13 @@ class HeterogeneousTransformerConfig(TransformerConfig):
         transformer_config_dict = asdict(self)
 
         # remove keys that are not in TransformerConfig
-        transformer_config_field_names = {f.name for f in fields(TransformerConfig)}
+        transformer_config_field_names = {f.name for f in fields(TransformerConfig) if f.init}
         transformer_config_dict = {
             k: v for k, v in transformer_config_dict.items() if k in transformer_config_field_names
         }
 
         transformer_config_dict.update(keys_to_update)
 
-        return TransformerConfig(**transformer_config_dict)
+        config = TransformerConfig(**transformer_config_dict)
+        config.finalize()
+        return config

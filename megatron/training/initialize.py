@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from megatron.core import mpu, tensor_parallel, tuning
-from megatron.core._rank_utils import safe_get_world_size
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_geglu import bias_geglu
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
@@ -28,6 +28,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
+from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     get_pg_rank,
@@ -54,9 +55,22 @@ from megatron.training.global_vars import (
     get_train_state,
     initialize_runtime_services,
 )
+from megatron.training.models.gpt import GPTModelConfig
+from megatron.training.models.hybrid import HybridModelConfig
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
+
+
+def _get_embedding_ranks(pp_ranks: list[int]) -> list[int]:
+    """Include input embeddings, tied output weights, and every MTP pipeline stage."""
+    embedding_ranks = [pp_ranks[0]]
+    if len(pp_ranks) > 1:
+        model_config = get_run_config().model
+        if model_config.share_embeddings_and_output_weights:
+            embedding_ranks.append(pp_ranks[-1])
+        embedding_ranks.extend(get_mtp_ranks(pp_ranks, model_config.transformer))
+    return sorted(set(embedding_ranks))
 
 
 def initialize_megatron(
@@ -102,6 +116,14 @@ def initialize_megatron(
     # Inference's args-only entrypoints keep their existing input boundary. Training
     # supplies a typed model config, including callback-based applications.
     model_config = cfg.model.transformer if training else args
+    if training and get_embedding_ranks is None and isinstance(
+        cfg.model, (GPTModelConfig, HybridModelConfig)
+    ):
+        get_embedding_ranks = _get_embedding_ranks
+    if args is None and training and model_config.deterministic_mode:
+        from megatron.training.determinism import apply_determinism_to_args
+
+        apply_determinism_to_args(model_config)
     transformer_config = getattr(cfg.model, "transformer", None)
     tp_comm_overlap = (
         transformer_config.tp_comm_overlap
@@ -122,7 +144,7 @@ def initialize_megatron(
     setup_logging()
 
     if training and cfg.checkpoint.async_save and cfg.checkpoint.use_persistent_ckpt_worker:
-        init_persistent_async_worker(args.rank, 'forkserver')
+        init_persistent_async_worker(safe_get_rank(), 'forkserver')
 
     # init rerun state
     def state_save_func():
@@ -132,7 +154,6 @@ def initialize_megatron(
         if state_dict['rng_tracker_states']:
             tensor_parallel.get_cuda_rng_tracker().set_states(state_dict['rng_tracker_states'])
 
-    args = get_args()
     if training:
         initialize_rerun_state_machine(
             state_save_func=state_save_func,
@@ -155,13 +176,13 @@ def initialize_megatron(
 
     # Before any Triton kernel runs, including the kernel warm-up before model construction.
     tuning.install(
-        _triton_autotune_config_from_args(args), deterministic=model_config.deterministic_mode
+        _triton_autotune_config_from_args(args) if args is not None else tuning.AutotunePolicy(),
+        deterministic=model_config.deterministic_mode,
     )
 
     # torch.distributed initialization
     def finish_mpu_init():
         cfg = get_run_config()
-        args = get_args()
         # Pytorch distributed.
         _initialize_distributed(
             get_embedding_ranks,
@@ -219,7 +240,6 @@ def initialize_megatron(
     if skip_mpu_initialization:
         return None
 
-    args = get_args()
     if cfg.dist.lazy_mpu_init:
         # TODO is this still a necessary option?
         model_config.use_cpu_initialization = True
@@ -228,7 +248,7 @@ def initialize_megatron(
         mpu.set_tensor_model_parallel_world_size(model_config.tensor_model_parallel_size)
         # and return function for external DDP manager
         # to call when it has DDP initialized
-        mpu.set_tensor_model_parallel_rank(args.rank)
+        mpu.set_tensor_model_parallel_rank(safe_get_rank())
         return finish_mpu_init
     else:
         # Megatron's MPU is the master. Complete initialization right away.
@@ -261,8 +281,6 @@ def initialize_megatron(
 
 
 def _compile_dependencies():
-
-    args = get_args()
 
     # =========================
     # Compile dataset C++ code.
@@ -374,8 +392,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
     if torch.distributed.is_initialized():
 
         print_rank_0("torch distributed is already initialized, skipping initialization ...")
-        args.rank = torch.distributed.get_rank()
-        args.world_size = torch.distributed.get_world_size()
+        if args is not None:
+            args.rank = torch.distributed.get_rank()
+            args.world_size = torch.distributed.get_world_size()
 
     else:
 
@@ -440,7 +459,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             'backend': cfg.dist.distributed_backend,
             'store': store,
             'world_size': safe_get_world_size(),
-            'rank': args.rank,
+            'rank': safe_get_rank(),
             'timeout': timedelta(minutes=cfg.dist.distributed_timeout_minutes),
         }
         if cfg.dist.fake_process_group:
@@ -455,7 +474,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
-        if args.deterministic_mode:
+        if model_config.deterministic_mode:
             from megatron.training.determinism import assert_nccl_algo_still_empty
 
             assert_nccl_algo_still_empty()
@@ -593,7 +612,7 @@ def write_args_to_tensorboard():
     """Write arguments to tensorboard."""
     args = get_args()
     writer = get_tensorboard_writer()
-    if writer:
+    if writer and args is not None:
         for arg in vars(args):
             writer.add_text(arg, str(getattr(args, arg)), global_step=get_train_state().iteration)
 

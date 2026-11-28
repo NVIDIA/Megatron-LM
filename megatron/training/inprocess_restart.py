@@ -156,7 +156,7 @@ def maybe_force_nccl_backend_init(device_id):
     # does not terminate NCCL kernels if NCCL backend wasn't fully initialized
     # before additional distributed subgroups are created. This forces initialization
     # of the NCCL backend.
-    if args.inprocess_restart:
+    if args is not None and args.inprocess_restart:
         tensor = torch.ones(128, device=device_id)
         torch.distributed.all_reduce(tensor)
         torch.cuda.synchronize()

@@ -30,7 +30,6 @@ from megatron.bridge.models.hybrid.model_config import (
     BridgeHybridMLAModelConfig,
     BridgeHybridModelConfig,
 )
-from megatron.bridge.models.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.activations import squared_relu
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
@@ -41,6 +40,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.training.models.hybrid import HybridModelConfig
 
 
@@ -67,6 +67,40 @@ def _core_attention(stack_spec: ModuleSpec):
 
 
 class TestStrictOverrides:
+    def test_yarn_is_model_owned_and_projected_for_core(self):
+        config = _make_model_config(
+            position_embedding_type="yarn",
+            yarn_rotary_scaling_factor=8.0,
+            yarn_original_max_position_embeddings=4096,
+            yarn_beta_fast=32.0,
+            yarn_beta_slow=1.0,
+            yarn_mscale=1.0,
+            yarn_mscale_all_dim=0.0,
+            yarn_correction_range_round_to_int=True,
+        )
+        config.finalize()
+        assert config.transformer.yarn_rotary_scaling_factor == 8.0
+        serialized = config.as_dict()
+        assert serialized["yarn_rotary_scaling_factor"] == 8.0
+        assert "yarn_rotary_scaling_factor" not in serialized["transformer"]
+        restored = BridgeHybridModelConfig.from_dict(serialized)
+        restored.finalize()
+        assert restored.yarn_rotary_scaling_factor == 8.0
+        assert restored.transformer.yarn_rotary_scaling_factor == 8.0
+
+        legacy = dict(serialized)
+        legacy["transformer"] = dict(serialized["transformer"])
+        for name in tuple(legacy):
+            if name.startswith("yarn_"):
+                legacy["transformer"][name] = legacy.pop(name)
+        restored = BridgeHybridModelConfig.from_dict(legacy)
+        restored.finalize()
+        assert restored.yarn_rotary_scaling_factor == 8.0
+        assert "yarn_rotary_scaling_factor" in legacy["transformer"]
+        legacy["yarn_rotary_scaling_factor"] = 4.0
+        with pytest.raises(ValueError, match="Conflicting saved"):
+            BridgeHybridModelConfig.from_dict(legacy)
+
     def test_flat_assignment_routes_to_declared_field_owner(self) -> None:
         config = _make_model_config()
 

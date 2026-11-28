@@ -28,7 +28,6 @@ from megatron.bridge.models.common.base import (
     ModelConfigOverrideMixin,
 )
 from megatron.bridge.models.hybrid.hybrid_builder import DEFAULT_MAMBA_CHUNK_SIZE
-from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.bridge.utils.activation_map import callable_to_str, str_to_callable
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -38,6 +37,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.config.instantiate_utils import _resolve_target
 from megatron.training.models.hybrid import HybridModelConfig
 
@@ -85,6 +85,43 @@ class BridgeHybridModelConfig(ModelConfigOverrideMixin, HybridModelConfig, Model
     hf_model_text_only: bool = False
     """Whether the source HF checkpoint was projected to its language model."""
 
+    # Non-MLA YaRN is a model rotary-embedding choice, not a generic transformer
+    # setting. MLA keeps its existing Core rotary fields on MLATransformerConfig.
+    yarn_rotary_scaling_factor: float | None = None
+    yarn_original_max_position_embeddings: int | None = None
+    yarn_beta_fast: float | None = None
+    yarn_beta_slow: float | None = None
+    yarn_mscale: float | None = None
+    yarn_mscale_all_dim: float | None = None
+    yarn_correction_range_round_to_int: bool | None = None
+
+    @staticmethod
+    def upgrade_cfg_dict(config: dict[str, Any]) -> dict[str, Any]:
+        """Restore backward compatibility with YaRN saved on the old Bridge transformer."""
+        nested = config.get("transformer")
+        if not isinstance(nested, dict):
+            return config
+        result = dict(config)
+        nested = dict(nested)
+        for name in (
+            "yarn_rotary_scaling_factor",
+            "yarn_original_max_position_embeddings",
+            "yarn_beta_fast",
+            "yarn_beta_slow",
+            "yarn_mscale",
+            "yarn_mscale_all_dim",
+            "yarn_correction_range_round_to_int",
+        ):
+            if name not in nested:
+                continue
+            value = nested.pop(name)
+            if value is not None:
+                if result.get(name) is not None and result[name] != value:
+                    raise ValueError(f"Conflicting saved model and transformer values for {name}")
+                result[name] = value
+        result["transformer"] = nested
+        return result
+
     def validate(self) -> None:
         """Check the Hybrid settings without changing the config.
 
@@ -119,6 +156,30 @@ class BridgeHybridModelConfig(ModelConfigOverrideMixin, HybridModelConfig, Model
             self.hybrid_override_pattern = None
 
         transformer = self.transformer
+        # Preserve Bridge recipe defaults without changing Core's public policy.
+        if not transformer._finalized:
+            if transformer.pipeline_model_parallel_size > 1 and transformer.pipeline_dtype is None:
+                transformer.pipeline_dtype = transformer.params_dtype
+            if transformer.sequence_parallel and transformer.tensor_model_parallel_size <= 1:
+                transformer.sequence_parallel = False
+            if (
+                transformer.expert_tensor_parallel_size is None
+                and transformer.expert_model_parallel_size > 1
+            ):
+                transformer.expert_tensor_parallel_size = 1
+        if self.position_embedding_type == "yarn" and self.yarn_rotary_scaling_factor is not None:
+            # Core's non-MLA attention and rotary embedding currently consume these
+            # runtime attributes. The model config is their sole serialized owner.
+            for name in (
+                "yarn_rotary_scaling_factor",
+                "yarn_original_max_position_embeddings",
+                "yarn_beta_fast",
+                "yarn_beta_slow",
+                "yarn_mscale",
+                "yarn_mscale_all_dim",
+                "yarn_correction_range_round_to_int",
+            ):
+                setattr(transformer, name, getattr(self, name))
         mtp_pattern = transformer.mtp_hybrid_override_pattern
         if self.hybrid_layer_pattern is not None and mtp_pattern:
             separator = Symbols.MTP_SEPARATOR
@@ -159,6 +220,11 @@ class BridgeHybridModelConfig(ModelConfigOverrideMixin, HybridModelConfig, Model
             transformer.num_layers = num_layers
 
         super().finalize()
+        if (
+            getattr(transformer, "_enable_in_batch_packing", False)
+            and transformer.pipeline_model_parallel_size > 1
+        ):
+            transformer.variable_seq_lengths = True
 
     def get_builder_cls(self) -> type:
         """Resolve the configured builder through Bridge's target allowlist."""

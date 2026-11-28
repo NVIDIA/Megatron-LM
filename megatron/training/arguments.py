@@ -2795,10 +2795,6 @@ def _add_training_args(parser):
                        help="Use torch.optim.Optimizer instead of Megatron's optimizer in optimizer cpu offload mode.")
     group.add_argument('--overlap-cpu-optimizer-d2h-h2d', action='store_true', default=False,
                        help='Overlap CPU optimizer step, gradients D2H and updated parameters H2D.')
-    group.add_argument('--dump-param-to-param-group-map', type=str, default=None,
-                        help="Path to a file containing parameter-to-parameter-group mapping. "
-                        "Provide a JSON file that specifies which parameters belong to which "
-                        "parameter group for global coordination.")
     group.add_argument('--no-pin-cpu-grads', action='store_false', dest='pin_cpu_grads',
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
@@ -3147,9 +3143,6 @@ def _add_data_args(parser):
                        '(3) a list of prefixes e.g. prefix1 prefix2. '
                        'For (3), weights are inferred from the lengths of the contributing datasets. '
                        'This argument is exclusive to the other independent --*-data-path arguments.')
-    group.add_argument('--phase-transition-iterations', type=str, default=None,
-                       help='Comma-separated list of iterations where phase '
-                       'transitions occur. Requires fixed global batch size across phases.')
     group.add_argument('--split', type=str, default=None,
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '

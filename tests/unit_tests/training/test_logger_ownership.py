@@ -39,10 +39,13 @@ def test_cli_aliases_and_native_config_match(run_config):
             '--otel-span-groups',
             'checkpoint',
             '--no-barrier-with-level-1-timing',
+            '--dump-param-to-param-group-map',
+            'param-groups',
         ]
     )
     config = _default_config_from_args(LoggerConfig, args)
     expected = LoggerConfig(
+        dump_param_to_param_group_map='param-groups',
         enable_one_logger=False,
         one_logger_project='project',
         one_logger_run_name='run',
@@ -105,6 +108,7 @@ def test_native_memory_interval_validation(interval, valid, run_config):
 
 @pytest.mark.parametrize('rank,enabled', [(0, False), (1, True)])
 def test_tensorboard_uses_owned_directory_and_queue(monkeypatch, rank, enabled, run_config):
+    monkeypatch.setattr(global_vars, 'safe_get_rank', lambda: rank)
     monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 2)
     factory = Mock()
     monkeypatch.setitem(
@@ -122,6 +126,7 @@ def test_tensorboard_uses_owned_directory_and_queue(monkeypatch, rank, enabled, 
 
 
 def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, run_config):
+    monkeypatch.setattr(global_vars, 'safe_get_rank', lambda: 0)
     monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 1)
     wandb = SimpleNamespace(init=Mock())
     monkeypatch.setitem(sys.modules, 'wandb', wandb)
@@ -153,6 +158,7 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
 
 @pytest.mark.parametrize('wandb_project,asynchronous', [(None, False), ('project', True)])
 def test_one_logger_async_policy(monkeypatch, wandb_project, asynchronous, run_config):
+    monkeypatch.setattr(global_vars, 'safe_get_rank', lambda: 0)
     monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 1)
     factory = Mock()
     monkeypatch.setitem(sys.modules, 'one_logger', SimpleNamespace(OneLogger=factory))
@@ -216,7 +222,7 @@ def test_tensorboard_metadata_preserves_legacy_args(monkeypatch):
     args = Namespace(log_interval=99, run_workload_inspector_server=False)
     train_state = TrainState(iteration=13)
     writer = Mock()
-    monkeypatch.setattr(initialize, 'get_args', lambda: args)
+    monkeypatch.setattr(global_vars, '_GLOBAL_ARGS', args)
     monkeypatch.setattr(initialize, 'get_train_state', lambda: train_state)
     monkeypatch.setattr(initialize, 'get_tensorboard_writer', lambda: writer)
     monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', None)

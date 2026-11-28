@@ -226,4 +226,5 @@ def get_vision_model_config(hf_config, megatron_config=None):
     if megatron_config is not None and hasattr(megatron_config, "use_cpu_initialization"):
         config.use_cpu_initialization = megatron_config.use_cpu_initialization
 
+    config.finalize()
     return config

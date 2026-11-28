@@ -1,0 +1,138 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""Recipe overrides edit native config leaves without replacing Python objects."""
+
+import pytest
+import torch
+
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.training.config.utils import apply_config_overrides
+
+
+@pytest.mark.parametrize("dtype", ["torch.bfloat16", "bfloat16"])
+def test_overrides_preserve_dtype_and_enum(run_config, dtype):
+    apply_config_overrides(
+        run_config,
+        [f"model.transformer.params_dtype={dtype}", "model.transformer.attention_backend=local"],
+    )
+    assert run_config.model.transformer.params_dtype is torch.bfloat16
+    assert run_config.model.transformer.attention_backend is AttnBackend.local
+    # Optional typed fields must work even when their initial value is None.
+    run_config.model.transformer.pipeline_dtype = None
+    apply_config_overrides(run_config, [f"model.transformer.pipeline_dtype={dtype}"])
+    assert run_config.model.transformer.pipeline_dtype is torch.bfloat16
+    apply_config_overrides(run_config, ["model.transformer.pipeline_dtype=null"])
+    assert run_config.model.transformer.pipeline_dtype is None
+
+
+@pytest.mark.parametrize(
+    "override",
+    ["model.transformer.params_dtype=invalid", "model.transformer.attention_backend=invalid"],
+)
+def test_invalid_typed_overrides_fail_before_assignment(run_config, override):
+    transformer = run_config.model.transformer
+    original = (transformer.params_dtype, transformer.attention_backend)
+    with pytest.raises(ValueError, match="Invalid"):
+        apply_config_overrides(run_config, [override])
+    assert (transformer.params_dtype, transformer.attention_backend) == original
+
+
+def test_llama_recipe_preserves_bridge_effective_weight_decay():
+    from megatron.bridge.recipes.llama import llama3_8b_pretrain_config
+
+    cfg = llama3_8b_pretrain_config()
+    cfg.scheduler.finalize_scheduler_config(cfg.optimizer.weight_decay)
+    assert cfg.optimizer.weight_decay == 0.033
+    assert cfg.scheduler.start_weight_decay == cfg.scheduler.end_weight_decay == 0.033
+
+
+def test_overrides_preserve_native_objects_and_leave_finalization_to_startup(run_config):
+    transformer = run_config.model.transformer
+    activation = transformer.activation_func
+    layout = PipelineParallelLayerLayout.from_str("Et*2L", pipeline_model_parallel_size=1)
+    transformer.pipeline_model_parallel_layout = layout
+    apply_config_overrides(
+        run_config,
+        [
+            "train.train_iters=4",
+            "train.train_iters=8",
+            "optimizer.lr=3e-4",
+            "train.manual_gc=true",
+            "train.exit_interval=null",
+            "profiling.profile_ranks=[2,4]",
+        ],
+    )
+    assert run_config.train.train_iters == 8
+    assert run_config.optimizer.lr == 3e-4
+    assert run_config.train.manual_gc is True
+    assert run_config.train.exit_interval is None
+    assert run_config.profiling.profile_ranks == [2, 4]
+    assert run_config.model.transformer is transformer
+    assert transformer.activation_func is activation
+    assert transformer.pipeline_model_parallel_layout is layout
+    assert not run_config._finalized
+
+
+@pytest.mark.parametrize(
+    "layout", ["Et*2|t*2L", "[[embedding,decoder,decoder],[decoder,decoder,loss]]", "null"]
+)
+def test_pipeline_layout_override_is_normalized_at_finalization(run_config, layout):
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    transformer = TransformerConfig(num_layers=4, hidden_size=128, num_attention_heads=4)
+    run_config.model.transformer = transformer
+    apply_config_overrides(
+        run_config,
+        [
+            "model.transformer.pipeline_model_parallel_size=2",
+            "model.transformer.pipeline_dtype=float32",
+            f"model.transformer.pipeline_model_parallel_layout={layout}",
+        ],
+    )
+    assert not isinstance(transformer.pipeline_model_parallel_layout, PipelineParallelLayerLayout)
+    assert not run_config._finalized
+    transformer.finalize()
+    if layout == "null":
+        assert transformer.pipeline_model_parallel_layout is None
+    else:
+        assert isinstance(transformer.pipeline_model_parallel_layout, PipelineParallelLayerLayout)
+        assert transformer.pipeline_model_parallel_layout.layout == (
+            PipelineParallelLayerLayout.from_str("Et*2|t*2L", pipeline_model_parallel_size=2).layout
+        )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "train.typo=2",
+        "train.train_iters.value=2",
+        "_finalized=true",
+        "train={}",
+        "train.train_iters",
+        "model.transformer.activation_func=silu",
+    ],
+)
+def test_invalid_override_cannot_create_phantom_fields(run_config, override):
+    with pytest.raises(ValueError):
+        apply_config_overrides(run_config, [override])
+    assert not hasattr(run_config.train, "typo")
+    assert not run_config._finalized
+
+
+def test_rank_local_failure_reaches_launcher_without_collective_teardown(run_config, monkeypatch):
+    from megatron.training import api
+    from scripts import run_recipe
+
+    def fail_training(*args, **kwargs):
+        raise RuntimeError("rank-local dataset failure")
+
+    def fail_teardown():
+        pytest.fail("Collective teardown can hide the rank-local exception")
+
+    monkeypatch.setattr(run_recipe, "_load_callable", lambda path: lambda: run_config)
+    monkeypatch.setattr(api, "pretrain", fail_training)
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+    monkeypatch.setattr("torch.distributed.destroy_process_group", fail_teardown)
+    with pytest.raises(RuntimeError, match="rank-local dataset failure"):
+        run_recipe.main(["--recipe", "test:recipe", "--forward-step", "test:step"])

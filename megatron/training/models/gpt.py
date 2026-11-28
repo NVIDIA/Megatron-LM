@@ -268,8 +268,7 @@ class GPTModelConfig(ModelConfig):
 
     def finalize(self) -> None:
         """Finalize nested model settings after the run has propagated its RNG policy."""
-        if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
-            self.transformer.finalize()
+        self.transformer.finalize()
 
         # Offline speculative decoding builds the base model with num_layers=0; ModelOpt reads
         # the original layer count from the TransformerConfig. It is not a TransformerConfig

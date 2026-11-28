@@ -11,6 +11,117 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
 
+class TestDeferredFinalization:
+    def test_overrides_precede_derivation_and_validation_is_read_only(self):
+        config = TransformerConfig(num_layers=2, hidden_size=128, num_attention_heads=4)
+        assert config.ffn_hidden_size is None
+        assert config.kv_channels is None
+        assert config.init_method is None
+        config.hidden_size = 256
+        config.init_method_std = 0.01
+        config.validate()
+        config.validate()
+        assert config.ffn_hidden_size is None
+        assert config.kv_channels is None
+        assert config.init_method is None
+        assert not config._finalized
+        config.finalize()
+        assert config.ffn_hidden_size == 1024
+        assert config.kv_channels == 64
+        actual = torch.empty(256)
+        expected = torch.empty_like(actual)
+        torch.manual_seed(1234)
+        config.init_method(actual)
+        torch.manual_seed(1234)
+        expected.normal_(mean=0.0, std=0.01)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        init_method = config.init_method
+        config.finalize()
+        assert config.init_method is init_method
+
+    def test_validation_restores_backend_policy_on_failure(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=3,
+            tensor_model_parallel_size=2,
+            bf16=True,
+            disable_bf16_reduced_precision_matmul=True,
+        )
+        old_policy = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+        with pytest.raises(ValueError, match="num_attention_heads"):
+            config.validate()
+        assert torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction == old_policy
+        assert not config._finalized
+
+    def test_mla_uses_the_same_deferred_lifecycle(self):
+        from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+        config = MLATransformerConfig(
+            num_layers=2, hidden_size=128, num_attention_heads=4, layernorm_epsilon=1e-6
+        )
+        assert config.attention_latent_norm_epsilon is None
+        config.validate()
+        assert config.attention_latent_norm_epsilon is None
+        config.finalize()
+        assert config.attention_latent_norm_epsilon == 1e-6
+        assert config.kv_channels == 32
+
+        base = TransformerConfig(
+            num_layers=2, hidden_size=128, num_attention_heads=4, layernorm_epsilon=1e-6
+        )
+        base.finalize()
+        assert TransformerConfig.from_config(base)._finalized
+        promoted = MLATransformerConfig.from_config(base)
+        assert not promoted._finalized
+        promoted.finalize()
+        assert promoted.attention_latent_norm_epsilon == 1e-6
+
+    def test_heterogeneous_configs_serialize_before_finalizing(self):
+        import json
+
+        from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+            HeterogeneousTransformerConfig,
+        )
+        from megatron.training.config.utils import serialize_dataclass
+
+        config = HeterogeneousTransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            heterogeneous_layers_config_encoded_json=json.dumps(
+                {
+                    "block_configs": [
+                        {"attention": {"num_query_groups": 2}, "mlp": {"ffn_hidden_size": 256}}
+                    ]
+                }
+            ),
+        )
+        before = serialize_dataclass(config)
+        config.validate()
+        assert serialize_dataclass(config) == before
+        assert config.per_block_parameters == []
+        config.finalize()
+        layer_config = config.get_config_for_layer(1)
+        assert layer_config._finalized
+        assert layer_config.ffn_hidden_size == 256
+        assert layer_config.num_query_groups == 2
+
+    def test_yaml_constructor_does_not_require_private_lifecycle_fields(self):
+        from dataclasses import fields
+        from types import SimpleNamespace
+
+        from megatron.training.yaml_arguments import core_config_from_args
+
+        config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+        values = {f.name: getattr(config, f.name) for f in fields(config) if f.init}
+        kwargs = core_config_from_args(SimpleNamespace(**values))
+        assert "_finalized" not in kwargs
+        restored = TransformerConfig(**kwargs)
+        restored.finalize()
+        assert restored.kv_channels == 32
+
+
 def _make_glu_interleave_config(**overrides):
     kwargs = dict(
         num_layers=1,

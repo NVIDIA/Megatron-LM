@@ -68,6 +68,7 @@ def test_guard_agrees_with_config_resolution(
     config = TransformerConfig(
         num_layers=1, hidden_size=8, num_attention_heads=1, num_moe_experts=4, **fusion_flags
     )
+    config.finalize()
 
     args = make_args(**fusion_flags)
     requested_args = vars(args).copy()
