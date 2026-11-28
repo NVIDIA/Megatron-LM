@@ -716,7 +716,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 )
 
             out, out_bias = precision_aware_checkpoint(
-                _checkpointed_compute, self.config, self.pg_collection.tp, hidden_states
+                _checkpointed_compute, self.config, active_pg_collection.tp, hidden_states
             )
         else:
             out, out_bias = self._forward_compute(

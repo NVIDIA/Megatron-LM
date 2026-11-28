@@ -89,7 +89,8 @@ def test_wrapper_does_not_repeat_core_inverse_rope(monkeypatch, fused, packed):
         num_attention_heads_per_partition=1,
         output_projection_local_groups=1,
         o_local_groups=1,
-        linear_o_group_proj=torch.eye(4),
+        # Identity grouped output projection, so the output is the core's result.
+        _apply_linear_o_group_proj=lambda x: x,
         linear_proj=lambda value: (value, None),
         _post_o_group_proj=lambda attn_out, q_compressed: attn_out,
         get_query_key_value_tensors=lambda *args, **kwargs: (raw,) * 5,

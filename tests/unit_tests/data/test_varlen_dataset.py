@@ -1368,6 +1368,16 @@ def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
     # Merged pretrain_gpt carries main's aliased import, so patch the alias. The restored
     # varlen-SBHD disjunct should short-circuit before this is consulted at all.
     monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank_func", lambda *args, **kwargs: False)
+    # NOTE(nightly-sync 2026-11-03): main (831aa66d4) moved is_dataset_built_on_rank into
+    # megatron.training.datasets.providers, which pretrain_gpt re-exports. It reads the arguments
+    # and the transformer config at call time from global_vars and arguments, so patch those too.
+    from megatron.training import arguments as training_arguments
+    from megatron.training import global_vars
+
+    monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    monkeypatch.setattr(
+        training_arguments, "core_transformer_config_from_args", lambda _: SimpleNamespace()
+    )
 
     assert pretrain_gpt.is_dataset_built_on_rank() is True
 
@@ -1713,7 +1723,18 @@ def test_packing_scheduler_dataloader_prefetches_next_global_batch(
 def test_datasets_provider_selects_dataset_type(
     monkeypatch, entrypoint, sft, use_varlen_dataset, mock_data, expected_type, expected_packed
 ):
-    """GPT and Hybrid pretraining select the same dataset type for each data mode."""
+    """GPT and Hybrid pretraining select the same dataset type for each data mode.
+
+    Both scripts' providers delegate to ``providers.build_gpt_datasets`` (main #8341), which hands
+    the builder the dataset class ``cfg.data`` resolved from the legacy family flags, together with
+    the packed-sequence flag for that class.
+    """
+    from megatron.core.datasets import gpt_dataset
+    from megatron.training import argument_utils, global_vars
+    from megatron.training import utils as training_utils
+    from megatron.training.config import dataset_config
+    from megatron.training.datasets import providers, sft_dataset
+
     module = importlib.import_module(entrypoint)
     args = SimpleNamespace(
         sft=sft,
@@ -1722,20 +1743,39 @@ def test_datasets_provider_selects_dataset_type(
         varlen_sbhd_validation=False,
         fim_data=False,
     )
+    family = argument_utils.requested_dataset_family(args)
+    dataset = SimpleNamespace(
+        tokenizer=object(), varlen_sbhd_validation=args.varlen_sbhd_validation
+    )
+    data = SimpleNamespace(
+        dataset=dataset,
+        dataset_type=dataset_config.dataset_type_from_family(family, mock=mock_data),
+    )
+    data.builder_inputs = lambda: dataset_config.DataConfig.builder_inputs(data)
     built = {}
 
     class _RecordingBuilder:
         def __init__(self, dataset_type, num_samples, is_built_on_rank, config):
-            built.update(dataset_type=dataset_type, is_built_on_rank=is_built_on_rank)
+            built.update(
+                dataset_type=dataset_type, is_built_on_rank=is_built_on_rank, config=config
+            )
 
         def build(self):
             return "train", "valid", "test"
 
-    monkeypatch.setattr(module, "get_args", lambda: args)
-    monkeypatch.setattr(module, "core_gpt_dataset_config_from_args", lambda _: None)
-    monkeypatch.setattr(module, "BlendedMegatronDatasetBuilder", _RecordingBuilder)
-    monkeypatch.setattr(module, "print_rank_0", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(global_vars, "get_run_config", lambda: SimpleNamespace(data=data))
+    monkeypatch.setattr(providers, "BlendedMegatronDatasetBuilder", _RecordingBuilder)
+    monkeypatch.setattr(training_utils, "print_rank_0", lambda *_args, **_kwargs: None)
 
+    expected_classes = {
+        "MockSFTDataset": MockSFTDataset,
+        "SFTDataset": sft_dataset.SFTDataset,
+        "MockVarlenDataset": MockVarlenDataset,
+        "VarlenDataset": VarlenDataset,
+        "MockGPTDataset": gpt_dataset.MockGPTDataset,
+        "GPTDataset": gpt_dataset.GPTDataset,
+    }
     assert module.train_valid_test_datasets_provider([1, 1, 1]) == ("train", "valid", "test")
-    assert built["dataset_type"] is getattr(module, expected_type)
+    assert built["dataset_type"] is expected_classes[expected_type]
+    assert built["config"] is dataset
     assert built["is_built_on_rank"].keywords["is_packed_sequence"] is expected_packed

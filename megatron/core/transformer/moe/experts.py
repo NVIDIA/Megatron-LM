@@ -29,6 +29,7 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.extensions.transformer_engine import (
     mark_grouped_tensor as _mark_te_grouped_tensor,
 )
+from megatron.core.fp8_utils import is_grouped_tensor
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -97,6 +98,7 @@ from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     FlashInferCutlassMXFP8Weight,
     FlashInferRoutedMXFP8Weight,
+    attach_routed_mxfp8_writeback,
     flashinfer_cutlass_mxfp8_moe,
     flashinfer_routed_mxfp8_moe,
     prepare_cutlass_mxfp8_weights,
@@ -305,6 +307,14 @@ class TEGroupedMLP(MegatronModule):
 
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
+        # Replica coordinates of the shared TE activation extra state (see sharded_state_dict):
+        # the joint ETP x EP group and the full expert data-distribution group
+        # (expt_dp x EGTP_remat), which gives EGTP_remat peers distinct replica ids like
+        # TEGroupedLinear. Resolved leniently because unit tests build this module with
+        # minimal duck-typed collections that only carry ``ep`` and ``expt_tp``.
+        self.tp_ep_group = getattr(pg_collection, "tp_ep", None)
+        self.dp_group = getattr(pg_collection, "expt_dp", None)
+        self.dp_group_gtp_remat = getattr(pg_collection, "expt_dp_gtp_remat", None)
 
         # Double the output width with gated linear unit, see https://arxiv.org/pdf/2002.05202.pdf
         ffn_hidden_size = not_none(self.config.moe_ffn_hidden_size)
@@ -763,13 +773,6 @@ class TEGroupedMLP(MegatronModule):
         register_grouped_linear_params(
             op, self.linear_fc1, fc1_single_grouped_weight, fc1_single_grouped_bias
         )
-        # FP8 dispatch: the FC1 input arrives as an opaque MXFP8 carrier tensor (TE EP dispatch
-        # packs E4M3 data + scales into a plain tensor's storage); tell TE to rebuild the
-        # grouped view at the op boundary.
-        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
-        # TODO: remove after TE support the grouped tensor path
-        if getattr(self.config, 'moe_dispatch_fwd_dtype', 'bf16') == 'mxfp8':
-            op.ep_mxfp8_carrier_input = True
         ops.append(op)
 
         # Activation and post-multiply probs (SwiGLU, SiTU-GLU, clamped GeGLU, or SReLU).
@@ -892,13 +895,6 @@ class TEGroupedMLP(MegatronModule):
             op, self.linear_fc2, fc2_single_grouped_weight, fc2_single_grouped_bias
         )
         op.wgrad_store = self.linear_fc2.wgrad_store
-        # FP8 combine backward: the FC2 output grad arrives as an opaque MXFP8 carrier tensor
-        # (TE EP combine backward, same packing as dispatch); tell TE to rebuild the grouped
-        # view at the op boundary.
-        # Only works with TE PR https://github.com/NVIDIA/TransformerEngine/pull/3355
-        # TODO: remove after TE support the grouped tensor path
-        if getattr(self.config, 'moe_combine_bwd_dtype', 'bf16') == 'mxfp8':
-            op.ep_mxfp8_carrier_grad = True
         ops.append(op)
 
         # Emulate submodule pre-forward hooks
@@ -1063,12 +1059,14 @@ class TEGroupedMLP(MegatronModule):
             fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
         )
         with fused_group_mlp_manager as permuted_local_hidden_states:
-            # NCCL-EP zero-copy is active exactly when ``output_buffer`` is not None, and then the
-            # fused-MLP input aliases the persistent symm buffer (also the fc2 output combine
-            # reads), whose storage is non-resizable — so skip the force-release in that case.
+            # In case of MXFP8 Dispatch permuted_local_hidden_states is GroupedTensor which does
+            # not have a single backing storage to release. Rely on garbage collection to do its
+            # job.
             forced_released_tensors = (
                 [permuted_local_hidden_states]
-                if fine_grained_activation_offloading and output_buffer is None
+                if fine_grained_activation_offloading
+                and output_buffer is None
+                and not is_grouped_tensor(permuted_local_hidden_states)
                 else []
             )
             # Deterministic mode: TE's op fuser builds its CuTe fused grouped MLP only for the
@@ -1458,11 +1456,28 @@ class TEGroupedMLP(MegatronModule):
         """
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
+        activation_metadata = dict(metadata)
+        activation_metadata["dp_cp_group"] = self.dp_group_gtp_remat
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
+            # The grouped activation module has one shared TE extra-state object. Unlike the
+            # expert-indexed linears, it is replicated across ETP x EP, expert-DP and
+            # EGTP_remat. Use the joint ETP-EP group as its TP replica coordinate and the full
+            # expt_dp x EGTP_remat group as its DP coordinate so exactly one rank is selected
+            # without changing the checkpoint object's global shape or key.
+            is_activation_module = name == "activation_func"
+            if is_activation_module:
+                assert self.tp_ep_group is not None and self.dp_group_gtp_remat is not None, (
+                    "TEGroupedMLP.sharded_state_dict needs the tp_ep and expt_dp_gtp_remat "
+                    "process groups to select one owner of the shared TE activation extra state"
+                )
             sub_sd = sharded_state_dict_default(
-                module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group
+                module,
+                f'{name}.',
+                sharded_offsets,
+                activation_metadata if is_activation_module else metadata,
+                tp_group=self.tp_ep_group if is_activation_module else self.tp_group,
             )
             if name == 'linear_fc1' and self.config.gated_linear_unit:
                 num_global_experts = self.ep_group.size() * self.num_local_experts
@@ -1712,7 +1727,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """Build contiguous expert stacks after checkpoint loading.
 
         Torch, vLLM and FlashInfer CUTLASS rebind each per-expert MXFP8Tensor to
-        its stacked view. Only FlashInfer routed needs a separate Major-K copy.
+        its stacked view. FlashInfer routed derives a shuffled Major-K stack and makes
+        the canonical tensors write through to it, releasing their storage.
         """
 
         use_flashinfer = (
@@ -1748,6 +1764,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     concatenated_weight.padded_rows,
                     concatenated_weight.padded_cols,
                 )
+                for i in range(self.num_local_experts):
+                    weight = InferenceGroupedMLP._unwrap_mxfp8_weight(getattr(linear, f'weight{i}'))
+                    attach_routed_mxfp8_writeback(weight, concatenated_weight, i)
             else:
                 concatenated_weight = stacked_weight
             setattr(self, buf_name, concatenated_weight)
@@ -1783,20 +1802,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
         ):
             # Selective-precision recipes also build BF16 expert weights for
             # FlashInfer. BF16 and CUTLASS MXFP8 share canonical storage and are
-            # refit directly; only routed MXFP8 needs a derived copy refreshed.
+            # refit directly; routed MXFP8 is written through by refit as well.
             return False
 
-        for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
-            flashinfer_weight = getattr(self, buf_name)
-            canonical_weight = self._stack_mxfp8_linear_weight(linear_name, "triton")
-            if isinstance(flashinfer_weight, FlashInferRoutedMXFP8Weight):
-                require_flashinfer_routed_mxfp8()
-                prepare_routed_mxfp8_weights(canonical_weight, out=flashinfer_weight)
-            else:
-                raise TypeError(
-                    "FlashInfer MXFP8 weights must use CUTLASS or routed layout; "
-                    f"got {type(flashinfer_weight).__name__}"
-                )
+        # Refit already wrote through to the routed weights (attach_routed_mxfp8_writeback);
+        # returning True still makes refit synchronize before graphs replay.
         return True
 
     @torch.inference_mode(False)

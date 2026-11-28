@@ -17,6 +17,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     CheckpointWithoutOutputManager,
@@ -172,6 +173,72 @@ class TestParallelTransformerLayer:
                 cp_comm_type[layer_number - 1] if isinstance(cp_comm_type, list) else cp_comm_type
             )
             assert seen["cp_comm_type"] == expected
+
+    def test_fp8_mlp_recompute_forwards_mlp_kwargs_through_checkpoint(self, monkeypatch):
+        """FP8 MLP recompute must deliver ``padding_mask`` and the MoE kwargs to the MLP.
+
+        ``te_checkpoint`` only receives the hidden states positionally; every other MLP
+        argument travels as a keyword and must survive the checkpoint boundary (TE's own
+        ``_CheckpointFunction`` forwards kwargs, torch's reentrant fallback rejects them).
+        """
+        import megatron.core.extensions.transformer_engine as transformer_engine
+        import megatron.core.transformer.transformer_layer as transformer_layer_module
+
+        layer = self.parallel_transformer_layer
+        layer.config.fp8 = "hybrid"
+        layer.recompute_mlp = True
+        # Mark the layer as MoE so ``_run_mlp`` builds ``input_ids``/``packed_seq_params``
+        # kwargs; ``_maybe_unflatten_for_moe`` stays a no-op without ``tokens_per_sample``.
+        layer.is_moe_layer = True
+
+        seen = {}
+
+        class RecordingMLP(torch.nn.Module):
+            def forward(
+                self, hidden_states, padding_mask=None, input_ids=None, packed_seq_params=None
+            ):
+                seen["padding_mask"] = padding_mask
+                seen["input_ids"] = input_ids
+                seen["packed_seq_params"] = packed_seq_params
+                return hidden_states + 1, None
+
+        layer.mlp = RecordingMLP()
+        monkeypatch.setattr(
+            layer,
+            "_pre_mlp_layernorm_and_residual",
+            lambda hidden_states, **_kwargs: (hidden_states, hidden_states, ()),
+        )
+        monkeypatch.setattr(transformer_layer_module, "nvtx_range_push", lambda **kwargs: None)
+        monkeypatch.setattr(transformer_layer_module, "nvtx_range_pop", lambda **kwargs: None)
+
+        def checkpoint(forward_func, _distribute, _rng_tracker, _tp_group, *args, **kwargs):
+            seen["checkpoint_args"] = args
+            seen["checkpoint_kwargs"] = kwargs
+            return forward_func(*args, **kwargs)
+
+        monkeypatch.setattr(transformer_engine, "te_checkpoint", checkpoint)
+
+        hidden_states = torch.randn(4, 2, layer.config.hidden_size)
+        padding_mask = torch.ones(2, 4, dtype=torch.bool)
+        input_ids = torch.arange(8, dtype=torch.long).view(2, 4)
+        packed_seq_params = PackedSeqParams(qkv_format="thd")
+        output_with_bias, residual = layer._forward_mlp_output_with_bias(
+            hidden_states,
+            padding_mask=padding_mask,
+            packed_seq_params=packed_seq_params,
+            input_ids=input_ids,
+        )
+
+        # Only the checkpointed activation is positional; nothing else may leak into args.
+        assert len(seen["checkpoint_args"]) == 1
+        assert seen["checkpoint_args"][0] is hidden_states
+        assert set(seen["checkpoint_kwargs"]) == {"padding_mask", "input_ids", "packed_seq_params"}
+        assert seen["padding_mask"] is padding_mask
+        assert seen["input_ids"] is input_ids
+        assert seen["packed_seq_params"] is packed_seq_params
+        assert torch.equal(output_with_bias[0], hidden_states + 1)
+        assert output_with_bias[1] is None
+        assert residual is hidden_states
 
     def test_offload_scope_in_cuda_graph_preserves_gpt_rules(self):
         """The shared helper keeps the existing GPT attention/dense-MLP scope rules."""

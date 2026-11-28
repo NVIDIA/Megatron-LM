@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import os
@@ -49,8 +49,6 @@ class MaskedWordPieceDatasetConfig(BlendedMegatronDatasetConfig):
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
-        super().__post_init__()
-
         assert self.tokenizer is not None
 
         assert self.masking_probability is not None

@@ -18,7 +18,7 @@ from megatron.core.transformer.residual_recompute import (
     finalize_recompute_block,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_decorator
+from megatron.core.utils import ensure_params_ready, nvtx_decorator
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
@@ -397,6 +397,8 @@ class HyperConnectionModule(MegatronModule):
         # Keep the activation-dtype input in autograd and upcast inside the recomputed
         # projection. This avoids retaining a full FP32 copy of the residual stream.
         x_2d = x.reshape(s * b, nC)
+        # mapping_proj is read here, not called, so its forward pre-hook never publishes it.
+        ensure_params_ready([self.mapping_proj.weight])
         weight = self.mapping_proj.weight
         if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
             proj, r = checkpoint(
@@ -464,6 +466,8 @@ class HyperConnectionModule(MegatronModule):
         if self._proj_rms_compute_h_op is not None:
             # Fused path: proj_rms + compute_h in one kernel launch sequence
             x_2d = x.reshape(s * b, self.n * self.hidden_size)
+            # The fused kernel reads mapping_proj.weight without calling mapping_proj.
+            ensure_params_ready([self.mapping_proj.weight])
             with torch.cuda.nvtx.range("HyperConnection::fused_proj_rms_compute_h"):
                 h_pre, h_post, h_res, _ = self._proj_rms_compute_h_op(
                     x_2d,

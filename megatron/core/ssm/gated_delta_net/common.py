@@ -254,7 +254,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         # Attributes from config
         self.config = config
         self.hidden_size = config.hidden_size
-        self.act_fn = config.activation_func
+        # GDN-family convolution and output gates use SiLU independently of the FFN activation.
+        self.act_fn = nn.functional.silu
         self.activation = self.act_fn.__name__
         self.conv_kernel_dim = config.linear_conv_kernel_dim
         self.key_head_dim = config.linear_key_head_dim
@@ -298,13 +299,11 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             assert (
                 getattr(self, attr) is not None
             ), f"Attribute {attr} for the GDN-family variant is not set"
-        # Full input projection width: q, k, v, output gate, and variant-specific gate features.
-        # Two-stage gates use separate projections; in_proj emits QKV only.
-        if getattr(self, "two_stage_gates", False):
-            self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim
-        else:
-            self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
-        self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
+        # Shared q, k, v, output-gate width; the full input projection width also carries
+        # variant-specific gate features and is resolved through the variant hook (KDA with
+        # separate F-decay / output-gate projections, e.g. two-stage gates, emits QKV only).
+        self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
+        self.in_proj_dim = self._get_in_proj_dim()
 
         if self.config.fp8 and not _kda_fp8_disabled(self.config):
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
@@ -450,12 +449,23 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             is not TwoStageAttentionLayer.forward_pre_attn_and_core_attn
         )
 
+    def _get_in_proj_dim(self) -> int:
+        """Return the fused input-projection width for this GDN-family variant.
+
+        The shared GDN layout contains Q, K, V, the output gate, and any
+        variant-specific gate features. Variants with separately parameterized
+        projections can override this hook without encoding a negative
+        ``in_proj_extra_dim``.
+        """
+
+        return self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
+
     def _setup_variant_attrs(self):
         """Set variant projection sections, gate parameter sizes, and kernel callable.
 
         Must set:
-        - ``in_proj_extra_dim`` (the in_proj sections beyond q/k/v/z; the base
-          class derives ``in_proj_dim`` from it)
+        - ``in_proj_extra_dim`` (the in_proj sections beyond q/k/v/z; the default
+          ``_get_in_proj_dim`` implementation derives ``in_proj_dim`` from it)
         - ``in_proj_split_names``
         - ``in_proj_split_sections``
         - ``dt_bias_dim`` / ``a_log_dim`` (sizes of the gate parameters, which the
@@ -750,6 +760,32 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             )
 
         return sharded_state_dict
+
+    def _projections_reading_hidden_states(self) -> list[nn.Module]:
+        """Linear projections whose input is the layer's hidden states.
+
+        These modules consume the input-layernorm output directly; variants with additional
+        projections (KDA) extend the list.
+        """
+        return [self.in_proj]
+
+    def set_for_recompute_input_layernorm(self) -> None:
+        """Prepare the layer for recomputing the input layernorm (needed under FP8/FP4).
+
+        With "layernorm" in ``recompute_modules`` the TransformerLayer discards the
+        input-layernorm output after the forward and recomputes it in the backward. Under
+        FP8/FP4 the Transformer Engine linears would otherwise keep their own quantized copy of
+        that output, so every projection that reads the hidden states is told to save its
+        original input instead (mirrors ``SelfAttention.set_for_recompute_input_layernorm``).
+        Projections that fuse the normalization themselves (a TE LayerNormLinear in_proj, the
+        default for GatedDeltaNet) read the residual stream rather than a separate layernorm
+        output and have no ``save_original_input`` switch; they are left alone.
+        """
+        from megatron.core.extensions.transformer_engine import set_save_original_input
+
+        for module in self._projections_reading_hidden_states():
+            if hasattr(module, "save_original_input"):
+                set_save_original_input(module)
 
     def backward_dw(self):
         """Execute weight gradient computation for all linear layers."""

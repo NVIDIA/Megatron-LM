@@ -23,16 +23,22 @@ from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     consume_vision_model_flops_stats,
     num_floating_point_operations,
+    reset_seqlen_stats_in_iteration,
+    set_seqlen_stats_in_iteration,
     update_seqlen_stats_from_cu_seqlens,
+    update_seqlen_stats_from_padding_mask,
     update_vision_model_flops_stats,
     validate_vision_flops_metadata,
 )
+
+pytestmark = pytest.mark.launch_on_gb200
 
 
 def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
     training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
+    training_module._seqlen_stats_are_global = False
 
 
 def _reset_vision_flops_accumulator():
@@ -65,6 +71,8 @@ def _make_gpt_args(
     args.num_query_groups = num_attention_heads
     args.attention_output_gate = False
     args.gated_attention_proj_granularity = "elementwise"
+    args.enable_attention_residuals = False
+    args.attn_res_block_layers = None
     args.multi_latent_attention = False
     # MoE / MTP disabled.
     args.num_experts = None
@@ -85,6 +93,8 @@ def _make_gpt_args(
     args.linear_num_value_heads = None
     args.linear_conv_kernel_dim = None
     args.gdp_num_householder = 3
+    args.kda_f_lora_rank = None
+    args.kda_gate_lora_rank = None
     # MLA fields (unused but referenced).
     args.q_lora_rank = None
     args.qk_head_dim = None
@@ -122,6 +132,8 @@ def _make_kda_hybrid_args():
     args.hybrid_layer_pattern = "K"
     args.linear_key_head_dim = 32
     args.linear_value_head_dim = 32
+    args.kda_f_lora_rank = 16
+    args.kda_gate_lora_rank = None
     args.linear_num_key_heads = 8
     args.linear_num_value_heads = 8
     args.linear_conv_kernel_dim = 4
@@ -734,21 +746,35 @@ class TestMTPLogitFlops:
 class TestKimiDeltaAttentionFlops:
     """KDA layers must contribute their projection and kernel work."""
 
-    def test_direct_projection_formula(self):
+    @pytest.mark.parametrize(
+        ("f_lora_rank", "gate_lora_rank"),
+        [(None, None), (16, None), (16, 24), (None, 24)],
+        ids=["legacy-fused", "kimi-k3", "both-low-rank", "low-rank-gate-only"],
+    )
+    def test_projection_formula(self, f_lora_rank, gate_lora_rank):
         args, cfg = _make_kda_hybrid_args()
+        args.kda_f_lora_rank = f_lora_rank
+        args.kda_gate_lora_rank = gate_lora_rank
         batch_size = 2
         total_tokens = batch_size * args.seq_length
         qk_dim = args.linear_key_head_dim * args.linear_num_key_heads
         v_dim = args.linear_value_head_dim * args.linear_num_value_heads
-        in_proj_dim = 3 * qk_dim + 2 * v_dim
+        f_projection_flops = args.hidden_size * qk_dim
+        if f_lora_rank is not None:
+            f_projection_flops = args.hidden_size * f_lora_rank + f_lora_rank * qk_dim
+        gate_projection_flops = args.hidden_size * v_dim
+        if gate_lora_rank is not None:
+            gate_projection_flops = args.hidden_size * gate_lora_rank + gate_lora_rank * v_dim
+        projection_flops = (
+            args.hidden_size * (2 * qk_dim + v_dim + args.linear_num_key_heads)
+            + f_projection_flops
+            + gate_projection_flops
+            + args.hidden_size * v_dim
+        )
         kda_forward = (
             2
             * total_tokens
-            * (
-                args.hidden_size * (in_proj_dim + args.linear_num_key_heads)
-                + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
-                + args.hidden_size * v_dim
-            )
+            * (projection_flops + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim))
         )
         kda_forward += (
             8
@@ -853,6 +879,176 @@ class TestGatedDeltaProductFlops:
         expected_delta = 3 * num_gdp_layers * forward_delta_per_layer
 
         assert flops_m4 - flops_m3 == expected_delta
+
+
+class TestAttentionResidualFlops:
+    """AttnRes FLOPs must follow the runtime depth-source schedule."""
+
+    @staticmethod
+    def _enabled_delta(args, cfg, batch_size=2, block_layers=2, **flops_kwargs):
+        # ``cfg`` only supplies ``tokenizer.padded_vocab_size`` to the FLOPs
+        # formula and is never mutated here, so both calls share it; only the
+        # ``args`` copies differ in the AttnRes flags.
+        disabled_args = SimpleNamespace(**vars(args))
+        disabled_args.enable_attention_residuals = False
+        disabled_args.attn_res_block_layers = None
+        disabled_flops = num_floating_point_operations(
+            disabled_args, cfg, batch_size, **flops_kwargs
+        )
+        enabled_args = SimpleNamespace(**vars(args))
+        enabled_args.enable_attention_residuals = True
+        enabled_args.attn_res_block_layers = block_layers
+        enabled_flops = num_floating_point_operations(enabled_args, cfg, batch_size, **flops_kwargs)
+        return enabled_flops - disabled_flops
+
+    @staticmethod
+    def _source_visits(num_layers, block_layers, *, hybrid, mtp_depths=0, mtp_entries=2):
+        """Simulate the residual-state transitions independently of the closed formula."""
+        sources = ["embedding"]
+        partial = []
+        visits = 0
+        for start in range(0, num_layers, block_layers):
+            if partial:
+                sources.append(tuple(partial))
+            partial = []
+            for layer in range(start, min(start + block_layers, num_layers)):
+                visits += len(sources) + bool(partial)
+                partial.append((layer, "attention"))
+                if not hybrid:
+                    visits += len(sources) + bool(partial)
+                    partial.append((layer, "mlp"))
+        trunk_history = (*sources, tuple(partial))
+        visits += len(trunk_history)
+        for depth in range(mtp_depths):
+            # A fresh projection/partial per depth; never append it to trunk_history.
+            depth_sources = (*trunk_history, (depth, "partial"))
+            for _ in range(mtp_entries):
+                visits += len(depth_sources)
+            visits += len(depth_sources)  # The per-depth output aggregation.
+        return visits
+
+    @staticmethod
+    def _hybrid_args(main_pattern, mtp_pattern=None, mtp_depths=0):
+        args, cfg = _make_mla_hybrid_args()
+        args.num_layers = len(main_pattern.replace("|", ""))
+        args.hybrid_layer_pattern = main_pattern + (f"/{mtp_pattern}" * mtp_depths)
+        args.mtp_num_layers = mtp_depths or None
+        args.linear_key_head_dim = args.linear_value_head_dim = 32
+        args.linear_num_key_heads = args.linear_num_value_heads = 8
+        args.linear_conv_kernel_dim = 4
+        args.num_experts = 4
+        args.moe_router_topk = 2
+        args.moe_ffn_hidden_size = 256
+        return args, cfg
+
+    def test_standard_transformer_counts_both_sublayers_and_final_head(self):
+        args, cfg = _make_gpt_args(num_layers=4)
+        total_tokens = 2 * args.seq_length
+
+        # Source arities for block size 2:
+        # attention = [1, 2, 2, 3], MLP = [2, 2, 3, 3], final = [3].
+        total_source_arity = 21
+        expected_delta = 3 * 4 * total_tokens * args.hidden_size * total_source_arity
+
+        assert self._enabled_delta(args, cfg) == expected_delta
+
+    def test_hybrid_counts_pattern_entries_and_final_head(self):
+        args, cfg = _make_hybrid_args(num_layers=4)
+        total_tokens = 2 * args.seq_length
+
+        # A hybrid pattern entry is one sublayer. For block size 2, "*M*M"
+        # therefore has per-entry arities [1, 2, 2, 3] and final arity 3.
+        total_source_arity = 11
+        expected_delta = 3 * 4 * total_tokens * args.hidden_size * total_source_arity
+
+        assert self._enabled_delta(args, cfg) == expected_delta
+
+    def test_standard_mtp_counts_three_aggregations_per_depth(self):
+        args, cfg = _make_gpt_args(num_layers=4)
+        args.mtp_num_layers = 2
+        total_tokens = 2 * args.seq_length
+
+        # The trunk contributes 21 source-visits. Its final history has arity
+        # three; each MTP depth adds a fresh partial to three aggregations.
+        total_source_arity = 21 + 2 * 3 * 4
+        expected_delta = 3 * 4 * total_tokens * args.hidden_size * total_source_arity
+
+        assert self._enabled_delta(args, cfg) == expected_delta
+
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    @pytest.mark.parametrize("mtp_depths", [0, 1, 2])
+    @pytest.mark.parametrize(
+        ("num_layers", "block_layers"),
+        [(1, 1), (1, 8), (3, 1), (4, 2), (5, 2), (5, 3), (7, 4), (32, 24)],
+    )
+    def test_matches_residual_state_transitions(self, hybrid, mtp_depths, num_layers, block_layers):
+        if hybrid:
+            args, cfg = self._hybrid_args("K" * num_layers, "+E", mtp_depths)
+        else:
+            args, cfg = _make_gpt_args(num_layers=num_layers)
+            args.mtp_num_layers = mtp_depths or None
+        visits = self._source_visits(num_layers, block_layers, hybrid=hybrid, mtp_depths=mtp_depths)
+        expected = 3 * 4 * (2 * args.seq_length) * args.hidden_size * visits
+        assert self._enabled_delta(args, cfg, block_layers=block_layers) == expected
+
+    @pytest.mark.parametrize("mtp_pattern", ["+", "+E", "KE", "+EKE+E"])
+    @pytest.mark.parametrize("mtp_depths", [1, 2])
+    @pytest.mark.parametrize("block_layers", [1, 3, 24])
+    def test_hybrid_mtp_entries_share_trunk_history(self, mtp_pattern, mtp_depths, block_layers):
+        # Uneven pipeline segmentation must not add a source or reset depth history.
+        args, cfg = self._hybrid_args("K-|KE+E", mtp_pattern, mtp_depths)
+        visits = self._source_visits(
+            6, block_layers, hybrid=True, mtp_depths=mtp_depths, mtp_entries=len(mtp_pattern)
+        )
+        expected = 3 * 4 * (2 * args.seq_length) * args.hidden_size * visits
+        assert self._enabled_delta(args, cfg, block_layers=block_layers) == expected
+
+    @pytest.mark.parametrize("block_layers", [1, 2, 5])
+    @pytest.mark.parametrize("mtp_depths", [0, 1, 2])
+    def test_equivalent_gpt_and_hybrid_block_units(self, block_layers, mtp_depths):
+        gpt, gpt_cfg = _make_gpt_args(num_layers=4)
+        gpt.mtp_num_layers = mtp_depths or None
+        hybrid, hybrid_cfg = _make_hybrid_args(num_layers=8)
+        hybrid.hybrid_layer_pattern = "*-|*-*-*-" + "/*-" * mtp_depths
+        hybrid.mtp_num_layers = mtp_depths or None
+        assert self._enabled_delta(gpt, gpt_cfg, block_layers=block_layers) == self._enabled_delta(
+            hybrid, hybrid_cfg, block_layers=2 * block_layers
+        )
+
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    @pytest.mark.parametrize(("tokens", "sum_sq"), [(0, 0), (150, 12500), (150, 22500)])
+    def test_packed_tokens_scale_linearly(self, hybrid, tokens, sum_sq):
+        args, cfg = self._hybrid_args("K-+E", "+E", 2) if hybrid else _make_gpt_args(num_layers=4)
+        args.mtp_num_layers = 2
+        visits = self._source_visits(4, 2, hybrid=hybrid, mtp_depths=2)
+        assert (
+            self._enabled_delta(
+                args, cfg, total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=sum_sq
+            )
+            == 3 * 4 * tokens * args.hidden_size * visits
+        )
+
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    @pytest.mark.parametrize("block_layers", [None, 0, -1, 1.5, True, "2"])
+    def test_invalid_block_size(self, hybrid, block_layers):
+        args, cfg = self._hybrid_args("K-+E", "+E", 2) if hybrid else _make_gpt_args()
+        with pytest.raises(ValueError, match="positive integer"):
+            self._enabled_delta(args, cfg, block_layers=block_layers)
+
+    @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
+    def test_missing_optional_flags_preserves_disabled_flops(self, hybrid):
+        args, cfg = self._hybrid_args("K-+E", "+E", 2) if hybrid else _make_gpt_args()
+        expected = num_floating_point_operations(args, cfg, 2)
+        del args.enable_attention_residuals
+        del args.attn_res_block_layers
+        assert num_floating_point_operations(args, cfg, 2) == expected
+
+    @pytest.mark.parametrize("backend", ["eager", "compile", "fla"])
+    def test_nominal_flops_are_backend_independent(self, backend):
+        args, cfg = _make_gpt_args(num_layers=4)
+        args.attn_res_impl = backend
+        expected_delta = 3 * 4 * (2 * args.seq_length) * args.hidden_size * 21
+        assert self._enabled_delta(args, cfg) == expected_delta
 
 
 class TestPaddingRemoval:
@@ -1013,6 +1209,73 @@ class TestAccumulator:
         # returning ``(None, None)`` so ``num_floating_point_operations`` takes
         # the closed-form defaults.
         assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_scheduler_totals_are_not_added_again_by_forward(self):
+        cu = torch.tensor([0, 65536], dtype=torch.int32)
+        totals = (8 * 65536, 8 * 65536**2)
+        training_module.set_seqlen_stats_in_iteration(*totals)
+        for _ in range(8):
+            update_seqlen_stats_from_cu_seqlens(cu)
+        assert consume_seqlen_stats_in_iteration() == totals
+
+        # The next iteration can still use ordinary microbatch accumulation.
+        update_seqlen_stats_from_cu_seqlens(cu)
+        assert consume_seqlen_stats_in_iteration() == (65536, 65536**2)
+
+    def test_update_from_padding_mask_counts_real_tokens_only(self):
+        # Two right-padded SBHD-validation samples of length 8 with 5 and 3
+        # real tokens: the padded tail must not be counted as useful work.
+        padding_mask = torch.tensor(
+            [[False] * 5 + [True] * 3, [False] * 3 + [True] * 5], dtype=torch.bool
+        )
+        update_seqlen_stats_from_padding_mask(padding_mask)
+        total_real_tokens, seqlen_squared_sum = consume_seqlen_stats_in_iteration()
+        assert total_real_tokens == 5 + 3
+        assert seqlen_squared_sum == 5**2 + 3**2
+
+    def test_update_from_padding_mask_matches_cu_seqlens(self):
+        padding_mask = torch.zeros((3, 16), dtype=torch.bool)
+        padding_mask[0, 10:] = True
+        padding_mask[1, 16:] = True  # full-length sample, no padding
+        padding_mask[2, 1:] = True
+        update_seqlen_stats_from_padding_mask(padding_mask)
+        from_mask = consume_seqlen_stats_in_iteration()
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 10, 26, 27], dtype=torch.int32))
+        assert consume_seqlen_stats_in_iteration() == from_mask
+
+    def test_update_from_padding_mask_none_is_noop(self):
+        update_seqlen_stats_from_padding_mask(None)
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_reset_discards_pending_updates(self):
+        # Statistics of a superseded train_step attempt or of evaluation forwards must not
+        # reach the next training consumer.
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 5, 8], dtype=torch.int32))
+        reset_seqlen_stats_in_iteration()
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+
+    def test_reset_then_update_counts_only_the_new_attempt(self):
+        # Evaluation (or a retried attempt) with real lengths [5, 3], then one training
+        # micro-batch with the same lengths: the consumer sees (8, 34), not (16, 68).
+        padding_mask = torch.tensor(
+            [[False] * 5 + [True] * 3, [False] * 3 + [True] * 5], dtype=torch.bool
+        )
+        update_seqlen_stats_from_padding_mask(padding_mask)
+        reset_seqlen_stats_in_iteration()
+        update_seqlen_stats_from_padding_mask(padding_mask)
+        assert consume_seqlen_stats_in_iteration() == (8, 34)
+
+    def test_two_microbatches_of_one_attempt_still_add_up(self):
+        cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+        update_seqlen_stats_from_cu_seqlens(cu)
+        update_seqlen_stats_from_cu_seqlens(cu)
+        assert consume_seqlen_stats_in_iteration() == (16, 68)
+
+    def test_reset_clears_a_global_seed(self):
+        set_seqlen_stats_in_iteration(100, 10000)
+        reset_seqlen_stats_in_iteration()
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+        assert training_module._seqlen_stats_are_global is False
 
     def test_no_updates_returns_none(self):
         """BSHD path: never calling update must NOT issue a collective. The
@@ -1197,6 +1460,35 @@ class TestAccumulatorDistributed:
 
         _reset_seqlen_accumulator()
         Utils.destroy_model_parallel()
+
+    def test_distributed_rank_is_global(self):
+        """Multi-node runs must not reuse node-local ranks in the world group."""
+        import os
+
+        from tests.unit_tests.test_utilities import Utils
+
+        assert Utils.rank == int(os.environ.get('RANK', os.environ.get('LOCAL_RANK', '0')))
+
+    @pytest.mark.parametrize(
+        "global_rank,local_rank,world_size,expected_rank",
+        [(6, 2, 8, 6), (6, 2, 4, -1), (6, None, 8, 6), (None, 2, 8, 2)],
+    )
+    def test_resize_uses_global_rank(
+        self, monkeypatch, global_rank, local_rank, world_size, expected_rank
+    ):
+        """Resizing a test world must select global, not per-node, participants."""
+        from tests.unit_tests.test_utilities import Utils
+
+        monkeypatch.setattr(Utils, 'rank', Utils.rank)
+        monkeypatch.setattr(Utils, 'world_size', Utils.world_size)
+        monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: False)
+        for name, value in [('RANK', global_rank), ('LOCAL_RANK', local_rank)]:
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, str(value))
+        Utils.set_world_size(world_size=world_size)
+        assert Utils.rank == expected_rank
 
     def test_pure_dp_sums_across_ranks(self):
         from tests.unit_tests.test_utilities import Utils

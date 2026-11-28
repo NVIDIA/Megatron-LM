@@ -148,6 +148,7 @@ def _postprocess_after_decoder(
     cp_layout_plan=None,
     output_processor=None,
     output_processor_context=None,
+    attn_res_sources=None,
 ):
     """MTP block, LM head and loss of ``model``: everything that follows the decoder.
 
@@ -181,6 +182,7 @@ def _postprocess_after_decoder(
             hidden_states=hidden_states,
             decoder_input=decoder_input if use_precomputed_mtp_embeddings else None,
             mhc_multistream=mhc_multistream,
+            attn_res_sources=attn_res_sources,
             labels=labels,
             loss_mask=loss_mask,
             mtp_input_mask=mtp_input_mask,
@@ -231,6 +233,7 @@ def _postprocess_after_decoder(
             position_ids=mtp_inputs.position_ids,
             hidden_states=mtp_inputs.hidden_states,
             mhc_multistream=mtp_inputs.mhc_multistream,
+            attn_res_sources=mtp_inputs.attn_res_sources,
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=(
@@ -294,6 +297,7 @@ def _postprocess_after_decoder(
                 ),
                 main_hidden_states=hidden_states,
             )
+    # Give callers a post-decoder hook before the default output projection and loss path.
     if output_processor is not None:
         return output_processor(
             hidden_states=hidden_states,
@@ -880,6 +884,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             pre_process=self.pre_process,
             layer_config_list=layer_config_list,
             pp_layer_offset=layer_offset,
+            vp_stage=self.vp_stage,
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
@@ -1290,11 +1295,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
             )
+        # With MTP the outer HybridStack may return one auxiliary value: mHC's
+        # pre-contraction multi-stream tensor or AttnRes's complete trunk source
+        # tuple. The modes are mutually exclusive, so disambiguate by config.
+        mhc_multistream = None
+        attn_res_sources = None
         if isinstance(decoder_output, tuple):
-            hidden_states, mhc_multistream = decoder_output
+            if self.config.enable_attention_residuals:
+                hidden_states, attn_res_sources = decoder_output
+            else:
+                hidden_states, mhc_multistream = decoder_output
         else:
             hidden_states = decoder_output
-            mhc_multistream = None
 
         postprocess_block = getattr(self, 'postprocess_block', None)
         if (
@@ -1350,4 +1362,5 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             cp_layout_plan=cp_layout_plan,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
+            attn_res_sources=attn_res_sources,
         )

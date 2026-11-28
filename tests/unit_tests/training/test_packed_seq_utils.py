@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.training.utils import packed_seq_utils
 
 
@@ -64,6 +65,43 @@ def test_prepare_attention_routes_uses_physical_capacity(
 def test_unpacked_batch_needs_no_attention_config(monkeypatch):
     monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", lambda params: params)
     assert packed_seq_utils.prepare_packed_seq_params(None, SimpleNamespace()) is None
+
+
+@pytest.mark.parametrize("graph_impl", ["none", "local", "transformer_engine"])
+def test_hca_preparation_refreshes_each_microbatch(monkeypatch, graph_impl):
+    """Reused buffers get a fresh HCA verdict even for writes without a version bump."""
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import aligned_hca
+
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", lambda params: params)
+    cu = torch.tensor([0, 65536, 65536], device="cpu", dtype=torch.int32)
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, max_seqlen_q=65536)
+    config = SimpleNamespace(
+        hca_aligned_backward=True,
+        dsa_cp_balance_indexer=False,
+        cuda_graph_impl=graph_impl,
+        cuda_graph_modules=[CudaGraphModule.mlp],
+    )
+    for boundary, expected in [(65536, True), (32768, False), (65536, True)]:
+        cu.data[1] = boundary
+        assert packed_seq_utils.prepare_packed_seq_params(packed, config) is packed
+        with monkeypatch.context() as context:
+            context.setattr(torch.Tensor, "item", lambda _: pytest.fail("per-layer readback"))
+            assert aligned_hca._is_single_sequence(packed, cu, 65536) is expected
+
+
+@pytest.mark.parametrize("graph_impl", ["local", "transformer_engine", "full_iteration"])
+def test_hca_graph_batches_add_no_host_readback(monkeypatch, graph_impl):
+    """Attention graphs keep device-only validation without new batch-time readbacks."""
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", lambda params: params)
+    cu = torch.tensor([0, 65536], device="cpu", dtype=torch.int32)
+    packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, max_seqlen_q=65536)
+    config = SimpleNamespace(
+        hca_aligned_backward=True,
+        cuda_graph_impl=graph_impl,
+        cuda_graph_modules=[CudaGraphModule.attn],
+    )
+    monkeypatch.setattr(torch.Tensor, "item", lambda _: pytest.fail("graph batch readback"))
+    assert packed_seq_utils.prepare_packed_seq_params(packed, config) is packed
 
 
 class _SizedGroup:

@@ -15,12 +15,44 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+def split_megakernel_backend_config(config: TransformerConfig) -> tuple[str, dict]:
+    """Separate MCore's shared policy from a copy of backend-specific options."""
+    options = dict(config.moe_megakernel_backend_config or {})
+    mode = options.pop("shared_expert_mode", "auto")
+    if mode not in ("auto", "fused", "native"):
+        raise ValueError("shared_expert_mode must be auto, fused, or native")
+    return mode, options
+
+
+def megakernel_fuses_shared_expert(config: TransformerConfig) -> bool:
+    """Resolve shared execution from structural compatibility, independently of activation."""
+    if config.moe_megakernel_backend is None:
+        return False
+    if config.moe_megakernel_backend != "mok":
+        raise ValueError(f"Unsupported MoE megakernel backend: {config.moe_megakernel_backend!r}")
+    mode, _ = split_megakernel_backend_config(config)
+    compatible = (
+        config.moe_shared_expert_intermediate_size is not None
+        and config.tensor_model_parallel_size == 1
+        and config.moe_latent_size is None
+        and config.moe_shared_expert_intermediate_size == config.moe_ffn_hidden_size
+        and not config.use_grouped_gemm_for_shared_expert
+        and config.moe_shared_expert_glu_interleave_size is None
+    )
+    if mode == "fused" and not compatible:
+        raise ValueError(
+            "Fused MOK shared execution requires a dense, non-interleaved shared MLP "
+            "with TP=1, the routed intermediate size, and no latent projection"
+        )
+    return mode != "native" and compatible
+
+
 def build_megakernel_backend(
     *,
     config: TransformerConfig,
     ep_group: ProcessGroup,
     routed_experts: nn.Module,
-    shared_experts: nn.Module,
+    shared_experts: nn.Module | None,
     num_local_experts: int,
 ) -> MegakernelBackend:
     """Build the configured megakernel backend.
@@ -45,7 +77,7 @@ def build_megakernel_backend(
 def prepare_megakernel_shared_expert_config(config: TransformerConfig) -> TransformerConfig:
     """Return the config used to construct backend-compatible shared experts."""
     backend = config.moe_megakernel_backend
-    if backend is None:
+    if not megakernel_fuses_shared_expert(config):
         return config
     if backend == "mok":
         from megatron.core.transformer.moe.megakernel.mok.weights import (
@@ -59,7 +91,7 @@ def prepare_megakernel_shared_expert_config(config: TransformerConfig) -> Transf
 def megakernel_shared_expert_init_context(config: TransformerConfig):
     """Return the backend-specific context used to construct shared experts."""
     backend = config.moe_megakernel_backend
-    if backend is None:
+    if not megakernel_fuses_shared_expert(config):
         return nullcontext()
     if backend == "mok":
         from megatron.core.fp8_utils import get_fp8_disabled_context

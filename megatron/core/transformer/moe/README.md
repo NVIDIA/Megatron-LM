@@ -622,17 +622,25 @@ through `docker/common/install_mok.sh`. Use that image or its installation helpe
 supported dependency and Blackwell build targets. The AMD64 image skips MOK because its H100
 target is unsupported.
 
+Routed-only execution and SiTU-GLU require a newer MOK build containing the
+[companion support](https://github.com/QiZhangNV/mixture-of-kittens/pull/9);
+the pinned snapshot above predates those features. Set `shared_expert_mode` inside
+`moe_megakernel_backend_config`: `auto` (default) fuses compatible shared experts,
+`fused` requires compatibility, and `native` keeps shared experts in MCore.
+Latent projections always stay in MCore; TP>1, latent MoE, or incompatible shared
+structure selects routed-only MOK in `auto` mode. Activation selection is independent.
+
 | Area | Current MOK support |
 |------|---------------------|
 | GPU architecture | NVIDIA Blackwell SM100/SM103; upstream integration validated on GB300 |
 | Routed precision | BF16, or MXFP8 with `fp8_param=True` and native TE rowwise/columnwise payloads and scales |
 | Router precision | `moe_router_dtype=None` or `"fp32"`; FP64 routing/weighted averaging is unsupported |
-| Shared experts | Required; BF16; same intermediate size as routed experts; optional BF16 sigmoid output gate via `moe_shared_expert_gate` |
-| Activation | SwiGLU, without a linear offset or tanh clamp |
+| Shared experts | Optional; fused shared experts use BF16 and the routed intermediate size, with optional sigmoid output gate via `moe_shared_expert_gate`; native shared experts retain MCore's precision and structure |
+| Activation | SwiGLU or SiTU-GLU, without a linear offset or tanh clamp |
 | Routed weight layout | Per-expert non-single weights, or single-grouped weights with `moe_use_grouped_tensor=True` and Transformer Engine 2.14+ |
-| Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
+| Parallelism | Expert TP=1; TP>1 requires sequence parallelism and native shared execution; EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
 | Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
-| Recomputation | Whole-MoE activation recompute |
+| Recomputation | Whole-MoE activation recompute; shared-expert-only recompute when shared execution is native |
 | CUDA Graph | Full-iteration capture |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
 
@@ -656,8 +664,8 @@ static input token counts alone do not establish that lifecycle.
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
-wgrad, native shared-expert overlap, shared-expert-only
-recompute, latent MoE, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
+wgrad, native shared-expert overlap, fused shared-expert-only
+recompute, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
 partial MoE CUDA Graph replay, MCore expert-input
 capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
 layouts.

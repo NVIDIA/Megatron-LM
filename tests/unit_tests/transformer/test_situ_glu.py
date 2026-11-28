@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -93,6 +94,7 @@ def test_situlu_reference_matches_fixed_values():
 
 
 def test_transformer_config_accepts_situ_glu_defaults():
+    """Accept the Kimi SiTU beta defaults for the explicit TE backend."""
     config = TransformerConfig(
         num_layers=1,
         hidden_size=16,
@@ -107,6 +109,7 @@ def test_transformer_config_accepts_situ_glu_defaults():
 
 
 def test_transformer_config_accepts_pytorch_situ_glu_fallback():
+    """Accept the same activation with native Torch execution."""
     config = TransformerConfig(
         num_layers=1,
         hidden_size=16,
@@ -117,6 +120,47 @@ def test_transformer_config_accepts_pytorch_situ_glu_fallback():
     )
 
     assert config.activation_func is situlu
+
+
+@pytest.mark.parametrize("frontend", ["legacy", "config_container"])
+@pytest.mark.parametrize("use_te_activation", [False, True])
+def test_situ_glu_cli_preserves_activation_backend(monkeypatch, frontend, use_te_activation):
+    """Both CLI bridges preserve the requested native/TE SiTU implementation."""
+    from megatron.training import argument_utils, arguments
+
+    argv = [
+        "test_situ_glu",
+        "--num-layers",
+        "1",
+        "--hidden-size",
+        "16",
+        "--num-attention-heads",
+        "4",
+        "--seq-length",
+        "16",
+        "--max-position-embeddings",
+        "16",
+        "--micro-batch-size",
+        "1",
+        "--tokenizer-type",
+        "NullTokenizer",
+        "--vocab-size",
+        "128",
+        "--situ-glu",
+    ]
+    if use_te_activation:
+        argv.append("--use-te-activation-func")
+    monkeypatch.setattr(sys, "argv", argv)
+    args = arguments.validate_args(arguments.parse_args())
+    # Normally populated when the tokenizer is built, after validation.
+    args.padded_vocab_size = 128
+    bridge = arguments if frontend == "legacy" else argument_utils
+    config = bridge.core_transformer_config_from_args(args)
+
+    assert config.activation_func is situlu
+    assert config.gated_linear_unit
+    assert config.use_te_activation_func is use_te_activation
+    assert not config.bias_activation_fusion
 
 
 @pytest.mark.parametrize(
@@ -130,6 +174,7 @@ def test_transformer_config_accepts_pytorch_situ_glu_fallback():
     ],
 )
 def test_transformer_config_rejects_unsupported_situ_glu(overrides, match):
+    """Reject incompatible activation settings and invalid beta values."""
     kwargs = dict(
         num_layers=1,
         hidden_size=16,

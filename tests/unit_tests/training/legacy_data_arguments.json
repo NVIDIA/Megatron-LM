@@ -1,0 +1,582 @@
+{
+ "allow_ambiguous_pad_tokens": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--allow-ambiguous-pad-tokens"
+  ],
+  "required": false,
+  "type": null
+ },
+ "create_attention_mask_in_dataloader": {
+  "action": "_StoreFalseAction",
+  "choices": null,
+  "const": false,
+  "default": true,
+  "nargs": 0,
+  "option_strings": [
+   "--no-create-attention-mask-in-dataloader"
+  ],
+  "required": false,
+  "type": null
+ },
+ "data_args_path": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--data-args-path"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "data_cache_path": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--data-cache-path"
+  ],
+  "required": false,
+  "type": null
+ },
+ "data_path": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": "*",
+  "option_strings": [
+   "--data-path"
+  ],
+  "required": false,
+  "type": null
+ },
+ "data_sharding": {
+  "action": "_StoreFalseAction",
+  "choices": null,
+  "const": false,
+  "default": true,
+  "nargs": 0,
+  "option_strings": [
+   "--no-data-sharding"
+  ],
+  "required": false,
+  "type": null
+ },
+ "dataloader_defer_npy_index_mmap": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--dataloader-defer-npy-index-mmap"
+  ],
+  "required": false,
+  "type": null
+ },
+ "dataloader_fast_cache_load": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--dataloader-fast-cache-load"
+  ],
+  "required": false,
+  "type": null
+ },
+ "dataloader_inter_document_masking": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--dataloader-inter-document-masking"
+  ],
+  "required": false,
+  "type": null
+ },
+ "dataloader_type": {
+  "action": "_StoreAction",
+  "choices": [
+   "single",
+   "cyclic",
+   "external"
+  ],
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--dataloader-type"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "decoder_seq_length": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--decoder-seq-length"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "encoder_seq_length": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--encoder-seq-length"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "eod_mask_loss": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--eod-mask-loss"
+  ],
+  "required": false,
+  "type": null
+ },
+ "fim_data": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--fim-data"
+  ],
+  "required": false,
+  "type": null
+ },
+ "fim_eod_token": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": "<|endoftext|>",
+  "nargs": null,
+  "option_strings": [
+   "--fim-eod-token"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "fim_fragment_rate": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--fim-fragment-rate"
+  ],
+  "required": false,
+  "type": "float"
+ },
+ "fim_middle_token": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": "<fim_middle>",
+  "nargs": null,
+  "option_strings": [
+   "--fim-middle-token"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "fim_no_prefix": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--fim-no-prefix"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "fim_pad_token": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": "<fim_pad>",
+  "nargs": null,
+  "option_strings": [
+   "--fim-pad-token"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "fim_prefix_token": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": "<fim_prefix>",
+  "nargs": null,
+  "option_strings": [
+   "--fim-prefix-token"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "fim_rate": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": 0.5,
+  "nargs": null,
+  "option_strings": [
+   "--fim-rate"
+  ],
+  "required": false,
+  "type": "float"
+ },
+ "fim_split_sample": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--fim-split-sample"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "fim_spm_rate": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": 0.5,
+  "nargs": null,
+  "option_strings": [
+   "--fim-spm-rate"
+  ],
+  "required": false,
+  "type": "float"
+ },
+ "fim_suffix_token": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": "<fim_suffix>",
+  "nargs": null,
+  "option_strings": [
+   "--fim-suffix-token"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "mask_prob": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": 0.15,
+  "nargs": null,
+  "option_strings": [
+   "--mask-prob"
+  ],
+  "required": false,
+  "type": "float"
+ },
+ "mid_level_dataset_surplus": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": 0.005,
+  "nargs": null,
+  "option_strings": [
+   "--mid-level-dataset-surplus"
+  ],
+  "required": false,
+  "type": "float"
+ },
+ "mmap_bin_files": {
+  "action": "_StoreFalseAction",
+  "choices": null,
+  "const": false,
+  "default": true,
+  "nargs": 0,
+  "option_strings": [
+   "--no-mmap-bin-files"
+  ],
+  "required": false,
+  "type": null
+ },
+ "mock_data": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--mock-data"
+  ],
+  "required": false,
+  "type": null
+ },
+ "num_dataset_builder_threads": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": 1,
+  "nargs": null,
+  "option_strings": [
+   "--num-dataset-builder-threads"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "num_workers": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": 2,
+  "nargs": null,
+  "option_strings": [
+   "--num-workers"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "object_storage_cache_path": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--object-storage-cache-path"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "per_dataset_sequences_path": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--per-dataset-sequences-path"
+  ],
+  "required": false,
+  "type": null
+ },
+ "per_split_data_args_path": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--per-split-data-args-path"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "phase_transition_iterations": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--phase-transition-iterations"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "reset_attention_mask": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--reset-attention-mask"
+  ],
+  "required": false,
+  "type": null
+ },
+ "reset_position_ids": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--reset-position-ids"
+  ],
+  "required": false,
+  "type": null
+ },
+ "sample_rate": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": 1.0,
+  "nargs": null,
+  "option_strings": [
+   "--sample-rate"
+  ],
+  "required": false,
+  "type": "float"
+ },
+ "seq_length": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--seq-length"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "sft": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--sft"
+  ],
+  "required": false,
+  "type": null
+ },
+ "sft_mock_dataset_config_json": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--sft-mock-dataset-config-json"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "short_seq_prob": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": 0.1,
+  "nargs": null,
+  "option_strings": [
+   "--short-seq-prob"
+  ],
+  "required": false,
+  "type": "float"
+ },
+ "split": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--split"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "test_data_path": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": "*",
+  "option_strings": [
+   "--test-data-path"
+  ],
+  "required": false,
+  "type": null
+ },
+ "train_data_path": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": "*",
+  "option_strings": [
+   "--train-data-path"
+  ],
+  "required": false,
+  "type": null
+ },
+ "use_varlen_dataset": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--use-varlen-dataset"
+  ],
+  "required": false,
+  "type": null
+ },
+ "valid_data_path": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": "*",
+  "option_strings": [
+   "--valid-data-path"
+  ],
+  "required": false,
+  "type": null
+ },
+ "varlen_mock_dataset_config_json": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--varlen-mock-dataset-config-json"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "varlen_sbhd_validation": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--varlen-sbhd-validation"
+  ],
+  "required": false,
+  "type": null
+ }
+}

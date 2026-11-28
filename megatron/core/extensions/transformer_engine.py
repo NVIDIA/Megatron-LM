@@ -1290,6 +1290,8 @@ class TENorm:
             **_get_extra_te_kwargs(config),
         )
 
+        if config.normalization == "RMSNorm":
+            instance.weight.is_rmsnorm_weight = True
         instance.returns_residual = use_fused_residual
         return cast(LayerNormInterface, instance)
 
@@ -1503,8 +1505,11 @@ class TELinear(te.pytorch.Linear):
                     # Reduce the gradient further on the TP group since the weight is
                     # duplicated across TP ranks
                     setattr(param, "sequence_parallel", self.config.sequence_parallel)
-                    # Mark as NOT tensor parallel since weight is duplicated
+                    # TE stamps partition_dim=0 when parallel_mode=None. Restore the canonical
+                    # tensor-parallel metadata for parameters replicated across TP ranks.
                     setattr(param, "tensor_model_parallel", False)
+                    setattr(param, "partition_dim", -1)
+                    setattr(param, "partition_stride", 1)
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
@@ -1654,6 +1659,8 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
             setattr(param, "allreduce", True)
             setattr(param, "sequence_parallel", self.config.sequence_parallel)
             setattr(param, "tensor_model_parallel", False)
+            setattr(param, "partition_dim", -1)
+            setattr(param, "partition_stride", 1)
 
     def finish_init(self, quantization_config: QuantizationConfig):
         """Post-init of quantization override."""
@@ -1866,6 +1873,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
                 zero_centered_gamma=self.config.layernorm_zero_centered_gamma,
                 **extra_kwargs,
             )
+
+        if self.config.normalization == "RMSNorm":
+            self.layer_norm_weight.is_rmsnorm_weight = True
 
         # Set proper partition_stride
         setattr(self.weight, 'partition_stride', stride)

@@ -2,23 +2,42 @@
 import pytest
 import torch
 
+from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig, ParamKey, ParamPredicate
 
 
 def test_layer_sharded_muon_tp_mode_requirements():
     """muon_tp_mode='layer_sharded' needs muon, the layer-wise path and no split-QKV."""
     ok = dict(optimizer='muon', use_layer_wise_distributed_optimizer=True, muon_split_qkv=False)
-    OptimizerConfig(muon_tp_mode='layer_sharded', **ok)
+    OptimizerConfig(muon_tp_mode='layer_sharded', **ok).validate()
     # dist_muon is the deprecated alias for muon + the layer-wise path.
-    OptimizerConfig(muon_tp_mode='layer_sharded', optimizer='dist_muon', muon_split_qkv=False)
+    OptimizerConfig(
+        muon_tp_mode='layer_sharded', optimizer='dist_muon', muon_split_qkv=False
+    ).validate()
+    OptimizerConfig(
+        muon_tp_mode='layer_sharded',
+        optimizer='muon',
+        use_distributed_optimizer=True,
+        muon_split_qkv=False,
+    ).validate()
     with pytest.raises(ValueError, match="requires optimizer='muon'"):
-        OptimizerConfig(muon_tp_mode='layer_sharded', **{**ok, 'optimizer': 'adaptive_muon'})
+        OptimizerConfig(
+            muon_tp_mode='layer_sharded', **{**ok, 'optimizer': 'adaptive_muon'}
+        ).validate()
     with pytest.raises(ValueError, match="layer-wise"):
         OptimizerConfig(
             muon_tp_mode='layer_sharded', **{**ok, 'use_layer_wise_distributed_optimizer': False}
-        )
+        ).validate()
     with pytest.raises(ValueError, match="split-QKV"):
-        OptimizerConfig(muon_tp_mode='layer_sharded', **{**ok, 'muon_split_qkv': True})
+        OptimizerConfig(muon_tp_mode='layer_sharded', **{**ok, 'muon_split_qkv': True}).validate()
+
+
+@pytest.mark.parametrize("optimizer", ["adam", "adaptive_muon"])
+def test_factory_rejects_invalid_optimizer_config(optimizer):
+    """Standalone Core callers get validation without a training container."""
+    config = OptimizerConfig(optimizer=optimizer, lr=1e-3, muon_tp_mode="layer_sharded")
+    with pytest.raises(ValueError, match="requires optimizer='muon'"):
+        get_megatron_optimizer(config, [])
 
 
 def test_paramkey_matches():

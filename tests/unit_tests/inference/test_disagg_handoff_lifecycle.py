@@ -39,7 +39,11 @@ from megatron.core.inference.disaggregation.pending_handoff_imports import (
     PendingSSMImport,
 )
 from megatron.core.inference.disaggregation.transfer_backends.base import TransferStartError
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
+from megatron.core.inference.engines.dynamic_engine import (
+    DynamicInferenceEngine,
+    EngineState,
+    RequestEntry,
+)
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -590,6 +594,8 @@ def test_handoff_records_rl_metadata_only_on_final_decode(
     prefill.local_metadata_ledger = {}
     prefill.payload_stager = mock.Mock()
     prefill.socket_for_receiving_requests = mock.Mock()
+    prefill.finished_request_count = 0
+    prefill.context = mock.Mock()
     source = DynamicInferenceRequest(
         request_id=7,
         uid="chatcmpl-source",
@@ -611,7 +617,7 @@ def test_handoff_records_rl_metadata_only_on_final_decode(
         "kv_meta": {"resume_tokens": [99]},
     }
     entry = RequestEntry(record=record, future=handoff_loop.create_future())
-    finalized = record.merge() if already_finalized else None
+    finalized = prefill._finalize_request(entry) if already_finalized else None
     with mock.patch.object(record, "merge", wraps=record.merge) as merge:
         if already_finalized:
             completed = prefill._complete_request(entry, finalized)
@@ -1267,8 +1273,10 @@ def test_handoff_finishes_without_an_extra_decode_step(
     request.stop_word_ids = stop_word_ids
     engine.stop_word_being_finished_ids = set()
     engine.finished_request_count = 0
+    engine.context.remove_vlm_request_data = lambda request_id: None
     engine._set_finish_reason = DynamicInferenceEngine._set_finish_reason.__get__(engine)
-    engine._complete_request = DynamicInferenceEngine._complete_request
+    engine._finalize_request = DynamicInferenceEngine._finalize_request.__get__(engine)
+    engine._complete_request = DynamicInferenceEngine._complete_request.__get__(engine)
 
     def complete_request(request_id):
         engine.requests[request_id] = RequestEntry(
@@ -1318,8 +1326,11 @@ def test_handoff_finishes_without_an_extra_decode_step(
     assert pending.continuation_blocks == []
 
 
-def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
-    engine = object.__new__(DynamicInferenceEngine)
+@pytest.mark.parametrize("use_coordinator", [False, True])
+def test_immediate_handoff_completion_resolves_request_future(handoff_loop, use_coordinator):
+    # The real class, so the mixin's completion resolves through the engine's reply path.
+    engine = object.__new__(StateHandoffDynamicInferenceEngine)
+    engine._initialize_disaggregation_state()
     engine.stop_word_being_finished_ids = set()
     engine.controller = SimpleNamespace(
         terminating_token_ids=lambda _, stop_token_ids=None: frozenset(stop_token_ids or ())
@@ -1333,20 +1344,18 @@ def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
     request.add_event_add_engine()
     record = DynamicInferenceRequestRecord.from_request(request)
     request_future = handoff_loop.create_future()
-    engine.requests = {7: SimpleNamespace(record=record, future=request_future)}
+    engine.requests = {7: RequestEntry(record=record, future=request_future)}
     engine.finished_request_count = 0
-    engine.use_coordinator = False
-    engine.is_mp_coordinator = False
+    engine.use_coordinator = use_coordinator
+    engine.is_mp_coordinator = use_coordinator
+    engine.local_metadata_ledger_enabled = False
+    engine.payload_stager = None
+    engine.socket_for_receiving_requests = mock.Mock()
+    engine._partial_emit_lengths = {7: 1}
+    engine.context = mock.Mock()
     tokenizer = SimpleNamespace(eod=None, detokenize=mock.Mock(return_value="answer"))
 
-    def complete_request(request_entry):
-        finished_request = request_entry.record.merge()
-        request_entry.future.set_result(finished_request)
-        return finished_request
-
-    engine._complete_request = complete_request
-
-    InferenceStateHandoffMixin._complete_handoff_request_without_forward(engine, 7)
+    engine._complete_handoff_request_without_forward(7)
 
     assert request.status == Status.COMPLETED
     assert request.generated_length == 1
@@ -1357,6 +1366,9 @@ def test_immediate_handoff_completion_resolves_request_future(handoff_loop):
     assert finished_request.finalize_text(tokenizer).generated_text == "answer"
     assert engine.finished_request_count == 1
     assert 7 not in engine.requests
+    # No step follows this completion, so the coordinator reply leaves now.
+    assert engine.socket_for_receiving_requests.send_multipart.call_count == int(use_coordinator)
+    assert (7 not in engine._partial_emit_lengths) == use_coordinator
 
 
 def test_handoff_completion_waits_for_all_ranks_but_failure_is_immediate():
@@ -2022,3 +2034,96 @@ def test_hybrid_handoff_uses_mirrored_slots_without_request_collectives():
         is not requests[1].disaggregated_params["kv_meta"]
     )
     assert all("ssm" not in meta for meta in engine._kv_peer_metas)
+
+
+class _CoordinatorLoopPrefillEngine(DisaggDynamicInferenceEngine):
+    """Prefill engine shell that drives the real coordinator loop on scripted work."""
+
+    def __init__(self, *, ep_world_size, peer_work, iterations, dummy_forward) -> None:
+        self._initialize_disaggregation_state()
+        self._kv_transfer_role = "prefill"
+        self.state = EngineState.RUNNING
+        self.rank = 0
+        self.tp_ep_world_size = ep_world_size
+        self.ep_consensus_interval = 20
+        self._ep_consensus_loop_counter = 0
+        self._last_ep_consensus = (0, False)
+        self.use_synchronous_zmq_collectives = False
+        self.waiting_request_ids = deque([7])
+        self.context = SimpleNamespace(
+            step_count=0, prefix_cache_lru_clock=0, get_active_request_count=lambda: 0
+        )
+        self.controller = SimpleNamespace(dummy_forward=dummy_forward)
+        self.step_start_event = mock.Mock()
+        self.step_end_event = mock.Mock()
+        self.step_calls = 0
+        self.all_reduce_inputs = []
+        self._peer_work = peer_work
+        self._iterations_left = iterations
+        if ep_world_size > 1:
+            self.expert_parallel_zmq_communicator = SimpleNamespace(
+                all_reduce_max=self._all_reduce_max
+            )
+
+    async def _all_reduce_max(self, local_work, consensus, async_op):
+        self.all_reduce_inputs.append(local_work)
+        return max(local_work, self._peer_work), consensus
+
+    def schedule_requests(self):
+        self._iterations_left -= 1
+        if self._iterations_left < 0:
+            self.state = EngineState.STOPPING
+        return 0
+
+    async def async_step(self, *, verbose=False):
+        # The prompt finishes prefill in one step and leaves the batch; its detached
+        # recurrent-state slot stays pinned until decode releases the handoff.
+        self.step_calls += 1
+        self.waiting_request_ids.clear()
+        await asyncio.sleep(0)
+
+    async def shutdown(self):
+        return None
+
+
+def _run_coordinator_loop(engine, loop):
+    run = DynamicInferenceEngine.run_engine_with_coordinator.__wrapped__
+    loop.run_until_complete(asyncio.wait_for(run(engine, loop=loop), timeout=30))
+
+
+def test_idle_prefill_without_expert_parallelism_skips_dummy_forward(handoff_loop):
+    """A drained EP=1 engine must not act on a cached EP consensus.
+
+    Pending handoffs may hold every request-owned recurrent-state slot, and EP=1 reserves no
+    dummy slot, so a dummy forward here fails to allocate a slot and kills the engine.
+    """
+    dummy_forward = mock.Mock(
+        side_effect=AssertionError(
+            "No free recurrent-state slots for 1 expert-parallel dummy request(s)"
+        )
+    )
+    engine = _CoordinatorLoopPrefillEngine(
+        ep_world_size=1, peer_work=0, iterations=4, dummy_forward=dummy_forward
+    )
+
+    _run_coordinator_loop(engine, handoff_loop)
+
+    assert engine.step_calls == 1
+    dummy_forward.assert_not_called()
+    assert engine.context.step_count == 0
+    assert engine._last_ep_consensus == (0, False)
+
+
+def test_idle_expert_parallel_rank_keeps_amortized_consensus_dummy_forward(handoff_loop):
+    """EP>1 ranks still reuse consensus within the interval and join busy peers."""
+    dummy_forward = mock.Mock()
+    engine = _CoordinatorLoopPrefillEngine(
+        ep_world_size=2, peer_work=1, iterations=4, dummy_forward=dummy_forward
+    )
+
+    _run_coordinator_loop(engine, handoff_loop)
+
+    assert engine.all_reduce_inputs == [1]
+    assert engine.step_calls == 1
+    assert dummy_forward.call_count == 3
+    assert engine.context.step_count == 3

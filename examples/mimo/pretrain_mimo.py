@@ -73,6 +73,7 @@ def _parse_and_validate() -> argparse.Namespace:
     if not (
         args.use_distributed_optimizer
         or getattr(args, "use_layer_wise_distributed_optimizer", False)
+        or args.optimizer == "dist_muon"
     ):
         raise ValueError("Other optimizer paths have not been tested with heterogeneous MIMO")
     validate_encoder_prefetch_args(args)

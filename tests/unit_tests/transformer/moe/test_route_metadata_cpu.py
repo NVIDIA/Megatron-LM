@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.moe import moe_layer
 
 
@@ -29,7 +30,10 @@ def test_hash_ids_and_padding_use_owning_tp_group(monkeypatch):
     layer = object.__new__(moe_layer.MoELayer)
     torch.nn.Module.__init__(layer)
     layer.config = SimpleNamespace(
-        sequence_parallel=True, tensor_model_parallel_size=2, cuda_graph_impl="none"
+        sequence_parallel=True,
+        tensor_model_parallel_size=2,
+        cuda_graph_impl="none",
+        moe_megakernel_backend=None,
     )
     layer.tp_group = group
     layer.router = Router()
@@ -46,6 +50,7 @@ def test_hash_ids_and_padding_use_owning_tp_group(monkeypatch):
 @pytest.mark.parametrize("tp_rank", [0, 1])
 def test_flex_preprocess_aligns_padding_to_owning_sp_rank(monkeypatch, tp_rank):
     group = SimpleNamespace(size=lambda: 2)
+    packed = PackedSeqParams(qkv_format="thd")
     calls = []
 
     def scatter(value, group=None):
@@ -62,6 +67,7 @@ def test_flex_preprocess_aligns_padding_to_owning_sp_rank(monkeypatch, tp_rank):
         def dispatch_preprocess(
             self, hidden, routing, probs, padding_mask=None, packed_seq_params=None
         ):
+            assert packed_seq_params is packed
             received.append(padding_mask)
             assert padding_mask.shape == (hidden.shape[1], hidden.shape[0])
             return hidden, probs
@@ -69,7 +75,10 @@ def test_flex_preprocess_aligns_padding_to_owning_sp_rank(monkeypatch, tp_rank):
     layer = object.__new__(moe_layer.MoELayer)
     torch.nn.Module.__init__(layer)
     layer.config = SimpleNamespace(
-        sequence_parallel=True, cuda_graph_impl="none", moe_latent_size=None
+        sequence_parallel=True,
+        cuda_graph_impl="none",
+        moe_latent_size=None,
+        moe_megakernel_backend=None,
     )
     layer.tp_group = group
     layer.token_dispatcher = Dispatcher()
@@ -77,10 +86,10 @@ def test_flex_preprocess_aligns_padding_to_owning_sp_rank(monkeypatch, tp_rank):
     hidden = torch.zeros(2, 2, 4)
     probs = torch.ones(4, 2)
     routing = torch.ones(4, 2, dtype=torch.bool)
-    layer.preprocess(hidden, probs, routing, mask)
+    layer.preprocess(hidden, probs, routing, mask, packed_seq_params=packed)
     expected = mask[:, tp_rank * 2 : (tp_rank + 1) * 2]
     torch.testing.assert_close(received[0], expected)
     # Already local metadata must not be scattered a second time.
-    layer.preprocess(hidden, probs, routing, expected)
+    layer.preprocess(hidden, probs, routing, expected, packed_seq_params=packed)
     torch.testing.assert_close(received[1], expected)
     assert calls == [group]

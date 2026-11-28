@@ -26,6 +26,9 @@ from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     cp_utils,
     thd_layout_kernels,
 )
+from megatron.core.transformer.experimental_attention_variant.csa_utils.aligned_hca import (
+    aligned_hca_cp_rank,
+)
 from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_compressor import (
     maybe_compress_thd_fused,
 )
@@ -67,7 +70,13 @@ from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
-from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import (
+    ensure_params_ready,
+    get_pg_rank,
+    get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 
 def _build_csa_submodule(spec, *args, **kwargs):
@@ -1308,6 +1317,9 @@ class Compressor(MegatronModule):
         ``pre_compacted_hidden`` keeps the fallback's high-dimensional input
         shared across the two compressors as well.
         """
+        # Called directly by the attention, not through __call__, so this module's forward
+        # pre-hook never publishes ape.
+        ensure_params_ready([self.ape])
         linears = (self.linear_wkv, self.linear_wgate)
         # Deferred wgrad stores one GEMM per backward_dw call. FSDP can likewise
         # request a single overwrite of main_grad. Preserve their single-call
@@ -3986,6 +3998,17 @@ class CompressedSparseAttention(MegatronModule):
 
         # ---- Step 7b: sparse attention path ----------------------------------
         if self.use_fused_kernels:
+            hca_cp_rank = None
+            if self.config.hca_aligned_backward and indexer is None and torch.is_grad_enabled():
+                hca_cp_rank = aligned_hca_cp_rank(
+                    query,
+                    kv_full_thd,
+                    packed_seq_params,
+                    cp_group,
+                    window_size=self.window_size,
+                    compress_ratio=ratio,
+                    boundary_rows=d_window,
+                )
             output = csa_sparse_attn(
                 query,
                 kv_full_thd,
@@ -3998,6 +4021,8 @@ class CompressedSparseAttention(MegatronModule):
                 out_rope=fused_out_rope,
                 deterministic=self.config.deterministic_mode,
                 cuda_graph=self.config.cuda_graph_impl != "none",
+                hca_cp_rank=hca_cp_rank,
+                hca_cp_size=cp_size,
             )
         else:
             output = unfused_compressed_sparse_attn(

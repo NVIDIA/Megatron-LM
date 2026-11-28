@@ -1,96 +1,65 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Coverage for occurrence-based FSDP prefetch and weak module ownership."""
+"""Coverage for one cursor over registration or recorded execution sequences."""
 
 import gc
-from unittest.mock import Mock
 from weakref import ref
 
 import pytest
 from torch import nn
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionEvent,
     ExecutionOrder,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 
 
-@pytest.mark.parametrize(
-    'budget, expected',
-    [
-        (None, [[1], [0], [0], [2], []]),
-        (0, [[], [], [], [], []]),
-        (2, [[1, 0], [0, 0], [0, 2], [2], []]),
-    ],
-)
-def test_prefetch_replays_occurrences(budget, expected):
-    """Reused modules have occurrence-specific successors under every prefetch budget."""
-    modules = [Mock(spec=FsdpModule, num_parameter_elements=1) for _ in range(3)]
-    prefetched = []
-    for module in modules:
-        # Prefetch passes the successor's compute phase; record only which module it targets.
-        module._unshard_parameter_groups.side_effect = (
-            lambda _phase, target=module: prefetched.append(target)
-        )
-    sequence = [modules[index] for index in (0, 1, 0, 0, 2)]
-    order = ExecutionOrder()
-    for module in sequence:
-        order.append(module)
-    # A second cycle checks cursor reset; each lookahead must leave demand calls intact.
-    for _ in range(2):
-        for module, targets, successor in zip(sequence, expected, sequence[1:] + [None]):
-            prefetched.clear()
-            FsdpModule._prefetch_parameter_groups(module, order, budget)
-            assert prefetched == [modules[index] for index in targets]
-            assert order.next_item() is successor
-
-
-def test_unique_calls_resynchronize_and_repeated_calls_validate():
-    """Unique VPP chunk calls select their position; ambiguous repeats stay strict."""
-    chunk0, layer0, chunk1, layer1 = (nn.Module() for _ in range(4))
-    order = ExecutionOrder([chunk0, layer0, chunk1, layer1])
-    # Grouped VPP repeats chunk 0 before switching to chunk 1, in one shared order.
-    for chunk in (chunk0, chunk0, chunk0, chunk1, chunk1, chunk0):
-        layer = layer0 if chunk is chunk0 else layer1
-        order.advance(chunk)
-        assert order.next_item() is layer
-        order.advance(layer)
-        assert order.next_item() is (chunk1 if chunk is chunk0 else None)
-
-    order = ExecutionOrder([chunk0, layer0, chunk0])
-    order.advance(chunk0)
-    assert order.next_item() is layer0
-    with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(chunk0)
-    # A rejected repeated call must not consume the expected occurrence.
-    order.advance(layer0)
-    assert order.next_item() is chunk0
-    order.advance(chunk0)
-    assert order.next_item() is None
-    # Unique calls remain valid anchors even when the sequence also has repeats.
-    order.advance(layer0)
-    order.advance(chunk0)
-    assert order.next_item() is None
-
-    empty = ExecutionOrder()
-    assert empty.next_item() is None
-    with pytest.raises(RuntimeError, match='diverged'):
-        empty.advance(chunk0)
-
-
-def test_iteration_and_weak_references():
-    """Traversal preserves repeated occurrences without retaining deleted modules."""
+def test_cursor_wraps_across_phases():
+    """One cursor follows the complete trace, including adjacent repeated calls."""
     first, second = nn.Module(), nn.Module()
-    order = ExecutionOrder([first, second, first, second])
-    assert list(order) == [first, second, first, second]
+    events = [
+        ExecutionEvent(first, Phase.FORWARD),
+        ExecutionEvent(first, Phase.FORWARD),
+        ExecutionEvent(second, Phase.FORWARD),
+        ExecutionEvent(first, Phase.BACKWARD),
+        ExecutionEvent(second, Phase.BACKWARD),
+        ExecutionEvent(first, Phase.BACKWARD),
+    ]
+    order = ExecutionOrder(events)
+    for _ in range(2):
+        for index, event in enumerate(events):
+            assert order.peek() == event
+            assert list(order.successors()) == events[index + 1 :]
+            assert order.peek() == event
+            order.advance()
+        assert order.position == 0
 
+
+def test_empty_order_can_be_populated():
+    """Recording does not move the cursor, so replay starts at the first event."""
+    order = ExecutionOrder()
+    assert order.peek() is None
+    with pytest.raises(RuntimeError, match="empty"):
+        order.advance()
+    event = ExecutionEvent(nn.Module(), Phase.FORWARD)
+    order.append(event)
+    assert order.peek() == event
+    for _ in range(2):
+        assert list(order.successors()) == []
+        order.advance()
+        assert order.peek() == event
+
+
+def test_order_does_not_keep_modules_alive():
+    """The sequence holds weak references and iteration skips dead modules."""
+    first, second = nn.Module(), nn.Module()
+    order = ExecutionOrder(
+        [ExecutionEvent(first, Phase.FORWARD), ExecutionEvent(second, Phase.FORWARD)]
+    )
     second_ref = ref(second)
     del second
     gc.collect()
     assert second_ref() is None
-    assert list(order) == [first, first]
-    order.advance(first)
-    assert order.next_item() is None
-    # Traversal skips dead references, but the demand cursor must not skip a call.
-    with pytest.raises(RuntimeError, match='diverged'):
-        order.advance(first)
+    assert list(order) == [ExecutionEvent(first, Phase.FORWARD)]
+    assert list(order.successors()) == []

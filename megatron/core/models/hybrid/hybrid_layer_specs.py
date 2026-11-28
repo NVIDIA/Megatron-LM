@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from dataclasses import replace
 from functools import partial
 
@@ -39,6 +39,9 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import (
+    deepseek_v4_hybrid_attention_module_specs as dsv4_hybrid_specs,
+)
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
@@ -103,6 +106,7 @@ _csa_indexer = partial(
     ),
 )
 _csa_qk_norm = TESpecProvider().layer_norm(for_qk=True)
+_dsv4_o_group_proj = dsv4_hybrid_specs.get_dsv4_o_group_proj_spec()
 
 
 # MTP block spec - provides norms and projection only.
@@ -180,16 +184,22 @@ hybrid_stack_spec = ModuleSpec(
                     module=KimiDeltaAttention,
                     submodules=KimiDeltaAttentionSubmodules(
                         in_proj=TEColumnParallelLinear,
-                        beta_proj=TEColumnParallelLinear,
-                        # Two-stage low-rank gates (GLM-5.3-Flash); only used when
-                        # config.kda_two_stage_gates=True, else IdentityOp.
-                        # f_a/g_a are replicated (TELinear parallel_mode="duplicated");
-                        # f_b/g_b are TP-sharded column-parallel.
+                        # Beta is one scalar per key head and stays replicated across TP
+                        # (TELinear parallel_mode="duplicated") so MXFP8 quantizes the
+                        # globally aligned output dimension.
+                        beta_proj=TELinear,
+                        out_norm=TENorm,
+                        # Separate F-decay / output-gate projections; only built when
+                        # config.kda_two_stage_gates=True (GLM-5.3-Flash, latent = head dim) or
+                        # kda_f_lora_rank / kda_gate_lora_rank is set (Kimi-K3), else IdentityOp.
+                        # f/g (full-rank) and f_b/g_b are TP-sharded column-parallel;
+                        # f_a/g_a are replicated (TELinear parallel_mode="duplicated").
+                        f_proj=TEColumnParallelLinear,
                         f_a_proj=TELinear,
                         f_b_proj=TEColumnParallelLinear,
+                        g_proj=TEColumnParallelLinear,
                         g_a_proj=TELinear,
                         g_b_proj=TEColumnParallelLinear,
-                        out_norm=TENorm,
                         out_proj=TERowParallelLinear,
                     ),
                 ),
@@ -281,6 +291,7 @@ hybrid_stack_spec = ModuleSpec(
                                 compressor=_csa_compressor, indexer=_csa_indexer
                             ),
                         ),
+                        linear_o_group_proj=_dsv4_o_group_proj,
                         linear_proj=TERowParallelLinear,
                         q_layernorm=IdentityOp,
                         kv_layernorm=IdentityOp,
@@ -307,6 +318,7 @@ hybrid_stack_spec = ModuleSpec(
                                 compressor=_csa_compressor, indexer=_csa_indexer
                             ),
                         ),
+                        linear_o_group_proj=_dsv4_o_group_proj,
                         linear_proj=TERowParallelLinear,
                         q_layernorm=_csa_qk_norm,
                         kv_layernorm=_csa_qk_norm,
@@ -462,13 +474,18 @@ hybrid_inference_stack_spec = ModuleSpec(
                     module=KimiDeltaAttention,
                     submodules=KimiDeltaAttentionSubmodules(
                         in_proj=InferenceColumnParallelLinear,
-                        beta_proj=InferenceColumnParallelLinear,
-                        # Two-stage low-rank gates (GLM-5.3-Flash); only used when
-                        # config.kda_two_stage_gates=True, else IdentityOp.
+                        # Beta is replicated across TP (TELinear parallel_mode="duplicated"),
+                        # matching the training spec.
+                        beta_proj=TELinear,
+                        # Separate F-decay / output-gate projections; only built when
+                        # config.kda_two_stage_gates=True or kda_f_lora_rank /
+                        # kda_gate_lora_rank is set, else IdentityOp.
                         # f_a/g_a replicated (TELinear parallel_mode="duplicated");
-                        # f_b/g_b TP-sharded inference column-parallel.
+                        # f/g and f_b/g_b TP-sharded inference column-parallel.
+                        f_proj=InferenceColumnParallelLinear,
                         f_a_proj=TELinear,
                         f_b_proj=InferenceColumnParallelLinear,
+                        g_proj=InferenceColumnParallelLinear,
                         g_a_proj=TELinear,
                         g_b_proj=InferenceColumnParallelLinear,
                         out_norm=TENorm,
@@ -747,10 +764,16 @@ def hybrid_dsv4_stack_spec(config):
             ),
         )
 
+    # HybridStack builds 'C' layers from csa_qk_layernorm_layer when qk_layernorm is enabled.
+    # The DSv4 attention spec already selects the qk-norm form from config, so both slots share
+    # one layer; leaving csa_qk_layernorm_layer at the static default would silently drop the
+    # config-aware attention (e.g. TE BatchedLinear) for every CSA layer.
+    csa_layer = _wrap_dsv4_layer(compress_ratio=4)
     submodules = dataclasses.replace(
         hybrid_stack_spec.submodules,
         dsa_layer=_wrap_dsv4_layer(),  # 'D': array-driven (or window) DSv4 attention
-        csa_layer=_wrap_dsv4_layer(compress_ratio=4),  # 'C': CSA
+        csa_layer=csa_layer,  # 'C': CSA
+        csa_qk_layernorm_layer=csa_layer,  # 'C' with qk_layernorm
         hca_layer=_wrap_dsv4_layer(compress_ratio=128),  # 'H': HCA
         window_layer=_wrap_dsv4_layer(compress_ratio=0),  # 'W': sliding-window-only
     )
