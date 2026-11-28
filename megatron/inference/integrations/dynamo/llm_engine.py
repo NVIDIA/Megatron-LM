@@ -38,6 +38,9 @@ from dynamo.common.model_fetch import fetch_model
 from dynamo.llm import KvEventPublisher, ModelInput
 from dynamo.llm.exceptions import EngineShutdown, StreamIncomplete
 
+from megatron.core.inference.data_parallel_inference_coordinator.auth import (
+    split_authenticated_address,
+)
 from megatron.core.inference.disaggregation.handoff_ownership import HandoffClaimStatus
 from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.headers import Headers
@@ -51,11 +54,31 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.integrations.dynamo.args import Config, parse_args
 from megatron.inference.integrations.dynamo.handoff_channel import HandoffChannel
 from megatron.inference.integrations.dynamo.handoff_recovery import HandoffRelease
+from megatron.inference.integrations.dynamo.source_credentials import SourceCredentials
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
 
 logger = logging.getLogger(__name__)
 _HEALTH_CHECK_TIMEOUT = 5.0
 _RELEASE_TIMEOUT = 5.0
+
+
+def _write_private_file(path: Path, text: str) -> None:
+    """Atomically write ``text`` to ``path``, readable only by the current user.
+
+    The file is created with its final permissions, never briefly world-readable, because it
+    holds a credential (the authenticated coordinator address).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.unlink(missing_ok=True)  # never inherit the permissions of a stale file
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            handle.write(text)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 class InferenceRequestRejected(InferenceRequestError, ValueError):
@@ -129,6 +152,7 @@ class MegatronLLMEngine(LLMEngine):
         self._published_block_hashes: set[int] = set()
         self._event_receiver: Optional[EngineEventReceiver] = None
         self._release_context: zmq.asyncio.Context | None = None
+        self._source_credentials = SourceCredentials(config.source_coordinator_address_files)
         self._handoff_channels: dict[str, HandoffChannel] = {}
         self._retired_handoff_channels: set[HandoffChannel] = set()
         self._cleanup_tasks: set[asyncio.Task] = set()
@@ -258,6 +282,11 @@ class MegatronLLMEngine(LLMEngine):
             temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
             temporary.write_text(json.dumps(identity, sort_keys=True) + "\n")
             os.replace(temporary, path)
+
+        if self.config.coordinator_address_file is not None:
+            _write_private_file(
+                Path(self.config.coordinator_address_file), endpoint.coordinator_address + "\n"
+            )
 
         capabilities = endpoint.capabilities
         return EngineConfig(
@@ -393,7 +422,11 @@ class MegatronLLMEngine(LLMEngine):
                     raise RuntimeError("Dynamo handoff requires coordinator instance IDs")
                 disagg = dict(final.get("disaggregated_params") or {})
                 disagg["release"] = {
-                    "coordinator_addr": endpoint.coordinator_address,
+                    # The endpoint only: this travels through Dynamo with every request, so
+                    # the launch secret stays out of it. Decode adapters get that from files.
+                    "coordinator_addr": split_authenticated_address(endpoint.coordinator_address)[
+                        0
+                    ],
                     "coordinator_instance_id": self.client.coordinator_instance_id,
                     "request_id": int(
                         disagg.get("request_id", final.get("request_id", stream.request_id))
@@ -622,7 +655,10 @@ class MegatronLLMEngine(LLMEngine):
         if channel is None:
             if self._release_context is None:
                 self._release_context = zmq.asyncio.Context()
-            channel = HandoffChannel(self._release_context, address)
+            # The secret comes from the deployment's files, never from the handoff itself.
+            channel = HandoffChannel(
+                self._release_context, self._source_credentials.connect_address(address)
+            )
             self._handoff_channels[address] = channel
         return channel
 

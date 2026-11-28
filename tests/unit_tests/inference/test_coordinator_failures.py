@@ -11,6 +11,10 @@ import torch
 import zmq
 from zmq.utils.monitor import recv_monitor_message
 
+from megatron.core.inference.data_parallel_inference_coordinator.auth import (
+    present_credentials,
+    split_authenticated_address,
+)
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
@@ -60,7 +64,9 @@ class _CoordinatorRuntime(CoordinatorThread):
         if self.thread.is_alive():
             context = zmq.Context()
             socket = context.socket(zmq.DEALER)
-            socket.connect(self.address)
+            endpoint, auth_token = split_authenticated_address(self.address)
+            present_credentials(socket, auth_token)
+            socket.connect(endpoint)
             socket.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
             if socket.poll(5000) & zmq.POLLIN:
                 socket.recv_multipart()
@@ -91,7 +97,9 @@ class _EnginePeer:
         self.identity, self.context = identity, zmq.Context()
         self.socket = self.context.socket(zmq.DEALER)
         self.socket.setsockopt(zmq.IDENTITY, identity)
-        self.socket.connect(address)
+        endpoint, auth_token = split_authenticated_address(address)
+        present_credentials(self.socket, auth_token)
+        self.socket.connect(endpoint)
         self.socket.send(b"")
 
     def receive_request(self):

@@ -16,6 +16,9 @@ import zmq
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.data_parallel_inference_coordinator.auth import (
+    split_authenticated_address,
+)
 from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
@@ -170,9 +173,11 @@ class RoutedModel:
         torch.distributed.broadcast_object_list(address, src=0)
         self.address = address[0]
         self._observe_forwards()
+        endpoint, auth_token = split_authenticated_address(self.address)
         await self.engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=int(self.address.rsplit(":", 1)[-1]),
+            inference_coordinator_port=int(endpoint.rsplit(":", 1)[-1]),
             launch_inference_coordinator=False,
+            coordinator_auth_token=auth_token,
             hostname="127.0.0.1",
         )
         if self.rank == 0:

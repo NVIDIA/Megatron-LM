@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -37,6 +37,8 @@ class Config:
     endpoint_types: str = "chat,completions"
     handoff_owner: str | None = None
     streaming_interval: int = 1
+    coordinator_address_file: str | None = None
+    source_coordinator_address_files: list[str] = field(default_factory=list)
 
 
 def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -94,6 +96,30 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default=None,
         help="Write this worker's assigned Dynamo identity as JSON after engine readiness.",
     )
+    parser.add_argument(
+        "--coordinator-address-file",
+        default=None,
+        help=(
+            "Write this worker's coordinator launch address after engine readiness, readable only "
+            "by its owner. With --inference-authenticate-coordinator the address contains the "
+            "coordinator's secret, which a deployment supervisor needs to run the "
+            "handoff_recovery hook against this source, and which decode adapters read through "
+            "--source-coordinator-address-file."
+        ),
+    )
+    parser.add_argument(
+        "--source-coordinator-address-file",
+        action="append",
+        default=[],
+        help=(
+            "Decode role: a file holding one source (prefill) coordinator's launch address, as "
+            "written by that adapter's --coordinator-address-file. Repeat for every source. "
+            "Handoffs are accepted only from these sources, and their secrets come from here "
+            "rather than from request metadata. Required when the sources run with "
+            "--inference-authenticate-coordinator. Without it, any source endpoint named by a "
+            "handoff is trusted and none is authenticated."
+        ),
+    )
     parser.add_argument("--megatron-root", default=str(Path(__file__).resolve().parents[4]))
     parser.add_argument("--drain-timeout", type=float, default=30.0)
     parser.add_argument("--engine-start-timeout", type=float, default=1800.0)
@@ -144,6 +170,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         parser.error("--engine-shutdown-timeout must be positive")
     if args.streaming_interval < 1:
         parser.error("--streaming-interval must be at least 1")
+    if args.source_coordinator_address_file and args.role != "decode":
+        parser.error("--source-coordinator-address-file applies only to --role decode")
     if not megatron_argv:
         parser.error("Megatron arguments are required after '--'")
     if args.role in ("prefill", "decode") and not args.coordinator_host:
@@ -177,4 +205,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         endpoint_types=args.endpoint_types,
         handoff_owner=args.handoff_owner,
         streaming_interval=args.streaming_interval,
+        coordinator_address_file=args.coordinator_address_file,
+        source_coordinator_address_files=args.source_coordinator_address_file,
     )
