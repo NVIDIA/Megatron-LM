@@ -3,9 +3,11 @@
 """Real allocator/backpressure and message-level disaggregation regressions."""
 
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from threading import Event
+from types import SimpleNamespace
 from unittest import mock
 
 import msgpack
@@ -15,8 +17,14 @@ import torch.distributed as dist
 import zmq
 
 from megatron.core.inference.config import KVCacheManagementMode, PrefixCachingEvictionPolicy
+from megatron.core.inference.data_parallel_inference_coordinator.handlers import HANDLERS
+from megatron.core.inference.disaggregation.coordinator_runtime import DisaggCoordinatorRuntime
+from megatron.core.inference.disaggregation.coordinator_setup import NativeDisaggregationConfig
+from megatron.core.inference.disaggregation.engine import DisaggDynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.headers import Headers
+from tests.unit_tests.inference.coordinator_test_utils import make_coordinator_direct
+from tests.unit_tests.inference.engines import disagg_test_utils
 from tests.unit_tests.inference.engines.disagg_test_utils import (
     ForwardWitness,
     _enqueue_decode_handoff,
@@ -334,3 +342,189 @@ def test_prefill_handoff_pin_survives_persist_suspend_until_release(transport_wo
             assert (allocator.pc_state.block_ref_counts[blocks] == 0).all()
         dist.barrier(group=transport_world)
         assert_released(engine)
+
+
+class _EngineSocket:
+    """An engine's coordinator socket: frames the coordinator routed in, replies out."""
+
+    def __init__(self):
+        self.inbox, self.outbox = deque(), deque()
+
+    def recv_multipart(self, flags=0):
+        if not self.inbox:
+            raise zmq.Again()
+        return self.inbox.popleft()
+
+    def send(self, frame):
+        self.outbox.append([frame])
+
+    def send_multipart(self, frames):
+        self.outbox.append(list(frames))
+
+
+class _LoopbackP2P:
+    """Match the NCCL backend's planned sends and receives in post order, in one process."""
+
+    class _Work:
+        done = False
+
+        def is_completed(self):
+            return self.done
+
+        def wait(self):
+            assert self.done, "loopback: a point-to-point operation has no peer"
+
+    def __init__(self):
+        self.sends, self.receives = deque(), deque()
+
+    def batch_isend_irecv(self, ops):
+        works = []
+        for op in ops:
+            work = self._Work()
+            (self.sends if op.op is dist.isend else self.receives).append((op.tensor, work))
+            works.append(work)
+        while self.sends and self.receives:
+            (source, sent), (destination, received) = self.sends.popleft(), self.receives.popleft()
+            assert source.shape == destination.shape
+            destination.copy_(source)
+            sent.done = received.done = True
+        return works
+
+
+class _NativeDisaggregation:
+    """The native coordinator's handlers and runtime, routing between in-process engines."""
+
+    def __init__(self, engines):
+        self.engines = engines
+        self.client = []
+        coordinator = make_coordinator_direct(data_parallel_size=0)
+        coordinator.disaggregated_runtime = DisaggCoordinatorRuntime(coordinator)
+        coordinator.known_clients = {b"client"}
+        coordinator.request_id_to_client_id = {}
+        coordinator.request_id_to_client_request_id = {}
+        coordinator.client_request_to_request_id = {}
+        coordinator.next_request_id = 101
+        coordinator.router_socket = SimpleNamespace(send_multipart=self._route)
+        self.coordinator = coordinator
+        for identity, engine in engines.items():
+            role = engine._kv_transfer_role
+            engine._disagg_config = NativeDisaggregationConfig(
+                role=role, identity=identity, spawn_coordinator=False, coordinator_group=None
+            )
+            engine.use_coordinator = engine.is_mp_coordinator = True
+            engine.socket_for_receiving_requests = _EngineSocket()
+            engine.model_parallel_publisher_socket = mock.Mock()
+            metadata = [Headers.REGISTER_ROLE.value, role, "nccl"]
+            metadata.append(engine._build_instance_transfer_meta())
+            HANDLERS[Headers.REGISTER_ROLE](coordinator, identity, metadata, [])
+            engine.socket_for_receiving_requests.inbox.clear()  # The registration ACK.
+
+    def _route(self, frames):
+        identity, *body = frames
+        if identity in self.engines:
+            self.engines[identity].socket_for_receiving_requests.inbox.append(body)
+        else:
+            self.client.append(frames)  # [client identity, metadata, bodies...]
+
+    def submit(self, client_request_id, tokens, params):
+        HANDLERS[Headers.SUBMIT_REQUEST](
+            self.coordinator,
+            b"client",
+            [Headers.SUBMIT_REQUEST.value, client_request_id, params.serialize(), None],
+            [msgpack.packb(tokens), msgpack.packb([]), msgpack.packb(None), msgpack.packb(None)],
+        )
+
+    def run(self, done, *, limit=256):
+        """Step each engine as its coordinator loop does and deliver every message."""
+        for _ in range(limit):
+            if done():
+                return
+            for identity, engine in self.engines.items():
+                engine.schedule_requests()
+                if (
+                    engine.context.get_active_request_count()
+                    or engine.waiting_request_ids
+                    or engine.has_admittable_kv_import
+                ):
+                    engine.step_modern()
+                socket = engine.socket_for_receiving_requests
+                while socket.outbox:
+                    frames = socket.outbox.popleft()
+                    metadata = msgpack.unpackb(frames[0], raw=False)
+                    HANDLERS[Headers(metadata[0])](self.coordinator, identity, metadata, frames[1:])
+        raise AssertionError("The native disaggregation flow did not settle")
+
+    def replies(self, client_request_id):
+        return [
+            (Headers(header[0]), header, frames[2:])
+            for frames in self.client
+            for header in [msgpack.unpackb(frames[1], raw=False)]
+            if header[1] == client_request_id
+        ]
+
+
+@torch.inference_mode()
+def test_impossible_handoff_fails_on_arrival_and_releases_its_source():
+    """A handoff that can never fit decode's pool fails once; later handoffs still run.
+
+    Both real engines run in one process behind the native coordinator's real handlers.
+    A loopback carries the NCCL backend's own planned operations between them.
+    """
+    Utils.initialize_model_parallel()
+    try:
+        config = disagg_config()
+        short_tokens = prompt(9)
+
+        def params():
+            return sampling(7, detokenize_generations=False)
+
+        weights, expected = collocated_reference(config, short_tokens, params())
+        with ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(
+                    disagg_test_utils,
+                    "StateHandoffDynamicInferenceEngine",
+                    DisaggDynamicInferenceEngine,
+                )
+            )
+            prefill = stack.enter_context(real_engine(config, role="prefill", weights=weights))
+            buffer = prefill.context.memory_buffer
+            block_bytes = buffer[:, :, 0].numel() * buffer.element_size()
+            # A decode pool of four usable blocks, smaller than the prefill pool.
+            decode_config = disagg_config(context_buffer_size_gb=5.5 * block_bytes / 1024**3)
+            decode = stack.enter_context(real_engine(decode_config, role="decode", weights=weights))
+            usable = decode.context.kv_block_allocator.pool_size - 1
+            assert usable == 4 and prefill.context.kv_block_allocator.pool_size > 2 * usable
+            loopback = _LoopbackP2P()
+            stack.enter_context(
+                mock.patch.object(dist, "batch_isend_irecv", loopback.batch_isend_irecv)
+            )
+            native = _NativeDisaggregation({b"prefill": prefill, b"decode": decode})
+            runtime = native.coordinator.disaggregated_runtime
+            block = config.context_block_size_tokens
+
+            # The prompt alone needs five blocks: the import can never start on decode.
+            native.submit(1, prompt(5 * block), params())
+            native.run(lambda: native.replies(1))
+            [(header, reply, _)] = native.replies(1)
+            assert header == Headers.REQUEST_ERROR, reply
+            assert "the import needs 6 KV blocks, but the pool has 4" in reply[2]
+            assert reply[3] is True  # Source-safe: the coordinator released the prefill pins.
+            native.run(lambda: not prefill._pinned_handoff_blocks)
+            assert not decode._deferred_kv_handoffs and not decode._pending_kv_imports
+            assert not runtime.requests and not runtime.terminating_request_ids
+
+            # A later handoff that fits runs at once and matches a collocated engine.
+            native.submit(2, short_tokens, params())
+            native.run(lambda: native.replies(2))
+            [(header, _, bodies)] = native.replies(2)
+            assert header == Headers.ENGINE_REPLY
+            assert msgpack.unpackb(bodies[0], raw=False)["generated_tokens"] == expected
+            assert native.replies(1) == [(Headers.REQUEST_ERROR, reply, [])]
+            native.run(lambda: not prefill._pinned_handoff_blocks)
+            assert not runtime.requests and not runtime.terminating_request_ids
+            assert not runtime.hop1_request_ids
+            assert_released(prefill)
+            assert_released(decode)
+    finally:
+        Utils.destroy_model_parallel()

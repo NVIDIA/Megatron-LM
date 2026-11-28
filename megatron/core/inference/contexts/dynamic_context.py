@@ -175,6 +175,43 @@ class BlockOverflowError(ContextOverflowError):
     pass
 
 
+def request_limit_errors(
+    context: Any,
+    request_id: int,
+    prompt_length: int,
+    num_tokens_to_generate: int,
+    *,
+    chunked_prefill: bool,
+) -> List[ContextOverflowError]:
+    """Return the fixed context limits that a request can never meet.
+
+    The limits do not depend on the current load, so a request that violates one
+    fails again on every later attempt.
+
+    Args:
+        context: The dynamic context whose limits apply.
+        request_id (int): Request named in each error.
+        prompt_length (int): Number of prompt tokens.
+        num_tokens_to_generate (int): The request's resolved generation budget.
+        chunked_prefill (bool): Whether the engine can split a prompt across steps.
+
+    Returns:
+        List[ContextOverflowError]: The violated limits, empty when the request fits.
+    """
+    errors = []
+    if prompt_length > context.max_tokens and not chunked_prefill:
+        errors.append(TokenOverflowError(request_id))
+    # The shared KV pool must hold the prompt, all generated tokens but the last, and the
+    # final decode step's drafts.
+    max_stored_tokens = prompt_length
+    if num_tokens_to_generate > 1:
+        max_stored_tokens += num_tokens_to_generate - 1 + context.num_speculative_tokens
+    request_block_count = math.ceil(max_stored_tokens / context.block_size_tokens)
+    if request_block_count > context.kv_block_allocator.pool_size - 1:
+        errors.append(BlockOverflowError(request_id))
+    return errors
+
+
 class ActiveRequestCountOverflowError(ContextOverflowError):
     '''Used when `initialize_attention_state()` is called with
     `num_warmup_requests > max_requests.'''
