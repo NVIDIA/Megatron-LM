@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import warnings
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn, Optional, Union
 
@@ -59,11 +60,13 @@ try:
         _FusedMLARoPEKVSplit,
         fused_apply_mla_rope_for_kv,
         fused_apply_mla_rope_for_q,
+        fused_mla_rope_kv_split_emb_grad,
     )
 except:
     _FusedMLARoPEKVSplit = None
     fused_apply_mla_rope_for_kv = None
     fused_apply_mla_rope_for_q = None
+    fused_mla_rope_kv_split_emb_grad = None
 
 
 if HAVE_TE:
@@ -93,6 +96,26 @@ if HAVE_TE:
     except ImportError:
         # Older TE lacks the fused MLA key/value split + RoPE + MXFP8 quantize kernel.
         fused_mla_kv_rope_mxfp8 = None
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            fused_mla_q_rope_backward_,
+            fused_mla_q_rope_mxfp8,
+        )
+    except ImportError:
+        # Older TE lacks the query RoPE + MXFP8 kernel and the kernels writing the attention
+        # scale layout (fused_mla_kv_rope_mxfp8's transpose_swizzle_scales).
+        fused_mla_q_rope_mxfp8 = None
+        fused_mla_q_rope_backward_ = None
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            fused_mla_kv_split_backward_mxfp8,
+            fused_mla_q_rope_backward_mxfp8,
+        )
+    except ImportError:
+        # Older TE lacks the RoPE backward kernels that write the MXFP8 up-projection gradients.
+        fused_mla_kv_split_backward_mxfp8 = None
+        fused_mla_q_rope_backward_mxfp8 = None
+    from transformer_engine.common.recipe import Format
     from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
     from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
@@ -119,10 +142,15 @@ else:
         mxfp8_quantize_only,
         mxfp8_transpose_swizzle,
         fused_mla_kv_rope_mxfp8,
+        fused_mla_q_rope_mxfp8,
+        fused_mla_q_rope_backward_,
+        fused_mla_kv_split_backward_mxfp8,
+        fused_mla_q_rope_backward_mxfp8,
+        Format,
         FP8GlobalStateManager,
         QuantizedTensor,
         MXFP8Quantizer,
-    ) = (None, None, None, None, None, None, None, None, None, None, None, None, None, None, None)
+    ) = (None,) * 20
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
@@ -169,9 +197,18 @@ class _FusedKVRoPEQuantForFusedAttn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim):
-        """Split kv, apply RoPE to k_pos_emb and quantize key and value"""
-        key, value = fused_mla_kv_rope_mxfp8(kv, k_pos_emb, cos, sin, v_dim)
+    def forward(
+        ctx, kv, k_pos_emb, cos, sin, emb_dim, k_dim, v_dim, transpose_swizzle_scales=False
+    ):
+        """Split kv, apply RoPE to k_pos_emb and quantize key and value. With
+        transpose_swizzle_scales, the scales are written in attention's layout (as
+        mxfp8_transpose_swizzle would leave them)."""
+        if transpose_swizzle_scales:
+            key, value = fused_mla_kv_rope_mxfp8(
+                kv, k_pos_emb, cos, sin, v_dim, transpose_swizzle_scales=True
+            )
+        else:
+            key, value = fused_mla_kv_rope_mxfp8(kv, k_pos_emb, cos, sin, v_dim)
         ctx.save_for_backward(cos, sin)
         ctx.emb_dim, ctx.k_dim, ctx.v_dim = emb_dim, k_dim, v_dim
         ctx.cu_seqlens_kv, ctx.cp_rank, ctx.cp_size = None, 0, 1
@@ -182,7 +219,133 @@ class _FusedKVRoPEQuantForFusedAttn(torch.autograd.Function):
     def backward(ctx, dk, dv):
         """Attention returns bf16 key and value gradients"""
         d_kv, d_emb = _FusedMLARoPEKVSplit.backward(ctx, dk, dv)[:2]
-        return d_kv, d_emb, None, None, None, None, None
+        return d_kv, d_emb, None, None, None, None, None, None
+
+
+class _FusedQRoPEQuantForFusedAttn(torch.autograd.Function):
+    """Apply RoPE to the query and quantize it to MXFP8 in one TE kernel, with the scales in
+    attention's layout.
+
+    The output is that of _QuantizeQueryForFusedAttn(fused_apply_mla_rope_for_q(q)) after
+    mxfp8_transpose_swizzle. The backward is the query RoPE backward of
+    fused_apply_mla_rope_for_q (same BF16 operations), in place on the query gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, q, cos, sin):
+        """Apply RoPE to the query and quantize it"""
+        query = fused_mla_q_rope_mxfp8(q, cos, sin)
+        ctx.save_for_backward(cos, sin)
+        return query
+
+    @staticmethod
+    def backward(ctx, dq):
+        """Attention returns a bf16 query gradient"""
+        cos, sin = ctx.saved_tensors
+        return fused_mla_q_rope_backward_(dq.contiguous(), cos, sin), None, None
+
+
+class _FusedQUpProjRoPEQuantForFusedAttn(torch.autograd.Function):
+    """_FusedQRoPEQuantForFusedAttn on the query projection output [num_tokens, n * d], whose
+    gradient is returned already quantized to MXFP8.
+
+    The backward applies the query RoPE backward and quantizes the result as the projection's
+    grad_output (row-wise and column-wise, GEMM-swizzled scales, E4M3) in one TE kernel. TE's
+    linear layers use a quantized grad_output as is, so the BF16 gradient is neither written nor
+    quantized again. Bitwise identical to _FusedQRoPEQuantForFusedAttn followed by TE's
+    quantization of the BF16 gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, q_proj_out, cos, sin, num_heads):
+        """Apply RoPE to the query and quantize it"""
+        s, b, n = q_proj_out.shape
+        query = fused_mla_q_rope_mxfp8(q_proj_out.view(s, b, num_heads, n // num_heads), cos, sin)
+        ctx.save_for_backward(cos, sin)
+        return query
+
+    @staticmethod
+    def backward(ctx, dq):
+        """Attention returns a bf16 query gradient"""
+        cos, sin = ctx.saved_tensors
+        return fused_mla_q_rope_backward_mxfp8(dq.contiguous(), cos, sin), None, None, None
+
+
+class _FusedKVUpProjRoPEQuantForFusedAttn(torch.autograd.Function):
+    """_FusedKVRoPEQuantForFusedAttn (attention scale layout) on the key/value up-projection
+    output [num_tokens, n * (k_dim + v_dim)], whose gradient is returned already quantized to
+    MXFP8.
+
+    The backward writes the key/value split gradient as the projection's grad_output (row-wise and
+    column-wise MXFP8, GEMM-swizzled scales, E4M3) in one TE kernel, and the k_pos_emb gradient
+    with the Triton key/value split backward kernel (same autotuned config, same bits). Bitwise
+    identical to _FusedKVRoPEQuantForFusedAttn followed by TE's quantization of the BF16 gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, kv_proj_out, k_pos_emb, cos, sin, num_heads, emb_dim, k_dim, v_dim):
+        """Split kv, apply RoPE to k_pos_emb and quantize key and value"""
+        s, b, n = kv_proj_out.shape
+        kv = kv_proj_out.view(s, b, num_heads, n // num_heads)
+        key, value = fused_mla_kv_rope_mxfp8(
+            kv, k_pos_emb, cos, sin, v_dim, transpose_swizzle_scales=True
+        )
+        ctx.save_for_backward(cos, sin)
+        ctx.emb_dim, ctx.k_dim, ctx.v_dim = emb_dim, k_dim, v_dim
+        return key, value
+
+    @staticmethod
+    def backward(ctx, dk, dv):
+        """Attention returns bf16 key and value gradients"""
+        cos, sin = ctx.saved_tensors
+        dk, dv = dk.contiguous(), dv.contiguous()
+        d_emb = fused_mla_rope_kv_split_emb_grad(dk, cos, sin, ctx.emb_dim, ctx.k_dim, ctx.v_dim)
+        d_kv = fused_mla_kv_split_backward_mxfp8(dk, dv, ctx.k_dim)
+        return d_kv, d_emb, None, None, None, None, None, None
+
+
+def _quantizes_grad_output_to_mxfp8_e4m3(projection: torch.nn.Module) -> bool:
+    """Whether the TE linear ``projection``, as set up by its last forward, runs an FP8 backward
+    that quantizes its grad_output to MXFP8 E4M3 (so that an MXFP8 E4M3 grad_output with
+    GEMM-swizzled scales is used as is)."""
+    fp8_meta = getattr(projection, "fp8_meta", None)
+    if not getattr(projection, "fp8", False) or not isinstance(fp8_meta, dict):
+        return False
+    # TE's debug tools (e.g. DisableQuantizationGEMM) may run this iteration's backward in high
+    # precision or through debug quantizers, which need the BF16 grad_output.
+    if getattr(projection, "debug_enabled_in_this_iteration", False):
+        return False
+    recipe = fp8_meta.get("recipe")
+    return (
+        recipe is not None
+        and recipe.mxfp8()
+        and recipe.fp8_format == Format.E4M3
+        and getattr(recipe, "backward_override", None) is None
+    )
+
+
+# TE's query RoPE + MXFP8 kernel and the key/value kernel writing attention's scale layout use
+# 32-bit offsets: they reject a BF16 key/value up-projection output [s, b, h, 256] of 2 GiB or more.
+_FUSED_MLA_QKV_ROPE_QUANT_MAX_KV_BYTES = 2**31
+_warned_fused_mla_qkv_rope_quant_size = False
+
+
+def _fits_fused_mla_qkv_rope_quant_kernels(kv: torch.Tensor) -> bool:
+    """Whether TE's fused query (and attention-layout key/value) RoPE + MXFP8 kernels accept the
+    key/value up-projection output ``kv`` [s, b, h, 256]; warns once when it is too large."""
+    global _warned_fused_mla_qkv_rope_quant_size
+    if kv.shape[2] % 2 != 0:
+        return False
+    if kv.numel() * kv.element_size() < _FUSED_MLA_QKV_ROPE_QUANT_MAX_KV_BYTES:
+        return True
+    if not _warned_fused_mla_qkv_rope_quant_size:
+        _warned_fused_mla_qkv_rope_quant_size = True
+        warnings.warn(
+            f"use_fused_mla_qkv_rope_quant: the key/value up-projection output {tuple(kv.shape)} "
+            "is at or above the 2 GiB limit of the fused MLA query RoPE + MXFP8 kernel; running "
+            "the use_fused_mla_kv_rope_quant path."
+        )
+    return False
 
 
 # Transformer Engine's DotProductAttention reads these once, when it is imported; mirror that.
@@ -352,6 +515,40 @@ class MultiLatentAttention(Attention):
             and self.config.qk_pos_emb_head_dim == 64
             and self.config.v_head_dim == 128
         )
+        # On top of the key/value kernel: the query RoPE and quantization in one TE kernel, and
+        # both kernels writing the scales in attention's layout (no separate scale permute and
+        # swizzle).
+        self._use_fused_qkv_rope_quant = (
+            self._use_fused_kv_rope_quant
+            and getattr(self.config, "use_fused_mla_qkv_rope_quant", False)
+            and fused_mla_q_rope_mxfp8 is not None
+            and self.config.qk_head_dim + self.config.qk_pos_emb_head_dim == 192
+        )
+        # On top of that: the RoPE backward kernels write the up-projections' gradients already
+        # quantized to MXFP8, for the projections' backward to use as is.
+        self._use_fused_up_proj_grad_quant = (
+            self._use_fused_qkv_rope_quant
+            and getattr(self.config, "use_fused_mla_up_proj_grad_quant", False)
+            and fused_mla_q_rope_backward_mxfp8 is not None
+            and fused_mla_rope_kv_split_emb_grad is not None
+        )
+        # These options need TE kernels that older TE releases lack; say so instead of silently
+        # running the unfused path.
+        missing_te_kernels = [
+            option
+            for option, kernel in (
+                ("use_fused_mla_qkv_rope_quant", fused_mla_q_rope_mxfp8),
+                ("use_fused_mla_up_proj_grad_quant", fused_mla_q_rope_backward_mxfp8),
+            )
+            if getattr(self.config, option, False) and kernel is None
+        ]
+        if missing_te_kernels:
+            warnings.warn(
+                f"{', '.join(missing_te_kernels)} requested, but the installed Transformer Engine "
+                "does not provide the fused MLA query RoPE + MXFP8 kernels "
+                "(fused_mla_q_rope_mxfp8, fused_mla_q_rope_backward_mxfp8); running the "
+                "unfused path."
+            )
 
         mscale = _yarn_get_mscale(self.config.rotary_scaling_factor, self.config.mscale_all_dim)
         self.softmax_scale = (
@@ -1125,6 +1322,7 @@ class MLASelfAttention(MultiLatentAttention):
                 and runtime_cp_group.size() == 1
             )
 
+            q_proj_out = None  # The query projection output, unless use_fused_q_uproj.
             if use_fused_q_uproj:
                 b = q_compressed.shape[1]
 
@@ -1168,11 +1366,13 @@ class MLASelfAttention(MultiLatentAttention):
                     # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
                     q, _ = self.linear_q_proj(q_compressed)
 
+                q_proj_out = q
                 # q: [num_tokens, n, q_head_dim]
                 q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
 
             # kv: [num_tokens, n * (qk_head_dim + v_head_dim)]
             kv, _ = self.linear_kv_up_proj(_up_proj_input(self.linear_kv_up_proj, kv_compressed))
+            kv_proj_out = kv
 
             # kv: [num_tokens, n, (qk_head_dim + v_head_dim)]
             kv = kv.view(
@@ -1198,6 +1398,62 @@ class MLASelfAttention(MultiLatentAttention):
                 and k_pos_emb.dtype == torch.bfloat16
                 and _is_mxfp8_attention_active()
             )
+            use_fused_qkv_rope_quant = (
+                use_fused_kv_rope_quant
+                and self._use_fused_qkv_rope_quant
+                and not use_fused_q_uproj
+                and q.dtype == torch.bfloat16
+                and rotary_pos_cos.dtype == torch.bfloat16
+                and rotary_pos_sin.dtype == torch.bfloat16
+                and _fits_fused_mla_qkv_rope_quant_kernels(kv)
+            )
+            q_projection = (
+                self.linear_q_up_proj if self.config.q_lora_rank is not None else self.linear_q_proj
+            )
+            if (
+                use_fused_qkv_rope_quant
+                and self._use_fused_up_proj_grad_quant
+                and q_proj_out.is_contiguous()
+                and kv_proj_out.is_contiguous()
+                and _quantizes_grad_output_to_mxfp8_e4m3(q_projection)
+                and _quantizes_grad_output_to_mxfp8_e4m3(self.linear_kv_up_proj)
+            ):
+                # As the branch below, on the projection outputs: their gradients come back as
+                # the MXFP8 grad_output the projections' backward would have quantized.
+                quantized_query = _FusedQUpProjRoPEQuantForFusedAttn.apply(
+                    q_proj_out,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.num_attention_heads_per_partition,
+                )
+                key, value = _FusedKVUpProjRoPEQuantForFusedAttn.apply(
+                    kv_proj_out,
+                    k_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.num_attention_heads_per_partition,
+                    self.config.qk_pos_emb_head_dim,
+                    self.config.qk_head_dim,
+                    self.config.v_head_dim,
+                )
+                return quantized_query, key, value
+            if use_fused_qkv_rope_quant:
+                # One kernel each for q and for k/v: RoPE, MXFP8 quantization and the scales in
+                # attention's layout. Same MXFP8 q/k/v as the branch below.
+                quantized_query = _FusedQRoPEQuantForFusedAttn.apply(
+                    q, rotary_pos_cos, rotary_pos_sin
+                )
+                key, value = _FusedKVRoPEQuantForFusedAttn.apply(
+                    kv,
+                    k_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    self.config.qk_pos_emb_head_dim,
+                    self.config.qk_head_dim,
+                    self.config.v_head_dim,
+                    True,
+                )
+                return quantized_query, key, value
             if use_fused_kv_rope_quant:
                 # RoPE'd q quantized as attention would; k and v split, RoPE'd and quantized in
                 # one kernel. Same MXFP8 q/k/v as the unfused path gives attention.
