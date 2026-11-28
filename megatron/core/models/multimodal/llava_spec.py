@@ -55,16 +55,22 @@ def decoder_model_with_transformer_engine_default_spec(
 
 
 def decoder_model_with_local_default_spec(
-    num_experts: Optional[int] = None, moe_grouped_gemm: bool = True, qk_layernorm: bool = False
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: bool = True,
+    qk_layernorm: bool = False,
+    normalization: Optional[str] = None,
 ) -> ModuleSpec:
     """LLava decoder local spec."""
     mlp = get_mlp_module_spec(
         use_te=False, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
+    rms_norm = normalization == "RMSNorm"
+    layer_norm = _local.layer_norm(rms_norm=rms_norm)
+    qk_norm = _local.layer_norm(rms_norm=rms_norm, for_qk=True)
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=_local.layer_norm(),
+            input_layernorm=layer_norm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -72,10 +78,12 @@ def decoder_model_with_local_default_spec(
                     linear_qkv=_local.column_parallel_linear(),
                     core_attention=_local.core_attention(),
                     linear_proj=_local.row_parallel_linear(),
+                    q_layernorm=qk_norm if qk_layernorm else IdentityOp,
+                    k_layernorm=qk_norm if qk_layernorm else IdentityOp,
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=_local.layer_norm(),
+            pre_mlp_layernorm=layer_norm,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
         ),
