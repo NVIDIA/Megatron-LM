@@ -172,8 +172,8 @@ Megatron-FSDP's `fully_shard_*` API has a comprehensive set of arguments for fin
 
 Megatron-FSDP natively supports mixed-precision activations and parameter sharding in conjunction with [TransformerEngine](https://github.com/NVIDIA/TransformerEngine).
 
-- Within the [`transformer_engine.pytorch.autocast(recipe: transformer_engine.common.recipe.Recipe)`](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html#transformer_engine.pytorch.autocast) context, model activations are converted based on the recipe.
-- Within the [`transformer_engine.pytorch.quantized_model_init(recipe: transformer_engine.common.recipe.Recipe)`](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html#transformer_engine.pytorch.quantized_model_init) context, TransformerEngine native modules (e.g. [`transformer_engine.pytorch.TransformerLayer`](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/api/pytorch.html#transformer_engine.pytorch.TransformerLayer)) have their parameters converted based on the recipe.
+- Within the [`transformer_engine.pytorch.autocast(recipe: transformer_engine.common.recipe.Recipe)`](https://docs.nvidia.com/deeplearning/transformer-engine/api/pytorch.html#transformer_engine.pytorch.autocast) context, model activations are converted based on the recipe.
+- Within the [`transformer_engine.pytorch.quantized_model_init(recipe: transformer_engine.common.recipe.Recipe)`](https://docs.nvidia.com/deeplearning/transformer-engine/api/pytorch.html#transformer_engine.pytorch.quantized_model_init) context, TransformerEngine native modules (e.g. [`transformer_engine.pytorch.TransformerLayer`](https://docs.nvidia.com/deeplearning/transformer-engine/api/pytorch.html#transformer_engine.pytorch.TransformerLayer)) have their parameters converted based on the recipe.
     - Requires quantized model activations, i.e. `transformer_engine.pytorch.autocast`.
 
 ```python

@@ -8,7 +8,7 @@ This guide will walk you through how you can use the megatron core export for ex
     - [1.1 Understanding The Code](#11-understanding-the-code)
     - [1.2 Running The Code](#12-running-the-code)
   - [2. GPU Export](#2-gpu-export)
-  - [3. Future work](#4-future-work)
+  - [3. Future work](#3-future-work)
 
 #### 1. Quick Start
 This will walk you through the flow of converting an mcore gpt model to trtllm format using single device mode. The file can be found at [gpt_single_device_cpu_export.py](./single_device_export/gpt_single_device_cpu_export.py)

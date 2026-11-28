@@ -22,7 +22,7 @@ Boxin Wang, Wei Ping, Chaowei Xiao, Peng Xu, Mostofa Patwary, Mohammad Shoeybi, 
 
 ### Prepare your environment
 
-The project environment is based on the standard [nvcr docker](nvcr.io/nvidia/pytorch:21.12-py3) of version `nvcr.io/nvidia/pytorch:21.12-py3`.
+The project environment is based on the standard [NVIDIA PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch/tags?version=21.12-py3) of version `nvcr.io/nvidia/pytorch:21.12-py3`.
 
 To run Perspective API, you need to install `google-api-python-client`
 ```bash
