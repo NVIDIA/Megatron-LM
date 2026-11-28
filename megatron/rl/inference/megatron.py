@@ -1,6 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
+import uuid
 from typing import Any
 
 import httpx
@@ -19,13 +21,46 @@ from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import FinishedRequestRecord
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import get_pg_size, log_single_rank
-from megatron.training.global_vars import get_args, get_run_config, get_tokenizer
+from megatron.training.global_vars import get_args, get_run_config, get_tokenizer, get_train_state
 from megatron.training.utils import print_rank_0
 
+from ..rollout_bank import (
+    FinishedRequestLedgerWriter,
+    LedgerPayloadStager,
+    gather_view,
+    request_record_backup_path,
+    request_records_dir,
+    resolve_bank_dir,
+)
 from ..server.api import InferenceServer
+from ..token_custody import HeldPrefixPreparer, PrefixStore
 from .chat_interface import MegatronChatInterface
 
 logger = logging.getLogger(__name__)
+
+
+def _check_shared_bank_dir(bank_dir: str) -> None:
+    """Fail the launch unless every rank sees the files rank 0 writes under the bank directory.
+
+    Every engine backs its records up there and only rank 0 reads them back, so a node-local
+    path would lose the other nodes' records silently at every checkpoint and restart.
+    """
+    probe = [None]
+    if dist.get_rank() == 0:
+        os.makedirs(request_records_dir(bank_dir), exist_ok=True)
+        probe[0] = os.path.join(request_records_dir(bank_dir), f".probe-{uuid.uuid4().hex}")
+        open(probe[0], "w").close()
+    dist.broadcast_object_list(probe, src=0)
+    seen = [None] * dist.get_world_size()
+    dist.all_gather_object(seen, os.path.exists(probe[0]))
+    if dist.get_rank() == 0:
+        os.remove(probe[0])
+    if not all(seen):
+        missing = [rank for rank, ok in enumerate(seen) if not ok]
+        raise RuntimeError(
+            f"rollout-bank directory {bank_dir} is not shared: rank(s) {missing} cannot see the "
+            "files rank 0 writes there; point --rl-rollout-bank-dir at a shared file system"
+        )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
@@ -79,6 +114,8 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
     _client: InferenceClient = PrivateAttr(None)
     _inference_engine: DynamicInferenceEngine = PrivateAttr(None)
     _generation_lag: float = PrivateAttr(None)
+    _request_record_backup_dir: str | None = PrivateAttr(None)
+    _prefix_store: PrefixStore | None = PrivateAttr(None)
 
     @property
     def generation_lag(self) -> float:
@@ -114,7 +151,6 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         args.skip_prompt_log_probs = True
 
         inference_engine: DynamicInferenceEngine = get_dynamic_inference_engine(model=model)
-        inference_engine.local_metadata_ledger_enabled = True
         if inference_engine.context.config.disaggregation_shards is not None:
             print_rank_0(
                 "WARNING: disaggregated RL generation-lag autotuning and HTTP concurrency "
@@ -131,6 +167,26 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
                 dp_size=get_pg_size(inference_engine.pg_collection.dp),
                 max_requests=inference_engine.context.max_requests,
             )
+        bank_dir = writer = None
+        if cfg.rl.rl_durable_rollout_bank:
+            # Need to copy the staged payloads into the durable bank.
+            bank_dir = resolve_bank_dir(cfg.rl.rl_rollout_bank_dir, cfg.checkpoint.save)
+            _check_shared_bank_dir(bank_dir)
+            writer = FinishedRequestLedgerWriter(
+                request_record_backup_path(bank_dir, dist.get_rank(), get_train_state().iteration)
+            )
+        # Gym admissions need the parent call's exact tokens on whichever engine continues it:
+        # rank 0 serves them for the job, every stager publishes, every preparer fetches.
+        address = [None]
+        if dist.get_rank() == 0:
+            prefix_store = PrefixStore(is_master=True)
+            address[0] = (prefix_store.host, prefix_store.port)
+        dist.broadcast_object_list(address, src=0)
+        if dist.get_rank() != 0:
+            prefix_store = PrefixStore(*address[0])
+        print_rank_0("Prefix store for held calls at %s:%d" % address[0])
+        inference_engine.payload_stager = LedgerPayloadStager(writer, prefix_store)
+        inference_engine.prompt_preparer = HeldPrefixPreparer(prefix_store)
         dp_addr = await inference_engine.start_listening_to_data_parallel_coordinator(
             inference_coordinator_port=41521, launch_inference_coordinator=True,
         )
@@ -164,6 +220,8 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
         launched_server._client = client
         launched_server._inference_engine = inference_engine
         launched_server._generation_lag = generation_lag
+        launched_server._request_record_backup_dir = bank_dir
+        launched_server._prefix_store = prefix_store
 
         concurrency_limit = (
             get_pg_size(inference_engine.pg_collection.dp) * inference_engine.context.max_requests
@@ -199,6 +257,13 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
             self._client.stop_engines()
         await self._inference_engine.wait_until(EngineState.STOPPED)
 
+        try:
+            self._inference_engine.payload_stager.close()
+        except RuntimeError:
+            # Keep tearing down: the coordinator below is a non-daemon child, and rank 0 cannot
+            # exit while it runs. The failed write is logged here with its cause.
+            logger.exception("Finished-request ledger writer failed; its backup is incomplete")
+
         if dist.get_rank() == 0:
             self._client.shutdown_coordinator()
             self._client.stop()
@@ -208,6 +273,11 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
                 stop_text_gen_server,
             )
             stop_text_gen_server()
+
+    def forget_held_prefixes(self, uids) -> None:
+        """Drop the prefix store's calls whose rollouts the trainer consumed."""
+        if dist.get_rank() == 0:
+            self._prefix_store.forget(uids)
 
     def set_generation_epoch(self, generation_epoch: int):
         if dist.get_rank() == 0:
@@ -222,18 +292,53 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
             self._client.suspend_engines()
         await self._inference_engine.wait_until(EngineState.SUSPENDED)
 
-    def merge_global_request_ledgers(self) -> dict[str, FinishedRequestRecord]:
-        """Union every engine's local-metadata ledger and clear them."""
-        engine = self._inference_engine
-        local, engine.local_metadata_ledger = engine.local_metadata_ledger, {}
-        shards = [None] * dist.get_world_size()
-        dist.all_gather_object(shards, local)
+    def merge_global_request_ledgers(
+        self, rotate_to: int | None = None
+    ) -> dict[str, FinishedRequestRecord]:
+        """Drain every engine's staged records into rank 0 (a gather over the world).
+
+        Only what the joins read is gathered: token ids, generated log probs and the stamps.
+        Routing indices survive only in the owning rank's durable backup when
+        `rl_durable_rollout_bank` is on; top-N log probs and media tensors are kept nowhere.
+
+        Args:
+            rotate_to: New window for the writer to point to after the drain,
+                so that the drained records can be flushed to a durable backup.
+
+        Returns:
+            The union of every engine's records on rank 0; an empty dict elsewhere.
+        """
+        stager = self._inference_engine.payload_stager
+        drained = stager.drain()
+        writer_error = None
+        if rotate_to is not None and self._request_record_backup_dir is not None:
+            try:
+                stager.rotate(
+                    request_record_backup_path(
+                        self._request_record_backup_dir, dist.get_rank(), rotate_to
+                    )
+                )
+            except RuntimeError as error:
+                writer_error = error
+        # A backup write fails on one rank: raise on every rank, after agreeing,
+        # instead of leaving the peers in the gather below until the distributed timeout.
+        failures = [None] * dist.get_world_size()
+        dist.all_gather_object(failures, None if writer_error is None else repr(writer_error))
+        if any(failure is not None for failure in failures):
+            raise RuntimeError(
+                f"finished-request ledger writer failed: {failures}"
+            ) from writer_error
+        local = {uid: gather_view(record) for uid, record in drained.items()}
+        shards = [None] * dist.get_world_size() if dist.get_rank() == 0 else None
+        dist.gather_object(local, shards, dst=0)
+        if shards is None:
+            return {}
         merged: dict[str, FinishedRequestRecord] = {}
         for shard in shards:
             merged.update(shard)
-        assert len(merged) == sum(len(shard) for shard in shards), (
-            "finished-request ledger: duplicate uids across engine ledgers"
-        )
+        assert len(merged) == sum(
+            len(shard) for shard in shards
+        ), "finished-request ledger: duplicate uids across engine ledgers"
         return merged
 
     async def resume(self):
