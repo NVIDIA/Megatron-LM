@@ -135,6 +135,28 @@ def get_custom_layer_type(layer_config: object) -> type[MegatronModule] | None:
     return layer_type
 
 
+def validate_layer_offloading(
+    config: TransformerConfig, layers: str | Sequence[TransformerConfig]
+) -> None:
+    """Check activation-offload scopes against the full hybrid architecture."""
+    model_offloads_gdn = (
+        config.fine_grained_activation_offloading and "gdn_core_attn" in config.offload_modules
+    )
+    if isinstance(layers, str):
+        layer_offloads_gdn = model_offloads_gdn and Symbols.GDN in layers
+    else:
+        layer_offloads_gdn = any(
+            type(layer) is GDNLayerConfig
+            and layer.fine_grained_activation_offloading
+            and "gdn_core_attn" in layer.offload_modules
+            for layer in layers
+        )
+    if model_offloads_gdn and not layer_offloads_gdn:
+        raise ValueError("gdn_core_attn offloading requires a GDN layer with the scope enabled.")
+    if layer_offloads_gdn and not model_offloads_gdn:
+        raise ValueError("gdn_core_attn offloading requires the scope on the HybridModel config.")
+
+
 def invoke_custom_layer(
     layer: MegatronModule,
     hidden_states: Tensor,
