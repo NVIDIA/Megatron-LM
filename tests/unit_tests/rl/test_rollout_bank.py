@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import os
 from collections import Counter
 from contextlib import aclosing
 
@@ -240,6 +241,40 @@ def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, 
         assert {group.uid for group in restarted.restore(checkpoint_iteration + 1)} == {
             never_consumed
         }
+
+
+def test_restart_after_kill_during_first_start(tmp_path, monkeypatch):
+    """A kill before the first manifest is published must not block every restart."""
+
+    class Killed(BaseException):
+        """Stands in for a SIGKILL at the first manifest flip."""
+
+    def kill(*args, **kwargs):
+        raise Killed
+
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "replace", kill)
+        with pytest.raises(Killed):
+            RolloutBank(str(tmp_path))
+    assert not (tmp_path / _MANIFEST).exists()
+
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(0)
+    uid = bank.append(_token_group())
+    bank.close()
+    assert [group.uid for group in RolloutBank(str(tmp_path)).restore(0)] == [uid]
+
+
+def test_missing_manifest_over_banked_groups_is_refused(tmp_path):
+    """Without a manifest, a directory that holds banked groups is never reinitialized."""
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(0)
+    bank.append(_token_group())
+    bank.close()
+    (tmp_path / _MANIFEST).unlink()
+
+    with pytest.raises(FileNotFoundError, match="Refusing to overwrite"):
+        RolloutBank(str(tmp_path))
 
 
 def _env_group(env_id, problem_id):

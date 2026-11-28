@@ -225,6 +225,16 @@ class RolloutBank:
         self._bytes_written = 0
         self._warned_over_cap = False
         if not os.path.exists(self._manifest_path):
+            if os.listdir(self.bank_dir) and self._holds_only_unpublished_scaffolding():
+                # A kill during the first start, before its manifest was published,
+                # leaves empty generations behind. Nothing was ever banked: start over.
+                for name in os.listdir(self.bank_dir):
+                    path = os.path.join(self.bank_dir, name)
+                    if os.path.isdir(path):
+                        _rmtree(path)
+                    else:
+                        os.remove(path)
+                _fsync_directory(self.bank_dir)
             if os.listdir(self.bank_dir):
                 raise FileNotFoundError(
                     f"RolloutBank manifest is missing at {self._manifest_path}, but "
@@ -250,6 +260,28 @@ class RolloutBank:
         # live-size accounting and to fail closed on malformed existing state.
         self._bytes_written = self._manifest_sidecar_bytes(manifest)
         self._maybe_warn_over_cap()
+
+    def _holds_only_unpublished_scaffolding(self) -> bool:
+        """Whether ``bank_dir`` holds only what a first start writes before its manifest.
+
+        That is the ``generations/`` directory, whose generations hold nothing but an
+        empty ``consumed.log``, and possibly the manifest's temporary file.
+        """
+        for name in os.listdir(self.bank_dir):
+            path = os.path.join(self.bank_dir, name)
+            if name == _MANIFEST + ".tmp" and os.path.isfile(path):
+                continue
+            if name != _GENERATIONS or not os.path.isdir(path):
+                return False
+            for generation in os.listdir(path):
+                generation_dir = os.path.join(path, generation)
+                if not generation.startswith("generation-") or not os.path.isdir(generation_dir):
+                    return False
+                for entry in os.listdir(generation_dir):
+                    entry_path = os.path.join(generation_dir, entry)
+                    if entry != _CONSUMED or os.path.getsize(entry_path) != 0:
+                        return False
+        return True
 
     # ------------------------------------------------------------------ paths
     @property
