@@ -87,7 +87,7 @@ Each weight is sharded 1/N across a GTP_remat group along `out_features`, stored
 
 - **Independent state per param**: each has its own AG state (`state`) and RS state (`rs_state`) machines, both cycling `NONE → ASYNC_WAIT → DATA_READY → NONE` and tracked separately so fwd and bwd async ops don't interfere.
 - **Prefetch chain for AG** (doubly-linked `prev_w` / `next_w`): during fwd, each weight's `all_gather_and_prefetch` issues async AG for `next_w`; during bwd, `all_gather_and_prefetch_bwd` issues async AG for `prev_w`. Layer *i*'s AG overlaps with layer *i−1*'s GEMM. For an L-layer model, L−1 all-gathers are fully hidden behind compute. When activation recompute is enabled, a **third** chain prefetches the recompute-forward gathers during backward — see §3.1 *Recompute-forward prefetch chain*. One GEMM of runway covers a gather that stays inside the NVLink domain, but **not one that leaves it** — the case for MoE routed-expert weights, which also dominate the bytes gathered per block; those get their own *one-block-ahead* chains — see §3.4 *Grouped-expert chains*.
-- **Deferred RS finalize for wgrad**: `wgrad_reduce_scatter` on param *i* launches an **async** reduce-scatter (handle stashed in `_wgrad_rs_handle`) and returns `None` to autograd — the wgrad is NOT finalized into `main_grad` yet. Finalization is **deferred one step**: the next bwd step (param *i−1*'s `wgrad_reduce_scatter`) calls `self.next_w._wait_reduce_scatter()` + `_finalize_wgrad()`, which waits on the stashed handle, accumulates the reduced wgrad into `main_grad`, and fires the DDP `register_grad_ready` hook. The chain's head (first-in-fwd, last-in-bwd) uses a synchronous RS since nothing follows it. This one-step deferral is what lets layer *i*'s RS overlap with layer *i−1*'s bwd GEMMs.
+- **Deferred RS finalize for wgrad**: `wgrad_reduce_scatter` on param *i* launches an **async** reduce-scatter (handle stashed in `_wgrad_rs_handle`), queues it on its chain's in-flight queue and returns `None` to autograd — the wgrad is NOT finalized into `main_grad` yet. Finalization is **deferred one step**: the chain's next `wgrad_reduce_scatter` (param *i−1*'s, on a chain walked in reverse) drains the queued one: it waits on the stashed handle, accumulates the reduced wgrad into `main_grad` and fires the DDP `register_grad_ready` hook. It drains earlier when the new RS is for the same weight. The chain's head (first-in-fwd, last-in-bwd) uses a synchronous RS since nothing follows it, and the end-of-backward fence collects whatever is still queued. This one-step deferral is what lets layer *i*'s RS overlap with layer *i−1*'s bwd GEMMs.
 - **Cold start only**: every weight's very first AG is synchronous (`DATA_READY_SYNC`, no prefetch has run yet); the async prefetch chain kicks in from the second forward onward.
 
 Contrast with FSDP: FSDP gathers at module-group granularity in full precision with PyTorch-managed lifecycle. GTP_remat works at individual-weight granularity, in quantized form, with its own explicit ticket-based buffer pool and a one-step-deferred RS finalizer.
@@ -755,6 +755,8 @@ The prefetch chains (§3.1) are **not configured — they are observed at runtim
 
 2. **Linking (lazily, on the first forward).** The doubly-linked list (`prev_w` / `next_w`) is built the **first time each weight is materialized** inside `all_gather_and_prefetch`: a class-level per-chain cursor (`GTPShardedParam._chain_state[chain_id]["last_weight"]`) records the previously-seen weight, and the current weight links itself after it. The chain therefore **encodes the forward execution order of the first step** and replays it every step after to predict the next weight to prefetch. The recompute chain (`_recompute_next`) self-populates the same way, from the weights re-gathered while `in_fp8_activation_recompute_phase()` is true.
 
+   From the first gradient fence on (`wait_for_gtp_grad_reduction_on_current_stream()`, called by `finalize_model_grads`), ungraphed chains also record every consume of a step, repeats included, plan their all-gathers from that list, and reuse a gather still held in its buffer. The fence forgets every held gather, so **shards may change only after the fence**. A loop that never calls it keeps the links above and gathers at every consume.
+
 A weight can be kept **out** of a chain by setting `weight.prefetch_initialized = True` (and `_need_weight_prefetch = False`) before its first materialization, which skips registration entirely. Nothing does this today: `embedding` and `output_layer` are ordinary `UNGRAPHED` chain members (they are the head and the tail — see the link table GTP logs on the first backward), and only run outside the CUDA-graph boundary. The hook remains available as the fallback for any weight that cannot satisfy the assumptions below.
 
 **Why this needs careful consideration.** Because `_chain_state` is a *class attribute* and `prev_w`/`next_w` are strong references between `GTPShardedParam` instances, the chain **holds the weights alive for the life of the process** and **assumes the first step's behavior is representative of every step**. Neither is free:
@@ -868,7 +870,7 @@ Two independent violations of the *one consume per weight per step* assumption i
 
 The chain stays a plain linear list — one slot per weight, no branching. MTP is absorbed by three rules:
 
-- **Every consume needs its own all-gather.** A weight is gathered by its chain *neighbour* — predecessor in forward, successor in backward — so one pass of the chain issues exactly one gather per node. Consumes past the first have none of their own, and the prefetched path would hand the GEMM whatever the shared buffer last held. They fall back to an on-demand gather instead: correct, at the cost of that consume's comm/compute overlap.
+- **Every consume needs a current gathered weight, not necessarily its own all-gather.** On the linked chain a weight is gathered by its chain *neighbour* — predecessor in forward, successor in backward — so one pass of the chain issues exactly one gather per node. Consumes past the first have none of their own, and the prefetched path would hand the GEMM whatever the shared buffer last held, so they gather on demand. With weight prefetch on, an eager (ungraphed) chain stops relying on that once it reaches the first gradient fence: a consume reads the gather its buffers still hold, whichever gather put it there (residency), and only a consume whose weight no buffer holds gathers on demand. The fence clears residency before the optimizer changes any shard. Consumes between the first and second fence are recorded, and the second fence builds them into the chain's per-use prefetch plan. Graphed chains and activation recompute keep the linked prefetch, and a loop that never calls the fence never enables residency.
 
 - **Per-consume gradients accumulate.** Every consume produces its own wgrad and its own reduce-scatter, and the weight's `main_grad` ends up holding their sum — which is its true gradient. A weight keeps only one reduce-scatter in flight at a time, so an outstanding one is completed and accumulated before the next begins.
 
@@ -878,6 +880,8 @@ The chain stays a plain linear list — one slot per weight, no branching. MTP i
   `WgradAccumulationWindow` tracks outstanding uses: each counted forward adds one,
   and each backward removes one. Closing the forward window allows reduction when
   that count reaches zero, including repeated MTP heads, with compute left to overlap.
+  That reduce-scatter is collected at the fence (or drained by this weight's next one), not by
+  the chain's next reduce-scatter, so the rest of backward hides it.
   Counts never depend on the global microbatch calculator or a previous iteration.
   Grad-disabled or unexpected forwards select an explicit `FENCE_ONLY` state until
   finalization resets the window; counters never double as fallback flags.
@@ -892,9 +896,9 @@ The chain stays a plain linear list — one slot per weight, no branching. MTP i
   Pipeline-parallel and CUDA-graphed weights retain per-consume reduction. TE-backed weights
   never reach this accumulation hook.
 
-- **The deferred finalize is conditional.** Normally a weight finalizes its chain *successor's* reduce-scatter, hiding that latency behind the next backward. Once backward stops following chain order, the successor may not have started one yet, so the finalize runs only when something is actually in flight.
+- **The deferred finalize follows issue order, not the chain.** Each reduce-scatter finalizes the one its chain issued before it, hiding that latency behind the next backward. Once backward stops following chain order, that is not the chain successor, so the in-flight reduce-scatters are queued per chain rather than looked up through `next_w`.
 
-Output-layer accumulation is independent of `async_reduction`. Deferred finalization applies only when that option is on; with it off, each issued reduce-scatter completes inline.
+The first rule applies with or without `async_reduction`, and so does output-layer accumulation. Deferred finalization applies only when that option is on; with it off, each issued reduce-scatter completes inline.
 
 > Both hazards are **silent**. A stale gather keeps the loss finite and merely wrong, and a dropped reduce-scatter trains on an incomplete gradient — neither raises. The state guard that would catch the first (`check_param_states`) is off outside debug builds.
 
