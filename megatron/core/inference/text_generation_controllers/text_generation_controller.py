@@ -1509,9 +1509,11 @@ class TextGenerationController(MTPControllerMixin):
             # Gather: [num_decode, num_spec+1]
             gathered_log_probs = decode_log_probs.gather(2, gather_tokens.unsqueeze(-1)).squeeze(-1)
 
+            # Read the compact results once instead of synchronizing for each request.
+            accepted_counts_host = accepted_counts.tolist()
+            gathered_log_probs_host = gathered_log_probs.tolist()
             log_probs_list_decode = [
-                gathered_log_probs[i, : accepted_counts[i].item() + 1].tolist()
-                for i in range(num_decode_requests)
+                row[: count + 1] for row, count in zip(gathered_log_probs_host, accepted_counts_host)
             ]
 
         log_probs_list_prefill = []
@@ -1527,7 +1529,7 @@ class TextGenerationController(MTPControllerMixin):
                 selected_log_probs = prefill_log_probs[
                     torch.arange(num_prefill_requests, device=logits.device), prefill_new_tokens
                 ]
-                log_probs_list_prefill = [[lp.item()] for lp in selected_log_probs]
+                log_probs_list_prefill = [[lp] for lp in selected_log_probs.tolist()]
             else:
                 prefill_token_ids = context.gpu_view.token_to_input_ids[
                     decode_len : context.active_token_count
