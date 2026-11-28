@@ -195,7 +195,7 @@ def test_shortcut_moe_is_rejected_at_startup(tmp_path):
 class _MemoryStub(torch.nn.Module):
     """Engram stand-in: a constant residual that records the token IDs it receives."""
 
-    def __init__(self, value=1.0):
+    def __init__(self, value=1.0) -> None:
         super().__init__()
         self.value = value
         self.calls = []
@@ -221,7 +221,7 @@ class _SingleRankGroup:
 class _RecordingLayer(TransformerLayer):
     """TransformerLayer stand-in that records its call and may own an Engram memory."""
 
-    def __init__(self, layer_number, engram=None, config=None):
+    def __init__(self, layer_number, engram=None, config=None) -> None:
         torch.nn.Module.__init__(self)
         self.layer_number = layer_number
         self.config = config if config is not None else SimpleNamespace(cuda_graph_impl="none")
@@ -438,7 +438,7 @@ def test_hybrid_stack_rejects_engram_inside_shortcut_pairs():
 class _PassthroughHyperConnection(torch.nn.Module):
     """Identity mHC that records the n-stream tensor its read gate receives."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.inputs = []
 
@@ -453,7 +453,7 @@ class _PassthroughHyperConnection(torch.nn.Module):
 class _RecordingMlpLayer(_RecordingLayer):
     """An MLP-only layer, which the wrapper runs through its raw-branch fast path."""
 
-    def __init__(self, engram):
+    def __init__(self, engram) -> None:
         super().__init__(layer_number=1, engram=engram)
         self.config = SimpleNamespace(bias_dropout_fusion=False, cuda_graph_impl="none")
         self.self_attention = IdentityOp()
@@ -520,7 +520,7 @@ def test_mhc_wrapper_without_memory_keeps_the_inner_kwargs():
 
 
 class _RecordingDecoder:
-    def __init__(self):
+    def __init__(self) -> None:
         self.kwargs = None
 
     def __call__(self, **kwargs):
@@ -612,6 +612,86 @@ def test_builder_rejects_modelopt_model_building(tmp_path, modelopt):
     )
     with pytest.raises(ValueError, match="Engram does not support ModelOpt"):
         hybrid.HybridModelBuilder(model_config).build_model(ProcessGroupCollection())
+
+
+def _hand_assembled_model_config(tmp_path, **transformer_overrides):
+    """A hybrid model config that names its memory without EngramConfig.from_args."""
+    from megatron.training.models import hybrid
+
+    return hybrid.HybridModelConfig(
+        transformer=_transformer_config(num_layers=2, **transformer_overrides),
+        vocab_size=16,
+        hybrid_layer_pattern=Symbols.ATTENTION * 2,
+        engram_config=_engram_config(tmp_path),
+    )
+
+
+@_requires_te
+def test_builder_routes_token_ids_for_a_hand_assembled_config(tmp_path, monkeypatch):
+    """Naming the memory in the model config is enough for the built model to feed it.
+
+    The model hands the token IDs to its stack, which passes them on to the layers that own a
+    memory (test_hybrid_stack_passes_token_ids_to_engram_layers_only).
+    """
+    from megatron.training.models import hybrid
+
+    decoder = _RecordingDecoder()
+    # The stack is replaced: its layers are Transformer Engine modules.
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_model.build_module", lambda *_args, **_kwargs: decoder
+    )
+    # Per-stage pipeline logging needs a default process group, which these CPU tests lack.
+    monkeypatch.setattr(
+        "megatron.core.models.hybrid.hybrid_layer_allocation.log_on_each_pipeline_stage",
+        lambda *_args, **_kwargs: None,
+    )
+    model_config = _hand_assembled_model_config(tmp_path)
+    assert not model_config.transformer.engram_enabled
+
+    model = hybrid.HybridModelBuilder(model_config).build_model(
+        SimpleNamespace(tp=None, pp=None, cp=None, dp_cp=None, embd=None),
+        pre_process=False,
+        post_process=False,
+    )
+    assert model.hybrid_stack_spec.submodules.attention_layer.submodules.engram.module is Engram
+
+    input_ids = torch.arange(8).view(2, 4)
+    model.forward(
+        input_ids=input_ids,
+        position_ids=torch.arange(4).repeat(2, 1),
+        attention_mask=None,
+        decoder_input=torch.randn(4, 2, 8),
+    )
+    assert decoder.kwargs["input_ids"] is input_ids
+    # The training loop and the batch function prefetch the tokens from the same switch, on the
+    # config object the model keeps.
+    assert model.config is model_config.transformer
+    assert model_config.transformer.engram_enabled
+
+
+def test_builder_rejects_unsupported_modes_of_a_hand_assembled_config(tmp_path, monkeypatch):
+    """The builder runs the startup validation itself, before it builds a stage."""
+    from megatron.training.models import hybrid
+
+    def fail_construction(*_args, **_kwargs):
+        pytest.fail("HybridModel construction must not begin")
+
+    monkeypatch.setattr(hybrid, "HybridModel", fail_construction)
+
+    # A transformer feature, which every stage build checks.
+    model_config = _hand_assembled_model_config(
+        tmp_path, wide_residual=WideResidualConfig(num_streams=2)
+    )
+    with pytest.raises(ValueError, match="wide_residual"):
+        hybrid.HybridModelBuilder(model_config).build_model(ProcessGroupCollection())
+    assert not model_config.transformer.engram_enabled
+
+    # The wrapper, which only the distributed build knows.
+    model_config = _hand_assembled_model_config(tmp_path)
+    with pytest.raises(ValueError, match="FSDP"):
+        hybrid.HybridModelBuilder(model_config).build_distributed_models(
+            ProcessGroupCollection(), use_megatron_fsdp=True
+        )
 
 
 def _hybrid_model(monkeypatch, config, **kwargs):

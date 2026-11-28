@@ -29,7 +29,7 @@ from ._test_utils import write_tokenizer_map
 
 
 class _FakeTokenizer:
-    def __init__(self, decoded_tokens, raw_tokens):
+    def __init__(self, decoded_tokens, raw_tokens) -> None:
         self.decoded_tokens = decoded_tokens
         self.raw_tokens = raw_tokens
 
@@ -267,6 +267,7 @@ def test_packed_sequences_with_pipeline_parallelism_need_capacity_padding(
         (dict(moe_shortcut_connection=True), "moe_shortcut_connection"),
         (dict(enable_attention_residuals=True), "enable_attention_residuals"),
         (dict(use_mup=True), "use_mup"),
+        (dict(moe_expert_rank_capacity_factor=1.5), "moe_expert_rank_capacity_factor"),
         (dict(dynamic_context_parallel=True), "dynamic context parallelism"),
     ],
 )
