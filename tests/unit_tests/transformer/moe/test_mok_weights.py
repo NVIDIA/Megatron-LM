@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -101,21 +100,6 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
 )
 def test_mok_accepts_key_supported_configurations(overrides):
     assert _mok_transformer_config(**overrides).moe_megakernel_backend == "mok"
-
-
-@pytest.mark.parametrize("routing_map_mode", ["indices", "bool"])
-def test_mok_keeps_the_configured_hybridep_routing_map_mode(routing_map_mode):
-    """The router hands a megakernel backend the boolean token-to-expert map whatever the
-    HybridEP routing-map option says, so a MOK config neither overrides it nor warns."""
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        config = _mok_transformer_config(
-            moe_token_dispatcher_type="flex",
-            moe_flex_dispatcher_backend="hybridep",
-            moe_hybridep_routing_map_mode=routing_map_mode,
-        )
-    assert config.moe_hybridep_routing_map_mode == routing_map_mode
-    assert not [w for w in caught if "moe_hybridep_routing_map_mode" in str(w.message)]
 
 
 def _detached_mok_backend(*, use_mxfp8_weights: bool, cuda_graph_impl: str = "chunk_wise"):

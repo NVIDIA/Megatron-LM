@@ -276,7 +276,8 @@ def _validate_nonpacked_cp_uniform_length(
     device: torch.device,
 ) -> None:
     """Validate the uniform-length precondition for non-packed allgather CP."""
-    if torch.cuda.is_current_stream_capturing():
+    # is_available() first: a CUDA-less torch build raises from the capture query.
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
         # The sample of a CUDA graph capture has the static shape that the eager warm-up
         # forwards validated; the check uploads a host tensor and reads the result back.
         return

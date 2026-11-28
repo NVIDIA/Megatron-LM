@@ -759,3 +759,170 @@ def test_mok_bf16_fixed_length_capture_replay_matches_eager(monkeypatch):
             )
     finally:
         functional.clear_workspace_cache()
+
+
+def _build_fp32_residual_gpt(cuda_graph_impl, seq_length):
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
+
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        fp32_residual_connection=True,
+        create_attention_mask_in_dataloader=False,
+        **{**_BF16, **_graph_config(cuda_graph_impl)},
+    )
+    model_parallel_cuda_manual_seed(42)
+    return GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=_VOCAB,
+        max_sequence_length=seq_length,
+        position_embedding_type="rope",
+    ).cuda()
+
+
+@pytest.mark.launch_on_gb200
+def test_fp32_residual_stream_enters_the_block_graph_in_float32(monkeypatch):
+    """With ``fp32_residual_connection`` the residual stream is float32 between the layers and
+    between the pipeline stages. Transformer Engine copies a replay's input into the graph's
+    static input, casting to its dtype: a block captured with a BF16 sample would round the
+    stream at its entry (and the gradient it returns), which eager never does. The sample
+    therefore has the dtype of what the block receives.
+
+    The embedding of a BF16 model is exact in BF16, so both models add the same float32 offset
+    to it: the block then receives what a later pipeline stage does, values with more mantissa
+    than BF16 holds, and its replays have to match eager on them."""
+    seq_length, micro_batch_size = 64, 2
+
+    def make_batches():
+        return [_fixed_length_batch(seed, micro_batch_size, seq_length) for seed in (1, 2, 3)]
+
+    with _capture_state(micro_batch_size) as helpers:
+        model = _build_fp32_residual_gpt("chunk_wise", seq_length)
+        twin = _build_fp32_residual_gpt("none", seq_length)
+
+        batch = make_batches()[0]
+        embedded = twin.embedding(input_ids=batch["input_ids"], position_ids=batch["position_ids"])
+        assert embedded.dtype == torch.float32
+        sample = model.decoder.get_layer_static_inputs(seq_length, micro_batch_size)
+        assert sample["hidden_states"].dtype == embedded.dtype
+        assert sample["hidden_states"].shape == embedded.shape
+
+        generator = torch.Generator(device="cpu").manual_seed(7)
+        offset = torch.randn(embedded.shape, generator=generator).cuda()
+        assert not torch.equal(offset, offset.bfloat16().float())
+        for gpt in (model, twin):
+            gpt.embedding.register_forward_hook(lambda module, args, output: output + offset)
+
+        _capture_replay_and_compare(
+            monkeypatch,
+            model,
+            twin,
+            make_batches,
+            _fixed_length_step,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            helpers=helpers,
+        )
+
+
+def _build_qk_clip_gpt(cuda_graph_impl, seq_length):
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
+
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        qk_clip=True,
+        # Far below the logits of a freshly initialized model: every clip_qk() rescales Q and K.
+        qk_clip_threshold=1e-3,
+        # The batch carries no attention mask (causal attention).
+        create_attention_mask_in_dataloader=False,
+        **{**_BF16, **_graph_config(cuda_graph_impl)},
+    )
+    model_parallel_cuda_manual_seed(42)
+    return GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=_VOCAB,
+        max_sequence_length=seq_length,
+        position_embedding_type="rope",
+    ).cuda()
+
+
+@pytest.mark.launch_on_gb200
+def test_qk_clip_statistic_follows_every_replay(monkeypatch):
+    """QK clipping reads the max attention logit of every step; a replay has to refresh it.
+
+    The attention forward publishes the statistic and ``clip_qk()`` consumes and resets it after
+    every optimizer step. A block replay runs no Python: the statistic has to be a tensor the
+    captured forward updates in place, or clipping stops after the first replayed step.
+    """
+    if not is_te_min_version("2.9.0"):
+        pytest.skip("Transformer Engine returns the max attention logit from 2.9.0")
+    seq_length, micro_batch_size = 64, 2
+
+    def make_batches():
+        return [_fixed_length_batch(seed, micro_batch_size, seq_length) for seed in range(3)]
+
+    def attentions(model):
+        return [layer.self_attention for layer in model.decoder.layers]
+
+    def statistics(model):
+        values = [
+            attention.core_attention.current_max_attn_logits for attention in attentions(model)
+        ]
+        assert all(value is not None for value in values)
+        return [value.detach().float().clone() for value in values]
+
+    def clip(model):
+        """What clip_qk() does to every attention module of a model chunk."""
+        for attention in attentions(model):
+            attention.clip_qk()
+
+    def qkv_weights(model):
+        return [
+            attention.linear_qkv.weight.detach().float().clone() for attention in attentions(model)
+        ]
+
+    with _capture_state(micro_batch_size) as helpers:
+        model = _build_qk_clip_gpt("chunk_wise", seq_length)
+        twin = _build_qk_clip_gpt("none", seq_length)
+        batches, _, tolerance = _capture_replay_and_compare(
+            monkeypatch,
+            model,
+            twin,
+            make_batches,
+            _fixed_length_step,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            helpers=helpers,
+        )
+        # The two models have seen different numbers of forwards so far: start from a reset.
+        for attention in attentions(model) + attentions(twin):
+            attention.core_attention.current_max_attn_logits = None
+
+        def assert_same(actual, expected, what):
+            for layer, (value, reference) in enumerate(zip(actual, expected)):
+                error = (value - reference).norm().item() / reference.norm().item()
+                assert error <= tolerance, f"{what}, layer {layer}: relative error {error:.3e}"
+
+        clipped = False
+        for index in (0, 1, 2, 1):
+            # Two micro-batches per step: the statistic is the maximum over both.
+            for batch in (batches[index], batches[(index + 1) % len(batches)]):
+                _fixed_length_step(model, batch)
+                _fixed_length_step(twin, batch)
+            assert_same(statistics(model), statistics(twin), f"max attention logit, step {index}")
+            before = qkv_weights(model)
+            clip(model)
+            clip(twin)
+            after = qkv_weights(model)
+            assert_same(after, qkv_weights(twin), f"clipped QKV weight, step {index}")
+            clipped |= any(not torch.equal(old, new) for old, new in zip(before, after))
+            # Consumed: nothing above any threshold is left for a step without a forward.
+            assert all(torch.isneginf(value).all() for value in statistics(model))
+        assert clipped, "the threshold never triggered: the test would not see a stale statistic"

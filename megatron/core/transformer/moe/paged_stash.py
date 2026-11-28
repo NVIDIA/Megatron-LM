@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import math
 from contextlib import contextmanager, nullcontext
 from typing import Any
 
@@ -523,6 +524,9 @@ class PagedStashManager:
         # Track max tokens computed from avg_num_tokens (heuristic) across all vp_stages
         self.max_avg_tokens_across_vp_stages = None
         self.temp_avg_tokens_across_vp_stages = None
+        # The number of in-flight microbatches that the maxima above stand for, once a chunk
+        # capture raised them above the discovery iteration's own (reserve_for_capture_order).
+        self._sized_for_in_flight_peak = None
 
         self.num_tokens_tensor = None
         self.max_num_tokens = None
@@ -880,6 +884,86 @@ class PagedStashManager:
             f"paged_tensors_stash_in_progress is not empty "
             f"{self.paged_tensors_stash_in_progress}"
         )
+
+    def discovered_microbatches(self):
+        """``(microbatches the discovery iteration ran, VP stages with paged layers)``.
+
+        Read from the forward entries of the recorded schedule. A forward that an activation
+        recompute runs inside a backward is recorded under the number of the latest forward
+        microbatch, so it adds no microbatch of its own.
+        """
+        microbatches = {}
+        for schedule_layer in self._pp_schedule or ():
+            if schedule_layer > 0:
+                microbatches.setdefault(schedule_layer // 1_000_000, set()).add(
+                    schedule_layer % 1_000
+                )
+        count = max((len(numbers) for numbers in microbatches.values()), default=0)
+        return count, set(microbatches)
+
+    @staticmethod
+    def _in_flight_peak(order, paged_vp_stages):
+        """The most microbatches a chunk-level pipeline order keeps in flight on the VP stages
+        with paged layers. ``order`` names model chunks from 1: ``c`` is a forward of chunk
+        ``c``, ``-c`` its backward (``convert_schedule_table_to_order``)."""
+        in_flight = peak = 0
+        for chunk_id in order:
+            if abs(chunk_id) in paged_vp_stages:
+                in_flight += 1 if chunk_id > 0 else -1
+                peak = max(peak, in_flight)
+        return peak
+
+    def reserve_for_capture_order(self, order, discovery_order, config=None):
+        """Size the page buffers for the pipeline order the chunk graphs are captured for.
+
+        The buffers are sized from the first eager iteration: the peak of its concurrently
+        stashed tokens, times the configured factor. With dynamic microbatches that iteration
+        may have run fewer microbatches than the pipeline keeps in flight in a later step
+        (fewer packs than this stage holds), while the graphs are captured for every step up
+        to their slot count. A longer step would then overflow the buffers, which ends a run
+        that replays graphs (there is no eager retry).
+
+        ``order`` is the capture's chunk-level pipeline order and ``discovery_order`` the order
+        of the same schedule for the microbatches the discovery iteration ran
+        (``discovered_microbatches``). When the capture order keeps more microbatches in
+        flight, the recorded maxima are raised by that ratio and the buffers are allocated
+        again. Layers that are recomputed in the backward are stashed inside one backward only,
+        so for them the ratio is an upper bound.
+        """
+        if (
+            self.status != 'captured'
+            or order is None
+            or discovery_order is None
+            or self.max_tokens_across_vp_stages is None
+        ):
+            return
+        _, paged_vp_stages = self.discovered_microbatches()
+        discovered_peak = self._in_flight_peak(discovery_order, paged_vp_stages)
+        capture_peak = self._in_flight_peak(order, paged_vp_stages)
+        sized_for = self._sized_for_in_flight_peak or discovered_peak
+        if sized_for <= 0 or capture_peak <= sized_for:
+            return
+        for maxima in (self.max_tokens_across_vp_stages, self.max_avg_tokens_across_vp_stages):
+            for key, tokens in maxima.items():
+                maxima[key] = math.ceil(tokens * capture_peak / sized_for)
+        self._sized_for_in_flight_peak = capture_peak
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "Paged stash: the chunk CUDA graphs are captured for a pipeline order that keeps "
+            f"{capture_peak} microbatches with paged MoE activations in flight, and the page "
+            f"buffers were sized for {sized_for} (the first iteration ran fewer microbatches "
+            "than the pipeline holds in flight). Sizing them for the capture order "
+            f"({capture_peak / sized_for:.2f}x).",
+        )
+        if self.stash_buffers is not None:
+            torch.cuda.synchronize()
+            self.stash_buffers = None
+            if not torch.cuda.is_current_stream_capturing():
+                # Hand the blocks of the old buffers back before the larger ones are
+                # allocated (as paged_stash_reset does before it allocates the stash).
+                torch.cuda.empty_cache()
+        self.prepare_stash_buffers(config)
 
     def update_pp_schedule(self, vp_stage, layer_no=None, microbatch_no=None):
         """Update the pp schedule."""
@@ -1400,6 +1484,13 @@ def paged_stash_prepare_for_cuda_graph_capture(config):
     if stash_manager.stash_buffers is None:
         stash_manager.prepare_stash_buffers(config)
     assert stash_manager.stash_buffers is not None
+
+
+def paged_stash_reserve_for_capture_order(order, discovery_order, config):
+    """Size the page buffers for the chunk-level pipeline order of a chunk CUDA graph capture
+    (``PagedStashManager.reserve_for_capture_order``); after
+    ``paged_stash_prepare_for_cuda_graph_capture``, before the capture starts."""
+    PagedStashManager.get_instance().reserve_for_capture_order(order, discovery_order, config)
 
 
 def paged_stash_reset(enabled=True, config=None):

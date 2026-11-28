@@ -1046,8 +1046,10 @@ def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group
     # RL packing may repeat the final boundary in fixed-size metadata.
     nonempty = local_lengths > 0
     # Validate on the host before indexing or communication. A CUDA graph capture cannot wait
-    # for the device, so the check runs in eager passes only.
-    if not torch.cuda.is_current_stream_capturing() and not bool(aligned):
+    # for the device, so the check runs in eager passes only (is_available() first: a CUDA-less
+    # torch build raises from the capture query).
+    capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    if not capturing and not bool(aligned):
         raise ValueError("Packed document lengths must be divisible by twice the CP size")
     if nonempty.numel() == 0:
         return rolled_tensor

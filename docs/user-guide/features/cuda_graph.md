@@ -179,15 +179,20 @@ per layer. `--cuda-graph-modules` must be empty and inference CUDA graphs are no
 With packed sequences (`--sequence-packing-scheduler`) the post-process of the last pipeline stage
 (MTP block, LM head and loss) is captured as a second callable of that chunk, in the same schedule
 order, so it shares the graph memory pool with the decoder graphs. The post-process stays eager
-(it runs after the decoder replay) for fixed-length batches, when the stage owns no decoder layer,
+(it runs after the decoder replay) for fixed-length batches, when the stage owns no decoder layer
+or its decoder block is not captured (`--freeze-base-model-for-mtp` and `--freeze-all-layers` run
+the decoder without autograd, so it stays eager; frozen parameters alone do not: a decoder that is
+frozen while another part of the model trains is captured as usual),
 and when Python has to see the logits of every microbatch: forward hooks on the LM head (logits
 savers, distillation captures) or, for `GPTModel`, `--config-logger-dir` (its post-process dumps
 the inputs and logits of every forward). A call that conditions the post-process on
-anything but the captured tensors (no labels, an MTP input mask, precomputed MTP embeddings, a
-per-call `runtime_gather_output`, an output processor, extra MTP block arguments, a sequence length
-offset, a disabled MTP loss or a context-parallel layout plan) takes the eager post-process as well.
-When the post-process of a packed run is not captured, a warning on its pipeline stage names the
-reason.
+anything but the captured tensors (no labels or no loss mask; with MTP on the stage, no token ids,
+position ids or padding mask; an MTP input mask, precomputed MTP embeddings, a per-call
+`runtime_gather_output`, an output processor, extra MTP block arguments, a sequence length offset,
+a disabled MTP loss or a context-parallel layout plan) takes the eager post-process as well.
+When the post-process of a packed run is never captured (the stage or model reasons above), a
+warning on its pipeline stage names the reason; a single call that takes the eager post-process
+does so without a message.
 
 ### Usage
 
@@ -195,8 +200,8 @@ reason.
 --cuda-graph-impl chunk_wise \
 --cuda-graph-warmup-steps 2 \
 # packed sequences: static shapes and a capture bound on the packed microbatch count
---micro-batch-size 1 --pad-packed-seq-alignment max --thd-max-packed-sequences <N> \
---cuda-graph-dynamic-microbatches \
+--micro-batch-size 1 --max-seqlen-per-dp-cp-rank <W> --pad-packed-seq-alignment max \
+--thd-max-packed-sequences <N> --cuda-graph-dynamic-microbatches \
 # packed sequences with PP > 1: the padded inter-stage shape is static, skip the P2P shape exchange
 --pipeline-p2p-fixed-shape \
 # optional: optimizer step in the same graph memory pool (optimizer state must stay on the GPU)
@@ -210,26 +215,59 @@ optimizer's first step always runs eagerly, so its state exists before the graph
 
 ### Requirements
 
+- Transformer Engine: the mode is developed and tested with Transformer Engine 2.20 development
+  builds. The capture passes Transformer Engine the options its version offers (shared graph
+  pool, buffer reuse between slots, parameter gradients without a copy), so older releases may
+  capture, but they are not tested; paged stash needs TE >= 2.19, which the configuration
+  enforces.
 - MoE layers need static token shapes: drop-padding MoE (`--moe-expert-capacity-factor` with
-  `--moe-pad-expert-input-to-capacity`), the HybridEP flex dispatcher with
+  `--moe-pad-expert-input-to-capacity` and the `alltoall` or `flex` token dispatcher; the
+  `allgather` dispatcher reads the token counts on the host), the HybridEP flex dispatcher with
   `--moe-expert-rank-capacity-factor`, or a MoE megakernel backend. HybridEP's runtime padding
   (`--moe-hybridep-pad-variable-tokens`) is turned off: every rank holds the same static token count.
   MoK's MXFP8 mode records its expert scale re-swizzle inside the captured block, so every replay
   picks up the scales of the latest parameter update.
-- Packed sequences need `--micro-batch-size 1`, `--cuda-graph-dynamic-microbatches`,
-  `--pad-packed-seq-alignment max` (or the value of `--max-seqlen-per-dp-cp-rank`) and a bound on
-  the sequences per pack (`--thd-max-packed-sequences`). Packed data paths without the
-  packing scheduler (`--sft`, `--dataloader-inter-document-masking`) are not captured: the training
-  CLI rejects them with `chunk_wise`, and in a custom training loop a block graph captured from
-  fixed-length batches raises when it receives packed sequence parameters.
+- Packed sequences need `--micro-batch-size 1`, `--cuda-graph-dynamic-microbatches`, an explicit
+  window `--max-seqlen-per-dp-cp-rank` (the static token count per rank that every pack is padded
+  to: a multiple of 2, or of 32 with MXFP8, times the TP size with sequence parallelism),
+  `--pad-packed-seq-alignment max` (or the value of the window) and a bound on the sequences per
+  pack (`--thd-max-packed-sequences`). With pipeline parallelism every microbatch in flight owns
+  a graph slot, and their number is derived from the global batch size: the dataset has to yield
+  one sequence per item (`--use-varlen-dataset`, or mock `--sft` data). The training CLI rejects
+  real `--sft` data and `--dataloader-inter-document-masking` there, whose items hold several
+  sequences, and a step that still needs more slots than were captured raises. Packed data paths without the packing scheduler (`--sft`,
+  `--dataloader-inter-document-masking`) are not captured: the training CLI rejects them with
+  `chunk_wise`, and in a custom training loop a block graph captured from fixed-length batches
+  raises when it receives packed sequence parameters. A tensor keyword the block was not captured
+  with (`extra_block_kwargs`, or an attention mask with `create_attention_mask_in_dataloader` off)
+  is not a graph input and has no effect on a replay, as with the per-layer graphs.
+- With fixed-length batches the graph slots follow the step: one slot without pipeline
+  parallelism, one per microbatch of the step with it. `--cuda-graph-dynamic-microbatches` only
+  applies to packed sequences and is turned off (with a warning) otherwise.
+- With pipeline parallelism the graph slots are sized when the graphs are captured. With
+  fixed-length batches a `--step-batch-size-schedule` transition to a larger batch needs a
+  relaunch: with `--save` set the training loop saves a checkpoint and exits at the transition;
+  without it the first step at the new size stops on the slot check. With packed sequences the
+  capture refuses a schedule that still has a larger batch ahead: capture after the schedule has
+  reached its maximum (relaunch from a checkpoint past the last transition).
 - Fixed-length batches that carry a padding mask (for example `--varlen-sbhd-validation`) need
   `--cuda-graph-warmup-steps >= 1` when the block has MoE layers: the capture reserves the mask
   input only if the block received a mask during the eager warm-up, and a mask that reaches a
   graph captured without one raises.
 - Not supported with `chunk_wise`: `--overlap-moe-expert-parallel-comm`, `--delay-wgrad-compute`,
-  dynamic context parallelism (the captured block records the context-parallel communicator of the
-  capture sample), and hybrid stacks that convert between context-parallel layouts across their
-  layers.
+  `--overlap-dispatch-backward-with-experts-wgrad`, sinkhorn routing
+  (`--moe-router-load-balancing-type sinkhorn`: its normalisation loop ends on a host-side read),
+  GTP weight rematerialization (`--tensor-parallel-num-weight-shards` or
+  `--expert-tensor-parallel-num-weight-shards` above the tensor-parallel size: its CUDA graph
+  integration covers the `local` and `full_iteration` graphs), Megatron-FSDP and Torch FSDP2
+  (they gather the parameters of a layer in its forward hooks, which a block replay does not
+  run; use `full_iteration` graphs with FSDP),
+  dynamic context parallelism (the captured
+  block records the context-parallel communicator of the capture sample), and hybrid stacks that
+  convert between context-parallel layouts across their layers. Features that support no
+  Transformer Engine captured graph are refused here as well: attention residuals
+  (`--enable-attention-residuals`), wide residual streams, and MoE layers with
+  `--mlp-chunks-for-training` above 1.
 - Not supported together with packed sequences: `--position-embedding-type mrope` (the packing
   scheduler carries `[1, tokens]` position ids while mRoPE needs the `[3, batch, seq]` layout),
   GDN / KDA / GDP layers (selected by `--experimental-attention-variant`, by the `G` / `K` symbols of
@@ -237,28 +275,52 @@ optimizer's first step always runs eagerly, so its state exists before the graph
   layers: the FLA kernels derive their chunk indices on the host from the `cu_seqlens` values and
   cache them per tensor, so a captured block graph would replay the pack layout of the capture
   sample) and Mamba layers with chunkwise context parallelism (their CP metadata is built on the
-  host per pack). mRoPE and the GDN / KDA variants and pattern symbols are rejected when the
-  configuration is built, the other two when the block is first captured. These restrictions
-  apply to packed sequences only.
+  host per pack). mRoPE is rejected by the training CLI (a model built directly raises when its
+  block is first captured), the GDN / KDA variants and pattern symbols when the configuration
+  is built, the other two when the block is first captured. These restrictions apply to packed
+  sequences only.
 - With packed sequences `--defer-embedding-wgrad-compute` is turned off: the LM head is part of the
-  captured post-process, so its weight gradient is computed inside the graph.
+  captured post-process, so its weight gradient is computed inside the graph. So is
+  `--mtp-loss-early-backward`: the backward of the MTP heads is part of the post-process backward
+  graph. With fixed-length batches both keep working (the post-process is eager); the LM head
+  then keeps a copy of the decoder output of every microbatch until the deferred weight gradient
+  is computed, because the block graph reuses its output buffer.
 - A replay runs no Python inside the captured blocks. Forward tensor metrics that observe them
-  (residual and router sources; logits sources too with packed sequences) are rejected, and forward
-  hooks on modules inside a captured block do not fire at replay.
+  (residual and router sources; logits sources too with packed sequences) are rejected at the first
+  training step; `--log-moe-overload-factor`, whose token counts are recorded by Python inside the
+  MoE forward and backward, is rejected when the configuration is built; and forward or backward
+  hooks on modules inside a captured block do not fire at replay, so the hook-based dumps
+  (`--save-activations-interval`, `--save-tokens-per-expert-interval`, `--save-dgrads-interval`)
+  only cover what still runs eagerly.
 
 ### Precision and position embeddings
 
 A graph replay runs under the block-wide FP8 autocast the eager block forward opens (the replay does
 not run the forward), so delayed scaling keeps reducing its amax and updating its scales, and the FP8
-weight cache keeps following `is_first_microbatch`. NVFP4 is captured like FP8.
+weight cache keeps following `is_first_microbatch`. NVFP4 is captured like FP8. Modules that are
+quantized only through a per-module recipe (`--te-precision-config-file`, no model-wide FP8 / FP4
+mode) have no replay-driven weight cache: the graph re-quantizes their weights in every microbatch,
+where eager does it once per step.
 `--first-last-layers-bf16` layers opt out of the block-wide capture autocast and MTP layers opt in
 (`get_layer_fp8_context`, `get_layer_fp4_context`); a post-process without quantized modules (no MTP on
 the stage or `--keep-mtp-in-bf16`, and no MXFP8 output projection) is captured and replayed without an
-autocast, like its eager counterpart.
+autocast, like its eager counterpart. A captured callable replays under one autocast: with FP8
+delayed scaling and a captured post-process (packed sequences), the scales of the MTP layers are
+therefore reduced once per microbatch, where the eager MTP reduces them after every MTP depth. With
+the default amax history of one step and separate MTP layers the scales are the same; a longer
+`--fp8-amax-history-len`, or `--mtp-use-repeated-layer` with several MTP depths, follows a different
+cadence than eager. With `--fp32-residual-connection` the block's hidden-state input is captured in
+float32, the dtype the embedding and the pipeline deliver, so the residual stream is not rounded at a
+block boundary.
 
 `--position-embedding-type rope`, `yarn` and (fixed-length) `mrope`, or MLA's own rotary handling,
 can be captured: the block's sample inputs carry a rotary table of the runtime shape, which the
 runtime table overwrites at replay.
+
+MTP hidden-state mixing (`--mtp-hsm`) is captured with the post-process of a packed run. Its roll of
+the older hidden states depends on whether the data path hands one tensor as both the query and the
+padded boundaries of a pack; the captured post-process rebuilds the packed metadata the way the
+eager warm-up steps received it, so it needs `--cuda-graph-warmup-steps >= 1`.
 
 ### Activation recompute
 
@@ -287,7 +349,12 @@ graph's static input buffer.
 
 `--fine-grained-activation-offloading` runs in a whole-block capture mode: the D2H/H2D copies are
 captured into each slot's graphs, with host buffers no other slot reuses and no cross-slot prefetch,
-so any number of live slots can replay. The captured callables' static inputs (the block's
+so any number of live slots can replay. The pinned host memory of a rank is therefore the offloaded
+bytes of one microbatch (the Activation Offload Summary) times the captured slots of its stage, held
+for as long as the graphs live, where eager reuses a pool sized by the microbatches in flight. The
+capture logs the total per rank at INFO level (`--logging-level 20`; with
+`--fine-grained-offloading-buffer-size-gib`, the range of the fixed buffer it reserved) and,
+without a fixed buffer, returns the eager warm-up's pool first. Size host memory, or the fixed buffer, by that rule. The captured callables' static inputs (the block's
 `hidden_states`, which the first layer's `attn_norm` commit would otherwise free) are kept out of
 the offload release, and the group hooks are no-ops outside a capture-time forward, so a full
 activation recompute captured into the backward graph neither offloads nor reloads (a fully
@@ -319,7 +386,11 @@ lifetime, so eager offloads after a deletion use the remaining tail).
 `--moe-paged-stash` works in a runtime-keyed mode: each MoE layer stashes its own activations after
 its forward and reloads them right before its own backward (no cross-layer prefetch; GPU pages only
 by default), at any pipeline size, so the captured graphs do not depend on the recorded pipeline
-order; it needs TE >= 2.19 and `--cuda-graph-warmup-steps >= 2`. A MoE layer that is recomputed in
+order; it needs TE >= 2.19 and `--cuda-graph-warmup-steps >= 2`. The page buffers are sized from the
+first iteration; when that iteration ran fewer microbatches than the stage keeps in flight in the
+order the graphs are captured for (packed sequences, a first step with fewer packs than the stage
+holds), the capture raises the recorded sizes by the ratio of the microbatches in flight and
+allocates the buffers again. A MoE layer that is recomputed in
 the backward (full recompute, or selective recompute of `moe`) is stashed only when another MoE layer
 of the same recompute segment follows it; the last one of a segment is consumed by that backward at
 once and stays in place, as in the eager schedule. Only stashed layers count towards the size of the
@@ -328,7 +399,9 @@ no effect: no page buffers are allocated and a warning says so. As at larger pip
 that overflows its page buffers after the capture stops the run (raise
 `--moe-paged-stash-buffer-size-factor-cuda`), and so does a rank whose routed tokens exceed
 `--moe-expert-rank-capacity-factor`: a captured graph cannot repeat the step without the budget as
-the eager schedule does. Without pipeline parallelism the stash saves what the capacity factor pads:
+the eager schedule does. The budget check covers the MoE layers the schedule tracks, in eager runs
+as well: those directly in the decoder and MTP layer lists, not the ones behind a hybrid stack's
+hyper-connection wrappers or inside a hybrid MTP stack. Without pipeline parallelism the stash saves what the capacity factor pads:
 in a 16-layer MXFP8 MoE proxy (8 experts, top-4, 4096 tokens per rank, PP=1) it lowered the peak
 allocation by 9 % at a capacity factor of 2.0 and by 0.3 % at 1.25, at the same step time.
 

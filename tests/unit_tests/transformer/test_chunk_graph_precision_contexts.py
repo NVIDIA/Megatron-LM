@@ -21,6 +21,7 @@ from megatron.core.fp4_utils import (
     get_layer_quantization_context,
 )
 from megatron.core.fp8_utils import get_fp8_recipe, get_layer_fp8_context
+from megatron.core.tensor_parallel import random as tensor_parallel_random
 from megatron.core.transformer.chunk_cuda_graph import (
     ChunkCudaGraphBlockMixin,
     ChunkCudaGraphPostProcessBlock,
@@ -390,11 +391,15 @@ class TestChunkGraphPrecisionContexts:
         Utils.initialize_model_parallel(tensor_model_parallel_size=1)
         model_parallel_cuda_manual_seed(42)
         try:
-            assert run() == ["CheckpointFunctionBackward"]  # eager: mcore's node
+            # Autograd names the node of a custom Function "<class name>Backward".
+            megatron_node = tensor_parallel_random.CheckpointFunction.__name__ + "Backward"
+            eager_nodes = run()
+            assert eager_nodes == [megatron_node]  # eager: mcore's node
             cuda_graphs._set_capture_start()
             try:
                 assert run() == []  # mcore's checkpoint skips its node while a graph is captured
-                assert run(**_CHUNK) == ["_CheckpointFunctionBackward"]  # TE's does not
+                chunk_nodes = run(**_CHUNK)  # Transformer Engine's checkpoint does not
+                assert len(chunk_nodes) == 1 and chunk_nodes != eager_nodes
             finally:
                 cuda_graphs._set_capture_end()
         finally:
@@ -1088,3 +1093,232 @@ class TestNvfp4ChunkGraphEndToEnd:
                 assert _relative_error(grads[name], ref_grads[name]) <= 1e-2, (name, index)
         # No decoder or MTP module ran its forward after the capture: both callables replayed.
         recorder.check(["eager", "warmup", "capture"], expected, recompute)
+
+
+@contextmanager
+def _te_skip_weight_update_tensor(tensor):
+    """Run with ``tensor`` as Transformer Engine's process-global skip-weight-update flag and put
+    the previous one back afterwards. TE creates the flag the first time a capture turns on its
+    weight caching and keeps it for the life of the process, so ``None`` is the state of a
+    training run whose model has no model-wide FP8 / FP4 recipe (in a test process an earlier
+    test with such a recipe may have left the flag behind)."""
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    # TE >= 2.15 keeps the flag on quantization_state, older releases on the manager class.
+    owner = getattr(FP8GlobalStateManager, "quantization_state", FP8GlobalStateManager)
+    previous = owner.skip_fp8_weight_update_tensor
+    owner.skip_fp8_weight_update_tensor = tensor
+    try:
+        yield
+    finally:
+        owner.skip_fp8_weight_update_tensor = previous
+
+
+def _build_recipe_fp8_gpt_model(cuda_graph_impl):
+    """Fixed-length 4-layer GPTModel *without* a model-wide FP8 / FP4 recipe whose MLP linears
+    (``linear_fc1``: a TE LayerNormLinear, ``linear_fc2``: a TE Linear) run in per-tensor FP8
+    through a per-module ``quant_recipe``. Their weights are stored in BF16 and quantized in
+    the forward. Every build holds the same weights."""
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.quantization.quant_config import RecipeConfig
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.enums import AttnBackend
+
+    model_parallel_cuda_manual_seed(123)
+    torch.manual_seed(123)
+    # What --te-precision-config-file loads.
+    quant_recipe = RecipeConfig.from_config_dict(
+        {
+            "matchers": {
+                "mlp": {
+                    "type": "glob",
+                    "enabled": True,
+                    "pattern": "*mlp.linear_fc*",
+                    "config": "fp8",
+                }
+            },
+            "configs": {
+                "fp8": {
+                    "transformer_engine_config_type": "TEQuantizationParams",
+                    "training_recipe": {
+                        "fp8_quantization_recipe": "tensorwise",
+                        "override_nonquantized_autocast": True,
+                    },
+                }
+            },
+        }
+    )
+    config = _config(
+        hidden_size=256,
+        params_dtype=torch.bfloat16,
+        attention_backend=AttnBackend.unfused,  # like the other fixed-length chunk-graph tests
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        cuda_graph_impl=cuda_graph_impl,
+        cuda_graph_modules=[],
+        use_te_rng_tracker=True,
+        quant_recipe=quant_recipe,
+    )
+    assert not config.fp8 and not config.fp4
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=_VOCAB,
+        max_sequence_length=_SEQ_LENGTH,
+    )
+    return model.bfloat16().cuda()
+
+
+@pytest.mark.launch_on_gb200
+class TestQuantRecipeWeightsUnderChunkGraphs:
+    """Linears quantized only through a per-module ``quant_recipe`` (``--te-precision-config-file``
+    with ``override_nonquantized_autocast``; no model-wide FP8 / FP4 recipe) keep their weights
+    in BF16 and quantize them in the forward. Eager, ``is_first_microbatch`` makes Transformer
+    Engine quantize once per step and reuse the cached result for the other microbatches.
+
+    A graph replay runs no Python, and the capture turns on TE's replay-driven weight cache
+    (``fp8_weight_caching``) only with a model-wide recipe. Without one, a capture that handed
+    TE the Python flag (``False`` after the eager passes before it) recorded a read of the
+    cached quantized weights and no quantization: every replay computed with the weights of the
+    last eager step. ``_resolve_is_first_microbatch`` therefore withholds the flag from such a
+    capture, and TE records the quantization itself.
+    """
+
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not available")
+    def test_first_microbatch_flag_is_withheld_from_a_capture_without_te_weight_caching(self):
+        from megatron.core.extensions.transformer_engine import _resolve_is_first_microbatch
+        from megatron.core.transformer import cuda_graphs
+
+        def resolve(is_first_microbatch, cuda_graph_impl="chunk_wise", **quantization):
+            config = dict(fp8=None, fp4=None, quant_recipe=object())
+            config.update(quantization)
+            module = SimpleNamespace(
+                config=SimpleNamespace(cuda_graph_impl=cuda_graph_impl, **config),
+                disable_parameter_transpose_cache=False,
+                is_first_microbatch=is_first_microbatch,
+            )
+            return _resolve_is_first_microbatch(module)
+
+        with _te_skip_weight_update_tensor(None):
+            # Eager: the flag drives TE's weight cache.
+            assert resolve(True) is True and resolve(False) is False
+            cuda_graphs._set_capture_start()
+            try:
+                # Warm-up passes and capture of a chunk graph that nothing will tell the
+                # microbatch. Per-layer TE graphs keep dev's behaviour.
+                assert resolve(True) is None and resolve(False) is None
+                assert resolve(True, "transformer_engine") is True
+                assert resolve(False, "transformer_engine") is False
+            finally:
+                cuda_graphs._set_capture_end()
+        # A capture that turned on TE's weight caching (model-wide FP8 / FP4 recipe) has TE's
+        # flag: TE replaces the Python flag by it while it records, and the warm-up passes keep
+        # using the Python flag as before.
+        with _te_skip_weight_update_tensor(torch.zeros(1)):
+            cuda_graphs._set_capture_start()
+            try:
+                for quantization in (dict(fp8="e4m3"), dict(fp4="e2m1")):
+                    assert resolve(True, **quantization) is True
+                    assert resolve(False, **quantization) is False
+            finally:
+                cuda_graphs._set_capture_end()
+
+    @pytest.fixture
+    def capture_cleanups(self):
+        """``TestNvfp4ChunkGraphEndToEnd.capture_cleanups`` for any device with FP8, in the
+        state of a process in which no capture turned on TE's weight caching."""
+        import transformer_engine as te
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+        from megatron.core.tensor_parallel.random import initialize_rng_tracker
+        from megatron.core.transformer import cuda_graphs
+        from tests.unit_tests.test_utilities import Utils
+
+        if not hasattr(te.common.recipe, "Float8CurrentScaling"):
+            pytest.skip("This Transformer Engine has no per-tensor (current scaling) FP8 recipe")
+        fp8_available, reason = FP8GlobalStateManager.is_fp8_available()
+        if not fp8_available:
+            pytest.skip(f"FP8 not available on this device: {reason}")
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        # A failed earlier GPU test can leave the calculator initialized.
+        destroy_num_microbatches_calculator()
+        # The conftest fixture puts the previous tracker back after the test.
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        stream = torch.cuda.current_stream()
+        cleanups = []
+        with _te_skip_weight_update_tensor(None):
+            try:
+                yield cleanups
+            finally:
+                torch.cuda.synchronize()
+                for cleanup in reversed(cleanups):
+                    cleanup()
+                # Only still set if the capture raised.
+                cuda_graphs._set_capture_end()
+                cuda_graphs.te_set_capture_end()
+                torch.cuda.set_stream(stream)
+                destroy_num_microbatches_calculator()
+                Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not (HAVE_TE and torch.cuda.is_available()), reason="TE and CUDA required")
+    def test_weight_update_reaches_the_replay_of_recipe_quantized_linears(self, capture_cleanups):
+        """Chunk-graph replays against an eager twin with the same weights, before and after an
+        in-place update of the recipe-quantized weights (what an optimizer step does).
+
+        Fails without the fix: the capture records no weight quantization, so after the update
+        the replay still returns the logits of the old weights."""
+        from megatron.core.transformer import cuda_graphs
+
+        micro_batch_size = 2
+        _init_two_microbatches(micro_batch_size)
+        tokens = torch.arange(_SEQ_LENGTH, device="cuda").repeat(micro_batch_size, 1)
+        # Causal mask (True: masked), the layout the block's static capture input has.
+        attention_mask = (
+            ~torch.tril(torch.ones((_SEQ_LENGTH, _SEQ_LENGTH), dtype=torch.bool, device="cuda"))
+        ).tile(micro_batch_size, 1, 1, 1)
+
+        def build(cuda_graph_impl):
+            model = _build_recipe_fp8_gpt_model(cuda_graph_impl)
+            model.train()
+            quantized = {
+                name: module
+                for name, module in model.named_modules()
+                if getattr(module, "te_quant_params", None) is not None
+            }
+            assert sorted(quantized) == [
+                f"decoder.layers.{layer}.mlp.linear_fc{fc}" for layer in range(4) for fc in (1, 2)
+            ]
+            return model, list(quantized.values())
+
+        def step(model):
+            return _fixed_length_step(model, tokens, attention_mask)
+
+        eager_model, eager_linears = build("none")
+        graph_model, graph_linears = build("chunk_wise")
+        eager_logits, eager_grads = step(eager_model)
+        # The same weights under chunk graphs: eager before the capture, like the reference.
+        logits, _ = step(graph_model)
+        torch.testing.assert_close(logits, eager_logits, rtol=1e-2, atol=1e-2)
+        # Without a model-wide recipe, the matched linears still ran under FP8.
+        assert all(linear.fp8 for linear in eager_linears + graph_linears)
+
+        TestNvfp4ChunkGraphEndToEnd._capture(graph_model, micro_batch_size, capture_cleanups)
+        logits, grads = step(graph_model)
+        torch.testing.assert_close(logits, eager_logits, rtol=1e-2, atol=1e-2)
+        assert _relative_error(grads, eager_grads) <= 1e-2
+
+        # The sign flip keeps the final layer norm from hiding the update.
+        with torch.no_grad():
+            for linear in eager_linears + graph_linears:
+                linear.weight.mul_(-2.0)
+        updated_logits, updated_grads = step(eager_model)
+        assert _relative_error(updated_logits, eager_logits) > 5e-2
+        # Every microbatch of the step computes with the updated weights, like eager.
+        for microbatch in (0, 1):
+            cuda_graphs.set_current_microbatch(graph_model, microbatch)
+            logits, grads = step(graph_model)
+            torch.testing.assert_close(logits, updated_logits, rtol=1e-2, atol=1e-2)
+            assert _relative_error(grads, updated_grads) <= 1e-2, microbatch

@@ -572,7 +572,7 @@ class TestChunkCudaGraphPipeline:
 
                 # The capture has no slot for one more microbatch in flight.
                 with pytest.raises(
-                    AssertionError, match=f"only contains {num_microbatches} graph slots"
+                    RuntimeError, match=f"only contains {num_microbatches} graph slots"
                 ):
                     _forward(models[0], feeds[0][0], microbatch=num_microbatches)
 
@@ -729,6 +729,86 @@ class TestChunkCudaGraphPipeline:
                     results, _ = _run_pipeline_order(models, feeds, order)
                     for key, result in results.items():
                         _assert_result_matches(result, reference[key], f"step {step} replay {key}")
+
+    def test_deferred_lm_head_weight_gradient_uses_every_microbatch(self):
+        """``defer_embedding_wgrad_compute`` on the last pipeline stage, fixed-length batches.
+
+        The eager LM head keeps its input of every microbatch, and the schedule computes the
+        weight gradient from them after the last backward of the step. That input is the output
+        of the replayed decoder block: a static buffer of the block's graph, which Transformer
+        Engine lends to later graphs once the block's backward has run. Every kept input must
+        still be its own microbatch's when the schedule drains them.
+        """
+        pytest.importorskip("fused_weight_gradient_mlp_cuda")
+        from megatron.core.pipeline_parallel.schedules import finish_embedding_wgrad_compute
+
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+        num_microbatches, micro_batch_size, seq_length = 4, 2, 32
+        self._init_num_microbatches(num_microbatches, micro_batch_size)
+        settings = dict(
+            num_layers=4,
+            pipeline_model_parallel_size=2,
+            microbatch_group_size_per_vp_stage=2,
+            defer_embedding_wgrad_compute=True,
+            gradient_accumulation_fusion=True,
+            create_attention_mask_in_dataloader=False,
+        )
+        with _training_stream():
+            # Every rank holds the chunk of the last stage: decoder layers and the LM head.
+            config, models, eager_models = _build_graph_and_eager_chunks(
+                settings, stage_flags=(False, True)
+            )
+            hidden_shape = (seq_length, micro_batch_size, _HIDDEN)
+            feeds = []
+            for microbatch in range(num_microbatches):
+                generator = torch.Generator(device="cpu").manual_seed(microbatch)
+                tokens = torch.randint(
+                    0, _VOCAB, (micro_batch_size, seq_length + 1), generator=generator
+                ).cuda()
+                feeds.append(
+                    dict(
+                        inputs=dict(
+                            input_ids=tokens[:, :-1].contiguous(),
+                            position_ids=torch.arange(seq_length, device="cuda").expand(
+                                micro_batch_size, -1
+                            ),
+                            attention_mask=None,
+                            labels=tokens[:, 1:].contiguous(),
+                        ),
+                        hidden=_noise(hidden_shape, 0, Utils.rank, microbatch),
+                        output_grad=None,
+                        loss_mask=torch.ones(micro_batch_size, seq_length, device="cuda"),
+                    )
+                )
+            feeds = [feeds]
+            order = _pipeline_order(config, num_microbatches)
+
+            def step_with_deferred_weight_gradient(chunks):
+                """One step of the schedule: the microbatches, then the deferred GEMMs."""
+                core = chunks[0].module
+                core.embedding_activation_buffer.clear()
+                core.grad_output_buffer.clear()
+                results, _ = _run_pipeline_order(chunks, feeds, order)
+                assert len(core.embedding_activation_buffer) == num_microbatches
+                chunks[0].zero_grad_buffer()
+                finish_embedding_wgrad_compute(
+                    config, core, True, parallel_state.get_tensor_model_parallel_group()
+                )
+                assert not core.embedding_activation_buffer and not core.grad_output_buffer
+                return results, core.output_layer.weight.main_grad.detach().float().clone()
+
+            reference, reference_weight_grad = step_with_deferred_weight_gradient(eager_models)
+            assert reference_weight_grad.norm() > 0
+            with _captured_graphs(models, config, seq_length, micro_batch_size):
+                assert len(models[0].module.decoder.cuda_graphs) == num_microbatches
+                for step in range(2):
+                    results, weight_grad = step_with_deferred_weight_gradient(models)
+                    for key, result in results.items():
+                        _assert_result_matches(result, reference[key], f"step {step} replay {key}")
+                    error = _relative_error(weight_grad, reference_weight_grad)
+                    assert (
+                        error <= _TOLERANCE
+                    ), f"step {step}: the deferred LM head weight gradient is off by {error:.3e}"
 
     @pytest.mark.parametrize("metadata", ["full_length", "sp_sharded", "hybrid"])
     def test_later_stage_token_metadata_under_sequence_parallelism(self, metadata):

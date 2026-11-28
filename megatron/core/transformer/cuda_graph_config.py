@@ -40,11 +40,23 @@ def validate_moe_cuda_graph_support(config) -> None:
         config.num_moe_experts is None
         or config.num_moe_experts <= 1
         or not is_whole_moe_cuda_graph_scope(config.cuda_graph_modules)
-        or (
-            config.moe_expert_capacity_factor is not None
-            and config.moe_pad_expert_input_to_capacity
-        )
     ):
+        return
+
+    if config.moe_expert_capacity_factor is not None and config.moe_pad_expert_input_to_capacity:
+        # Drop-padding MoE: every expert holds the same static token count. The all-gather
+        # dispatcher still copies the per-expert counts to the host in every forward, which a
+        # chunk-wise capture of the whole MoE cannot record (a megakernel backend dispatches
+        # by itself).
+        assert (
+            getattr(config, "cuda_graph_impl", "none") != "chunk_wise"
+            or config.moe_megakernel_backend is not None
+            or config.moe_token_dispatcher_type != "allgather"
+        ), (
+            "chunk-wise CUDA graphs with drop-padding MoE need moe_token_dispatcher_type "
+            "'alltoall' or 'flex': the allgather dispatcher reads the per-expert token counts "
+            "on the host in every forward."
+        )
         return
 
     if getattr(config, "cuda_graph_impl", "none") == "chunk_wise":

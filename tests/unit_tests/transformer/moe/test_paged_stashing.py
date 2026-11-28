@@ -284,6 +284,126 @@ def test_paged_stash_schedule_skips_valid_vp_stage_without_paged_layers():
     assert manager._build_te_graph_capture_schedule([1, 2, -2, -1]) == manager._pp_schedule
 
 
+def _make_sized_schedule_manager(monkeypatch, recorded_schedule, vp_size=1):
+    """A manager whose discovery iteration recorded ``recorded_schedule`` and these maxima."""
+    manager = _make_schedule_manager(recorded_schedule, vp_size=vp_size)
+    key = (torch.bfloat16, 64)
+    manager.max_tokens_across_vp_stages = {key: 100}
+    manager.max_avg_tokens_across_vp_stages = {key: 81}
+    manager._sized_for_in_flight_peak = None
+    prepared = []
+
+    def prepare_stash_buffers(config=None):
+        assert manager.stash_buffers is None, "the buffers of the old size must be released"
+        prepared.append(
+            (manager.max_tokens_across_vp_stages[key], manager.max_avg_tokens_across_vp_stages[key])
+        )
+        manager.stash_buffers = {}
+
+    monkeypatch.setattr(manager, "prepare_stash_buffers", prepare_stash_buffers)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    return manager, prepared
+
+
+def test_chunk_capture_order_sizes_the_stash_for_its_in_flight_microbatches(monkeypatch):
+    """The page buffers are sized from the first eager iteration. With dynamic microbatches
+    that iteration can run fewer microbatches than the pipeline keeps in flight in a later
+    step; the chunk graphs are captured for the longer steps as well, and an overflow ends a
+    run that replays graphs. The capture therefore compares its pipeline order with the order
+    of the same schedule for the microbatches the first iteration ran, raises the recorded
+    maxima by the ratio of the microbatches in flight, and allocates the buffers again."""
+    # One microbatch of two paged layers; the schedule's order for it.
+    one_microbatch = [1_001_001, 1_002_001, -1_002_001, -1_001_001]
+    one = [1, -1]
+    manager, prepared = _make_sized_schedule_manager(monkeypatch, one_microbatch)
+    assert manager.discovered_microbatches() == (1, {1})
+
+    # A stage that keeps three of four microbatches in flight.
+    in_flight_three = [1, 1, 1, -1, 1, -1, -1, -1]
+    manager.reserve_for_capture_order(in_flight_three, one)
+    assert prepared == [(300, 243)]
+    # Capturing again (graphs deleted, e.g. for another step batch size) does not grow further,
+    # and an order within what the buffers are sized for leaves them alone.
+    manager.reserve_for_capture_order(in_flight_three, one)
+    manager.reserve_for_capture_order([1, 1, -1, -1], one)
+    assert prepared == [(300, 243)]
+    # A still longer in-flight window grows from the size reached, not from the discovery.
+    manager.reserve_for_capture_order([1, 1, 1, 1, -1, -1, -1, -1], one)
+    assert prepared == [(300, 243), (400, 324)]
+
+    # The discovery iteration already kept as many in flight as the capture order: unchanged.
+    two_microbatches = [
+        *(1_001_001, 1_002_001, 1_001_002, 1_002_002),
+        *(-1_002_001, -1_001_001, -1_002_002, -1_001_002),
+    ]
+    manager, prepared = _make_sized_schedule_manager(monkeypatch, two_microbatches)
+    assert manager.discovered_microbatches() == (2, {1})
+    manager.reserve_for_capture_order([1, 1, -1, 1, -1, -1], [1, 1, -1, -1])
+    assert prepared == []
+    assert manager.max_tokens_across_vp_stages == {(torch.bfloat16, 64): 100}
+
+    # Full activation recompute on the first of two pipeline stages, three microbatches: the
+    # forwards a recompute runs inside a backward are recorded under the number of the latest
+    # forward microbatch and have no backward of their own. They add no microbatch, and a
+    # capture for the same three microbatches leaves the buffers alone.
+    recomputed = [
+        *(1_001_001, 1_002_001, 1_001_002, 1_002_002),
+        *(1_003_002, 1_004_002, -1_004_002, -1_003_002),
+        *(1_001_003, 1_002_003),
+        *(1_003_003, 1_004_003, -1_004_003, -1_003_003),
+        *(1_005_003, 1_006_003, -1_006_003, -1_005_003),
+    ]
+    manager, prepared = _make_sized_schedule_manager(monkeypatch, recomputed)
+    assert manager.discovered_microbatches() == (3, {1})
+    three = [1, 1, -1, 1, -1, -1]
+    manager.reserve_for_capture_order(three, three)
+    assert prepared == []
+
+    # Not before the discovery is complete, not without the discovery iteration's order, and
+    # not for a rank without paged layers.
+    manager, prepared = _make_sized_schedule_manager(monkeypatch, one_microbatch)
+    manager.status = 'capture'
+    manager.reserve_for_capture_order(in_flight_three, one)
+    manager.status = 'captured'
+    manager.reserve_for_capture_order(in_flight_three, None)
+    manager.max_tokens_across_vp_stages = None
+    manager.reserve_for_capture_order(in_flight_three, one)
+    assert prepared == []
+
+
+@pytest.mark.parametrize(
+    "paged_vp_stages, expected",
+    [((1, 2), (300, 243)), ((1,), (500, 405)), ((2,), (300, 243))],
+    ids=["both_stages", "first_stage_only", "second_stage_only"],
+)
+def test_chunk_capture_order_counts_the_microbatches_of_the_paged_vp_stages(
+    monkeypatch, paged_vp_stages, expected
+):
+    """Two model chunks on the rank (virtual pipeline). An order names the chunks from 1: ``c``
+    is a forward of chunk ``c`` and ``-c`` its backward. Only the stages with paged layers hold
+    stashed activations, and which of the two they are changes what the order keeps in flight."""
+    from megatron.core.transformer.cuda_graphs import convert_schedule_table_to_order
+
+    # The example of convert_schedule_table_to_order: 2 pipeline stages, 2 chunks per rank,
+    # 5 microbatches in groups of 3, on the first pipeline rank (5 warm-up forwards).
+    schedule_table = list(zip([0, 1, 2, 0, 1, 2, 3, 4, 3, 4], [0, 0, 0, 1, 1, 1, 0, 0, 1, 1]))
+    capture_order = convert_schedule_table_to_order(5, 2, schedule_table)
+    assert capture_order == [1, 1, 1, 2, 2, 2, -2, 1, -2, 1, -2, 2, -1, 2, -1, -1, -2, -2, -1, -1]
+    # The discovery iteration ran one microbatch through both chunks.
+    discovery_order = [1, 2, -2, -1]
+    recorded = [stage * 1_000_000 + 1_001 for stage in paged_vp_stages]
+    recorded += [-entry for entry in reversed(recorded)]
+    manager, prepared = _make_sized_schedule_manager(monkeypatch, recorded, vp_size=2)
+    assert manager.discovered_microbatches() == (1, set(paged_vp_stages))
+
+    manager.reserve_for_capture_order(capture_order, discovery_order)
+    assert prepared == [expected]
+    # The order the discovery iteration ran: what the buffers are already sized for.
+    manager, prepared = _make_sized_schedule_manager(monkeypatch, recorded, vp_size=2)
+    manager.reserve_for_capture_order(discovery_order, discovery_order)
+    assert prepared == []
+
+
 def test_te_graph_capture_joins_auxiliary_streams_per_layer(monkeypatch):
     manager = PagedStashManager.__new__(PagedStashManager)
     manager._te_graph_capture = True
@@ -1309,6 +1429,68 @@ class TestChunkWiseGraphPagedStash:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
+    def test_page_buffers_resized_for_the_capture_order_serve_the_graphs(self):
+        """The capture may be for a pipeline order that keeps more microbatches in flight than
+        the first eager iteration did (dynamic microbatches). The page buffers are then
+        allocated again, larger, between the warm-up and the capture: the graphs record the new
+        buffers, and the replayed step stashes into them and reproduces the eager step."""
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        config.ENABLE_EXPERIMENTAL = True
+        with self._chunk_graph_run(expert_model_parallel_size=1) as helpers:
+            model = self._build_model(
+                num_layers=3,
+                recompute_granularity="full",
+                recompute_method="block",
+                recompute_num_layers=1,
+            )
+            batch = self._get_batch()
+            stash_manager = PagedStashManager.get_instance()
+
+            def cuda_pages():
+                return sum(
+                    stash_buffer.num_cuda_pages
+                    for dtype_buffers in stash_manager.stash_buffers.values()
+                    for stash_buffer in dtype_buffers.values()
+                )
+
+            loss = self._forward(model, batch)
+            loss.backward()
+            reference = self._step_result(model, loss)
+            loss = self._forward(model, batch)
+            loss.backward()
+            assert stash_manager.status == 'captured' and stash_manager.stash_buffers
+            pages = cuda_pages()
+            # The discovery iteration ran one microbatch.
+            assert stash_manager.discovered_microbatches() == (1, {1})
+
+            # Two microbatches in flight where the discovery iteration had one.
+            stash_manager.reserve_for_capture_order([1, 1, -1, -1], [1, -1], model.config)
+            assert stash_manager._sized_for_in_flight_peak == 2
+            assert cuda_pages() > 1.5 * pages
+
+            helper = TECudaGraphHelper(
+                model=[model], config=model.config, seq_length=self.seq_length, micro_batch_size=1
+            )
+            helpers.append(helper)
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            # The helper's own order (PP=1) is within what the buffers are sized for.
+            assert stash_manager._sized_for_in_flight_peak == 2
+
+            loss = self._forward(model, batch)
+            torch.cuda.synchronize()
+            allocated, held = _cuda_page_use(stash_manager)
+            assert allocated > 0 and held > 0, "the replayed forward did not stash"
+            loss.backward()
+            torch.cuda.synchronize()
+            assert _cuda_page_use(stash_manager)[1] == 0
+            assert check_paged_stash_overflow().any().item() == 0
+            assert check_paged_stash_host_spill().any().item() == 0
+            self._assert_same_step(self._step_result(model, loss), reference, "replayed step")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     def test_pp1_with_every_moe_layer_recomputed_allocates_no_page_buffers(self):
         """PP=1, two layers, each a recompute segment of its own (full recompute, "uniform").
 
@@ -1515,8 +1697,23 @@ class TestChunkWiseGraphPagedStash:
                 model=[model], config=model.config, seq_length=self.seq_length, micro_batch_size=1
             )
             helpers.append(helper)
+            # The premise: the warm-ups on the constant sample do overflow the rank capacity.
+            # Read the flags where the helper is about to reset its state (every rank runs
+            # this in lockstep; the check reduces over the ranks and clears nothing).
+            flagged_by_the_warm_ups = []
+            reset_after_capture = helper._reset_after_capture
+
+            def record_flags_then_reset():
+                flagged_by_the_warm_ups.append(runner.check_moe_overflow()[1])
+                reset_after_capture()
+
+            helper._reset_after_capture = record_flags_then_reset
             helper.create_cudagraphs()
             assert helper.graphs_created()
+            assert flagged_by_the_warm_ups and flagged_by_the_warm_ups[0] > 0, (
+                "the capture warm-ups no longer overflow the rank capacity: "
+                f"{flagged_by_the_warm_ups}; the test would pass without the reset"
+            )
             runner.mark_te_graph_captured(num_microbatches=1)
             _, over_budget_ranks, _ = runner.check_moe_overflow()
             assert over_budget_ranks == 0, (

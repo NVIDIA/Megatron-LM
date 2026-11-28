@@ -730,11 +730,12 @@ layout is not detected automatically. In-place FSDP loading and
 `torch_dcp` / `fsdp_dtensor` formats are not supported by this conversion.
 
 ### CUDA Graph
-CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are three implementations:
+CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are four implementations:
 
 1. `--cuda-graph-impl=local`: Captures per-layer cuda graphs using the MCore-internal cuda graph manager.
 2. `--cuda-graph-impl=transformer_engine`: Captures per-layer cuda graphs using the TE `make_graphed_callables()` interface.
 3. `--cuda-graph-impl=full_iteration`: Captures the whole training/evaluation forward-backward iteration as a single cuda graph.
+4. `--cuda-graph-impl=chunk_wise`: Captures the whole decoder block of a pipeline stage per microbatch slot using the TE `make_graphed_callables()` interface. Its MoE requirements (static token shapes) are listed in the Chunk-wise CUDA Graph section of `docs/user-guide/features/cuda_graph.md`.
 
 For inference, CUDA graph scope is controlled separately with
 `--inference-cuda-graph-scope=layer|block` together with

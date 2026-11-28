@@ -1036,6 +1036,20 @@ def validate_args(args, defaults={}):
         "parameters sharded. Use DDP or --use-distributed-optimizer instead."
     )
 
+    if getattr(args, "cuda_graph_impl", "none") == "chunk_wise" and (
+        args.use_megatron_fsdp or args.use_torch_fsdp2
+    ):
+        # FSDP gathers and releases the parameters of a layer in its forward hooks (and
+        # Megatron-FSDP v2 checks the order in which the modules are called). A block graph
+        # replay runs none of the hooks inside the block, and the capture calls the blocks
+        # outside the model forward.
+        raise ValueError(
+            "--cuda-graph-impl chunk_wise does not support Megatron-FSDP or Torch FSDP2: FSDP "
+            "gathers the parameters of a layer in its forward hooks, which a whole-block graph "
+            "replay does not run. Use --cuda-graph-impl full_iteration with FSDP, or the "
+            "distributed optimizer with chunk_wise."
+        )
+
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), 'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
         assert args.ckpt_format in (
@@ -2263,6 +2277,36 @@ def validate_args(args, defaults={}):
                 "--sequence-packing-scheduler; --sft and --dataloader-inter-document-masking "
                 "pack sequences without it."
             )
+        if (
+            args.cuda_graph_impl == "chunk_wise"
+            and args.sequence_packing_scheduler is not None
+            and args.pipeline_model_parallel_size > 1
+        ):
+            # With pipeline parallelism every in-flight microbatch owns a graph slot, and the
+            # capture bounds the packed microbatch count from the global batch size, i.e. with
+            # one sequence per dataset item. A real --sft item is itself a pack of
+            # conversations and a --dataloader-inter-document-masking sample holds several
+            # documents; the scheduler takes both apart, so a step can need more slots than
+            # were captured (the replay raises then). Mock --sft data (--mock-data, or no data
+            # source at all) has one sequence per item.
+            declares_data = any(
+                getattr(args, name, None)
+                for name in (
+                    "data_path",
+                    "train_data_path",
+                    "data_args_path",
+                    "per_split_data_args_path",
+                )
+            )
+            real_sft = args.sft and not args.mock_data and declares_data
+            if real_sft or getattr(args, "dataloader_inter_document_masking", False):
+                raise ValueError(
+                    "--cuda-graph-impl chunk_wise with pipeline parallelism and "
+                    "--sequence-packing-scheduler needs one sequence per dataset item "
+                    "(--use-varlen-dataset, or mock --sft data): a real --sft item and a "
+                    "--dataloader-inter-document-masking sample hold several sequences, while "
+                    "the number of graph slots is derived from the global batch size."
+                )
         if (
             args.cuda_graph_impl == "chunk_wise"
             and args.position_embedding_type == "mrope"

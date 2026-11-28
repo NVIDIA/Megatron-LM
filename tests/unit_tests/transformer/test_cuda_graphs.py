@@ -863,9 +863,15 @@ class TestCudaGraphConfigAndArguments:
         the microbatch count may vary; the other whole-MoE paged-stash requirements hold."""
         chunk_wise = dict(cuda_graph_impl="chunk_wise", cuda_graph_modules=[])
         monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
-        cfg = _te_whole_moe_paged_stash_config(
-            **chunk_wise, cuda_graph_dynamic_microbatches=True, cuda_graph_warmup_steps=2
+        # Packed sequences, whose pack count varies from step to step.
+        packed = dict(
+            sequence_packing_scheduler="dp_balanced",
+            cuda_graph_dynamic_microbatches=True,
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=128,
+            thd_max_packed_sequences=8,
         )
+        cfg = _te_whole_moe_paged_stash_config(**chunk_wise, **packed, cuda_graph_warmup_steps=2)
         assert cfg.cuda_graph_dynamic_microbatches
         with pytest.raises(AssertionError, match="require at least 2 cuda_graph_warmup_steps"):
             _te_whole_moe_paged_stash_config(**chunk_wise, cuda_graph_warmup_steps=1)
@@ -963,6 +969,39 @@ class TestCudaGraphConfigAndArguments:
                 AssertionError, match="chunk-wise CUDA graphs with MoE need static token shapes"
             ):
                 validate_moe_cuda_graph_support(config)
+
+    @pytest.mark.parametrize(
+        "cuda_graph_impl, megakernel_backend, supported",
+        [
+            ("chunk_wise", None, False),
+            ("chunk_wise", "mok", True),
+            ("transformer_engine", None, True),
+        ],
+        ids=["chunk-wise", "chunk-wise-megakernel", "per-layer"],
+    )
+    def test_chunk_wise_drop_padding_moe_needs_a_dispatcher_without_host_reads(
+        self, cuda_graph_impl, megakernel_backend, supported
+    ):
+        """Drop-padding gives every expert a static token count, but the allgather dispatcher
+        still copies the counts to the host in every forward: a chunk-wise capture of the whole
+        MoE stops there. alltoall and flex have a static path."""
+        config = SimpleNamespace(
+            cuda_graph_impl=cuda_graph_impl,
+            cuda_graph_modules=[],
+            num_moe_experts=4,
+            moe_expert_capacity_factor=1.0,
+            moe_pad_expert_input_to_capacity=True,
+            moe_megakernel_backend=megakernel_backend,
+            moe_token_dispatcher_type="allgather",
+        )
+        if supported:
+            validate_moe_cuda_graph_support(config)
+        else:
+            with pytest.raises(AssertionError, match="need moe_token_dispatcher_type 'alltoall'"):
+                validate_moe_cuda_graph_support(config)
+        for dispatcher in ("alltoall", "flex"):
+            config.moe_token_dispatcher_type = dispatcher
+            validate_moe_cuda_graph_support(config)
 
     def test_full_iteration_impl_requires_empty_scope(self):
         with pytest.raises(
@@ -1086,6 +1125,52 @@ class TestCudaGraphConfigAndArguments:
             monkeypatch, ['--cuda-graph-impl', 'chunk_wise'], micro_batch_size=2
         )
         assert args.micro_batch_size == 2
+
+    def test_chunk_wise_cli_requires_one_sequence_per_item_for_pipeline_slots(self, monkeypatch):
+        """With pipeline parallelism every in-flight microbatch owns a graph slot, and their
+        number is derived from the global batch size: an --sft item, a pack of conversations
+        that the scheduler takes apart, could need more slots than the capture made."""
+        packed_chunk_wise = [
+            '--cuda-graph-impl',
+            'chunk_wise',
+            '--cuda-graph-dynamic-microbatches',
+            '--sequence-packing-scheduler',
+            'dp_balanced',
+            '--calculate-per-token-loss',
+            '--pad-packed-seq-alignment',
+            'max',
+            '--max-seqlen-per-dp-cp-rank',
+            '128',
+            '--thd-max-packed-sequences',
+            '4',
+            '--pipeline-p2p-fixed-shape',
+        ]
+        two_stages = dict(pipeline_model_parallel_size=2, world_size=2)
+        real_sft = dict(sft=True, data_path=['conversations.jsonl'])
+        for refused in (real_sft, dict(dataloader_inter_document_masking=True)):
+            with pytest.raises(ValueError, match="needs one sequence per dataset item"):
+                _validated_cuda_graph_cli_args(
+                    monkeypatch, packed_chunk_wise, **refused, **two_stages
+                )
+        # Mock --sft data (asked for, or built because no data source is declared) has one
+        # sequence per item; one pipeline stage has one slot.
+        for accepted in (
+            dict(sft=True, mock_data=True, **two_stages),
+            dict(sft=True, **two_stages),
+            real_sft,
+        ):
+            args, _, _ = _validated_cuda_graph_cli_args(monkeypatch, packed_chunk_wise, **accepted)
+            assert args.cuda_graph_impl == 'chunk_wise' and args.sft
+
+    @pytest.mark.parametrize("fsdp", ["use_megatron_fsdp", "use_torch_fsdp2"])
+    def test_chunk_wise_cli_rejects_fsdp(self, monkeypatch, fsdp):
+        """FSDP gathers the parameters of a layer in its forward hooks. A block replay runs
+        none of the hooks inside the block (the capture already fails: Megatron-FSDP sees the
+        blocks called outside the model forward), so the combination is refused up front."""
+        with pytest.raises(ValueError, match="does not support Megatron-FSDP or Torch FSDP2"):
+            _validated_cuda_graph_cli_args(
+                monkeypatch, ['--cuda-graph-impl', 'chunk_wise'], **{fsdp: True}
+            )
 
     @pytest.mark.parametrize("data_path", ["sft", "dataloader_inter_document_masking"])
     def test_chunk_wise_cli_rejects_packed_data_paths_without_the_packing_scheduler(
@@ -3523,6 +3608,41 @@ class TestChunkWiseCudaGraphs:
                 {'delay_wgrad_compute': True},
                 "incompatible with overlap_moe_expert_parallel_comm and delay_wgrad_compute",
             ),
+            # The third delayed-weight-gradient option: caught here, not by the capture.
+            (
+                {
+                    'overlap_dispatch_backward_with_experts_wgrad': True,
+                    'num_moe_experts': 4,
+                    'moe_expert_capacity_factor': 1.0,
+                    'moe_pad_expert_input_to_capacity': True,
+                },
+                "incompatible with overlap_dispatch_backward_with_experts_wgrad",
+            ),
+            # A host-side tracker that only the Python of the MoE forward / backward fills.
+            (
+                {
+                    'log_moe_overload_factor': True,
+                    'num_moe_experts': 4,
+                    'moe_expert_capacity_factor': 1.0,
+                    'moe_pad_expert_input_to_capacity': True,
+                },
+                "does not support log_moe_overload_factor",
+            ),
+            # A router whose iteration count the host decides from the values of each batch.
+            (
+                {
+                    'num_moe_experts': 4,
+                    'moe_router_load_balancing_type': 'sinkhorn',
+                    'moe_router_topk': 1,
+                },
+                "does not support sinkhorn routing",
+            ),
+            # Weight shards gathered on side streams that only the local and the
+            # full-iteration graph runners join.
+            (
+                {'tensor_model_parallel_size': 2, 'tensor_parallel_num_weight_shards': 4},
+                "does not support GTP weight rematerialization",
+            ),
             (
                 {**_PACKED, 'cuda_graph_dynamic_microbatches': False},
                 "chunk CUDA graphs require cuda_graph_dynamic_microbatches",
@@ -3559,6 +3679,10 @@ class TestChunkWiseCudaGraphs:
             "cuda_graph_modules",
             "overlap_moe_expert_parallel_comm",
             "delay_wgrad_compute",
+            "overlap_dispatch_backward_with_experts_wgrad",
+            "log_moe_overload_factor",
+            "sinkhorn_routing",
+            "gtp_weight_shards",
             "packed_without_dynamic_microbatches",
             "full_recompute_hidden_dropout",
             "full_recompute_attention_dropout",
@@ -3572,6 +3696,54 @@ class TestChunkWiseCudaGraphs:
         overrides = {'cuda_graph_modules': [], **overrides}
         with pytest.raises(ValueError, match=match):
             _base_cuda_graph_config(cuda_graph_impl='chunk_wise', **overrides)
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            (
+                {'recompute_modules': ['core_attn'], 'attention_dropout': 0.1},
+                "attention dropout is not supported with graphed attention recomputation",
+            ),
+            (
+                {'recompute_modules': ['mlp'], 'hidden_dropout': 0.1},
+                "hidden dropout is not supported with graphed MLP/MoE recomputation",
+            ),
+            (
+                {'recompute_modules': ['moe'], **_DROP_PADDING_MOE, 'hidden_dropout': 0.1},
+                "hidden dropout is not supported with graphed MLP/MoE recomputation",
+            ),
+            (
+                {'recompute_modules': ['moe'], **_DROP_PADDING_MOE, 'moe_input_jitter_eps': 1e-2},
+                "moe_input_jitter_eps is not supported with graphed moe recomputation",
+            ),
+        ],
+        ids=["core_attn_dropout", "mlp_dropout", "moe_dropout", "moe_input_jitter"],
+    )
+    def test_chunk_config_rejects_randomness_in_a_captured_selective_recompute(
+        self, overrides, match
+    ):
+        """A block graph records the recompute with the forward: a dropout mask or a router
+        jitter drawn again in the recomputed forward would differ from the first one. These
+        refusals are the per-layer graphs' (a whole layer in scope); a chunk captures it too."""
+        settings = {**self._NO_DROPOUT, 'recompute_granularity': 'selective', **overrides}
+        with pytest.raises(AssertionError, match=match):
+            _base_cuda_graph_config(cuda_graph_impl='chunk_wise', cuda_graph_modules=[], **settings)
+
+    def test_chunk_config_takes_fixed_length_slots_from_the_step(self):
+        """Fixed-length batches: one slot per microbatch of the step, captured in the order
+        the schedule runs them. Dynamic slots (the topology floor of the schedule, captured in
+        the order of that larger count) are for packed sequences."""
+        with pytest.warns(UserWarning, match="cuda_graph_dynamic_microbatches only applies"):
+            fixed_length = _base_cuda_graph_config(
+                cuda_graph_impl='chunk_wise',
+                cuda_graph_modules=[],
+                cuda_graph_dynamic_microbatches=True,
+            )
+        assert fixed_length.cuda_graph_dynamic_microbatches is False
+        packed = _base_cuda_graph_config(
+            cuda_graph_impl='chunk_wise', cuda_graph_modules=[], **self._PACKED
+        )
+        assert packed.cuda_graph_dynamic_microbatches is True
 
     def test_chunk_config_accepts_mhc_recompute_without_dropout(self):
         config = _base_cuda_graph_config(
@@ -3723,6 +3895,27 @@ class TestChunkWiseCudaGraphs:
             fixed_length = _base_cuda_graph_config(**deferred)
         assert fixed_length.defer_embedding_wgrad_compute is True
         assert not [w for w in caught if "defer_embedding_wgrad_compute" in str(w.message)]
+
+    def test_chunk_config_records_the_mtp_backward_in_a_captured_post_process(self):
+        """With packed sequences the MTP loss is part of the captured post-process: its
+        backward is recorded in the backward graph, so the early backward (which the eager
+        warm-up steps would run and a replay would not) is turned off with a warning.
+        Fixed-length chunk graphs keep the MTP eager and the option untouched."""
+        early = dict(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            mtp_num_layers=1,
+            mtp_loss_early_backward=True,
+        )
+        with pytest.warns(UserWarning, match="mtp_loss_early_backward is disabled"):
+            packed = _base_cuda_graph_config(**early, **self._PACKED)
+        assert packed.mtp_loss_early_backward is False
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fixed_length = _base_cuda_graph_config(**early)
+        assert fixed_length.mtp_loss_early_backward is True
+        assert not [w for w in caught if "mtp_loss_early_backward" in str(w.message)]
 
     @pytest.mark.parametrize("variant", ["gdn", "kda"])
     def test_chunk_config_rejects_gated_delta_net_with_packed_sequences(self, variant):
@@ -3954,10 +4147,11 @@ class TestChunkWiseCudaGraphs:
         )
         with pytest.warns(UserWarning, match="pipeline_p2p_fixed_shape=True"):
             _base_cuda_graph_config(**packed_pp)
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", UserWarning)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             _base_cuda_graph_config(**packed_pp, pipeline_p2p_fixed_shape=True)
             _base_cuda_graph_config(**{**packed_pp, "pipeline_model_parallel_size": 1})
+        assert not [w for w in caught if "pipeline_p2p_fixed_shape" in str(w.message)]
 
     def test_te_capture_runs_on_the_shared_capture_stream_for_pool_sharing(self, monkeypatch):
         """The chunk graphs and the optimizer-step graph share one memory pool, whose free blocks
@@ -4366,6 +4560,61 @@ class TestChunkWiseCudaGraphs:
         assert "runs eagerly because " + eager_reason in message
 
     @pytest.mark.parametrize(
+        "scenario", ["freeze_base_model_for_mtp", "forward_only", "frozen_parameters_only"]
+    )
+    def test_chunk_discovery_keeps_a_decoder_that_runs_without_autograd_eager(
+        self, monkeypatch, scenario
+    ):
+        """``freeze_base_model_for_mtp`` (the model wraps the decoder call) and
+        ``freeze_all_layers`` (the training loop runs the step without autograd and builds the
+        helper with ``forward_only``) run the decoder under torch.no_grad() and keep none of
+        its activations. A block graph would record them, with a backward nothing replays, so
+        the block and the post-process that follows it stay eager. Frozen parameters alone do
+        not decide: a pipeline stage that holds only frozen layers still passes gradients to
+        whatever trains upstream of it, and is captured."""
+        config = SimpleNamespace(
+            cuda_graph_impl='chunk_wise',
+            config_logger_dir="",
+            freeze_base_model_for_mtp=scenario == "freeze_base_model_for_mtp",
+        )
+        decoder = TransformerBlock.__new__(TransformerBlock)
+        torch.nn.Module.__init__(decoder)
+        decoder.config = config
+        decoder.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)])
+        model_chunk = torch.nn.Module()
+        model_chunk.decoder = decoder
+        model_chunk.postprocess_block = postprocess_block = self._postprocess_block(config)
+        if scenario == "frozen_parameters_only":
+            model_chunk.requires_grad_(False)
+        messages = []
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            "log_on_each_pipeline_stage",
+            lambda **kwargs: (
+                messages.append(kwargs["msg"]) if kwargs["level"] >= logging.WARNING else None
+            ),
+        )
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda *args: 0)
+        helper = object.__new__(TECudaGraphHelper)
+        helper.model = [model_chunk]
+        helper.config = config
+        helper.forward_only = scenario == "forward_only"
+        helper.tp_group = helper.dp_cp_group = None
+
+        helper._discover_layers()
+
+        if scenario == "frozen_parameters_only":
+            assert helper.flattened_callables == [decoder, postprocess_block]
+            assert messages == []
+            return
+        assert helper.flattened_callables == []
+        assert len(messages) == 2
+        assert "the decoder block runs eagerly because the training forward runs it without" in (
+            messages[0]
+        )
+        assert "runs eagerly because the decoder block of its stage is not captured" in messages[1]
+
+    @pytest.mark.parametrize(
         ("postprocess_config", "mtp_process", "postprocess_quantized"),
         [
             (dict(mtp_num_layers=1, keep_mtp_in_bf16=False), True, True),
@@ -4420,7 +4669,8 @@ class TestChunkWiseCudaGraphs:
     def test_thd_capture_slot_bound_covers_what_the_packing_scheduler_produces(
         self, monkeypatch, capacity_field, tail_padding_policy, real_documents_per_pack
     ):
-        """The capture needs one graph slot per packed microbatch of a step. The dp_balanced
+        """The packed-microbatch bound of the capture (one of the three terms the slot count is
+        the maximum of) against the packs the scheduler really makes. The dp_balanced
         scheduler caps the real documents per pack below the static THD capacity:
         cuda_graph_thd_max_packed_sequences includes the dummy padding document whenever
         padding is enabled, thd_max_packed_sequences only under the append_dummy_seq tail

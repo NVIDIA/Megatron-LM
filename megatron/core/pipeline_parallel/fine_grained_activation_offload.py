@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch.autograd.graph import saved_tensors_hooks
 
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor
 
 # CPU offload implementation for pipeline parallelism
@@ -447,8 +448,12 @@ class OffloadTensorPool:
         self._stats['current_in_use'] = 0
         debug_rank("OffloadTensorPool: Reset complete")
 
-    def clear(self):
-        """Clear cached tensors; fixed storage stays alive for captured graph reuse."""
+    def clear(self, empty_cuda_cache: bool = True):
+        """Clear cached tensors; fixed storage stays alive for captured graph reuse.
+
+        ``empty_cuda_cache=False`` only drops the host tensors: their pinned blocks go back to
+        PyTorch's host allocator, where the next pinned allocations of those sizes find them.
+        """
         if self._fixed_buffer is not None:
             # Even an idle buffer can be referenced by a captured graph. Keep its
             # backing allocation and external events for the pool's lifetime.
@@ -464,7 +469,7 @@ class OffloadTensorPool:
         self._stats['current_in_use'] = 0
 
         # Trigger GPU cache cleanup
-        if torch.cuda.is_available():
+        if empty_cuda_cache and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         debug_rank("OffloadTensorPool: Clear complete")
@@ -1005,6 +1010,13 @@ class PipelineOffloadManager:
             if vpp_rank not in self._block_capture_forward_end:
                 if template._forward_group_end is not None:
                     self._block_capture_forward_end[vpp_rank] = template._forward_group_end
+        # The eager warm-up filled the shared host pool, and nothing takes from it while graphs
+        # own the offloads: every captured slot addresses pinned buffers of its own. Hand the
+        # pool's tensors back before the capture allocates those buffers (same shapes, so the
+        # host allocator serves them from the returned blocks) instead of holding both for the
+        # run. An eager step after a failed or released capture refills the pool on demand; the
+        # fixed pinned buffer is shared with the capture and stays (clear() leaves it alone).
+        self._cpu_tensor_pool.clear(empty_cuda_cache=False)
 
     def exit_block_capture(self, captured=True):
         """Leave the whole-block capture mode.
@@ -1022,6 +1034,39 @@ class PipelineOffloadManager:
             # Transformer Engine disables the offload around its warm-up pass and skips the
             # re-enabling hook when that pass raises.
             self.enable_offload()
+        else:
+            # Every slot keeps host buffers of its own for as long as the graphs live, so the
+            # pinned total grows with the captured slots, not with the microbatches in flight.
+            host_buffers = [
+                host_buffer
+                for handler in self._block_capture_live_chunks
+                for host_buffer in handler._block_capture_host_buffers
+            ]
+            if host_buffers:
+                pinned_bytes = sum(
+                    buffer.numel() * buffer.element_size() for buffer in host_buffers
+                )
+                logger.info(
+                    "Activation offloading: rank %d pinned %.2f GiB of host memory in %d "
+                    "buffers for the offloads of %d captured block forwards.",
+                    safe_get_rank(),
+                    pinned_bytes / 2**30,
+                    len(host_buffers),
+                    len(self._block_capture_live_chunks),
+                )
+            elif self._cpu_tensor_pool.uses_fixed_buffer:
+                # With a fixed pinned buffer the capture reserves a range of it instead.
+                reserved_bytes = self._cpu_tensor_pool.get_pool_status()["fixed_buffer"][
+                    "graph_reserved_bytes"
+                ]
+                if reserved_bytes:
+                    logger.info(
+                        "Activation offloading: rank %d reserved %.2f GiB of the fixed pinned "
+                        "buffer for the offloads of %d captured block forwards.",
+                        safe_get_rank(),
+                        reserved_bytes / 2**30,
+                        len(self._block_capture_live_chunks),
+                    )
         self._cur_forward_chunk = None
         self._cur_backward_chunk = None
 

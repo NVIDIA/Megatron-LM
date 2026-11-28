@@ -6843,6 +6843,7 @@ def train(
             optimizers=[optimizer],
             pg_collection=model_pg_collection,
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
+            forward_only=bool(getattr(args, "freeze_all_layers", False)),
         )
 
     # OTel: everything above in train() (the preamble: weight-hash check, sniff
@@ -6999,6 +7000,13 @@ def train(
                     args, optimizer
                 ):
                     disable_forward_pre_hook(model, param_sync=False)
+                if getattr(config, "mtp_num_layers", None):
+                    # A chunk-wise capture of the post-process records whether the MTP
+                    # acceptance statistics are collected. train_step() sets that policy before
+                    # every forward; with no warm-up step the capture comes first.
+                    MTPLossLoggingHelper.configure_acceptance_collection(
+                        enabled=bool(cfg.logger.tensorboard_dir or cfg.logger.wandb_project)
+                    )
                 cuda_graph_helper.create_cudagraphs()
                 if cfg.model.transformer.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(
                     args, optimizer

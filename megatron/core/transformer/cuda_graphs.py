@@ -2459,6 +2459,7 @@ class TECudaGraphHelper:
         optimizers=[],
         pg_collection=None,
         thd_sequence_length_upper_bound=None,
+        forward_only=False,
     ):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
         assert config.cuda_graph_impl in (
@@ -2476,6 +2477,8 @@ class TECudaGraphHelper:
             assert micro_batch_size == 1, "Scheduler THD graphs require micro_batch_size=1."
         self.model = model
         self.config = config
+        # The training loop runs every step under torch.no_grad() (freeze_all_layers).
+        self.forward_only = forward_only
         self.seq_length = seq_length
         self.thd_sequence_length_upper_bound = thd_sequence_length_upper_bound
         self.micro_batch_size = micro_batch_size
@@ -2861,15 +2864,20 @@ class TECudaGraphHelper:
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
-            off_interface.enter_block_capture(
-                keep_last_group=self.config.fine_grained_offloading_graph_keep_last_group
-            )
         captured = False
+        entered_block_capture = False
         try:
+            if block_offload_capture:
+                # Inside the try: a refusal here (no warm-up policy recorded) ends the capture
+                # like any other failure.
+                off_interface.enter_block_capture(
+                    keep_last_group=self.config.fine_grained_offloading_graph_keep_last_group
+                )
+                entered_block_capture = True
             yield
             captured = True
         finally:
-            if block_offload_capture:
+            if entered_block_capture:
                 off_interface.exit_block_capture(captured=captured)
             if not captured:
                 _set_capture_end()
@@ -2919,6 +2927,22 @@ class TECudaGraphHelper:
                         "corrupt the recompute direct-write replay"
                     )
 
+    def _decoder_runs_without_autograd(self) -> bool:
+        """Whether the training forward runs the decoder blocks under ``torch.no_grad()``.
+
+        ``freeze_base_model_for_mtp``: the models wrap the decoder call (``GPTModel.forward``,
+        ``HybridModel.forward``). ``forward_only``: the training loop runs the whole step
+        without autograd (``freeze_all_layers``) and says so when it builds the helper. Both
+        hold for every pipeline stage alike. A decoder that is merely frozen while something
+        upstream of it trains (``--freeze-LM`` of a VLM with a trainable projection, also on a
+        stage that holds frozen layers only) takes part in the backward and is captured.
+        """
+        return bool(
+            getattr(self.config, "freeze_base_model_for_mtp", False)
+            # getattr: unit tests build the helper without its constructor.
+            or getattr(self, "forward_only", False)
+        )
+
     def _discover_layers(self):
         """Discover captureable layers from the model and populate internal data structures."""
         self.chunks_with_decoder = []
@@ -2960,12 +2984,32 @@ class TECudaGraphHelper:
                     if num_decoder_layers > 0 and _layer_is_graphable(
                         chunk_with_decoder.decoder, self.config
                     ):
-                        callables.append(chunk_with_decoder.decoder)
-                        callables_is_mtp.append(False)
+                        if not self._decoder_runs_without_autograd():
+                            callables.append(chunk_with_decoder.decoder)
+                            callables_is_mtp.append(False)
+                        else:
+                            # The training forward runs this block under torch.no_grad() and
+                            # keeps none of its activations. A graph would record them with a
+                            # backward that is never replayed, and offload or stash them in
+                            # every forward.
+                            log_on_each_pipeline_stage(
+                                logger=logger,
+                                tp_group=self.tp_group,
+                                dp_cp_group=self.dp_cp_group,
+                                level=logging.WARNING,
+                                msg=f'Rank {torch.distributed.get_rank()}: chunk-wise CUDA '
+                                'graphs: the decoder block runs eagerly because the training '
+                                'forward runs it without autograd (freeze_base_model_for_mtp '
+                                'or freeze_all_layers).',
+                            )
                     postprocess_block = getattr(chunk_with_decoder, 'postprocess_block', None)
                     if postprocess_block is not None:
                         if not callables:
-                            eager_reason = "its pipeline stage owns no decoder layer"
+                            eager_reason = (
+                                "its pipeline stage owns no decoder layer"
+                                if num_decoder_layers == 0
+                                else "the decoder block of its stage is not captured"
+                            )
                         else:
                             eager_reason = postprocess_block.eager_only_reason()
                         if eager_reason is None:
@@ -3720,6 +3764,63 @@ class TECudaGraphHelper:
             capture_mode,
         )
 
+    def _agree_on_dynamic_microbatch_slots(self, microbatch_group_size_per_vp_stage):
+        """Return the topology-only slot floor, agreed over the pipeline group.
+
+        The floor is the largest number of microbatches a PP / VPP schedule keeps in flight for
+        one chunk. It is reduced over the pipeline group, so every pipeline rank of a run with
+        dynamic microbatch slots has to call this exactly once per capture: also a rank that owns
+        no graphable layer (:meth:`_join_capture_collectives`).
+        """
+        from megatron.core.pipeline_parallel.schedules import (
+            get_pp_rank_microbatches,
+            get_schedule_table,
+        )
+
+        probe_num_microbatches = self._get_probe_num_microbatches_for_dynamic_slots()
+        _, _, probe_warmup, _ = get_pp_rank_microbatches(
+            probe_num_microbatches,
+            self.num_model_chunks,
+            microbatch_group_size_per_vp_stage,
+            False,
+            overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
+        )
+        probe_schedule_table = get_schedule_table(
+            probe_num_microbatches, self.num_model_chunks, microbatch_group_size_per_vp_stage
+        )
+        probe_order = convert_schedule_table_to_order(
+            probe_warmup, self.num_model_chunks, probe_schedule_table
+        )
+        auto_num_slots = self._get_required_num_microbatch_slots_from_order(
+            probe_order, self.num_model_chunks
+        )
+        if self.pp_group is not None and self.pp_group.size() > 1:
+            auto_num_slots_tensor = torch.tensor(
+                [auto_num_slots], dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            torch.distributed.all_reduce(
+                auto_num_slots_tensor, op=torch.distributed.ReduceOp.MAX, group=self.pp_group
+            )
+            auto_num_slots = int(auto_num_slots_tensor.item())
+        return auto_num_slots
+
+    def _join_capture_collectives(self):
+        """Take part in the collectives of a capture on a rank that has nothing to capture.
+
+        A pipeline stage can own no graphable layer (an embedding-only first stage, a loss-only
+        last stage). Its peers still run :meth:`_get_cuda_graph_input_data`, whose dynamic slot
+        inference reduces over the pipeline group; a rank that skipped the reduction would pair
+        its next pipeline-group collective (the packing scheduler's) with it.
+        """
+        if self.pp_group.size() == 1 and not self.config.overlap_moe_expert_parallel_comm:
+            return
+        if not self._should_use_dynamic_microbatch_slots():
+            return
+        microbatch_group_size_per_vp_stage = self.config.microbatch_group_size_per_vp_stage
+        if microbatch_group_size_per_vp_stage is None:
+            microbatch_group_size_per_vp_stage = self.pp_group.size()
+        self._agree_on_dynamic_microbatch_slots(microbatch_group_size_per_vp_stage)
+
     def _get_cuda_graph_input_data(self):
         """
         Create the CUDA Graph capturing input data.
@@ -3745,39 +3846,9 @@ class TECudaGraphHelper:
             ), "If PP is not enabled, there should be only one model chunk."
             self.num_microbatches = 1
         elif self._should_use_dynamic_microbatch_slots():
-            probe_num_microbatches = self._get_probe_num_microbatches_for_dynamic_slots()
-            from megatron.core.pipeline_parallel.schedules import (
-                get_pp_rank_microbatches as _probe_get_pp,
+            auto_num_slots = self._agree_on_dynamic_microbatch_slots(
+                microbatch_group_size_per_vp_stage
             )
-            from megatron.core.pipeline_parallel.schedules import (
-                get_schedule_table as _probe_get_st,
-            )
-
-            _, _, _probe_warmup, _ = _probe_get_pp(
-                probe_num_microbatches,
-                self.num_model_chunks,
-                microbatch_group_size_per_vp_stage,
-                False,
-                overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
-            )
-            _probe_st = _probe_get_st(
-                probe_num_microbatches, self.num_model_chunks, microbatch_group_size_per_vp_stage
-            )
-            _probe_order = convert_schedule_table_to_order(
-                _probe_warmup, self.num_model_chunks, _probe_st
-            )
-            auto_num_slots = self._get_required_num_microbatch_slots_from_order(
-                _probe_order, self.num_model_chunks
-            )
-            pp_group = parallel_state.get_pipeline_model_parallel_group()
-            if pp_group is not None and pp_group.size() > 1:
-                auto_num_slots_tensor = torch.tensor(
-                    [auto_num_slots], dtype=torch.int32, device=torch.cuda.current_device()
-                )
-                torch.distributed.all_reduce(
-                    auto_num_slots_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
-                )
-                auto_num_slots = int(auto_num_slots_tensor.item())
             (
                 dynamic_capture_num_microbatches,
                 runtime_num_microbatches,
@@ -3838,6 +3909,36 @@ class TECudaGraphHelper:
             level=logging.DEBUG,
             msg=f'Rank {torch.distributed.get_rank()}: ORDER {order}',
         )
+        if getattr(self.config, "moe_paged_stash", False) and is_chunk_wise_cuda_graph(self.config):
+            # The stash sized its page buffers from the first eager iteration, which may have
+            # kept fewer microbatches in flight than the order the graphs are captured for:
+            # compare the capture order with the order of the same schedule for the
+            # microbatches that iteration ran.
+            from megatron.core.transformer.moe.paged_stash import (
+                PagedStashManager,
+                paged_stash_reserve_for_capture_order,
+            )
+
+            discovery_order = None
+            discovered_microbatches, _ = PagedStashManager.get_instance().discovered_microbatches()
+            if discovered_microbatches > 0:
+                _, _, discovery_warmup_microbatches, _ = get_pp_rank_microbatches(
+                    discovered_microbatches,
+                    self.num_model_chunks,
+                    microbatch_group_size_per_vp_stage,
+                    forward_only=False,
+                    p2p_communicator=self.p2p_communicator,
+                )
+                discovery_order = convert_schedule_table_to_order(
+                    discovery_warmup_microbatches,
+                    self.num_model_chunks,
+                    get_schedule_table(
+                        discovered_microbatches,
+                        self.num_model_chunks,
+                        microbatch_group_size_per_vp_stage,
+                    ),
+                )
+            paged_stash_reserve_for_capture_order(order, discovery_order, self.config)
         chunk_id_list = None
         if self.config.overlap_moe_expert_parallel_comm:
             wgrad_in_graph_scope = CudaGraphModule.attn in self.config.cuda_graph_modules or (
@@ -4042,6 +4143,10 @@ class TECudaGraphHelper:
                     token_dispatcher = getattr(module, "token_dispatcher", None)
                     if hasattr(token_dispatcher, "reset_over_budget"):
                         token_dispatcher.reset_over_budget()
+                    if getattr(module, "_accumulate_max_attn_logits_in_place", False):
+                        # The max attention logit that QK clipping reads after the next step
+                        # must not include the constant sample inputs of the capture.
+                        module.current_max_attn_logits = None
         reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):
@@ -4115,6 +4220,7 @@ class TECudaGraphHelper:
             logger.warning(
                 'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
             )
+            self._join_capture_collectives()
         else:
             # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
             try:

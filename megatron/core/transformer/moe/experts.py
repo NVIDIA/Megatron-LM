@@ -241,6 +241,27 @@ class GroupedMLPSubmodules:
     """
 
 
+def _token_counts_on_device(tokens_per_expert, device) -> torch.Tensor:
+    """Per-expert token counts as an int64 tensor on ``device``.
+
+    Counts that still live on the host (a Python list, or the CPU tensor of a drop-and-pad
+    dispatch) are uniform whenever every expert is padded to the same capacity. Those are
+    created on the device instead of being uploaded: a CUDA graph capture refuses a blocking
+    host-to-device copy and records a non-blocking one with the address of a temporary host
+    buffer.
+    """
+    if isinstance(tokens_per_expert, torch.Tensor):
+        if tokens_per_expert.is_cuda or torch.device(device).type != "cuda":
+            # Nothing to upload: a device tensor, or a host tensor that stays on the host.
+            return tokens_per_expert.to(device=device, dtype=torch.int64, non_blocking=True)
+        counts = tokens_per_expert.tolist()
+    else:
+        counts = list(tokens_per_expert)
+    if counts and all(count == counts[0] for count in counts):
+        return torch.full((len(counts),), int(counts[0]), dtype=torch.int64, device=device)
+    return torch.tensor(counts, dtype=torch.int64, device=device)
+
+
 @functools.lru_cache(maxsize=1)
 def _te_grouped_tensor_supports_sharded_weights() -> bool:
     """Whether TE threads the sharded parameters through its grouped-tensor path.
@@ -1050,19 +1071,12 @@ class TEGroupedMLP(MegatronModule):
                 permuted_probs.unsqueeze(-1), unpadded_tokens_per_expert
             )
             permuted_probs = permuted_probs.squeeze(-1)
-            tokens_per_expert = torch.tensor(
-                tokens_per_expert, dtype=torch.int64, device=permuted_probs.device
-            )
+            tokens_per_expert = _token_counts_on_device(tokens_per_expert, permuted_probs.device)
 
         if self._use_grouped_tensor:
-            if not isinstance(tokens_per_expert, torch.Tensor):
-                tokens_per_expert = torch.tensor(
-                    tokens_per_expert, dtype=torch.int64, device=permuted_local_hidden_states.device
-                )
-            else:
-                tokens_per_expert = tokens_per_expert.to(
-                    device=permuted_local_hidden_states.device, dtype=torch.int64, non_blocking=True
-                )
+            tokens_per_expert = _token_counts_on_device(
+                tokens_per_expert, permuted_local_hidden_states.device
+            )
         else:
             raise RuntimeError(
                 "The Transformer Engine operation-fuser MoE path requires "
@@ -1436,14 +1450,9 @@ class TEGroupedMLP(MegatronModule):
             )
 
         if self._use_grouped_tensor:
-            if not isinstance(tokens_per_expert, torch.Tensor):
-                tokens_per_expert = torch.tensor(
-                    tokens_per_expert, dtype=torch.int64, device=permuted_local_hidden_states.device
-                )
-            else:
-                tokens_per_expert = tokens_per_expert.to(
-                    device=permuted_local_hidden_states.device, dtype=torch.int64, non_blocking=True
-                )
+            tokens_per_expert = _token_counts_on_device(
+                tokens_per_expert, permuted_local_hidden_states.device
+            )
         elif isinstance(tokens_per_expert, torch.Tensor):
             tokens_per_expert = tokens_per_expert.tolist()
 

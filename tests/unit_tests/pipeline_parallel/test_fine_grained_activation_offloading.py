@@ -3591,6 +3591,35 @@ def test_block_capture_hands_the_offloads_back_to_the_eager_policy(ending):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_capture_scope_ends_a_capture_the_offload_manager_refuses():
+    """The offload manager refuses a whole-block capture that no eager warm-up preceded (it has
+    no policy to clone). The helper's capture scope treats that like any failed capture: the
+    capture flag is cleared, so a later eager forward does not take the capture path, and the
+    manager, which never entered the capture, is not told that one ended."""
+    from megatron.core.transformer import cuda_graphs
+
+    off_interface.reset_instance()
+    helper = SimpleNamespace(
+        config=SimpleNamespace(
+            fine_grained_activation_offloading=True,
+            cuda_graph_impl="chunk_wise",
+            fine_grained_offloading_graph_keep_last_group=False,
+        )
+    )
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        cuda_graphs._set_capture_start()
+        with pytest.raises(AssertionError, match="at least one eager warm-up iteration"):
+            with cuda_graphs.TECudaGraphHelper._te_capture_scope(helper):
+                pytest.fail("the scope must not be entered")
+        assert not cuda_graphs.is_graph_capturing()
+        assert not manager._block_capture and not manager._block_graphs_captured
+    finally:
+        cuda_graphs._set_capture_end()
+        off_interface.reset_instance()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 def test_block_capture_clones_margin_flags_and_marks_kept_groups_as_margin():
     """A slot's handler clones the warm-up policy including ``is_offload_margin`` (a margin group
     takes no reload slot), and ``keep_last_group`` marks the groups it keeps resident as margin
@@ -3931,6 +3960,23 @@ def test_chunk_wise_cuda_graph_with_fine_grained_activation_offloading(
 
     monkeypatch.setattr(PipelineOffloadManager, "exit_block_capture", recording_exit_block_capture)
 
+    # The host tensors of the eager warm-up's shared pool, when the capture starts and when it
+    # ends: the graphs address buffers of their own, so the pool is handed back, not kept.
+    def pooled_host_tensors(manager):
+        return sum(len(pool["all"]) for pool in manager.cpu_tensor_pool._pools.values())
+
+    pooled_around_capture = []
+    enter_block_capture = PipelineOffloadManager.enter_block_capture
+
+    def recording_enter_block_capture(manager, *args, **kwargs):
+        pooled_around_capture.append(pooled_host_tensors(manager))
+        enter_block_capture(manager, *args, **kwargs)
+        pooled_around_capture.append(pooled_host_tensors(manager))
+
+    monkeypatch.setattr(
+        PipelineOffloadManager, "enter_block_capture", recording_enter_block_capture
+    )
+
     # Eager reference: no graphs, no offloading.
     _reset_cuda_memory()
     base_model = _build_gpt_model_with_cuda_graph(
@@ -3983,6 +4029,8 @@ def test_chunk_wise_cuda_graph_with_fine_grained_activation_offloading(
         assert not cuda_graphs.is_graph_capturing()
         # No capture-time forward ran: the manager holds no host buffer for a graph.
         assert captures == [(False, [])]
+        # The warm-up pool was handed back all the same; the eager step below refills it.
+        assert pooled_around_capture[0] > 0 and pooled_around_capture[1] == 0
     else:
         graph_logits, graph_grads, _ = _run_iters_with_cuda_graph(graph_model, **graph_run)
         _assert_chunk_graph_matches_eager(graph_logits, graph_grads, base_logits, base_grads)
@@ -3993,6 +4041,9 @@ def test_chunk_wise_cuda_graph_with_fine_grained_activation_offloading(
             # A full hidden state went through a captured offload and reload.
             hidden_state_size = seq_length * micro_batch_size * hidden_size
             assert max(host_buffer_sizes, default=0) >= hidden_state_size, host_buffer_sizes
+            # The eager warm-up offloaded through the shared pool, which the capture emptied
+            # before it allocated the buffers above.
+            assert pooled_around_capture[0] > 0 and pooled_around_capture[1] == 0
         else:
             # A fully recomputed block saves no group tensor in its capture-time forward.
             assert not host_buffer_sizes
@@ -4011,6 +4062,7 @@ def test_chunk_wise_cuda_graph_with_fine_grained_activation_offloading(
         handler = manager.cur_forward_chunk()
         assert handler is not None and handler in manager._cached_chunks_forward
         assert any(handler._group_has_offloaded_tensor(group) for group in handler.offload_groups)
+        assert pooled_host_tensors(manager) > 0  # refilled on demand
         eager_logits.float().sum().backward()
         torch.cuda.synchronize()
         eager_grads = {

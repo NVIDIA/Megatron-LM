@@ -5888,6 +5888,29 @@ class TransformerConfig(ModelParallelConfig):
                         "cuda_graph_impl='chunk_wise' captures the whole decoder chunk; "
                         "cuda_graph_modules must be empty."
                     )
+                if self.gtp_weight_remat_size > 1 or self.expert_gtp_weight_remat_size > 1:
+                    # GTP gathers and reduces its weight shards on side streams and reports
+                    # gradient readiness from Python. Its CUDA graph integration joins those
+                    # streams and replays that report for the local and the full-iteration
+                    # graphs; a block capture ends with unjoined work on the capturing stream.
+                    raise ValueError(
+                        "cuda_graph_impl='chunk_wise' does not support GTP weight "
+                        "rematerialization (tensor_parallel_num_weight_shards / "
+                        "expert_tensor_parallel_num_weight_shards above the tensor-parallel "
+                        "size): GTP's CUDA graph integration covers cuda_graph_impl 'local' and "
+                        "'full_iteration' only."
+                    )
+                balancing = self.moe_router_load_balancing_type
+                balancing = balancing if isinstance(balancing, (list, tuple)) else [balancing]
+                if "sinkhorn" in balancing and (self.num_moe_experts or 0) > 1:
+                    # The Sinkhorn normalisation iterates until an error that the host reads
+                    # falls below its tolerance: a capture can neither record that read nor
+                    # the iteration count of a later batch.
+                    raise ValueError(
+                        "cuda_graph_impl='chunk_wise' does not support sinkhorn routing "
+                        "(moe_router_load_balancing_type): its normalisation loop ends on a "
+                        "host-side read of the error, which a block graph cannot record."
+                    )
                 # The captured block includes the MoE dispatch, which needs static shapes.
                 validate_moe_cuda_graph_support(self)
                 if self.moe_hybridep_pad_variable_tokens:
@@ -5909,6 +5932,28 @@ class TransformerConfig(ModelParallelConfig):
                         "overlap_moe_expert_parallel_comm and delay_wgrad_compute: those "
                         "schedules invoke the layers individually."
                     )
+                if self.log_moe_overload_factor and (self.num_moe_experts or 0) > 1:
+                    # The overload tracker is a host-side timeline: Python inside the MoE
+                    # forward and backward appends every dispatch to it, and a replay runs
+                    # neither, so the report would repeat the entries of the capture.
+                    raise ValueError(
+                        "cuda_graph_impl='chunk_wise' does not support log_moe_overload_factor: "
+                        "the token counts are recorded by Python inside the MoE forward and "
+                        "backward, which a block replay does not run."
+                    )
+                if (
+                    self.overlap_dispatch_backward_with_experts_wgrad
+                    and (self.num_moe_experts or 0) > 1
+                ):
+                    # The expert GEMMs are built with a delayed weight gradient, for which
+                    # Transformer Engine wants a backward graph of its own next to every
+                    # block; a chunk capture has none, so the capture would abort after the
+                    # warm-up steps.
+                    raise ValueError(
+                        "cuda_graph_impl='chunk_wise' is incompatible with "
+                        "overlap_dispatch_backward_with_experts_wgrad: the delayed expert "
+                        "weight gradient needs a separate backward graph per layer."
+                    )
                 if (
                     self.sequence_packing_scheduler is not None
                     and self.defer_embedding_wgrad_compute
@@ -5923,6 +5968,33 @@ class TransformerConfig(ModelParallelConfig):
                         "graph; defer_embedding_wgrad_compute is disabled."
                     )
                     self.defer_embedding_wgrad_compute = False
+                if self.sequence_packing_scheduler is not None and self.mtp_hsm:
+                    # The roll of the hidden-state history depends on whether the data path
+                    # shares the padded and the query boundaries of a pack (one tensor in both
+                    # roles), which the capture learns from an eager step.
+                    assert self.cuda_graph_warmup_steps >= 1, (
+                        "cuda_graph_impl='chunk_wise' with packed sequences and mtp_hsm needs "
+                        "cuda_graph_warmup_steps >= 1: the captured post-process rebuilds the "
+                        "packed sequence metadata the way an eager step received it."
+                    )
+                if (
+                    self.sequence_packing_scheduler is not None
+                    and self.mtp_loss_early_backward
+                    and (self.mtp_num_layers or 0) > 0
+                ):
+                    # The MTP loss is part of a captured post-process as well. An early
+                    # backward needs a live autograd graph, so a capture records the deferred
+                    # one, while the eager warm-up steps would still run the early one: the LM
+                    # head's gradient hooks then fire a different number of times before and
+                    # after the capture, which the distributed optimizer's overlapped gradient
+                    # reduction counts. Whether a stage captures its post-process is only known
+                    # when the graphs are discovered, so the option is off for every packed run.
+                    warnings.warn(
+                        "cuda_graph_impl='chunk_wise' with packed sequences: a captured "
+                        "post-process records the backward of the MTP loss in its backward "
+                        "graph; mtp_loss_early_backward is disabled."
+                    )
+                    self.mtp_loss_early_backward = False
                 if self.dynamic_context_parallel:
                     # The context-parallel collectives of a captured block are recorded with
                     # the communicator of the capture sample.
@@ -5932,6 +6004,21 @@ class TransformerConfig(ModelParallelConfig):
                         "capture sample, so a microbatch scheduled on a different CP group "
                         "cannot be replayed."
                     )
+                if self.sequence_packing_scheduler is None and self.cuda_graph_dynamic_microbatches:
+                    # Fixed-length batches give every step the same microbatch count, and the
+                    # capture takes its slots from the step (one without pipeline parallelism,
+                    # one per microbatch with it) in the order the schedule runs them. Dynamic
+                    # slots would capture the order of a larger count (the
+                    # topology floor of the PP / VPP schedule) and lend buffers between slots
+                    # by that order; an interleaved schedule whose last microbatch group is
+                    # short runs the slots in another order.
+                    warnings.warn(
+                        "cuda_graph_impl='chunk_wise' with fixed-length batches sizes its "
+                        "graph slots from the microbatches of a step; "
+                        "cuda_graph_dynamic_microbatches only applies to packed sequences and "
+                        "is disabled."
+                    )
+                    self.cuda_graph_dynamic_microbatches = False
                 if (
                     self.sequence_packing_scheduler is not None
                     and not self.cuda_graph_dynamic_microbatches
@@ -6004,7 +6091,7 @@ class TransformerConfig(ModelParallelConfig):
                 if self.cuda_graph_impl != "transformer_engine":
                     assert not self.cuda_graph_dynamic_microbatches, (
                         "cuda_graph_dynamic_microbatches is only supported with "
-                        "cuda_graph_impl=transformer_engine."
+                        "cuda_graph_impl=transformer_engine or chunk_wise."
                     )
 
                 assert (
@@ -6073,7 +6160,8 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 assert self.cuda_graph_warmup_steps >= 2, (
                     "Transformer Engine whole-MoE CUDA graphs with paged stash require at least "
-                    "2 cuda_graph_warmup_steps to record the pipeline schedule before capture."
+                    "2 cuda_graph_warmup_steps: the stash discovers its schedule and its "
+                    "capacities in them, before the capture."
                 )
 
             if self.recompute_granularity:
@@ -6178,9 +6266,10 @@ class TransformerConfig(ModelParallelConfig):
                     self.cuda_graph_impl in ("transformer_engine", "full_iteration", "chunk_wise")
                     or local_partial_moe_offload
                 ), (
-                    "fine-grained activation offloading is only supported with "
-                    "transformer_engine CUDA graph implementation or local CUDA graph "
-                    "implementation with partial MoE offload. Local partial CUDA graphs "
+                    "fine-grained activation offloading is only supported with the "
+                    "transformer_engine, full_iteration or chunk_wise CUDA graph "
+                    "implementation, or the local one with partial MoE offload. Local partial "
+                    "CUDA graphs "
                     "are supported only for expert_fc1, moe_act, or fused_group_mlp "
                     "offload when the full MoE module is not captured."
                 )

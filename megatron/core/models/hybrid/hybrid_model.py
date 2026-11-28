@@ -125,6 +125,25 @@ def _validate_hash_moe_pipeline_placement(
 class HybridPostProcessBlock(ChunkCudaGraphPostProcessBlock):
     """``HybridModel`` post-process (MTP block, LM head, loss) as a chunk CUDA graph callable."""
 
+    def eager_only_reason(self):
+        """Also stay eager where every pack arrives with a context-parallel layout plan.
+
+        With context parallelism and ``linear_cp_layout`` different from
+        ``attention_cp_layout`` the data pipeline builds the contiguous / zigzag route of every
+        pack, and the MTP consumes it on the host. The model then calls the eager post-process
+        for every microbatch: a captured one would never be replayed.
+        """
+        config = self.config
+        # getattr: unit tests build the block on stand-in configs.
+        if getattr(config, "context_parallel_size", 1) > 1 and getattr(
+            config, "linear_cp_layout", None
+        ) != getattr(config, "attention_cp_layout", None):
+            return (
+                "linear_cp_layout differs from attention_cp_layout, so every pack carries a "
+                "context-parallel layout plan that the MTP reads on the host"
+            )
+        return super().eager_only_reason()
+
     def forward(
         self,
         hidden_states,
@@ -1064,6 +1083,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             and not use_precomputed_mtp_embeddings
             and runtime_gather_output is None
             and output_processor is None
+            # A graph cannot be replayed without a tensor it was captured with.
+            and postprocess_block.receives_every_captured_input(
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                padding_mask=padding_mask,
+            )
         ):
             # Captured into / replayed from the chunk CUDA graphs.
             output = postprocess_block(

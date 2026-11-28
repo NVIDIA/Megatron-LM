@@ -1333,8 +1333,10 @@ class TestDecomposeReconstruct:
         """A hybrid model called with a ContextParallelBatch (pretrain_hybrid.py always passes
         one) forwards its per-layout metadata to the decoder next to packed_seq_params and
         padding_mask. Graph replay accepts tensors only; for a single layout the dicts repeat
-        packed_seq_params / padding_mask and the plan is None, so all three are dropped. A real
-        layout plan (per-layer CP layout conversion) cannot be captured and is refused."""
+        packed_seq_params / padding_mask and the plan is None, so all three are dropped. So is
+        the plan the data pipeline builds for every pack when linear_cp_layout differs from
+        attention_cp_layout, on a stack that converts no layout (its eager forward ignores it
+        too); only a stack that would convert layouts per layer refuses it."""
         block = _build_chunk_gpt_model(256, 4, 4, 1024, 128, 8).decoder
         psp = _make_psp([64, 64])
         padding_mask = torch.zeros(1, 128, dtype=torch.bool, device="cuda")
@@ -1359,7 +1361,13 @@ class TestDecomposeReconstruct:
         }
         assert kw['padding_mask'] is padding_mask
         assert all(v is None or torch.is_tensor(v) for v in kw.values())
-        with pytest.raises(AssertionError, match="layout plan"):
+        for layout_manager in (None, SimpleNamespace(requires_conversion=False)):
+            block._cp_layout_manager = layout_manager
+            unused_plan = {'cp_layout_plan': object()}
+            block._decompose_packed_seq_params_to_kwargs(unused_plan)
+            assert unused_plan == {}
+        block._cp_layout_manager = SimpleNamespace(requires_conversion=True)
+        with pytest.raises(RuntimeError, match="layout plan"):
             block._decompose_packed_seq_params_to_kwargs({'cp_layout_plan': object()})
 
     @pytest.mark.internal
@@ -1488,11 +1496,20 @@ def _build_chunk_gpt_model_and_eager_twin(*args, **kwargs):
 
 
 def _build_chunk_hybrid_model(
-    max_seqlen, max_num_seqs, *, tp=1, sp=False, vocab=128, cuda_graph_impl="chunk_wise"
+    max_seqlen,
+    max_num_seqs,
+    *,
+    tp=1,
+    sp=False,
+    cp=1,
+    vocab=128,
+    cuda_graph_impl="chunk_wise",
+    mtp_depths=1,
+    mtp_hsm=False,
 ):
-    """HybridModel (``*-`` decoder, one ``*-`` MTP depth) of a packed-sequence chunk-graph run:
-    attention and MLP are separate layers of the ``HybridStack`` the decoder graph captures,
-    and the MTP's inner stack runs inside the post-process graph."""
+    """HybridModel (``*-`` decoder, ``mtp_depths`` ``*-`` MTP depths) of a packed-sequence
+    chunk-graph run: attention and MLP are separate layers of the ``HybridStack`` the decoder
+    graph captures, and the MTP's inner stack runs inside the post-process graph."""
     from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
     from megatron.core.models.hybrid.hybrid_model import HybridModel
 
@@ -1503,9 +1520,11 @@ def _build_chunk_hybrid_model(
         num_query_groups=4,
         ffn_hidden_size=512,
         is_hybrid_model=True,
-        mtp_num_layers=1,
+        mtp_num_layers=mtp_depths,
+        mtp_hsm=mtp_hsm,
         tensor_model_parallel_size=tp,
         sequence_parallel=sp,
+        context_parallel_size=cp,
         bf16=True,
         params_dtype=torch.bfloat16,
         hidden_dropout=0.0,
@@ -1526,7 +1545,7 @@ def _build_chunk_hybrid_model(
             hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=vocab,
             max_sequence_length=max_seqlen,
-            hybrid_layer_pattern="*-/*-",
+            hybrid_layer_pattern="*-" + "/*-" * mtp_depths,
             position_embedding_type="rope",
         )
     )
@@ -1970,9 +1989,15 @@ def _thd_batch(seqlens, vocab, seed, capacity, max_num_seqs):
             alignment=alignment,
             target_len=target_len,
             max_num_seqs=padded_num_seqs,
+            # The pack is padded before any context-parallel slicing (the callers slice it
+            # themselves where they need a rank's share), so ``capacity`` is its global length
+            # whatever the context-parallel size of the test.
+            cp_size=1,
+            cp_rank=0,
         )
     )
     assert input_ids.shape == (1, capacity)
+    assert int(packed_seq_params.cu_seqlens_q_padded[-1]) == capacity
     assert packed_seq_params.cu_seqlens_q.numel() == max_num_seqs + 1
     return dict(
         input_ids=input_ids,
@@ -2158,7 +2183,7 @@ class _ChunkCaptureEnv:
         self.cleanups = []
         self.stream = None
 
-    def setup(self, tensor_model_parallel_size=1, micro_batch_size=1):
+    def setup(self, tensor_model_parallel_size=1, micro_batch_size=1, context_parallel_size=1):
         """Model-parallel state, the micro-batch count the capture sizes its Transformer Engine
         warm-up from (two microbatches per step) and the Transformer Engine RNG tracker."""
         from megatron.core.num_microbatches_calculator import (
@@ -2168,7 +2193,10 @@ class _ChunkCaptureEnv:
         from megatron.core.tensor_parallel.random import initialize_rng_tracker
 
         Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(tensor_model_parallel_size=tensor_model_parallel_size)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=tensor_model_parallel_size,
+            context_parallel_size=context_parallel_size,
+        )
         if self.stream is None:
             # Read after the rank selected its device: setting a stream makes its device the
             # current one, so a stream saved before that would move the rank back to device 0.
@@ -2313,6 +2341,9 @@ def chunk_capture():
 _THD_PACKINGS = ([120], [60, 60], [32, 88], [16, 40, 60])
 # The same with no document longer than a 64-entry position table.
 _THD_SHORT_DOCUMENT_PACKINGS = ([64, 56], [60, 60], [32, 64], [16, 40, 60])
+# Packs that fill the capacity exactly: no padding tail, hence no dummy sequence and no masked
+# token (one sample of the full length; two documents that add up to it).
+_THD_FULL_PACKINGS = ([128], [40, 88])
 
 
 @pytest.mark.internal
@@ -2347,8 +2378,11 @@ class TestChunkGraphRegression:
         assert model.mtp_process == bool(mtp_layers)
         batches = [
             _thd_batch(seqlens, vocab, seed, tokens, max_num_seqs)
-            for seed, seqlens in enumerate(_THD_PACKINGS)
+            for seed, seqlens in enumerate(_THD_PACKINGS + _THD_FULL_PACKINGS)
         ]
+        # The full packs carry no padded token; every other pack does.
+        padded = [bool(batch["loss_mask"].eq(0).any()) for batch in batches]
+        assert padded == [True] * len(_THD_PACKINGS) + [False] * len(_THD_FULL_PACKINGS)
 
         helper = chunk_capture.capture_and_replay_against_eager(
             monkeypatch, model, twin, batches, tokens
@@ -2473,28 +2507,44 @@ class TestChunkGraphRegression:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
-        "tensor_model_parallel_size", [1, pytest.param(2, marks=_REQUIRES_TWO_RANKS)]
+        "tensor_model_parallel_size, context_parallel_size",
+        [
+            (1, 1),
+            pytest.param(2, 1, marks=_REQUIRES_TWO_RANKS),
+            pytest.param(1, 2, marks=_REQUIRES_TWO_RANKS),
+        ],
+        ids=["tp1", "tp2", "cp2"],
     )
     def test_hybrid_capture_replay_matches_eager_called_like_pretrain_hybrid(
-        self, chunk_capture, monkeypatch, tensor_model_parallel_size
+        self, chunk_capture, monkeypatch, tensor_model_parallel_size, context_parallel_size
     ):
         """``pretrain_hybrid.py`` passes every microbatch's ``ContextParallelBatch``, so the
         ``HybridStack`` receives the per-layout dicts (``packed_seq_params_by_layout``,
         ``padding_mask_by_layout``) and the layout plan next to the tensors on every call,
         including the replays, which accept tensors only. With sequence parallelism the model
-        hands the stack the padding mask already scattered to its token frame."""
-        tp = tensor_model_parallel_size
-        chunk_capture.setup(tensor_model_parallel_size=tp)
+        hands the stack the padding mask already scattered to its token frame. With context
+        parallelism every rank captures its share of the window (the zigzag slice of a pack of
+        ``context_parallel_size`` windows), and the attention layers exchange tokens over the
+        CP group inside the block graph."""
+        tp, cp = tensor_model_parallel_size, context_parallel_size
+        chunk_capture.setup(tensor_model_parallel_size=tp, context_parallel_size=cp)
         tokens, max_num_seqs, vocab = 128, 4, 128
         model, twin = _build_chunk_hybrid_model_and_eager_twin(
-            tokens, max_num_seqs, tp=tp, sp=tp > 1, vocab=vocab
+            tokens, max_num_seqs, tp=tp, sp=tp > 1, cp=cp, vocab=vocab
         )
         assert model.postprocess_block is not None and twin.postprocess_block is None
         assert model.mtp_process
+        # A pack spans the windows of all CP ranks; its documents are multiples of 2 x CP.
         batches = [
-            _pretrain_hybrid_batch(model, _thd_batch(seqlens, vocab, seed, tokens, max_num_seqs))
-            for seed, seqlens in enumerate(_THD_PACKINGS)
+            _pretrain_hybrid_batch(
+                model,
+                _thd_batch(
+                    [cp * length for length in seqlens], vocab, seed, cp * tokens, max_num_seqs
+                ),
+            )
+            for seed, seqlens in enumerate(_THD_PACKINGS + _THD_FULL_PACKINGS)
         ]
+        assert all(batch["input_ids"].shape[-1] == tokens for batch in batches)
 
         helper = chunk_capture.capture_and_replay_against_eager(
             monkeypatch, model, twin, batches, tokens, step=_pretrain_hybrid_step
@@ -2502,6 +2552,67 @@ class TestChunkGraphRegression:
 
         assert helper.flattened_callables == [model.decoder, model.postprocess_block]
         assert len(model.postprocess_block.cuda_graphs) > 0
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hybrid_mtp_hidden_state_mixing_rolls_its_history_like_eager(
+        self, chunk_capture, monkeypatch
+    ):
+        """MTP hidden-state mixing (``mtp_hsm``) rolls the older hidden states once per depth and
+        picks the roll by whether the padded boundaries of the pack are a tensor of their own.
+        ``pretrain_hybrid.py``'s data path hands one tensor in both roles, which selects the
+        plain packed roll; the capture rebuilds the metadata from separate graph inputs and
+        would record the other roll, whose document ends differ for documents of odd length.
+        The rebuilt metadata therefore shares the tensors the way the eager calls saw them.
+
+        The mixing always picks the oldest entry here (it samples per token otherwise), so
+        every step depends on the rolled history and the two models compute the same thing."""
+        chunk_capture.setup()
+        tokens, max_num_seqs, vocab = 128, 4, 128
+        model, twin = _build_chunk_hybrid_model_and_eager_twin(
+            tokens, max_num_seqs, vocab=vocab, mtp_depths=2, mtp_hsm=True
+        )
+        assert model.postprocess_block is not None and twin.postprocess_block is None
+        # Documents of odd length.
+        batches = [
+            _pretrain_hybrid_batch(model, _thd_batch(seqlens, vocab, seed, tokens, max_num_seqs))
+            for seed, seqlens in enumerate(([33, 57, 31], [45, 75], [121], [17, 41, 59]))
+        ]
+        for batch in batches:
+            packed_seq_params = batch["packed_seq_params"]
+            assert packed_seq_params.cu_seqlens_q_padded is packed_seq_params.cu_seqlens_q
+
+        mixes = []
+
+        def oldest_entry(high, size, device=None, **kwargs):
+            mixes.append(tuple(size))
+            return torch.zeros(size, dtype=torch.long, device=device)
+
+        monkeypatch.setattr(torch, "randint", oldest_entry)
+
+        # The roll that eager never takes on this data path: every call of the translation
+        # that prepares it, in an eager step, a capture or (none) a replay.
+        from megatron.core.transformer import cuda_graphs, multi_token_prediction
+
+        local_rolls = []
+        translate = multi_token_prediction._packed_seq_params_for_local_hsm_roll
+
+        def recording_translate(*args, **kwargs):
+            local_rolls.append(cuda_graphs.is_graph_capturing())
+            return translate(*args, **kwargs)
+
+        monkeypatch.setattr(
+            multi_token_prediction, "_packed_seq_params_for_local_hsm_roll", recording_translate
+        )
+
+        helper = chunk_capture.capture_and_replay_against_eager(
+            monkeypatch, model, twin, batches, tokens, step=_pretrain_hybrid_step
+        )
+
+        assert mixes, "the hidden-state mixing never ran"
+        assert not local_rolls, f"local hidden-state roll taken (while capturing: {local_rolls})"
+        assert helper.flattened_callables == [model.decoder, model.postprocess_block]
+        assert len(model.postprocess_block.cuda_graphs) > 0
+        assert model.postprocess_block._packed_boundaries_shared_seen is True
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
@@ -3915,6 +4026,84 @@ class TestDynamicMicrobatchSlots:
         monkeypatch.setattr(cuda_graphs, "get_current_running_global_batch_size", lambda: 1)
         with pytest.raises(ValueError, match="step_batch_size_schedule"):
             helper._get_dynamic_capture_plan(auto_num_slots=3, microbatch_group_size_per_vp_stage=2)
+
+    @staticmethod
+    def _slot_agreement_helper(monkeypatch, *, pipeline_size, dynamic_slots=True):
+        """A helper stand-in on pipeline rank 1 and the pipeline-group reductions it issues."""
+        from types import SimpleNamespace
+
+        from megatron.core import parallel_state
+        from megatron.core.transformer import cuda_graphs
+
+        helper = object.__new__(cuda_graphs.TECudaGraphHelper)
+        helper.pp_group = SimpleNamespace(size=lambda: pipeline_size)
+        helper.num_model_chunks = 1
+        helper.flattened_callables = []
+        helper._captures_dsa_metric_writes = False
+        helper.config = SimpleNamespace(
+            cuda_graph_dynamic_microbatches=dynamic_slots,
+            overlap_moe_expert_parallel_comm=False,
+            microbatch_group_size_per_vp_stage=None,
+            moe_paged_stash=False,
+        )
+        monkeypatch.setattr(
+            parallel_state, "get_pipeline_model_parallel_world_size", lambda: pipeline_size
+        )
+        monkeypatch.setattr(parallel_state, "get_pipeline_model_parallel_rank", lambda: 1)
+        monkeypatch.setattr(
+            parallel_state, "get_virtual_pipeline_model_parallel_world_size", lambda: None
+        )
+        reductions = []
+
+        def record_reduction(tensor, op=None, group=None):
+            reductions.append((int(tensor.item()), op, group))
+            tensor.fill_(7)  # a peer stage reports a larger floor
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", record_reduction)
+        return helper, reductions
+
+    @pytest.mark.internal
+    def test_rank_without_graphable_layers_joins_the_slot_agreement(self, monkeypatch):
+        """A stage with no decoder layer reduces the slot floor with its pipeline peers.
+
+        The slot floor of a run with dynamic microbatch slots is reduced over the pipeline group
+        while the capture inputs are built. A rank with nothing to capture (an embedding-only or
+        loss-only stage) skips that step; without its own reduction, its next pipeline-group
+        collective (the packing scheduler's "out of data" flag) pairs with the peers' slot floor.
+        """
+        from megatron.core.transformer import cuda_graphs
+
+        helper, reductions = self._slot_agreement_helper(monkeypatch, pipeline_size=4)
+        # What a rank with layers does while it builds the capture inputs.
+        assert helper._agree_on_dynamic_microbatch_slots(4) == 7
+        with_layers = list(reductions)
+        assert len(with_layers) == 1
+        floor, op, group = with_layers[0]
+        assert floor >= 1 and op == torch.distributed.ReduceOp.MAX and group is helper.pp_group
+
+        # The capture entry point of a rank without layers issues the same reduction.
+        reductions.clear()
+        monkeypatch.setattr(cuda_graphs, "validate_moe_cuda_graph_support", lambda config: None)
+        helper._start_capturing = lambda: 0.0
+        finished = []
+        helper._finish_capturing = finished.append
+        helper.create_cudagraphs()
+        assert reductions == with_layers
+        assert finished == [0.0]
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "pipeline_size, dynamic_slots", [(1, True), (4, False)], ids=["pp1", "fixed-slots"]
+    )
+    def test_rank_without_graphable_layers_adds_no_collective_otherwise(
+        self, monkeypatch, pipeline_size, dynamic_slots
+    ):
+        """Without pipeline peers, or with one slot per microbatch, nothing is reduced."""
+        helper, reductions = self._slot_agreement_helper(
+            monkeypatch, pipeline_size=pipeline_size, dynamic_slots=dynamic_slots
+        )
+        helper._join_capture_collectives()
+        assert reductions == []
 
     @pytest.mark.internal
     def test_pp2_slots_track_max_outstanding_microbatches(self):

@@ -833,6 +833,15 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             and sequence_len_offset is None
             # The config logger dumps decoder_input, which the block does not take.
             and not has_config_logger_enabled(self.config)
+            # A graph cannot be replayed without a tensor it was captured with.
+            and postprocess_block.receives_every_captured_input(
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                padding_mask=padding_mask,
+            )
         ):
             # Captured into / replayed from the chunk CUDA graphs.
             output = postprocess_block(
@@ -852,6 +861,19 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             if mark_offload_group_ends:
                 off_interface.mark_forward_groups_end()
             return output
+
+        if (
+            self.post_process
+            and self.training
+            and getattr(self.config, "cuda_graph_impl", "none") == "chunk_wise"
+            and getattr(self.config, "defer_embedding_wgrad_compute", False)
+        ):
+            # The eager LM head keeps its input of every microbatch until the schedule computes
+            # the deferred weight gradient at the end of the step. A replayed decoder block
+            # returns a static output buffer of its graph, which Transformer Engine lends to
+            # later graphs once the block's backward has run: give the LM head its own tensor.
+            # Only the stage that owns the LM head keeps anything.
+            hidden_states = hidden_states.clone()
 
         output = self._postprocess(
             hidden_states=hidden_states,
