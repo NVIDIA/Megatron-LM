@@ -216,6 +216,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "output (cross_entropy_mxfp8_grad) when TE supports grad_quantizer.",
     ),
     KernelEntry(
+        name="liger_cross_entropy",
+        sources=("megatron/core/ops/loss/liger_cross_entropy.py",),
+        tests=(K + "test_liger_loss.py",),
+        kind="external-lib",
+        notes="Vocab-parallel loss and logits gradients replayed "
+        "under contention with explicit TP groups.",
+    ),
+    KernelEntry(
         name="te_batched_linear_matrix_parameter",
         sources=(
             "megatron/core/extensions/te_batched_linear.py",
