@@ -2,8 +2,6 @@
 
 """Optimizer param-group overrides for scale-learning QAD (LSQ)."""
 
-from typing import Dict
-
 from megatron.core.optimizer import ParamKey
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 
@@ -11,45 +9,35 @@ LSQ_SCALE_PARAM_NAMES = ("*_amax_pre", "*_amax_post")
 
 
 def get_lsq_config_overrides(
-    lsq_scale_lr: float | None, *, base_lr: float | None
-) -> Dict[ParamKey, ParamGroupOverride]:
+    lsq_scale_lr: float | None,
+    *,
+    base_lr: float | None,
+    scale_min_lr: float | None = None,
+    base_min_lr: float | None = None,
+    scale_wd_mult: float = 1.0,
+) -> dict[ParamKey, ParamGroupOverride]:
     """Optimizer overrides for scale-learning QAD (LSQ).
 
-    Puts the learnable scale (amax) params in their own param group with
-    max_lr=lsq_scale_lr. Returns no override when it equals the optimizer config's
-    base_lr: the group would then match the default group on every field that identifies
-    a group on checkpoint load, and the two would collide on resume.
+    Only settings that differ from the base policy are emitted, so identical scale
+    and ordinary groups do not collide on checkpoint load. Unset LR bounds inherit
+    the base schedule. The default weight-decay multiplier preserves the existing
+    policy; callers can explicitly disable weight decay on scales with 0.0.
+
+    Args:
+        lsq_scale_lr: Peak scale learning rate, or None to inherit the base rate.
+        base_lr: Peak learning rate in the optimizer configuration.
+        scale_min_lr: Minimum scale learning rate, or None to inherit the base rate.
+        base_min_lr: Minimum learning rate in the optimizer configuration.
+        scale_wd_mult: Weight-decay multiplier for the scales.
+
+    Returns:
+        Scale-specific contributions, without standard weight-decay or decoupled-LR rules.
     """
-    if lsq_scale_lr is None or lsq_scale_lr == base_lr:
-        return {}
-    return {ParamKey(name=LSQ_SCALE_PARAM_NAMES): ParamGroupOverride(max_lr=lsq_scale_lr)}
-
-
-def install_lsq_optimizer_overrides(lsq_scale_lr: float):
-    """Wrap megatron.training.training.get_standard_config_overrides to add LSQ overrides.
-
-    ``lsq_scale_lr`` comes from the model being built (``ModelTransformConfig.lsq_scale_lr``),
-    not from the run config, which may not hold that model (e.g. Flextron builds its own).
-
-    setup_model_and_optimizer() looks the function up by module global at call time, so this
-    takes effect if installed before the optimizer is built (it is called from the model
-    builder, which runs inside get_model()). Same pattern as
-    megatron/elastification/pretrain_hybrid_flex.py. Idempotent: the builder runs once per
-    model chunk.
-    """
-    import megatron.training.training as training
-
-    orig = training.get_standard_config_overrides
-    if getattr(orig, "_lsq_wrapped", False):
-        return
-
-    def get_standard_config_overrides(config):
-        config_overrides = orig(config)
-        config_overrides = {
-            **(config_overrides or {}),
-            **get_lsq_config_overrides(lsq_scale_lr, base_lr=config.lr),
-        }
-        return config_overrides
-
-    get_standard_config_overrides._lsq_wrapped = True
-    training.get_standard_config_overrides = get_standard_config_overrides
+    override = ParamGroupOverride()
+    if lsq_scale_lr is not None and lsq_scale_lr != base_lr:
+        override["max_lr"] = lsq_scale_lr
+    if scale_min_lr is not None and scale_min_lr != base_min_lr:
+        override["min_lr"] = scale_min_lr
+    if scale_wd_mult != 1.0:
+        override["wd_mult"] = scale_wd_mult
+    return {ParamKey(name=LSQ_SCALE_PARAM_NAMES): override} if override else {}

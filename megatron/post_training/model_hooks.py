@@ -27,7 +27,6 @@ from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
-from megatron.post_training.optimizer import install_lsq_optimizer_overrides
 from megatron.training import print_rank_0
 from megatron.training.checkpointing import resolve_checkpoint_load_dir
 
@@ -177,8 +176,7 @@ def lsq_hook(scale_lr: float | None) -> PreWrapHook:
     def hook(models: list[MegatronModule]) -> list[MegatronModule]:
         for model in models:
             _propagate_expert_allreduce_to_lsq_params(model)
-        if scale_lr is not None:
-            install_lsq_optimizer_overrides(scale_lr)
+            model._lsq_scale_lr = scale_lr
         return models
 
     return hook

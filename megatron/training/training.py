@@ -22,6 +22,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -82,8 +83,6 @@ from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
     get_megatron_optimizer,
-    get_mup_config_overrides,
-    get_standard_config_overrides,
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import (
@@ -93,10 +92,7 @@ from megatron.core.optimizer.layer_wise_optimizer import (
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
-from megatron.core.optimizer_param_scheduler import (
-    OptimizerParamScheduler,
-    get_canonical_lr_for_logging,
-)
+from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
 from megatron.core.parallel_state import (
     create_all_gather_groups,
     destroy_global_memory_buffer,
@@ -158,8 +154,12 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
-from megatron.training.config import TrainingConfig, ValidationConfig
+from megatron.training.config import (
+    TrainingConfig,
+    ValidationConfig,
+)
 from megatron.training.config.container import PretrainConfigContainer
+from megatron.training.config.optimizer_config import build_optimizer_config_overrides
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.datasets.utils import get_training_data_sequence_length
 from megatron.training.initialize import (
@@ -175,6 +175,7 @@ from megatron.training.logging.packed_sequence_stats import (
     update_packed_sequence_stats,
 )
 from megatron.training.models import ModelConfig, T5ModelConfig
+from megatron.training.optim import build_optimizer_param_scheduler, setup_optimizer
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -2443,32 +2444,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 def get_optimizer_param_scheduler(optimizer):
     """Build the learning rate scheduler."""
     cfg = get_run_config()
-    args = get_args()
 
     if cfg.train.train_iters is None and cfg.train.train_samples is None:
         raise Exception('either train-iters or train-samples should be provided.')
 
-    opt_param_scheduler = OptimizerParamScheduler(
-        optimizer,
-        init_lr=cfg.scheduler.lr_warmup_init,
-        max_lr=cfg.optimizer.lr,
-        min_lr=cfg.optimizer.min_lr,
-        lr_warmup_steps=cfg.scheduler.lr_warmup_steps,
-        lr_decay_steps=cfg.scheduler.lr_decay_steps,
-        lr_decay_style=cfg.scheduler.lr_decay_style,
-        start_wd=cfg.scheduler.start_weight_decay,
-        end_wd=cfg.scheduler.end_weight_decay,
-        wd_incr_steps=cfg.scheduler.wd_incr_steps,
-        wd_incr_style=cfg.scheduler.weight_decay_incr_style,
-        use_checkpoint_opt_param_scheduler=cfg.scheduler.use_checkpoint_opt_param_scheduler,
-        override_opt_param_scheduler=cfg.scheduler.override_opt_param_scheduler,
-        wsd_decay_steps=cfg.scheduler.wsd_decay_steps,
-        lr_wsd_decay_style=cfg.scheduler.lr_wsd_decay_style,
-        step_lr_rescale_schedule=cfg.scheduler.step_lr_rescale_schedule,
-        step_lr_rescale_warmup_samples=cfg.scheduler.step_lr_rescale_warmup_samples,
-    )
-
-    return opt_param_scheduler
+    return build_optimizer_param_scheduler(cfg.optimizer, cfg.scheduler, optimizer)
 
 
 def _reduce_sum_across_data_parallel_group(
@@ -2655,29 +2635,32 @@ def setup_model_and_optimizer(
         optimizer, opt_param_scheduler = None, None
     else:
         optim_cfg = cfg.optimizer
-        optim_cfg_overrides = get_standard_config_overrides(optim_cfg)
-        optim_cfg.timers = timers
-        if cfg.model.transformer.use_mup:
-            model_config_source = (
-                unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
-            )
-            model_config = get_model_config(model_config_source)
-            mup_overrides = get_mup_config_overrides(
-                config=optim_cfg,
-                mup_width_mult=model_config.mup_width_mult,
-                optimizer_type=optim_cfg.optimizer,
-            )
-            if mup_overrides:
-                optim_cfg_overrides = {**(optim_cfg_overrides or {}), **mup_overrides}
-
-        optimizer = get_megatron_optimizer(
+        optim_cfg_overrides = build_optimizer_config_overrides(
             optim_cfg,
+            model,
+            cfg.optimizer_config_overrides,
+            mode=cfg.optimizer_config_overrides_mode,
+        )
+        optim_cfg.timers = timers
+
+        # Legacy callers may supply a model/optimizer config without finalized scheduler
+        # horizons. As in get_optimizer_param_scheduler, use the finalized run settings.
+        run_cfg = get_run_config()
+        optimizer, opt_param_scheduler = setup_optimizer(
+            run_cfg.optimizer,
+            run_cfg.scheduler,
             model,
             config_overrides=optim_cfg_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
-            dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+            pg_collection=(
+                pg_collection if pg_collection is not None else _get_model_pg_collection(model[0])
+            ),
+            optimizer_factory=partial(
+                get_megatron_optimizer,
+                config=optim_cfg,
+                dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+            ),
         )
-        opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
     # Memory at the setup boundaries. The in-loop report_memory() calls only fire once an
