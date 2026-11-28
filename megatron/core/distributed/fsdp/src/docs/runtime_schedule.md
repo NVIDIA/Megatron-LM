@@ -60,6 +60,33 @@ with a record-and-replay mechanism.
 3. Different input sizes may require different runtime orders for efficiency. We could
    capture or compute multiple orders for the runtime to choose from.
 
+## Fused Weight Gradients
+
+![MFSDP backward runtime schedule with fused weight gradients][mfsdp-fused-wgrad-backward-schedule]
+
+Transformer Engine modules built with `fuse_wgrad_accumulation=True` accumulate weight
+gradients into `weight.main_grad` during Bwd\_i instead of returning them to autograd, so the
+reduce-scatter input must exist before Bwd\_i starts. Compared with the backward schedule above
+(changes in purple):
+
+- AI\_{i-1}, which also zeroes the buffer, is issued when Bwd\_i starts, next to the AG\_{i-1}
+  prefetch. It is queued ahead of RS\_i, so Bwd\_{i-1} can wait for it without waiting for
+  RS\_i. The first module in backward order (layer 2 here) issues its own.
+- When Bwd\_i starts, compute waits for AI\_i and sets each parameter's `main_grad` to its view
+  of the buffer.
+- CI\_i only adds the gradients autograd still returns and removes `main_grad`. TE fuses only
+  GEMM weight gradients; bias and LayerNorm gradients still go through autograd, as with
+  Megatron's DDP.
+- DI\_i still follows RS\_i, so at most two buffers are alive: one being filled and one being
+  reduced.
+- A group that needs no DP-inner reduction, such as experts with DP-inner size 1, gets no
+  buffer. TE accumulates into `main_grad` itself, which is zeroed before the step's first
+  backward, and `grad_scale` is applied when gradients are finalized.
+
+The wait at the start of Bwd\_i is needed even when the order is right. Backward order lists a
+parent before its children, so a parent issues its last child's AI with no CI in between. With
+`delay_wgrad_compute=True`, the caller picks the order of the `backward_dw()` calls.
+
 # Alternatives considered
 
 ## FSDP1
@@ -139,6 +166,8 @@ overlap.
 [mfsdp-forward-schedule]: images/runtime_schedule/mfsdp_forward_schedule.png
 
 [mfsdp-backward-schedule]: images/runtime_schedule/mfsdp_backward_schedule.png
+
+[mfsdp-fused-wgrad-backward-schedule]: images/runtime_schedule/mfsdp_fused_wgrad_backward_schedule.svg
 
 [pytorch-fsdp2-forward-schedule]: images/runtime_schedule/pytorch_fsdp2_forward_schedule.png
 
