@@ -138,6 +138,7 @@ def test_warmup_preserves_rng_and_live_storage(
     # Exercise the actual model loss wrapper, rather than assuming the layout
     # of the gradient that it supplies to the fused CE backward.
     model = Namespace(
+        config=config,
         tp_group=tp_group,
         vocab_parallel_cross_entropy=fused_cross_entropy.fused_vocab_parallel_cross_entropy,
     )

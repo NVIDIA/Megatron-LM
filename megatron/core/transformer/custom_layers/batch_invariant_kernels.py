@@ -205,8 +205,17 @@ def get_compute_units():
     return NUM_SMS
 
 
-def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
-    """Persistent matmul kernel used by batch-invariant GEMM."""
+def matmul_persistent(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+):
+    """Persistent matmul kernel used by batch-invariant GEMM.
+
+    With ``out`` (a 2-D [M, N] tensor of ``a``'s dtype, any strides), the result is written
+    there, e.g. straight into a symmetric-memory buffer; the bits do not depend on it.
+    """
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -218,8 +227,11 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    if out is None:
+        c = torch.empty((M, N), device=a.device, dtype=dtype)
+    else:
+        assert out.shape == (M, N) and out.dtype == dtype, "out must be [M, N] of a's dtype"
+        c = out
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):
@@ -531,6 +543,12 @@ def _resolve_backend(backend: str) -> str:
 def mm_batch_invariant(a, b):
     """Batch-invariant replacement for `aten::mm` (the "triton" backend)."""
     return matmul_persistent(a, b)
+
+
+def mm_out_batch_invariant(a, b, *, out):
+    """Batch-invariant replacement for `aten::mm.out`: same bits as `mm_batch_invariant`,
+    written into ``out`` (so `torch.matmul(..., out=buffer)` needs no extra copy)."""
+    return matmul_persistent(a, b, out=out)
 
 
 def addmm_batch_invariant(bias, a, b):
@@ -845,8 +863,10 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
 
         # TE flattens the outer dims of both operands before applying the layout's transposes,
         # and its output keeps B's leading dims unless B is transposed.
-        if A.dim() < 2:
-            raise ValueError(f"opA has insufficient dimensions: {A.shape}")
+        if A.dim() < 2 or B.dim() < 2:
+            raise ValueError(
+                f"TE GEMM operands must have at least two dimensions: {A.shape}, {B.shape}"
+            )
         A_2d = A.reshape(-1, A.shape[-1]) if A.dim() > 2 else A
         B_2d = B.reshape(-1, B.shape[-1]) if B.dim() > 2 else B
 
@@ -1034,6 +1054,13 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
             "Batch-invariant GEMM does not support Userbuffers/overlap "
             "(extra_output/ub/ub_type/bulk_overlap)."
         )
+
+    if grad and layout.upper() == "NT":
+        # Weight gradients reduce over tokens rather than the forward's K axis.
+        # Keep TE's native backward, including FP32 main_grad and accumulation;
+        # the replacement below rounds to the input dtype and overwrites out.
+        # Native GEMMs retain the workspace pin installed by this mode.
+        return _TE_GENERAL_GEMM_ORIG(*args, **kwargs)
 
     # Compute via autograd-aware function matching TE's layout semantics
     result = BatchInvariantTEGemmFn.apply(A, B, bias if not grad else None, out_dtype, layout)
@@ -1326,6 +1353,7 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
     _enable_te_native_workspace_starvation()
     if backend != "te_native":
         _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::mm.out", mm_out_batch_invariant, dispatch_key)
         _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)

@@ -55,7 +55,7 @@ def test_ReduceFromModelParallelRegion():
     class Ctx:
         group = tp_group
 
-    output_data, _ = mappings._ReduceFromModelParallelRegion.backward(Ctx(), input_data)
+    output_data, _, _ = mappings._ReduceFromModelParallelRegion.backward(Ctx(), input_data)
     assert torch.equal(input_data, output_data)
     Utils.destroy_model_parallel()
 

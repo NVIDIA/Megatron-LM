@@ -11,6 +11,7 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.ops.collectives.ordered_reduce import use_ordered_tp_reduce
 from megatron.core.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -986,7 +987,9 @@ if HAVE_TE:
         _pad_func = Fp8Padding(1)
         _unpad_func = Fp8Unpadding(1)
 
-        original_forward = module.forward
+        # Ordered TP reductions must see the unpadded local GEMM output.
+        wrap_te_forward = type(module).forward is TELinear.forward
+        original_forward = module._te_forward if wrap_te_forward else module.forward
 
         @wraps(original_forward)
         def padded_forward(input_tensor, *args, **kwargs):
@@ -1040,7 +1043,9 @@ if HAVE_TE:
                 # Reduce-scatter after unpadding
                 if is_row_parallel_linear(module):
                     unpadded_output = reduce_scatter_to_sequence_parallel_region(
-                        unpadded_output, group=module.tp_group
+                        unpadded_output,
+                        group=module.tp_group,
+                        ordered=use_ordered_tp_reduce(module.tp_group, unpadded_output.dtype),
                     )
 
                 # Reset sequence parallelism flag on the module
@@ -1051,7 +1056,10 @@ if HAVE_TE:
             else:
                 return unpadded_output
 
-        module.forward = padded_forward
+        if wrap_te_forward:
+            module._te_forward = padded_forward
+        else:
+            module.forward = padded_forward
         _fp8_inference_wrapped_modules.add(module)
 
     def is_wrapped_for_fp8_inference(module: torch.nn.Module) -> bool:
