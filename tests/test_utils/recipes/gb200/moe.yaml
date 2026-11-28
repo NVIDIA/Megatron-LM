@@ -232,3 +232,34 @@ products:
       - environment: [dev]
         scope: [nightly]
         platforms: [dgx_gb200]
+
+  - test_case: [mfsdp_v2_symmetric_allgather]
+    products:
+      - environment: [dev]
+        scope: [mr, nightly]
+        platforms: [dgx_gb200]
+        n_repeat: [1]
+        time_limit_override: [900]
+        script:
+          - |-
+            set -euo pipefail
+            cd /opt/megatron-lm
+            export PYTHONPATH="${{PWD}}:${{PYTHONPATH:-}}"
+            export CUDA_DEVICE_MAX_CONNECTIONS=32
+            # Exercise cross-LSA all-gather even when both nodes share an NVLink domain.
+            export NCCL_MNNVL_ENABLE=0
+            export NCCL_NVLS_ENABLE=1
+            export NCCL_GIN_TYPE=2
+            unset NCCL_ALGO NCCL_PROTO
+            NODE_RANK="${{SLURM_NODEID:-${{NODE_RANK:?NODE_RANK must identify this node}}}}"
+            uv run --no-sync python -m torch.distributed.run \
+              --nnodes={nodes} \
+              --nproc-per-node={gpus} \
+              --node-rank="$NODE_RANK" \
+              --master-addr="${{MASTER_ADDR:?MASTER_ADDR must identify node 0}}" \
+              --master-port="${{MASTER_PORT:-29500}}" \
+              --max-restarts=0 \
+              --log-dir="{assets_dir}/logs/node-$NODE_RANK" \
+              --tee=3 \
+              tests/functional_tests/test_cases/moe/{test_case}/run_test.py \
+              --output-dir={assets_dir}/results

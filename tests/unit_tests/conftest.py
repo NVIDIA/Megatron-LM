@@ -17,6 +17,7 @@ from tests.unit_tests.test_utilities import (
     reset_transient_process_state,
     restore_process_state,
     snapshot_process_state,
+    te_reads_legacy_grouped_env,
 )
 
 
@@ -84,7 +85,8 @@ def grouped_mlp_fusions(monkeypatch):
         checks.append(legacy_check)
     try:
         with monkeypatch.context() as patch:
-            patch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+            if te_reads_legacy_grouped_env():
+                patch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
             # Older TE caches a disabled flag and omits registration during import.
             # Re-evaluate its real support checks and keep registry changes test-local.
             patch.setattr(

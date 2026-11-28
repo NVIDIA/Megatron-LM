@@ -839,7 +839,6 @@ def test_multi_axis_allgather_on_3d_mesh(distributed_setup, axes, symmetric_memo
     tensors = _same_tensors_on_all_ranks(distributed_setup.device)
     source_placements = [Replicate() if axis < min(axes) else RowAtomic() for axis in range(3)]
     target_placements = [Replicate() if axis <= max(axes) else RowAtomic() for axis in range(3)]
-    source = DBuffer.distribute_tensors(tensors, mesh, source_placements)
     expected = DBuffer.distribute_tensors(tensors, mesh, target_placements)
     out = None
     if symmetric_memory:
@@ -849,8 +848,12 @@ def test_multi_axis_allgather_on_3d_mesh(distributed_setup, axes, symmetric_memo
         for axis in axes:
             dist.barrier(group=mesh.get_group(axis), device_ids=[distributed_setup.device.index])
         with torch.cuda.use_mem_pool(symm_mem.get_mem_pool(distributed_setup.device)):
+            source = DBuffer.distribute_tensors(tensors, mesh, source_placements)
             out = DBuffer(mesh, target_placements, source.layout, source.dtype, source.device)
+        assert source.is_symmetric_memory
         assert out.is_symmetric_memory
+    else:
+        source = DBuffer.distribute_tensors(tensors, mesh, source_placements)
     result = source.allgather(axes, out=out)
     if out is not None:
         assert result is out
