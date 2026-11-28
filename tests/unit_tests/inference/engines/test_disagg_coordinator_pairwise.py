@@ -96,8 +96,6 @@ async def _stop_services(engine, control, clients):
     await _async_barrier(control)
     if rank == 0:
         for client in clients:
-            client.shutdown_coordinator()
-        for client in clients:
             client.stop()
     await _async_barrier(control)
     process = getattr(engine, "inference_coordinator_process", None)

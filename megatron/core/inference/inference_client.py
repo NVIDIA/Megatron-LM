@@ -739,16 +739,9 @@ class InferenceClient:
         """Sends STOP to all engines via coordinator. Requires PAUSED or SUSPENDED.
 
         Callers should await engine.stopped for confirmation.
-        Does not affect the coordinator.
+        The engine that spawned the coordinator reaps it during its shutdown.
         """
         self._send_signal_to_engines(Headers.STOP)
-
-    def shutdown_coordinator(self):
-        """Tells the coordinator process to exit its main loop.
-
-        Does not affect the engines.
-        """
-        self._send_signal_to_engines(Headers.SHUTDOWN)
 
     def stop(self):
         """

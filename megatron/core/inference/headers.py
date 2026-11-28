@@ -63,7 +63,6 @@ class Lifecycle(IntEnum):
     """Process lifecycle signals."""
 
     DISCONNECT = 60
-    SHUTDOWN = 61
 
 
 class Transport(IntEnum):

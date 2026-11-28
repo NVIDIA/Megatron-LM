@@ -33,7 +33,7 @@ from megatron.core.inference.config import (
 from megatron.core.inference.disaggregation.handoff_ownership import HandoffClaimStatus
 from megatron.core.inference.headers import Headers
 
-from .state import CONTROL_TRANSITIONS, CoordinatorState
+from .state import CONTROL_TRANSITIONS
 
 try:
     import msgpack
@@ -523,10 +523,6 @@ def handle_control_signal(coordinator, sender_identity, metadata, bodies):
     # data-bearing signals (e.g. SET_GENERATION_EPOCH) retain their args.
     coordinator._broadcast_to_engines(metadata)
 
-    # STOP affects engines; reset coordinator to RUNNING to allow future engines.
-    if header == Headers.STOP:
-        coordinator.state = CoordinatorState.RUNNING
-
 
 @message_handler(Headers.START_CUDA_PROFILER, Headers.STOP_CUDA_PROFILER)
 def handle_cuda_profiler_signal(coordinator, sender_identity, metadata, bodies):
@@ -752,21 +748,6 @@ def handle_abort_request(coordinator, sender_identity, metadata, bodies):
             assigned_rank,
             [msgpack.packb([Headers.ABORT_REQUEST.value, request_id], use_bin_type=True)],
         )
-
-
-@message_handler(Headers.SHUTDOWN)
-def handle_shutdown(coordinator, sender_identity, metadata, bodies):
-    """Stop the coordinator event loop on request from a known client.
-
-    Sent by ``InferenceClient.shutdown_engines``.
-
-    ``metadata``: ``[header]``.
-    ``bodies``: empty.
-    """
-    if sender_identity not in coordinator.known_clients:
-        logging.warning("Coordinator: ignoring signal from unknown client.")
-        return
-    return True
 
 
 @message_handler(Headers.DISCONNECT)

@@ -78,11 +78,7 @@ def _headers(observer, request_id):
 async def _shutdown(engine, client, address, comm, context, rank):
     await cleanup_engine(engine, client, timeout=30)
     if rank == 0:
-        shutdown_client = InferenceClient(address)
-        shutdown_client.start(connect_timeout_seconds=10)
-        shutdown_client.shutdown_coordinator()
-        engine.inference_coordinator_process.join(timeout=10)
-        shutdown_client.stop()
+        # STOP alone must have reaped the coordinator the engine spawned.
         assert not engine.inference_coordinator_process.is_alive()
     comm.close()
     context.term()

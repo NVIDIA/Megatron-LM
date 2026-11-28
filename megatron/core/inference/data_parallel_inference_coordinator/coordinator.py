@@ -186,6 +186,10 @@ class DataParallelInferenceCoordinator:
         self.router_socket = self.context.socket(zmq.ROUTER)
         # Raise error if the other side of the connection has dropped.
         self.router_socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
+        # Wakes on router traffic and when the spawner closes its pipe end or dies.
+        self._poller = zmq.Poller()
+        self._poller.register(self.router_socket, zmq.POLLIN)
+        self._poller.register(self.pipe_connection, zmq.POLLIN)
         is_bound = False
         if inference_coordinator_port is not None:
             try:
@@ -208,7 +212,6 @@ class DataParallelInferenceCoordinator:
 
         # Send the address to the parent process.
         self.pipe_connection.send(self.addr)
-        self.pipe_connection.close()
 
         logging.info("Inference Coordinator: waiting for connections from data parallel ranks...")
         # First wait for all data parallel ranks to establish connections.
@@ -698,7 +701,6 @@ class DataParallelInferenceCoordinator:
         A handler that returns a truthy value stops the loop.
         """
         # Todo [Siddharth]: Make this more robust to handle invalid messages.
-        self.router_socket.setsockopt(zmq.RCVTIMEO, 1000)
         next_handoff_sweep = 0.0
         while True:
             now = time.monotonic()
@@ -717,8 +719,12 @@ class DataParallelInferenceCoordinator:
             # being decoded here -- that is what keeps this loop's cost
             # independent of prompt length.
             try:
-                sender_identity, *frames = self.router_socket.recv_multipart()
+                sender_identity, *frames = self.router_socket.recv_multipart(zmq.NOBLOCK)
             except zmq.Again:
+                # Idle: sleep until a message arrives or the next sweep is due.
+                # Exit once the spawner has closed its end of the pipe or died.
+                if self.pipe_connection.fileno() in dict(self._poller.poll(1000)):
+                    break
                 continue
 
             # An empty payload is a data parallel rank (re-)registering itself.

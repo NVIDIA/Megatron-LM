@@ -14,7 +14,6 @@ class CoordinatorState(Enum):
     RUNNING = auto()
     PAUSED = auto()
     SUSPENDED = auto()
-    STOPPING = auto()
 
 
 _ALL_STATES = frozenset(CoordinatorState)
@@ -54,9 +53,10 @@ CONTROL_TRANSITIONS = {
     Headers.RESUME: ControlTransition(
         allowed_from=frozenset({CoordinatorState.SUSPENDED}), new_state=CoordinatorState.PAUSED
     ),
+    # Transition back to RUNNING temporarily, until the engine process kills the coordinator.
     Headers.STOP: ControlTransition(
         allowed_from=frozenset({CoordinatorState.PAUSED, CoordinatorState.SUSPENDED}),
-        new_state=CoordinatorState.STOPPING,
+        new_state=CoordinatorState.RUNNING,
     ),
     # No state change; broadcast in any state so engines stay in sync.
     Headers.SET_GENERATION_EPOCH: ControlTransition(allowed_from=_ALL_STATES, new_state=None),
