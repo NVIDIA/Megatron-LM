@@ -403,8 +403,10 @@ class StepPostProcessingMixin:
                 # Record tokens emitted (and kept) this step so a client can reconstruct
                 # per-step acceptance lengths. Runs AFTER the stop-word check, which may
                 # truncate the last step in place, so subtract the trim to keep the list
-                # summing to `generated_length`. The same reason excludes a consumed chunked
-                # prefill: it samples tokens that are never appended. Spec decoding only.
+                # summing to `generated_length` (the check itself unwinds earlier entries
+                # when a stop sequence reaches back past this step). The same reason excludes
+                # a consumed chunked prefill: it samples tokens that are never appended. Spec
+                # decoding only.
                 if (
                     self.num_speculative_tokens > 0
                     and request_id != consumed_chunked_prefill_request_id
@@ -413,20 +415,6 @@ class StepPostProcessingMixin:
                     emitted = len(tokens) - num_stop_word_trim
                     if emitted > 0:
                         request.acceptance_step_lengths.append(emitted)
-                    else:
-                        # A stop sequence can reach back past this step's tokens, removing ones
-                        # earlier entries already counted. Unwind them so the list keeps summing
-                        # to `generated_length`; a client reconstructing acceptance from it
-                        # would otherwise read a length longer than the output.
-                        residual = -emitted
-                        while residual > 0 and request.acceptance_step_lengths:
-                            last = request.acceptance_step_lengths[-1]
-                            if last > residual:
-                                request.acceptance_step_lengths[-1] = last - residual
-                                residual = 0
-                            else:
-                                residual -= last
-                                request.acceptance_step_lengths.pop()
 
                 # Track per-position acceptance statistics for logging.
                 # Skip prefill requests: MTP heads only propose speculative tokens
@@ -966,6 +954,17 @@ class StepPostProcessingMixin:
                     values = getattr(segment, key, None)
                     if values is not None:
                         setattr(segment, key, values[:-trim])
+
+                # Earlier steps' emitted-token counts are stored too. Unwind them
+                # newest first so they keep summing to the segment's tokens.
+                step_lengths = getattr(segment, "acceptance_step_lengths", None) or []
+                residual = trim
+                while residual > 0 and step_lengths:
+                    if step_lengths[-1] > residual:
+                        step_lengths[-1] -= residual
+                        residual = 0
+                    else:
+                        residual -= step_lengths.pop()
 
             # TPOT is intentionally sparse on non-logging steps. Trim it only
             # when it is demonstrably one value per generated token.
