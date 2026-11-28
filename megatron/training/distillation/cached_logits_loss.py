@@ -150,7 +150,12 @@ class StudentLogitsCapture:
         if not module.training:
             return
         # NOTE: Assumes main head runs after MTP layers, overwriting this value prior to pop().
-        self._logits = output[0] if isinstance(output, tuple) else output
+        logits = output[0] if isinstance(output, tuple) else output
+        # CrossEntropyTarget consumes logits in place (e.g., native FP32 CE and TE CE with
+        # overwrite_input=True), and topk_kl_div subtracts the row max in place on FP32
+        # input. Keep a differentiable copy so neither loss mutates storage needed by the
+        # other's forward or backward.
+        self._logits = logits.clone()
 
     def pop(self) -> torch.Tensor:
         """Return captured logits and clear the reference for the next forward."""
