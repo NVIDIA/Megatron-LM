@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import inspect
 from typing import Any, Optional
 
 import torch
@@ -16,6 +17,18 @@ from megatron.core.inference.sampling_params import (
     is_no_op_top_k,
     is_no_op_top_p,
 )
+
+# Newer FlashInfer releases default `top_p_renorm_probs` to a non-deterministic pivot search.
+_DETERMINISTIC_RENORM = {}
+if flashinfer is not None:
+    try:
+        if (
+            "is_deterministic"
+            in inspect.signature(flashinfer.sampling.top_p_renorm_probs).parameters
+        ):
+            _DETERMINISTIC_RENORM = {"is_deterministic": True}
+    except (TypeError, ValueError):
+        pass
 
 
 class FlashInferSampling(Sampling):
@@ -140,6 +153,81 @@ class FlashInferSampling(Sampling):
             return sampled_tokens
         output.copy_(sampled_tokens)
         return output
+
+    def probs_kernel(
+        self, logits: Tensor, context, *, token_to_request_index: Optional[Tensor] = None
+    ) -> Tensor:
+        """Per-row probabilities of the FlashInfer top-k / top-p sampling distribution.
+
+        Same filtering as `log_probs_kernel` (temperature, then top-k renorm, then top-p renorm),
+        but returns probabilities directly and skips the renorm kernels when no request in the
+        batch uses the filter.
+
+        Args:
+            logits (Tensor): Raw logits with shape `[num_rows, vocab_size]`.
+            context: Active dynamic inference context providing GPU sampling metadata.
+            token_to_request_index (Optional[Tensor]): Optional mapping from each
+                logits row to its request index.
+
+        Returns:
+            Tensor: `[num_rows, vocab_size]` float32 probabilities.
+        """
+        gpu_view = context.gpu_view
+        if token_to_request_index is None:
+            num_rows = logits.size(0)
+            temperature = gpu_view.temperature[:num_rows]
+            top_k = gpu_view.top_k[:num_rows]
+            top_p = gpu_view.top_p[:num_rows]
+        else:
+            token_to_request_index = token_to_request_index.to(logits.device, non_blocking=True)
+            temperature = gpu_view.temperature[token_to_request_index]
+            top_k = gpu_view.top_k[token_to_request_index]
+            top_p = gpu_view.top_p[token_to_request_index]
+
+        temperature = temperature.clamp(min=MIN_SAMPLING_TEMPERATURE)
+        # bf16 logits / fp32 temperature promotes to fp32 in one pass.
+        probs = torch.softmax(logits / temperature.unsqueeze(1), dim=-1, dtype=torch.float32)
+
+        no_top_k_batch, no_top_p_batch = context.active_sampling_filter_flags()
+        if not no_top_k_batch:
+            no_top_k = is_no_op_top_k(top_k) | (top_k >= self._vocab_size)
+            top_k_safe = top_k.masked_fill(no_top_k, self._vocab_size)
+            probs = flashinfer.sampling.top_k_renorm_probs(probs, top_k_safe)
+        if not no_top_p_batch:
+            top_p_safe = top_p.masked_fill(is_no_op_top_p(top_p), 1.0)
+            # Deterministic renorm: q is rebuilt at verification and must equal the q the draft
+            # was sampled from, bit for bit (and identically on every TP rank).
+            probs = flashinfer.sampling.top_p_renorm_probs(
+                probs, top_p_safe, **_DETERMINISTIC_RENORM
+            )
+        return probs
+
+    def sample_from_probs(self, probs: Tensor) -> Tensor:
+        """Draw one token per row of `probs` with FlashInfer's seeded sampling kernel."""
+        return flashinfer.sampling.sampling_from_probs(
+            probs, deterministic=True, generator=self._rng
+        ).long()
+
+    def chain_speculative_sampling(
+        self, draft_probs: Tensor, draft_token_ids: Tensor, target_probs: Tensor
+    ):
+        """Fused FlashInfer chain speculative sampling (falls back to the torch reference).
+
+        `flashinfer.sampling.chain_speculative_sampling` returns `[B, D + 1]` tokens with the
+        accepted drafts, then the replacement/bonus token at index `emitted_draft_token_num`,
+        then -1 padding; `emitted_draft_token_num` counts accepted drafts (no bonus).
+        """
+        kernel = getattr(flashinfer.sampling, "chain_speculative_sampling", None)
+        if kernel is None:
+            return super().chain_speculative_sampling(draft_probs, draft_token_ids, target_probs)
+        output_token_ids, _, emitted = kernel(
+            draft_probs.float().contiguous(),
+            draft_token_ids.to(torch.int32).contiguous(),
+            target_probs.float().contiguous(),
+            deterministic=True,
+            generator=self._rng,
+        )
+        return output_token_ids.long(), emitted.long()
 
     def log_probs_kernel(
         self, logits: Tensor, context, *, token_to_request_index: Optional[Tensor] = None

@@ -72,6 +72,7 @@ class DeferredKvHandoff:
     future: asyncio.Future
     offload_params: dict | None = None
     request_metadata: HandoffRequestMetadata | None = None
+    mtp_draft_q: Any = None  # [num_mtp_depths, vocab] fp32 CPU draft distributions, if sent.
 
 
 @dataclass(kw_only=True)
@@ -105,3 +106,4 @@ class PendingKvImport:
     destinations_safe: bool = True  # Whether allocated blocks may return to the pool.
     terminal_state_reported: bool = False  # Avoid repeat reports and premature block reuse.
     cancel_requested: bool = False
+    mtp_draft_q: Any = None  # Imported draft distributions for rejection verification.

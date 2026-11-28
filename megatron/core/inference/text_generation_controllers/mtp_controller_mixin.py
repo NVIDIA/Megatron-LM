@@ -15,15 +15,17 @@ the model -- including the chunked-prefill boundary carry, which lives on the co
 `MTPMetadata` so that it is invalidated alongside every other piece of MTP state.
 """
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from itertools import accumulate
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.inference.communication_utils import broadcast_from_last_pipeline_stage
+from megatron.core.inference.text_generation_controllers.mtp_utils_triton import HAVE_TRITON
 from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
@@ -36,6 +38,8 @@ from megatron.core.utils import (
     nvtx_range_push,
     round_up_to_nearest_multiple,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -59,6 +63,24 @@ class _CommitSegments:
     starts: Tensor
     hidden: Tensor
     tokens: Tensor
+
+
+@dataclass
+class _RejectionPlan:
+    """Decode requests verified by rejection sampling this step (host-side, active-row order).
+
+    Args:
+        rows (List[int]): Active decode row of each request.
+        draft_rows (List[int]): Its row in the last draft loop (`_mtp_draft_probs` /
+            `_sampled_mtp_tokens_cuda` column).
+    """
+
+    rows: List[int]
+    draft_rows: List[int]
+    # Plan index -> (q [num_mtp_depths, vocab] fp32 GPU, drafts [num_mtp_depths] int64 GPU) for
+    # requests whose drafts were imported from a disaggregated prefill engine; their
+    # `draft_rows` entry is unused.
+    imported: Dict[int, Tuple[Tensor, Tensor]] = field(default_factory=dict)
 
 
 class MTPControllerMixin:
@@ -88,6 +110,11 @@ class MTPControllerMixin:
         Addresses must be stable across steps for CUDA graph capture.
         """
         self._mtp_resolved_padded_count = None
+        self._mtp_draft_probs = None
+        self._mtp_draft_row_of_request = None
+        # Request id -> (q, drafts) imported with a disaggregated prefill->decode handoff,
+        # consumed by that request's first rejection-sampling verification.
+        self._imported_mtp_draft_q: Dict[int, Tuple[Tensor, Tensor]] = {}
         if not self.num_speculative_tokens:
             self._sampled_mtp_tokens_cuda = None
             self._accepted_tokens_per_request = None
@@ -141,6 +168,463 @@ class MTPControllerMixin:
         )
         self._async_sched_mtp_verification_gpu_ready_event = torch.cuda.Event()
         self._async_sched_accepted_counts_cpu_ready_event = torch.cuda.Event()
+
+        if self._mtp_rejection_enabled() and self.num_mtp_depths > 0:
+            # Rejection sampling of probabilistic drafts needs each depth's full draft
+            # distribution q at verification, one step later. Keep the filtered fp32 q the draft
+            # was sampled from (rather than the logits) so verification neither rebuilds q (a
+            # softmax + top-k/top-p renorm per draft row) nor can see a q that differs from the
+            # sampled one. Written and read eagerly outside every CUDA graph; static address, no
+            # host sync. Greedy drafts keep nothing.
+            self._mtp_draft_probs = torch.empty(
+                [self.num_mtp_depths, max_requests, self.vocab_size],
+                dtype=torch.float32,
+                device=device,
+            )
+            logger.info(
+                "MTP rejection sampling: draft-probability buffer %d x %d x %d fp32 = %.1f MiB",
+                self.num_mtp_depths,
+                max_requests,
+                self.vocab_size,
+                self._mtp_draft_probs.numel() * 4 / 2**20,
+            )
+
+    def _mtp_greedy_drafts(self) -> bool:
+        """Whether MTP drafts are the argmax of each depth's logits (one-hot draft distribution)."""
+        return getattr(self, "mtp_draft_sample_method", "greedy") == "greedy"
+
+    def _mtp_rejection_enabled(self) -> bool:
+        """Whether MTP drafts are verified by the chain rejection sampler with a stored q.
+
+        Only probabilistic drafts need it. A greedy draft's q is one-hot, for which rejection
+        sampling (accept with probability p(x), otherwise emit a sample of p with x removed) is
+        exactly the exact-match verifier, so greedy drafts always take the exact-match path.
+        """
+        return (
+            bool(self.num_speculative_tokens)
+            and getattr(self, "mtp_verification", "exact_match") == "rejection"
+            and not self._mtp_greedy_drafts()
+        )
+
+    def _sample_mtp_draft(self, depth: int, logits_2d: Tensor, num_rows: int) -> Tensor:
+        """Choose one draft depth's tokens, keeping q for rejection-sampling verification.
+
+        Greedy drafting (`mtp_draft_sample_method='greedy'`) returns the argmax; temperature
+        and top-k / top-p filtering do not change it, and nothing is stored. Probabilistic
+        drafting under exact-match verification is the plain sampler. Probabilistic drafting
+        under rejection sampling stores q, the backend's filtered distribution (`probs_kernel`,
+        the request's temperature / top-k / top-p), in `_mtp_draft_probs[depth]` and samples
+        the draft from that stored q, so verification uses exactly the distribution the draft
+        was drawn from. Greedy (top_k == 1) rows draft their argmax in every mode, and an
+        all-greedy batch keeps the plain sampler, so it is bit-identical across modes.
+
+        Args:
+            depth (int): Draft depth.
+            logits_2d (Tensor): `[num_rows, vocab]` draft logits for the active requests.
+            num_rows (int): Active request count.
+
+        Returns:
+            Tensor: `[num_rows]` draft tokens.
+        """
+        context = self.inference_wrapped_model.inference_context
+        # Pinned CPU metadata: no device sync. An all-greedy (top_k == 1) batch keeps the plain
+        # sampler in every mode, so its drafts are bit-identical across modes.
+        greedy = context.active_request_metadata["top_k"][:num_rows] == 1
+        if num_rows == 0 or bool(greedy.all()):
+            return self._sample_from_logits_2d(logits_2d)
+        if self._mtp_greedy_drafts():
+            return logits_2d.argmax(dim=-1)
+        # getattr: controllers built without `_init_mtp_sampling_tensors` (tests) draft plainly.
+        draft_probs_buf = getattr(self, "_mtp_draft_probs", None)
+        if draft_probs_buf is None:
+            return self._sample_from_logits_2d(logits_2d)
+
+        assert logits_2d.shape[-1] == draft_probs_buf.shape[-1], (
+            f"MTP logits vocab {logits_2d.shape[-1]} != draft buffer vocab "
+            f"{draft_probs_buf.shape[-1]}"
+        )
+        stored = draft_probs_buf[depth, :num_rows]
+        stored.copy_(self._sampling.probs_kernel(logits_2d, context))
+        tokens = self._sampling.sample_from_probs(stored)
+        if bool(greedy.any()):
+            greedy_gpu = greedy.to(tokens.device, non_blocking=True)
+            tokens = torch.where(greedy_gpu, logits_2d.argmax(dim=-1), tokens)
+        return tokens
+
+    def _record_mtp_draft_rows(self, context, num_draft_requests: int) -> None:
+        """Remember which request each draft row belongs to, for the next verification.
+
+        Requests are reordered (finished, paused, compacted) between drafting and verification,
+        so the next verification looks the draft rows up by request id.
+        """
+        if getattr(self, "_mtp_draft_probs", None) is None:
+            return
+        start = context.paused_request_count
+        request_ids = context.request_ids[start : start + num_draft_requests].tolist()
+        self._mtp_draft_row_of_request = {rid: row for row, rid in enumerate(request_ids)}
+
+    def _mtp_rejection_plan(self, num_decode_requests: int) -> Optional[_RejectionPlan]:
+        """Host-side selection of the decode requests verified by rejection sampling.
+
+        A request qualifies when it is not greedy (greedy keeps exact match, which is identical)
+        and the last draft loop drafted for it (looked up by request id; e.g. a request resumed
+        after a pause carries drafts from an older loop and keeps exact match). Consumes the
+        draft-row map: one verification per draft loop. Reads only pinned CPU state.
+
+        Returns:
+            Optional[_RejectionPlan]: The qualifying rows, or None when there are none.
+        """
+        row_of_request = getattr(self, "_mtp_draft_row_of_request", None) or {}
+        self._mtp_draft_row_of_request = None
+        imported = getattr(self, "_imported_mtp_draft_q", None) or {}
+        if (
+            getattr(self, "_mtp_draft_probs", None) is None
+            or not (row_of_request or imported)
+            or num_decode_requests == 0
+            or self.num_mtp_depths == 0
+        ):
+            return None
+        context = self.inference_wrapped_model.inference_context
+        start = context.paused_request_count
+        request_ids = context.request_ids[start : start + num_decode_requests].tolist()
+        top_k = context.active_request_metadata["top_k"][:num_decode_requests].tolist()
+        rows: List[int] = []
+        draft_rows: List[int] = []
+        plan_imported: Dict[int, Tuple[Tensor, Tensor]] = {}
+        for row, (rid, k) in enumerate(zip(request_ids, top_k)):
+            if k == 1:
+                continue
+            draft_row = row_of_request.get(rid)
+            if draft_row is None:
+                # First verification of a disaggregated import: its drafts came from the
+                # prefill engine's draft loop, and q came with the handoff.
+                entry = imported.pop(rid, None)
+                if entry is None:
+                    continue
+                plan_imported[len(rows)] = entry
+                draft_row = -1
+            rows.append(row)
+            draft_rows.append(draft_row)
+        if imported:
+            # Drop imports whose request left the context before its first verification.
+            live = set(context.request_ids[: context.total_request_count].tolist())
+            for rid in [rid for rid in imported if rid not in live]:
+                del imported[rid]
+        if not rows:
+            return None
+        return _RejectionPlan(rows=rows, draft_rows=draft_rows, imported=plan_imported)
+
+    def mtp_draft_q_shape(self) -> Optional[Tuple[int, int]]:
+        """`(num_mtp_depths, vocab)` of the stored draft distributions, or None when MTP
+        rejection-sampling verification is off."""
+        buf = getattr(self, "_mtp_draft_probs", None)
+        if buf is None or self.num_mtp_depths == 0:
+            return None
+        return self.num_mtp_depths, int(buf.shape[-1])
+
+    def export_mtp_draft_q(self, request_id: int) -> Optional[Tuple[Tensor, List[int]]]:
+        """q and drafts of a request drafted by the last draft loop, for a handoff export.
+
+        Side: disaggregated prefill engine, after the step whose draft loop produced the
+        handoff's `resume_tokens` proposals. Returns None when rejection verification is off or
+        the request was not drafted by the last draft loop. Call only for sampled requests.
+        Copies `[num_mtp_depths, vocab]` fp32 to the host (synchronizes the stream).
+        """
+        if getattr(self, "_mtp_draft_probs", None) is None or self.num_mtp_depths == 0:
+            return None
+        draft_row = (getattr(self, "_mtp_draft_row_of_request", None) or {}).get(request_id)
+        if draft_row is None:
+            return None
+        # The caller skips greedy requests (their rows may hold an unwritten q): the per-row
+        # sampling metadata may already be compacted for the next step here.
+        q = self._mtp_draft_probs[:, draft_row].cpu()
+        drafts = self._sampled_mtp_tokens_cuda[: self.num_mtp_depths, draft_row].tolist()
+        return q, drafts
+
+    def import_mtp_draft_q(self, request_id: int, q: Tensor, drafts: Sequence[int]) -> None:
+        """Register an imported request's draft distributions for its first verification.
+
+        Side: disaggregated decode engine, when the imported request is admitted. Ignored under
+        exact-match verification.
+        """
+        if getattr(self, "_mtp_draft_probs", None) is None:
+            return
+        expected = (self.num_mtp_depths, self._mtp_draft_probs.shape[-1])
+        if tuple(q.shape) != expected or len(drafts) != self.num_mtp_depths:
+            raise ValueError(
+                f"Imported MTP draft q has shape {tuple(q.shape)} / {len(drafts)} drafts; "
+                f"expected {expected} / {self.num_mtp_depths}"
+            )
+        device = self._mtp_draft_probs.device
+        self._imported_mtp_draft_q[int(request_id)] = (
+            q.to(device=device, dtype=torch.float32, non_blocking=True),
+            torch.tensor([int(t) for t in drafts], dtype=torch.int64).to(device, non_blocking=True),
+        )
+
+    def _sample_speculative_verify_rows(
+        self,
+        sample_logits: Tensor,
+        sample_gather_indices: Optional[Tensor],
+        num_decode_requests: int,
+        num_prefill_requests: int,
+        plan: Optional[_RejectionPlan],
+    ) -> Tensor:
+        """Independent target samples for the verify rows the rejection sampler does not write.
+
+        Without a plan this is the backend's `sample_speculative`. With one, the rows
+        `r * (D + 1) + 0..num_mtp_depths` of each planned request are produced by the chain
+        sampler in `_apply_mtp_rejection_sampling`, so they are skipped here (filled with -1);
+        every other row (exact-match requests, draft positions past `num_mtp_depths`, prefill)
+        is sampled exactly as before.
+
+        Returns:
+            Tensor: `[num_decode * (D + 1) + num_prefill]` sampled tokens.
+        """
+        context = self.inference_wrapped_model.inference_context
+        num_spec = self.num_speculative_tokens
+        if plan is None:
+            return self._sampling.sample_speculative(
+                sample_logits,
+                num_decode_requests,
+                num_prefill_requests,
+                num_spec,
+                context,
+                gather_indices=sample_gather_indices,
+            )
+
+        stride = num_spec + 1
+        num_decode_rows = num_decode_requests * stride
+        total = num_decode_rows + num_prefill_requests
+        device = sample_logits.device
+        row_request = torch.cat(
+            [
+                torch.arange(num_decode_requests).repeat_interleave(stride),
+                torch.arange(num_decode_requests, num_decode_requests + num_prefill_requests),
+            ]
+        )
+        keep = torch.ones(total, dtype=torch.bool)
+        for row in plan.rows:
+            keep[row * stride : row * stride + self.num_mtp_depths + 1] = False
+        subset = keep.nonzero().squeeze(1)
+
+        output = torch.full((total,), -1, dtype=torch.int64, device=device)
+        if subset.numel() > 0:
+            subset_gpu = subset.to(device, non_blocking=True)
+            gather = (
+                subset_gpu if sample_gather_indices is None else sample_gather_indices[subset_gpu]
+            )
+            no_top_k, no_top_p = context.active_sampling_filter_flags()
+            output[subset_gpu] = self._sampling.sample_kernel(
+                sample_logits,
+                subset.numel(),
+                context,
+                no_top_k=no_top_k,
+                no_top_p=no_top_p,
+                gather_indices=gather,
+                token_to_request_index=row_request[subset].to(device, non_blocking=True),
+                eager=True,
+            )
+        return output
+
+    def _apply_mtp_rejection_sampling(
+        self,
+        output_tokens: Tensor,
+        sample_logits: Tensor,
+        sample_gather_indices: Optional[Tensor],
+        input_tokens_required: Tensor,
+        plan: _RejectionPlan,
+    ) -> None:
+        """Write the chain speculative sampling result of each planned request into its rows.
+
+        `output_tokens` holds one token per verify row; request i's rows are `i * (D + 1) + j`,
+        row j predicting the token after input row j (so row k - 1 is the target position of
+        draft x_k). For each planned request this runs chain speculative sampling over its
+        `num_mtp_depths` drafts and writes rows 0..num_mtp_depths: the accepted drafts
+        (j < num_accepted), the replacement / bonus token (j == num_accepted), then -1. The
+        unchanged exact-match verifier downstream then reproduces exactly that acceptance:
+        accepted rows equal their draft, the replacement differs from the rejected draft (the
+        residual max(0, p - q) is zero there), and later rows are masked by the
+        consecutive-acceptance cummin. last_one_indices, the accepted mask/counts, the KV
+        rewind, the commit pass and the next draft inputs therefore need no changes.
+
+        A planned request whose verified draft tokens differ from the stored drafts (they were
+        replaced upstream) is verified against a point-mass q at its actual drafts: acceptance
+        p(x), residual p without x -- exact-match verification expressed as a chain, still
+        target-exact.
+
+        Modifies `output_tokens` in place.
+        """
+        nvtx_range_push("mtp-spec-decoding/verify/rejection")
+        context = self.inference_wrapped_model.inference_context
+        num_depths = self.num_mtp_depths
+        device = output_tokens.device
+        num_rows = len(plan.rows)
+        stride = self.num_speculative_tokens + 1
+        rows_cpu = torch.tensor(plan.rows, dtype=torch.long)
+        rows_gpu = rows_cpu.to(device, non_blocking=True)
+        # Imported requests (draft row -1) gather a placeholder row, overwritten below.
+        draft_rows_gpu = torch.tensor(
+            [max(row, 0) for row in plan.draft_rows], dtype=torch.long
+        ).to(device, non_blocking=True)
+
+        # [num_rows, num_depths + 1] verify rows: target positions of x_1..x_Dm, then the bonus.
+        offsets = torch.arange(num_depths + 1, device=device)
+        verify_rows = rows_gpu.unsqueeze(1) * stride + offsets.unsqueeze(0)
+        logit_rows = verify_rows.reshape(-1)
+        if sample_gather_indices is not None:
+            logit_rows = sample_gather_indices[logit_rows].long()
+        vocab = sample_logits.shape[-1]
+
+        target_probs = self._sampling.probs_kernel(
+            sample_logits[logit_rows],
+            context,
+            token_to_request_index=rows_cpu.repeat_interleave(num_depths + 1),
+        ).view(num_rows, num_depths + 1, vocab)
+        # [num_rows, num_depths, vocab] gathered copy of the stored q.
+        draft_probs = self._mtp_draft_probs.transpose(0, 1)[draft_rows_gpu]
+
+        # Drafts x_1..x_Dm sit on input rows 1..Dm of each request.
+        draft_tokens = input_tokens_required[verify_rows[:, 1:]]
+        stored_drafts = self._sampled_mtp_tokens_cuda[:num_depths, draft_rows_gpu].transpose(0, 1)
+        if plan.imported:
+            imported_idx = torch.tensor(list(plan.imported), dtype=torch.long).to(
+                device, non_blocking=True
+            )
+            draft_probs[imported_idx] = torch.stack([q for q, _ in plan.imported.values()])
+            stored_drafts = stored_drafts.clone()
+            stored_drafts[imported_idx] = torch.stack([d for _, d in plan.imported.values()])
+        consistent = (stored_drafts == draft_tokens).all(dim=1)
+        # Point-mass q for inconsistent requests (in place, no host sync).
+        draft_probs.mul_(consistent.view(-1, 1, 1))
+        draft_probs.scatter_add_(
+            2,
+            draft_tokens.unsqueeze(-1),
+            (~consistent).to(draft_probs.dtype).view(-1, 1, 1).expand(-1, num_depths, 1),
+        )
+
+        chain_tokens, _ = self._sampling.chain_speculative_sampling(
+            draft_probs, draft_tokens, target_probs
+        )
+        output_tokens[verify_rows.reshape(-1)] = chain_tokens.reshape(-1)
+        nvtx_range_pop("mtp-spec-decoding/verify/rejection")
+
+    def _mtp_commit_graph_supported(self) -> bool:
+        """Whether the commit pass can be CUDA-graphed at all for this model.
+
+        The graphed layout gives every request `num_speculative_tokens` rows and attends over
+        `start + num_speculative_tokens` keys, which stays inside the positions the draft loop
+        itself writes only when the draft loop runs a depth per speculative token.
+        """
+        return (
+            HAVE_TRITON
+            and getattr(self.model_config, "cuda_graph_impl", None) == "local"
+            and self.num_mtp_depths == self.num_speculative_tokens
+        )
+
+    def _mtp_commit_graphed_this_step(self, context) -> bool:
+        """Whether this step's commit pass replays the fixed-shape CUDA graph.
+
+        Requires a graphed, decode-only main step. Under the NVLS dispatcher each rank decides
+        locally (its all-gather-v / reduce-scatter-v accept per-rank token counts); under the NCCL
+        and training dispatchers the EP batch-dimension sync makes every graphed step decode-only
+        on all ranks, so the decision is uniform there. Idle EP ranks evaluate the same decision in
+        `_run_dummy_serial_mtp_forward` and then run `_mtp_dummy_commit_graphed_forward`, which
+        issues the commit pass's MoE collectives with the same token count.
+        """
+        return (
+            self._mtp_resolved_padded_count is not None
+            and self._mtp_commit_graph_supported()
+            and context.padded_batch_dimensions.prefill_req_count == 0
+        )
+
+    def _mtp_commit_row_indices(self, padded_count: int) -> Tensor:
+        """[padded_count * num_speculative_tokens] main-forward rows feeding the graphed commit.
+
+        Request r's slot j reads the main hidden at r * (num_spec + 1) + j (base, then drafts),
+        and pairs it with the input token one row later.
+        """
+        cache = self.__dict__.setdefault("_mtp_commit_row_index_cache", {})
+        if padded_count not in cache:
+            stride = self.num_speculative_tokens + 1
+            requests = torch.arange(padded_count, device=torch.cuda.current_device())
+            slots = torch.arange(self.num_speculative_tokens, device=requests.device)
+            cache[padded_count] = (requests[:, None] * stride + slots[None, :]).reshape(-1)
+        return cache[padded_count]
+
+    def _mtp_commit_pass_graphed(
+        self,
+        context,
+        unwrapped_model,
+        gathered_hidden,
+        active_request_count: int,
+        padded_count: int,
+        base_position,
+        token_row_indices: Optional[Tensor] = None,
+    ) -> None:
+        """Commit pass for a graphed decode-only step, replayed from a CUDA graph.
+
+        Same KV writes as `_mtp_commit_pass` on a decode-only step, given the same
+        `token_row_indices`: request r's accepted drafts are refreshed from the main hiddens at
+        positions `base_r - 1 - a_r ..`. Instead of packing the variable number of refreshed rows,
+        every request gets `num_speculative_tokens` rows whose unused tail writes the dummy block,
+        so the forward's shape depends only on `padded_count`, needs no host sync, and replays the
+        ("mtp_commit", padded_count) graph.
+
+        `token_row_indices` is async scheduling's map from each token row of the survivor-ordered
+        batch to its row in the forward that produced `gathered_hidden` (see `_mtp_commit_pass`);
+        None means the two orders agree. The gather reads through it on the GPU before the
+        replay, so it stays sync-free and leaves the captured shape unchanged.
+        """
+        num_slots = self.num_speculative_tokens
+        real_rows = active_request_count * num_slots
+        rows = self._mtp_commit_row_indices(padded_count)
+        hidden_rows = rows
+        token_rows = rows + 1
+        if token_row_indices is not None:
+            # Async compaction leaves the hidden states and input tokens in the pending forward's
+            # row order; read them through the same row map as verification. Padded rows past
+            # the map are clamped here and zeroed below.
+            last = token_row_indices.shape[0] - 1
+            hidden_rows = token_row_indices[hidden_rows.clamp(max=last)]
+            token_rows = token_row_indices[token_rows.clamp(max=last)]
+        hidden = gathered_hidden.index_select(
+            0, hidden_rows.clamp(max=gathered_hidden.shape[0] - 1)
+        )
+        input_ids = context.gpu_view.token_to_input_ids
+        tokens = input_ids.index_select(0, token_rows.clamp(max=input_ids.shape[0] - 1))
+        # Rows past the real requests read padding (or clamped) main-forward rows.
+        hidden[real_rows:] = 0
+        tokens[real_rows:] = 0
+        if self._sp_enabled:
+            hidden = scatter_to_sequence_parallel_region(
+                hidden, group=self.inference_wrapped_model.tp_group
+            )
+
+        # A graphed decode-only step has no in-flight chunked prefill to carry a boundary for.
+        context.mtp_metadata.invalidate_chunk_boundary()
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        context._mtp_setup_commit_graphed(
+            active_request_count,
+            padded_count,
+            accepted_counts=self._accepted_token_counts_per_request,
+            base_positions=base_position,
+            block_table_src=context.request_to_kv_block_ids[active_slice],
+        )
+        if context._nvls_dispatcher:
+            NVLSAllGatherVDispatcher.modify_real_token_count_for_mtp(real_rows)
+
+        token_ids = tokens.view(1, -1)
+        unwrapped_model.compute_mtp_kv_write(
+            hidden_states=hidden,
+            next_token_ids=token_ids,
+            # Positions are unused for attention (no RoPE); the write positions come from the
+            # metadata.
+            position_ids=torch.zeros_like(token_ids),
+            eager=False,
+            cache_key=("mtp_commit", padded_count),
+            mtp_inference_context=context,
+        )
+        context.mtp_metadata.end_forward()
 
     def _mtp_commit_pass(
         self,
@@ -470,6 +954,36 @@ class MTPControllerMixin:
         )
         context.mtp_metadata.end_forward()
 
+    def _mtp_dummy_commit_graphed_forward(
+        self, context, unwrapped_model, padded_count: int
+    ) -> None:
+        """Replay the ("mtp_commit", padded_count) graph with every row on the dummy block.
+
+        The EP-dummy counterpart of `_mtp_commit_pass_graphed`, issuing the same MoE collectives
+        with the same token count. Its KV writes and reads touch only the dummy block.
+        """
+        num_rows = padded_count * self.num_speculative_tokens
+        dummy_hidden = torch.zeros(
+            (num_rows, 1, self.model_config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=self.model_config.params_dtype,
+        )
+        if self._sp_enabled:
+            dummy_hidden = scatter_to_sequence_parallel_region(
+                dummy_hidden, group=self.inference_wrapped_model.tp_group
+            )
+        dummy_tokens = torch.zeros((1, num_rows), device=dummy_hidden.device, dtype=torch.long)
+        context._mtp_setup_commit_graphed(padded_count, padded_count)
+        unwrapped_model.compute_mtp_kv_write(
+            hidden_states=dummy_hidden,
+            next_token_ids=dummy_tokens,
+            position_ids=torch.zeros_like(dummy_tokens),
+            eager=False,
+            cache_key=("mtp_commit", padded_count),
+            mtp_inference_context=context,
+        )
+        context.mtp_metadata.end_forward()
+
     def _compute_serial_mtp_and_sample(
         self, base_position: Optional[Tensor] = None, token_row_indices: Optional[Tensor] = None
     ) -> None:
@@ -551,30 +1065,6 @@ class MTPControllerMixin:
             # Cast to int64 to match CUDA graph capture dtype expectations.
             base_position = (adjusted_offsets + processed_tokens).to(torch.int64)
 
-        # Before the draft loop, refresh every committed position's draft KV from the MAIN model
-        # hidden states, so committed KV never carries a stale chained-draft-hidden value (which
-        # would decay acceptance with depth). One forward covers both prefill prompts (seeded
-        # roll-by-one from the prompt) and decode accepted drafts (refreshed). Runs only on the
-        # last PP stage, where the gathered decoder hidden states exist.
-        if getattr(context, "enable_mtp_kv_cache", False) and has_mtp:
-            issued_slot = self._mtp_commit_pass(
-                context,
-                unwrapped_model,
-                hidden_states,
-                num_decode_requests=active_request_count - context.num_prefill_requests,
-                active_request_count=active_request_count,
-                base_position=base_position,
-                token_row_indices=token_row_indices,
-            )
-            if not issued_slot:
-                # EP consistency: every rank runs exactly one commit-pass forward per step (real
-                # above, or this dummy) so the MoE all-to-alls stay count-matched.
-                self._mtp_dummy_prefill_forward(context, unwrapped_model)
-
-        # Start with the freshly sampled base token.
-        next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
-        current_hidden = last_accepted_hidden if has_mtp else None
-
         # Compute padding needed to make batch compatible with SP and CUDA graphs.
         if self._mtp_resolved_padded_count is not None:
             # CUDA-graph path: use the EP-synced padded count.
@@ -588,6 +1078,39 @@ class MTPControllerMixin:
         else:
             padded_count = active_request_count
         pad_count = padded_count - active_request_count
+
+        # Before the draft loop, refresh every committed position's draft KV from the MAIN model
+        # hidden states, so committed KV never carries a stale chained-draft-hidden value (which
+        # would decay acceptance with depth). One forward covers both prefill prompts (seeded
+        # roll-by-one from the prompt) and decode accepted drafts (refreshed). Runs only on the
+        # last PP stage, where the gathered decoder hidden states exist. EP consistency: every
+        # rank runs exactly one commit-pass forward per step (graphed, eager, or the dummy below)
+        # so the MoE collectives stay count-matched.
+        if getattr(context, "enable_mtp_kv_cache", False) and has_mtp:
+            if self._mtp_commit_graphed_this_step(context):
+                self._mtp_commit_pass_graphed(
+                    context,
+                    unwrapped_model,
+                    hidden_states,
+                    active_request_count=active_request_count,
+                    padded_count=padded_count,
+                    base_position=base_position,
+                    token_row_indices=token_row_indices,
+                )
+            elif not self._mtp_commit_pass(
+                context,
+                unwrapped_model,
+                hidden_states,
+                num_decode_requests=active_request_count - context.num_prefill_requests,
+                active_request_count=active_request_count,
+                base_position=base_position,
+                token_row_indices=token_row_indices,
+            ):
+                self._mtp_dummy_prefill_forward(context, unwrapped_model)
+
+        # Start with the freshly sampled base token.
+        next_token_ids = self._sampled_tokens_cuda[:active_request_count].clone()
+        current_hidden = last_accepted_hidden if has_mtp else None
 
         # Pad hidden states and scatter for sequence parallelism.
         if has_mtp:
@@ -709,7 +1232,7 @@ class MTPControllerMixin:
             if mtp_kv_cache_on and num_mtp_draft_requests < active_request_count:
                 mtp_logits_2d = mtp_logits_2d.clone()
                 mtp_logits_2d[num_mtp_draft_requests:] = 0
-            spec_tokens = self._sample_from_logits_2d(mtp_logits_2d)
+            spec_tokens = self._sample_mtp_draft(depth, mtp_logits_2d, active_request_count)
             self._sampled_mtp_tokens_cuda[depth, :active_request_count] = spec_tokens
             nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}/sample")
 
@@ -717,12 +1240,15 @@ class MTPControllerMixin:
             next_token_ids = spec_tokens
             nvtx_range_pop(f"mtp-spec-decoding/depth-{depth}")
 
+        # Rejection-sampling verification of these drafts looks their rows up by request id.
+        # The dropped chunked-prefill row (drafted from masked logits) is not recorded.
+        self._record_mtp_draft_rows(context, num_mtp_draft_requests)
+
         # The final sampled token needs no additional MTP forward. On the next step, its
         # position is either refreshed from a main hidden by the commit pass (if accepted),
         # overwritten by draft depth 0, or remains beyond the causal read range until a later
         # depth overwrites it. The main verifier reads a separate KV plane.
 
-    @torch.inference_mode()
     def _run_dummy_serial_mtp_forward(self) -> None:
         """Run dummy MTP forward passes to participate in EP collectives.
 
@@ -778,8 +1304,9 @@ class MTPControllerMixin:
         context = self.inference_wrapped_model.inference_context
 
         # When the MTP KV cache is active, real ranks run one commit-pass forward before the
-        # depth loop. The dummy EP rank must mirror both the count (D+1 forwards) and the
-        # graph/eager mode, else the shared MoE all-to-all count/shape
+        # depth loop. The dummy EP rank must mirror the count (D+1 forwards), the commit pass's
+        # layout (fixed-shape on graphed decode-only steps, else the one-row prefill-style pass)
+        # and the graph/eager mode, else the shared MoE all-to-all count/shape
         # mismatches and the collective hangs. Mirror the real path's mode via the EP-synced
         # `_mtp_resolved_padded_count` (None iff the main step was eager) -- NOT the local live
         # `using_cuda_graph_this_step()`, which the commit pass clobbers on the real ranks.
@@ -798,7 +1325,10 @@ class MTPControllerMixin:
         mtp_context_kwarg = {"mtp_inference_context": context} if mtp_cache_active else {}
         with context._mtp_forward_phase(preserve_step_bookkeeping=mtp_cache_active):
             if mtp_cache_active:
-                self._mtp_dummy_prefill_forward(context, unwrapped_model)
+                if self._mtp_commit_graphed_this_step(context):
+                    self._mtp_dummy_commit_graphed_forward(context, unwrapped_model, padded_count)
+                else:
+                    self._mtp_dummy_prefill_forward(context, unwrapped_model)
                 context.mtp_metadata.begin_decode_for_capture(padded_count, graphed=main_graphed)
             for depth in range(self.num_mtp_depths):
                 nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")

@@ -676,3 +676,234 @@ def mtp_draft_step_metadata(
         BLOCK_C=block_c,
         SCAN_BLOCK=scan_block,
     )
+
+
+# ---------------------------------------------------------------------------
+# Kernel 6: Attention metadata for the CUDA-graphed MTP commit pass
+# ---------------------------------------------------------------------------
+@triton.jit
+def _mtp_commit_step_metadata_kernel(
+    # Per-request input (read-only)
+    ACCEPTED_COUNTS_PTR,
+    BASE_POSITIONS_PTR,
+    SRC_BLOCK_TABLE_PTR,
+    # Per-token KV write maps
+    TOKEN_TO_BLOCK_IDX_PTR,
+    TOKEN_TO_LOCAL_POS_PTR,
+    TOKEN_TO_REQUEST_IDX_PTR,
+    TOKEN_TO_POS_IN_REQUEST_PTR,
+    TOKEN_TO_POS_IDS_PTR,
+    # Per-request MHA read metadata
+    MHA_QUERY_LENGTHS_PTR,
+    MHA_CU_QUERY_PTR,
+    MHA_KV_LENGTHS_PTR,
+    MHA_CU_KV_PTR,
+    MHA_BLOCK_TABLE_PTR,
+    # Strides / limits
+    src_block_table_stride,
+    mha_block_table_stride,
+    num_block_columns,
+    active_request_count,
+    padded_count,
+    dummy_block_idx,
+    # Compile-time constants
+    SLOTS: tl.constexpr,  # num_speculative_tokens: commit rows per request
+    BLOCK_SIZE_TOKENS: tl.constexpr,
+    BLOCK_R: tl.constexpr,  # request slots per program
+    BLOCK_S: tl.constexpr,  # next_power_of_2(SLOTS)
+    BLOCK_C: tl.constexpr,  # block-table columns per program
+    SCAN_BLOCK: tl.constexpr,  # request slots per step of the cumulative-length scan
+):
+    """Write the fixed-shape commit-pass metadata for a decode-only step.
+
+    Request r owns token rows r*SLOTS .. r*SLOTS+SLOTS-1. Request r accepted a_r drafts, so its
+    refreshed run starts at MTP position `start_r = base_r - 1 - a_r`; slot j writes position
+    start_r + j when j < a_r and the dummy block otherwise. Every real request attends with SLOTS
+    query rows over `start_r + SLOTS` keys, so causal (bottom-right aligned) masking lets slot j
+    see keys up to start_r + j. Requests at or past active_request_count are padding:
+    dummy-block writes, zero lengths, and a -1 block table.
+
+    Grid: (cdiv(padded_count, BLOCK_R), cdiv(num_block_columns, BLOCK_C)), so the work per
+    program is bounded whatever the batch and table width.
+    - Program (r, c) copies its tile of the block table.
+    - Programs (r, 0) also write the per-token maps and per-request lengths of their requests.
+    - Program (0, 0) also writes the cumulative lengths, which span every request, scanning them
+      SCAN_BLOCK at a time with a running total.
+    """
+    pid_r = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    rows = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+    real = rows < active_request_count
+    padded = rows < padded_count
+
+    # --- Block table tile: real rows copy the source table, padding rows get -1 ---
+    cols = (pid_c * BLOCK_C + tl.arange(0, BLOCK_C))[None, :]
+    col_mask = cols < num_block_columns
+    real_2d = real[:, None]
+    values = tl.load(
+        SRC_BLOCK_TABLE_PTR + rows.to(tl.int64)[:, None] * src_block_table_stride + cols,
+        mask=real_2d & col_mask,
+        other=0,
+    )
+    values = tl.where(real_2d, values, -1)
+    tl.store(
+        MHA_BLOCK_TABLE_PTR + rows.to(tl.int64)[:, None] * mha_block_table_stride + cols,
+        values.to(MHA_BLOCK_TABLE_PTR.dtype.element_ty),
+        mask=padded[:, None] & col_mask,
+    )
+
+    if pid_c == 0:
+        accepted = tl.load(ACCEPTED_COUNTS_PTR + rows, mask=real, other=0).to(tl.int32)
+        base = tl.load(BASE_POSITIONS_PTR + rows, mask=real, other=1).to(tl.int32)
+        starts = base - 1 - accepted
+
+        # --- Per-token KV write maps ---
+        slots = tl.arange(0, BLOCK_S)
+        slot_in_range = (slots < SLOTS)[None, :]
+        tokens = rows[:, None] * SLOTS + slots[None, :]
+        token_mask = padded[:, None] & slot_in_range
+        positions = starts[:, None] + slots[None, :]
+        writes = real[:, None] & (slots[None, :] < accepted[:, None]) & slot_in_range
+        destinations = tl.load(
+            SRC_BLOCK_TABLE_PTR
+            + rows.to(tl.int64)[:, None] * src_block_table_stride
+            + positions // BLOCK_SIZE_TOKENS,
+            mask=writes,
+            other=0,
+        )
+        block_idx = tl.where(writes, destinations.to(tl.int64), dummy_block_idx)
+        local_pos = tl.where(writes, positions % BLOCK_SIZE_TOKENS, 0)
+        request_positions = tl.where(real[:, None], positions, 0)
+        tl.store(TOKEN_TO_BLOCK_IDX_PTR + tokens, block_idx, mask=token_mask)
+        tl.store(TOKEN_TO_LOCAL_POS_PTR + tokens, local_pos, mask=token_mask)
+        tl.store(
+            TOKEN_TO_REQUEST_IDX_PTR + tokens,
+            rows[:, None] + tl.zeros_like(tokens),
+            mask=token_mask,
+        )
+        tl.store(TOKEN_TO_POS_IN_REQUEST_PTR + tokens, request_positions, mask=token_mask)
+        tl.store(TOKEN_TO_POS_IDS_PTR + tokens, request_positions.to(tl.int64), mask=token_mask)
+
+        # --- Per-request lengths ---
+        tl.store(MHA_QUERY_LENGTHS_PTR + rows, tl.where(real, SLOTS, 0), mask=padded)
+        tl.store(MHA_KV_LENGTHS_PTR + rows, tl.where(real, starts + SLOTS, 0), mask=padded)
+
+    if (pid_r == 0) & (pid_c == 0):
+        # --- Cumulative lengths: entry 0 is 0, entry r + 1 sums requests 0..r. Padding requests
+        # add zero, so they repeat the last real total. ---
+        tl.store(MHA_CU_QUERY_PTR, 0)
+        tl.store(MHA_CU_KV_PTR, 0)
+        query_total = 0
+        kv_total = 0
+        for scan_start in range(0, padded_count, SCAN_BLOCK):
+            scan_rows = scan_start + tl.arange(0, SCAN_BLOCK)
+            scan_real = scan_rows < active_request_count
+            scan_padded = scan_rows < padded_count
+            scan_accepted = tl.load(ACCEPTED_COUNTS_PTR + scan_rows, mask=scan_real, other=0)
+            scan_base = tl.load(BASE_POSITIONS_PTR + scan_rows, mask=scan_real, other=1)
+            scan_query = tl.where(scan_real, SLOTS, 0)
+            scan_kv = tl.where(
+                scan_real, scan_base.to(tl.int32) - 1 - scan_accepted.to(tl.int32) + SLOTS, 0
+            )
+            tl.store(
+                MHA_CU_QUERY_PTR + 1 + scan_rows,
+                query_total + tl.cumsum(scan_query, axis=0),
+                mask=scan_padded,
+            )
+            tl.store(
+                MHA_CU_KV_PTR + 1 + scan_rows,
+                kv_total + tl.cumsum(scan_kv, axis=0),
+                mask=scan_padded,
+            )
+            query_total += tl.sum(scan_query, axis=0)
+            kv_total += tl.sum(scan_kv, axis=0)
+
+
+# Tile sizes of the commit-pass metadata kernel: the same bounds as the draft-step kernel's
+# block-table tile, and at most _COMMIT_META_MAX_TOKEN_TILE per-token entries per program.
+_COMMIT_META_MAX_TOKEN_TILE = 4096
+
+
+@functools.lru_cache(maxsize=None)
+def _commit_step_metadata_launch_config(padded_count, num_block_columns, num_slots):
+    """Return (grid, BLOCK_R, BLOCK_S, BLOCK_C, SCAN_BLOCK) for `_mtp_commit_step_metadata_kernel`.
+
+    Cached: it depends only on the three sizes, and the launch sits on the host's critical path
+    once per graphed commit pass.
+    """
+    block_s = triton.next_power_of_2(num_slots)
+    block_c = min(triton.next_power_of_2(max(num_block_columns, 1)), _DRAFT_META_MAX_COLS)
+    block_r = min(
+        triton.next_power_of_2(padded_count),
+        _DRAFT_META_MAX_TILE // block_c,
+        max(_COMMIT_META_MAX_TOKEN_TILE // block_s, 1),
+    )
+    scan_block = min(triton.next_power_of_2(padded_count), _DRAFT_META_SCAN_BLOCK)
+    grid = (triton.cdiv(padded_count, block_r), triton.cdiv(max(num_block_columns, 1), block_c))
+    return grid, block_r, block_s, block_c, scan_block
+
+
+def mtp_commit_step_metadata(
+    gpu_view,
+    accepted_counts,
+    base_positions,
+    block_table,
+    active_request_count,
+    padded_count,
+    num_slots,
+    block_size_tokens,
+    dummy_block_idx,
+):
+    """Launch the graphed commit-pass metadata kernel.
+
+    Lays the commit pass out as `num_slots` token rows per request (so its shape depends only on
+    `padded_count`) and writes the token maps and MHA metadata for it, without host syncs.
+
+    Args:
+        gpu_view: `ContextGPUView` whose token maps and `mha_*` buffers are written.
+        accepted_counts: `(>=active_request_count,)` drafts each request accepted this step.
+        base_positions: `(>=active_request_count,)` position of each request's next draft
+            (one past its last committed token).
+        block_table: `(>=active_request_count, num_block_columns)` block ids per request.
+        active_request_count: Real (decode) requests.
+        padded_count: Request slots the forward launches over, including padding.
+        num_slots: Commit rows per request (`num_speculative_tokens`).
+        block_size_tokens: KV block size, in tokens.
+        dummy_block_idx: Scratch block that unused and padding rows write to.
+    """
+    if padded_count == 0:
+        return
+    assert active_request_count <= padded_count
+    num_block_columns = gpu_view.mha_block_table.shape[1]
+    assert block_table.shape[1] == num_block_columns
+
+    grid, block_r, block_s, block_c, scan_block = _commit_step_metadata_launch_config(
+        padded_count, num_block_columns, num_slots
+    )
+    _mtp_commit_step_metadata_kernel[grid](
+        accepted_counts,
+        base_positions,
+        block_table,
+        gpu_view.token_to_block_idx,
+        gpu_view.token_to_local_position_within_kv_block,
+        gpu_view.token_to_request_idx,
+        gpu_view.token_to_position_in_request,
+        gpu_view.token_to_pos_ids,
+        gpu_view.mha_query_lengths,
+        gpu_view.mha_cu_query_seq_lengths,
+        gpu_view.mha_kv_seq_lengths,
+        gpu_view.mha_cu_kv_seq_lengths,
+        gpu_view.mha_block_table,
+        src_block_table_stride=block_table.stride(0),
+        mha_block_table_stride=gpu_view.mha_block_table.stride(0),
+        num_block_columns=num_block_columns,
+        active_request_count=active_request_count,
+        padded_count=padded_count,
+        dummy_block_idx=dummy_block_idx,
+        SLOTS=num_slots,
+        BLOCK_SIZE_TOKENS=block_size_tokens,
+        BLOCK_R=block_r,
+        BLOCK_S=block_s,
+        BLOCK_C=block_c,
+        SCAN_BLOCK=scan_block,
+    )

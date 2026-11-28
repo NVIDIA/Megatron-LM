@@ -9,6 +9,7 @@ from torch import Tensor
 
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     HAVE_TRITON,
+    mtp_commit_step_metadata,
     mtp_draft_step_metadata,
 )
 from megatron.core.inference.utils import tensor_swap
@@ -19,15 +20,18 @@ from .gpu_view import ContextGPUView
 class MTPForwardMode(Enum):
     """Which MTP forward, if any, currently owns the attention metadata.
 
-    The two non-NONE modes differ in query shape, which is what decides the attention kernel:
+    The non-NONE modes differ in query shape, which is what decides the attention kernel:
     a draft depth contributes exactly one token per active request (uniform, so the decode
-    kernel's `q.reshape(num_requests, tokens_per_request, ...)` is valid), while the commit
-    pass is roll-by-one over each request's committed span (ragged, so it must go varlen).
+    kernel's `q.reshape(num_requests, tokens_per_request, ...)` is valid), while the eager
+    commit pass is roll-by-one over each request's committed span (ragged, so it must go
+    varlen). The CUDA-graphed commit pass gives every request the same `num_speculative_tokens`
+    rows, unused ones writing to the dummy block, so it is uniform and takes the decode kernel.
     """
 
     NONE = "none"
     DRAFT = "draft"
     COMMIT = "commit"
+    COMMIT_GRAPHED = "commit_graphed"
 
 
 @dataclass
@@ -105,6 +109,10 @@ class MTPMetadata:
     kv_lengths: Optional[Tensor] = field(default=None, repr=False)
     # [max_requests] int64: constant [0, 1, ..., max_requests - 1].
     row_ids: Optional[Tensor] = field(default=None, repr=False)
+    # [max_requests] int64: synthetic graphed-commit inputs (no accepted drafts, base position
+    # 1) for CUDA-graph capture and EP dummy forwards, whose writes all go to the dummy block.
+    capture_accepted_counts: Optional[Tensor] = field(default=None, repr=False)
+    capture_base_positions: Optional[Tensor] = field(default=None, repr=False)
 
     # ---- Views into the buffers, refreshed once per draft loop by begin_decode(). ----
     active_offsets: Optional[Tensor] = field(default=None, repr=False)
@@ -119,6 +127,11 @@ class MTPMetadata:
     def is_varlen_forward(self) -> bool:
         """Whether the current MTP forward has ragged per-request query lengths."""
         return self.forward_mode is MTPForwardMode.COMMIT
+
+    @property
+    def is_graphed_commit_forward(self) -> bool:
+        """Whether the current MTP forward is the uniform, CUDA-graphed commit pass."""
+        return self.forward_mode is MTPForwardMode.COMMIT_GRAPHED
 
     def allocate(self, device: torch.device) -> None:
         """Reserve the persistent buffers. No-op when MTP KV caching is disabled.
@@ -141,6 +154,12 @@ class MTPMetadata:
         self.query_lengths = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
         self.kv_lengths = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
         self.row_ids = torch.arange(self.max_requests, dtype=torch.int64, device=device)
+        self.capture_accepted_counts = torch.zeros(
+            self.max_requests, dtype=torch.int64, device=device
+        )
+        self.capture_base_positions = torch.ones(
+            self.max_requests, dtype=torch.int64, device=device
+        )
         self.chunk_boundary_hidden = torch.zeros(
             (1, 1, self.hidden_size), dtype=self.hidden_dtype, device=device
         )
@@ -158,6 +177,8 @@ class MTPMetadata:
         self.query_lengths = None
         self.kv_lengths = None
         self.row_ids = None
+        self.capture_accepted_counts = None
+        self.capture_base_positions = None
         self.active_offsets = None
         self.active_block_table = None
         self.forward_mode = MTPForwardMode.NONE
@@ -310,6 +331,59 @@ class MTPMetadata:
         self.active_block_table = self.block_table[:active_request_count]
         self.graphed = graphed
         self.forward_mode = MTPForwardMode.DRAFT
+
+    def begin_commit_graphed(
+        self, active_request_count: int, padded_count: int, block_table_src: Optional[Tensor]
+    ) -> None:
+        """Stage the block table for a CUDA-graphed commit pass and enter its forward mode.
+
+        Args:
+            active_request_count (int): Decode requests whose accepted drafts are refreshed.
+            padded_count (int): Request slots the forward launches over.
+            block_table_src (Optional[Tensor]): [>=active_request_count, max_kv_block_count]
+                source table, or None to point every row at the dummy block (CUDA-graph capture
+                and EP dummy forwards).
+        """
+        n = active_request_count
+        if block_table_src is None:
+            self.block_table[:padded_count].fill_(self.dummy_block_idx)
+        else:
+            self.block_table[:n].copy_(block_table_src[:n], non_blocking=True)
+        self.active_request_count = n
+        self.padded_count = padded_count
+        self.active_offsets = None
+        self.active_block_table = self.block_table[:n]
+        self.graphed = True
+        self.forward_mode = MTPForwardMode.COMMIT_GRAPHED
+
+    def write_commit_step_metadata(
+        self,
+        gpu_view: ContextGPUView,
+        accepted_counts: Tensor,
+        base_positions: Tensor,
+        num_slots: int,
+    ) -> None:
+        """Write the token maps and MHA metadata for a CUDA-graphed commit pass.
+
+        Args:
+            gpu_view (ContextGPUView): Destination bookkeeping views.
+            accepted_counts (Tensor): [>=active_request_count] drafts each request accepted.
+            base_positions (Tensor): [>=active_request_count] position of each request's next
+                draft, one past its last committed token.
+            num_slots (int): Commit rows per request (`num_speculative_tokens`).
+        """
+        assert HAVE_TRITON, "the CUDA-graphed MTP commit pass requires Triton"
+        mtp_commit_step_metadata(
+            gpu_view=gpu_view,
+            accepted_counts=accepted_counts,
+            base_positions=base_positions,
+            block_table=self.block_table,
+            active_request_count=self.active_request_count,
+            padded_count=self.padded_count,
+            num_slots=num_slots,
+            block_size_tokens=self.block_size_tokens,
+            dummy_block_idx=self.dummy_block_idx,
+        )
 
     def advance_decode_step(self) -> None:
         """Advance every active request's MTP write position by one, in place."""
