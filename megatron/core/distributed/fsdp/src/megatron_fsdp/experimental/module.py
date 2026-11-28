@@ -31,7 +31,6 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .countdown import Countdown
-from .dbuffer import DBuffer
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .module_utils import get_parameter_owner, is_in_backward
 from .parameter_group import (
@@ -53,9 +52,6 @@ class FsdpModule:
     _trainable_parameter_countdown: Countdown
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
-    # Reduce-scatter inputs that TE writes fused wgrads into, allocated before this module's
-    # backward starts and dropped once their reduction is queued.
-    _partial_grads: dict[FsdpParameterGroup, DBuffer]
     # Recorded on the inner reduction stream after a partial_grad was last allocated and zeroed.
     _partial_grad_allocated: torch.cuda.Event | None
     # ``phase`` is FORWARD between pre_forward() and post_forward(), BACKWARD
@@ -84,7 +80,6 @@ class FsdpModule:
                 See ``fully_shard``.
         """
         self._context = context
-        self._partial_grads = {}
         self._partial_grad_allocated = None
         self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
@@ -375,13 +370,11 @@ class FsdpModule:
             if (
                 group.fuse_wgrad_accumulation
                 and group.requires_inner_reduction
-                and group not in self._partial_grads
+                and group.partial_grad is None
             ):
                 with torch.cuda.stream(inner_reduction_stream):
-                    partial_grad = group.allocate_partial_grad_buffer()
-                    partial_grad.local_buffer.zero_()
+                    group.allocate_partial_grad_buffer()
                     self._partial_grad_allocated = inner_reduction_stream.record_event()
-                self._partial_grads[group] = partial_grad
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
@@ -465,7 +458,7 @@ class FsdpModule:
             current_stream.wait_event(self._partial_grad_allocated)
         for group in self._parameter_groups:
             if group.fuse_wgrad_accumulation:
-                group.bind_main_grad(self._partial_grads.get(group))
+                group.bind_main_grad()
         # Allocate the next module's while prefetching, ahead of this module's reduce-scatter, so
         # that they are freed right after their own. unshard() advanced the order to that module.
         if prefetch:
@@ -538,15 +531,14 @@ class FsdpModule:
         """
         current_stream = self.context.current_stream()
         inner_reduction_stream = self.context.inner_reduction_stream
-        partial_grad = self._partial_grads.pop(group, None)
-        if partial_grad is None:
+        if group.partial_grad is None:
             with torch.cuda.stream(inner_reduction_stream):
-                partial_grad = group.allocate_partial_grad_buffer()
+                group.allocate_partial_grad_buffer()
             current_stream.wait_stream(inner_reduction_stream)
-        group.copy_gradients_to_partial_buffer(partial_grad)
+        group.copy_gradients_to_partial_buffer()
         inner_reduction_stream.wait_stream(current_stream)
         with torch.cuda.stream(inner_reduction_stream):
-            group.reduce_inner_gradients(partial_grad)
+            group.reduce_inner_gradients()
 
     @property
     def parameter_groups(self) -> tuple[FsdpParameterGroup, ...]:

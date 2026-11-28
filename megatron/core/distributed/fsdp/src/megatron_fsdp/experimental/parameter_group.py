@@ -108,6 +108,8 @@ class FsdpParameterGroup:
     # view; the remaining model_weight slices must be all-gathered before compute.
     _model_weight_is_stale: bool
     main_grad: DBuffer | None
+    # Unreduced gradients, allocated before backward for fused wgrads and released after reduction.
+    partial_grad: DBuffer | None
     # Optimizer-layout view into main_grad storage, avoiding a second allocation.
     # This is None exactly when main_grad is None.
     pre_optimizer_main_grad: DBuffer | None
@@ -384,6 +386,7 @@ class FsdpParameterGroup:
                     )
 
         self.main_grad = None
+        self.partial_grad = None
         self.pre_optimizer_main_grad = None
         self._main_grad_is_stale = False
         self._main_grad_is_scaled = False
@@ -640,18 +643,22 @@ class FsdpParameterGroup:
         )
 
     def allocate_partial_grad_buffer(self) -> DBuffer:
-        """Allocate the unreduced reduce-scatter input buffer."""
+        """Allocate and retain the reduce-scatter input, zeroing it for fused accumulation."""
         assert self.main_grad is not None
+        assert self.partial_grad is None
         with self._symmetric_memory_context():
-            return DBuffer(
+            self.partial_grad = DBuffer(
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 layout=self.main_weight.layout,
                 dtype=self.grad_comm_dtype,
                 device=self.main_weight.device,
             )
+        if self.fuse_wgrad_accumulation:
+            self.partial_grad.local_buffer.zero_()
+        return self.partial_grad
 
-    def bind_main_grad(self, partial_grad: DBuffer | None) -> None:
+    def bind_main_grad(self) -> None:
         """Expose the views TE accumulates fused wgrads into as each parameter's ``main_grad``.
 
         Like Megatron's DDP, every parameter gets one; TE uses it only for fused weights. They are
@@ -659,7 +666,7 @@ class FsdpParameterGroup:
         full tensors, so TE accumulates into it directly, unscaled, and reduce_outer_gradients()
         scales the total.
         """
-        buffer = partial_grad if self.requires_inner_reduction else self.main_grad
+        buffer = self.partial_grad if self.requires_inner_reduction else self.main_grad
         assert buffer is not None
         if buffer is self.main_grad:
             if self._main_grad_is_stale or not self._has_sharded_grads():
@@ -674,12 +681,14 @@ class FsdpParameterGroup:
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             fsdp_parameter.unsharded.main_grad = buffer.get_tensor_view(index)
 
-    def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
+    def copy_gradients_to_partial_buffer(self) -> None:
         """Pack full local gradients on compute into the reduce-scatter input buffer.
 
         With fuse_wgrad_accumulation, TE has already written the fused weight gradients, so add
         the gradients autograd returned (e.g. biases and LayerNorm weights) and drop main_grad.
         """
+        partial_grad = self.partial_grad if self.requires_inner_reduction else self.main_grad
+        assert partial_grad is not None
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             parameter = fsdp_parameter.unsharded
             if self.fuse_wgrad_accumulation:
@@ -701,7 +710,7 @@ class FsdpParameterGroup:
         assert self.main_grad is not None
         if self.fuse_wgrad_accumulation:
             # TE already accumulated the fused wgrads into main_grad, unscaled (bind_main_grad()).
-            self.copy_gradients_to_partial_buffer(self.main_grad)
+            self.copy_gradients_to_partial_buffer()
             return
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:
@@ -756,8 +765,8 @@ class FsdpParameterGroup:
         # Later microbatches must preserve the contributions already accumulated.
         self._main_grad_is_stale = False
 
-    def reduce_inner_gradients(self, partial_grad: DBuffer) -> None:
-        """Reduce a packed partial gradient across DP-inner and accumulate into main_grad.
+    def reduce_inner_gradients(self) -> None:
+        """Reduce and release partial_grad across DP-inner, accumulating into main_grad.
 
         main_grad rests at the DP-outer-Partial accumulation placement, accumulating
         each backward through the standard zero_grad contract, and ``.grad`` binds to
@@ -767,6 +776,8 @@ class FsdpParameterGroup:
         reduction overlap the next group's DP-inner reduction.
         """
         assert self.main_grad is not None
+        partial_grad = self.partial_grad
+        assert partial_grad is not None
 
         has_sharded_grads = self._has_sharded_grads()
         self._clear_stale_main_grad()
@@ -790,6 +801,7 @@ class FsdpParameterGroup:
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
         self._install_sharded_grads(self.main_grad)
+        self.partial_grad = None
 
     def reduce_outer_gradients(self) -> None:
         """Finalize the deferred DP-outer reduction into the optimizer-layout view.

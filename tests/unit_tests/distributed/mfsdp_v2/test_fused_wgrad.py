@@ -504,7 +504,11 @@ def test_fused_wgrad_buffer_is_allocated_by_the_previous_module(
     )
 
     def allocated() -> list[int]:
-        return [index for index, layer in enumerate(model) if layer._partial_grads]
+        return [
+            index
+            for index, layer in enumerate(model)
+            if any(group.partial_grad is not None for group in layer.parameter_groups)
+        ]
 
     # Registered after fully_shard(), so these run after MFSDP's own backward pre-hooks.
     seen = {}
