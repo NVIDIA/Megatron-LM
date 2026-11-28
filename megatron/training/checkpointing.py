@@ -46,7 +46,11 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
 )
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
-from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.optimizer import MegatronOptimizer
+from megatron.core.optimizer.checkpointing import (
+    contains_distributed_optimizer,
+    validate_optimizer_checkpoint_topology,
+)
 from megatron.core.optimizer.distrib_optimizer import get_legacy_grad_dtypes
 from megatron.core.post_training.modelopt.checkpointing import (
     save_modelopt_state,
@@ -686,6 +690,7 @@ def _build_sharded_state_dict_metadata(
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     *,
     ckpt_format: Optional[str] = None,
+    optimizer: Optional[MegatronOptimizer] = None,
 ) -> dict:
     """Builds metadata used for sharded_state_dict versioning.
 
@@ -700,6 +705,7 @@ def _build_sharded_state_dict_metadata(
     Args:
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
         ckpt_format: The format of the operation (default: the run's checkpoint section's)
+        optimizer: The active optimizer tree, when available.
     """
     cfg = get_run_config()
     checkpoint = cfg.checkpoint
@@ -713,9 +719,10 @@ def _build_sharded_state_dict_metadata(
     # ``use_distributed_optimizer`` off in that mode. Inference containers have no
     # optimizer section and only need the shared metadata below.
     optimizer_cfg = getattr(cfg, 'optimizer', None)
-    has_distributed_optimizer = optimizer_cfg is not None and (
-        optimizer_cfg.use_distributed_optimizer
+    has_distributed_optimizer = (
+        getattr(optimizer_cfg, 'use_distributed_optimizer', False)
         or getattr(optimizer_cfg, 'use_layer_wise_distributed_optimizer', False)
+        or contains_distributed_optimizer(optimizer)
     )
 
     if has_distributed_optimizer and ckpt_format == 'fsdp_dtensor':
@@ -1003,7 +1010,7 @@ def save_checkpoint(
     ):
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(
-                dp_cp_group=dp_cp_group, ckpt_format=save_format
+                dp_cp_group=dp_cp_group, ckpt_format=save_format, optimizer=optimizer
             )
             if hasattr(cfg, "optimizer") and cfg.optimizer.use_distributed_optimizer:
                 print_rank_0(
@@ -1915,7 +1922,7 @@ def generate_state_dict(
                 if 'metadata' not in optim_sd_kwargs:
                     optim_sd_kwargs['metadata'] = {}
                 optim_sd_kwargs['metadata'].update(
-                    _build_sharded_state_dict_metadata(ckpt_format=ckpt_format)
+                    _build_sharded_state_dict_metadata(ckpt_format=ckpt_format, optimizer=optimizer)
                 )
                 optimizer_sd = optimizer.sharded_state_dict(state_dict, **optim_sd_kwargs)
             else:
@@ -3188,7 +3195,7 @@ def load_checkpoint(
 
         if ckpt_type == CheckpointType.LOCAL:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(
-                dp_cp_group=dp_cp_group, ckpt_format=load_format
+                dp_cp_group=dp_cp_group, ckpt_format=load_format, optimizer=optimizer
             )
         else:
             sharded_sd_metadata = dist_checkpointing.load_content_metadata(
@@ -3211,52 +3218,53 @@ def load_checkpoint(
             gen_sd_optim = optimizer
             gen_sd_opt_param_scheduler = opt_param_scheduler
 
+            # Old checkpoints have no content metadata. Ordinary DistOpt selected its
+            # format from fully_parallel_save; mixed optimizers defaulted to model space.
+            source_distopt = ((checkpoint_config or {}).get('optimizer') or {}).get(
+                'use_distributed_optimizer',
+                getattr(ckpt_args, 'use_distributed_optimizer', False)
+                and getattr(ckpt_args, 'optimizer', 'adam') in ('adam', 'sgd'),
+            )
+            declared_distopt = cfg.optimizer.use_distributed_optimizer or source_distopt
+            if sharded_sd_metadata is None and declared_distopt:
+                sharded_sd_metadata = {
+                    'distrib_optim_sharding_type': (
+                        'fully_sharded_model_space'
+                        if saved.fully_parallel_save
+                        else 'dp_zero_gather_scatter'
+                    )
+                }
+            sharding_type = (sharded_sd_metadata or {}).get(
+                'distrib_optim_sharding_type', 'fully_sharded_model_space'
+            )
+            validate_optimizer_checkpoint_topology(
+                optimizer,
+                state_dict.get('optimizer'),
+                saved_tp_pp=ckpt_tp_pp,
+                current_tp_pp=run_tp_pp,
+                sharding_type=sharding_type,
+                distributed_optimizer_configured=declared_distopt,
+            )
             if cfg.optimizer.use_distributed_optimizer:
-                if sharded_sd_metadata is None:
-                    # Backward-compatibility with old checkpoints which don't have content versioning
-                    # Can be removed after ending support for MLM optimizer checkpoints with MCore < v0.13
-                    # (for MCore v0.13+ checkpoints `sharded_sd_metadata is not None`)
-                    sharded_sd_metadata = {
-                        'distrib_optim_sharding_type': (
-                            'fully_sharded_model_space'
-                            if saved.fully_parallel_save
-                            else 'dp_zero_gather_scatter'
-                        )
-                    }
                 # Retargeting optimizer state onto a GPT checkpoint only works for the
                 # model-space formats, where each optimizer ShardedTensor carries the
                 # model param's key and sharding. Bucket-space formats key state by a
                 # flat buffer layout that the extra hybrid layers reshuffle.
-                if gpt_compat_load_optim and sharded_sd_metadata[
-                    'distrib_optim_sharding_type'
-                ] not in ('fully_reshardable', 'fully_sharded_model_space'):
+                if gpt_compat_load_optim and sharding_type not in (
+                    'fully_reshardable', 'fully_sharded_model_space'
+                ):
                     raise RuntimeError(
                         'Loading optimizer state from a GPT checkpoint into a hybrid model '
                         'is only supported for model-space distributed-optimizer checkpoints '
                         "(sharding type 'fully_reshardable' or 'fully_sharded_model_space'), "
                         f'but the checkpoint uses '
-                        f'{sharded_sd_metadata["distrib_optim_sharding_type"]!r}. Re-save the '
+                        f'{sharding_type!r}. Re-save the '
                         'GPT checkpoint with --dist-ckpt-optim-fully-reshardable, or pass '
                         '--no-load-optim '
                         'to start from a fresh optimizer.'
                     )
-                if (
-                    ckpt_tp_pp != run_tp_pp
-                    and sharded_sd_metadata['distrib_optim_sharding_type']
-                    not in DistributedOptimizer.checkpoint_fully_reshardable_formats
-                ):
-                    raise RuntimeError(
-                        f'{mismatch_msg}: not supported for DistributedOptimizer with sharding type'
-                        f' {sharded_sd_metadata["distrib_optim_sharding_type"]}.'
-                        f' Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.'
-                    )
-
                 # Check if fully parallel load is compatible with sharding type
-                if (
-                    checkpoint.fully_parallel_load
-                    and sharded_sd_metadata['distrib_optim_sharding_type']
-                    == 'dp_zero_gather_scatter'
-                ):
+                if checkpoint.fully_parallel_load and sharding_type == 'dp_zero_gather_scatter':
                     raise RuntimeError(
                         'Fully parallel load is not supported for dp_zero_gather_scatter checkpoints. '
                         'Please remove --ckpt-fully-parallel-load flag'
@@ -3421,7 +3429,7 @@ def load_checkpoint(
 
         optim_sd_kwargs = dict(
             metadata=_build_sharded_state_dict_metadata(
-                dp_cp_group=dp_cp_group, ckpt_format=load_format
+                dp_cp_group=dp_cp_group, ckpt_format=load_format, optimizer=optimizer
             ),
             is_loading=True,
         )
