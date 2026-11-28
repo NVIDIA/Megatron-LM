@@ -9,7 +9,6 @@ import itertools
 import json
 import logging
 import math
-import os
 import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager, nullcontext
@@ -97,11 +96,19 @@ from megatron.rl.agent.api import (
 )
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
-from megatron.rl.inference import ReturnsRaw
+from megatron.rl.inference import ReturnsRaw, ReturnsTokens
 from megatron.rl.inference.disagg import disagg_refit_pools
 from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
+from megatron.rl.rollout_bank import (
+    RolloutBank,
+    load_finished_request_records,
+    rebuild_turns,
+    request_record_paths,
+    resolve_bank_dir,
+    unjoinable_reason,
+)
 from megatron.rl.rollout_granularity import ConsumptionGranularity, SubmissionGranularity
 from megatron.rl.sequence_packing_utils import (
     compute_packed_inference_logprobs_stats,
@@ -403,7 +410,7 @@ class RLRuntimeState:
     def __init__(self):
         self.packing_context = None
         self.last_collection_iteration = 0
-        # Persistent ledger of per-request metadata (e.g. staleness stats).
+        # Rank 0's finished-request records awaiting the rollout they belong to.
         self.request_ledger = {}
         self.consumed_train_bins = 0
         # Durable rollout-bank state (rank 0 only). Recovered groups live on the
@@ -720,11 +727,7 @@ def maybe_get_rollout_bank(args):
         logger.debug("Durable rollout bank runs on rank 0 only; skipping on this rank.")
         return None
     if _ROLLOUT_BANK is None:
-        from megatron.rl.rollout_bank import RolloutBank
-
-        bank_dir = cfg.rl.rl_rollout_bank_dir or os.path.join(
-            cfg.checkpoint.save or ".", "rollout_bank"
-        )
+        bank_dir = resolve_bank_dir(cfg.rl.rl_rollout_bank_dir, cfg.checkpoint.save)
         _ROLLOUT_BANK = RolloutBank(bank_dir, max_bytes=cfg.rl.rl_rollout_bank_max_bytes)
         get_rl_runtime_state().rollout_bank = _ROLLOUT_BANK
         log_single_rank(logger, logging.INFO, f"Durable rollout bank enabled at {bank_dir}")
@@ -740,7 +743,9 @@ def maybe_compact_rollout_bank(iteration):
     """Compact the bank at a durable-checkpoint boundary."""
     bank = get_rollout_bank()
     if bank is not None:
-        bank.checkpoint(iteration)
+        # The engines append to the window the last collection's drain opened;
+        # every earlier window is closed and may be folded.
+        bank.checkpoint(iteration, open_window=get_rl_runtime_state().last_collection_iteration + 1)
 
 
 def _get_or_create_rollout_agent(env_config_path):
@@ -752,7 +757,7 @@ def _get_or_create_rollout_agent(env_config_path):
 
 
 def get_rollout_generator(
-    inference_interface: ReturnsRaw,
+    inference_interface: ReturnsRaw | ReturnsTokens,
     n_prompts: int,
     samples_per_group: int,
     *,
@@ -798,6 +803,95 @@ def get_rollout_generator(
     return _ROLLOUT_GENERATOR
 
 
+def join_request_records(
+    rollouts: GroupedRollouts, request_ledger: dict[str, FinishedRequestRecord]
+) -> None:
+    """Pop each turn's finished-request record onto its TokenRollout."""
+    for group in rollouts:
+        for rollout in group:
+            if not isinstance(rollout, TokenRollout) or rollout.policy_epochs is not None:
+                continue
+            if rollout.is_placeholder:
+                # A failed episode: the caller released the records of the calls it made.
+                rollout.policy_epochs, rollout.kv_cache_epochs, rollout.num_evictions = [], [], []
+                continue
+            if rollout.trajectory is not None:
+                assert len(rollout.completion_ids) == len(rollout.trajectory), (
+                    f"finished-request ledger: {len(rollout.completion_ids)} completion ids for "
+                    f"{len(rollout.trajectory)} turns."
+                )
+            records = []
+            for completion_id in rollout.completion_ids:
+                record = request_ledger.pop(completion_id, None)
+                assert (
+                    record is not None
+                ), f"finished-request ledger: no record for {completion_id!r}."
+                assert (
+                    record.policy_epoch and record.kv_cache_epoch
+                ), f"finished-request ledger: record {completion_id!r} has no epoch stamps."
+                records.append(record)
+            if rollout.trajectory is None:
+                # Staged payloads (the Megatron interface): the records hold the turns.
+                for completion_id, record in zip(rollout.completion_ids, records, strict=True):
+                    # The engine appends and trims generated tokens and their log probs together;
+                    # a mismatched payload fails here instead of misaligning the IS correction.
+                    reason = unjoinable_reason(record)
+                    assert (
+                        reason is None
+                    ), f"finished-request ledger: record {completion_id!r} {reason}."
+                for field, value in rebuild_turns(records).items():
+                    setattr(rollout, field, value)
+                continue
+            if rollout.logprobs is None and records:
+                for completion_id, record, mask in zip(
+                    rollout.completion_ids, records, rollout.generation_mask, strict=True
+                ):
+                    log_probs = (
+                        None if record.payload is None else record.payload.generated_log_probs
+                    )
+                    assert (
+                        log_probs is not None
+                    ), f"finished-request ledger: record {completion_id!r} has no logprob payload."
+                    # The engine appends and trims generated tokens and their log probs together,
+                    # so a mismatched payload fails here instead of misaligning the IS correction.
+                    generated = sum(mask)
+                    assert generated == len(log_probs), (
+                        f"finished-request ledger: record {completion_id!r} has "
+                        f"{len(log_probs)} log probs for {generated} generated tokens."
+                    )
+                rollout.logprobs = [record.payload.generated_log_probs for record in records]
+            rollout.policy_epochs = [record.policy_epoch for record in records]
+            rollout.kv_cache_epochs = [record.kv_cache_epoch for record in records]
+            rollout.num_evictions = [record.num_evictions for record in records]
+
+
+def settle_request_ledger(
+    request_ledger: dict[str, FinishedRequestRecord],
+    rollouts: GroupedRollouts,
+    release_ids: list[str],
+) -> tuple[list[str], set[str]]:
+    """Release the records nothing trains on, then join the rest onto `rollouts`.
+
+    `release_ids` names the calls of dropped groups or of an evaluation's requests; a delivered
+    placeholder's calls and every delivered rollout's `retired_completion_ids` (its episode's
+    retries and dead branches) are released with them. A record nothing claims stays in the
+    ledger: it may be a turn of an episode still in flight.
+    Returns ids to retire in the bank and ids whose held prefix can be forgotten.
+    """
+    ledgered = set(request_ledger)
+    released = list(release_ids)
+    for rollout in (r for group in rollouts for r in group if isinstance(r, TokenRollout)):
+        # A placeholder's calls and an episode's retries or dead branches train on nothing.
+        released += rollout.completion_ids if rollout.is_placeholder else []
+        released += rollout.retired_completion_ids
+    for completion_id in released:
+        # A release trains on nothing: an id with no record (a streamed call is never staged)
+        # is ignored.
+        request_ledger.pop(completion_id, None)
+    join_request_records(rollouts, request_ledger)
+    return released, ledgered - set(request_ledger)
+
+
 def can_skip_inference() -> bool:
     """Return True when a full batch of rollout groups is already banked; no context switch."""
     if _ROLLOUT_PIPELINE is None:
@@ -816,7 +910,7 @@ def colocated_inference(
     optimizer: MegatronOptimizer,
     n_prompts: int,
     samples_per_group: int
-) -> tuple[GroupedRollouts, dict[str, FinishedRequestRecord]]:
+) -> GroupedRollouts:
     """Swap to the inference engine and collect rollout groups from it.
 
     Args:
@@ -827,7 +921,7 @@ def colocated_inference(
         samples_per_group: Amount of trajectories per prompt.
 
     Returns:
-        Collected rollout groups (on rank 0) and the merged per-request metadata ledger.
+        Collected rollout groups on rank 0; same-shaped placeholders on every other rank.
     """
     args = get_args()
     cfg = get_run_config()
@@ -884,7 +978,11 @@ def colocated_inference(
             if bank is not None:
                 agent = _get_or_create_rollout_agent(cfg.rl.langrl_env_config)
                 if not runtime_state.bank_restored:
-                    restored_groups: GroupedRollouts = bank.recover(train_state.resume_iteration)
+                    # Restored groups come back fully joined with their durable request records.
+                    records = load_finished_request_records(request_record_paths(bank.bank_dir))
+                    restored_groups: GroupedRollouts = bank.recover(
+                        train_state.resume_iteration, request_records=records
+                    )
                     total_restored_groups = agent.set_restored_groups(restored_groups)
                     runtime_state.bank_restored = True
                     if total_restored_groups:
@@ -941,10 +1039,7 @@ def colocated_inference(
                     # Just set up space to collect the rollouts
                     rollouts = [[None for _ in range(samples_per_group)] for _ in range(n_prompts)]
 
-        with nvtx_range("rl/sync-request-ledger", time=True):
-            request_ledger = inference_interface.merge_global_request_ledgers()
-
-    return rollouts, request_ledger
+    return rollouts
 
 
 def get_environment_rollouts(
@@ -954,7 +1049,7 @@ def get_environment_rollouts(
     n_prompts: int,
     samples_per_group: int,
     run_inference: bool = True,
-) -> tuple[GroupedRollouts, dict[str, FinishedRequestRecord]]:
+) -> GroupedRollouts:
     """Sample environment rollouts from an LLM.
 
     Args:
@@ -966,7 +1061,10 @@ def get_environment_rollouts(
             If False, consume a batch already banked by the rollout pipeline.
 
     Returns:
-        (GroupedRollouts, per-request metadata ledger)
+        Rollout groups, identical on every rank after the broadcast from rank 0. Token
+        rollouts come back joined with their finished-request records, popped from the ledger
+        on rank 0 before the broadcast: the turns, masks and log probs the interface left with
+        the engine (all three for the Megatron interface), staleness stamps, eviction counts.
     """
     args = get_args()
     cfg = get_run_config()
@@ -974,10 +1072,8 @@ def get_environment_rollouts(
     nvtx_range = get_nvtx_range()
     rank = torch.distributed.get_rank()
 
-    # Skip path: banked groups' records were merged in the window that generated them.
-    request_ledger: dict[str, FinishedRequestRecord] = {}
     if run_inference:
-        rollouts, request_ledger = colocated_inference(
+        rollouts = colocated_inference(
             model, inference_model, optimizer, n_prompts, samples_per_group
         )
     elif rank == 0:
@@ -1001,6 +1097,46 @@ def get_environment_rollouts(
         rollouts.sort(key=lambda group: group[0].problem_id if group and group[0].problem_id else "")
 
     with nvtx_range("rl/sync-rollout-state", time=True):
+        runtime_state = get_rl_runtime_state()
+        assert (
+            _INFERENCE_INTERFACE is not None
+        ), "rollouts were collected before the inference interface was launched"
+        with nvtx_range("rl/sync-request-ledger", time=True):
+            # Every engine drains its ledger and rank 0 receives the union.
+            # Rotating to the next window's file waits until this window's records are flushed.
+            runtime_state.request_ledger.update(
+                _INFERENCE_INTERFACE.merge_global_request_ledgers(
+                    rotate_to=train_state.iteration + 1
+                )
+            )
+        failure = None
+        if rank == 0:
+            try:
+                # Every record is popped by the one consumer that owns it, or released: groups
+                # the pipeline dropped never reach the trainer, a placeholder's calls belong to an
+                # episode that failed, and a rollout's retired calls are its episode's retries
+                # and dead branches. A record nothing claims stays (a disconnected call, a
+                # transport-level retry, a call an agent does not report) and shows in the
+                # unjoined-records metric.
+                retire, forget = settle_request_ledger(
+                    runtime_state.request_ledger,
+                    rollouts,
+                    _ROLLOUT_PIPELINE.take_dropped_completion_ids(),
+                )
+                bank = get_rollout_bank()
+                if bank is not None:
+                    bank.retire_records(retire)
+                # Consumed and released calls need no prefix any more; unconsumed ones stay held.
+                _INFERENCE_INTERFACE.forget_held_prefixes(forget)
+            except Exception as error:  # pylint: disable=broad-except
+                # Logged here: the teardown's hard exit prints no traceback.
+                logger.exception("rollout collection failed on rank 0")
+                failure = error
+        # A failure on rank 0 is raised on every rank, not left to the broadcast's timeout.
+        failed = [None if failure is None else repr(failure)]
+        torch.distributed.broadcast_object_list(failed, src=0)
+        if failed[0] is not None:
+            raise failure or RuntimeError(f"rollout collection failed on rank 0: {failed[0]}")
         # Wait for Rollouts to be collected
         # TODO(jbarker): double check why this isn't causing rank 0 memory allocations
         torch.distributed.broadcast_object_list(rollouts, src=0)
@@ -1019,7 +1155,7 @@ def get_environment_rollouts(
             ) as f:
                 json.dump([[r.model_dump() for r in group] for group in rollouts], f)
 
-    return rollouts, request_ledger
+    return rollouts
 
 
 def selective_log_softmax(logits, index):
@@ -1539,10 +1675,7 @@ def single_turn_termination_ok(
 
 
 def compute_group_stats(
-    rollouts: GroupedRollouts,
-    tokenizer: MegatronTokenizer,
-    seq_len: int,
-    request_ledger: dict[str, FinishedRequestRecord],
+    rollouts: GroupedRollouts, tokenizer: MegatronTokenizer, seq_len: int
 ) -> RolloutStats:
     """Add group-based rollout stats for logging.
 
@@ -1550,7 +1683,6 @@ def compute_group_stats(
         rollouts: Rollouts to generate the stats for. Each inner list is a group (as in GRPO group), i.e. all rollouts are for the same prompt.
         tokenizer: Tokenizer to tokenize the rollouts in case they are raw strings.
         seq_len: Maximum sequence length.
-        request_ledger: Per-turn ledger of additional metadata (e.g. staleness stats).
 
     Returns:
        RolloutStats object containing all the stats.
@@ -1627,32 +1759,29 @@ def compute_group_stats(
                 roll_turn_lens = [len(t) for t in rollout.trajectory]
             group_turn_lengths.extend(roll_turn_lens)
             group_traj_lengths.append(sum(roll_turn_lens))
-            turn_records = (
-                [request_ledger.pop(completion_id) for completion_id in rollout.completion_ids]
-                if isinstance(rollout, TokenRollout)
-                else []
-            )
-            for record in turn_records:
-                assert record.policy_epoch, "Request record has no policy_epoch data"
-                assert record.kv_cache_epoch, "Request record has no kv_cache_epoch data"
-            if turn_records:
+            if (
+                isinstance(rollout, TokenRollout)
+                and rollout.completion_ids
+                and not rollout.is_placeholder
+            ):
+                # Staleness stamps were joined from the finished-request ledger per turn.
+                assert (
+                    rollout.policy_epochs is not None
+                ), f"TokenRollout {rollout.completion_ids} was not joined with its records"
                 cumulative_turn_lens = [len(t) for t in rollout.trajectory]
                 group_policy_epoch_segments.append(
-                    expand_epoch_segments(
-                        [record.policy_epoch for record in turn_records], cumulative_turn_lens
-                    )
+                    expand_epoch_segments(rollout.policy_epochs, cumulative_turn_lens)
                 )
                 group_kv_epoch_segments.append(
-                    expand_epoch_segments(
-                        [record.kv_cache_epoch for record in turn_records], cumulative_turn_lens
-                    )
+                    expand_epoch_segments(rollout.kv_cache_epochs, cumulative_turn_lens)
                 )
+                group_completed_epochs.extend(epochs[-1][1] for epochs in rollout.policy_epochs)
+                group_num_evictions.append(sum(rollout.num_evictions))
             else:
-                # Unjoined rollouts (placeholders, text rollouts) pop no records: empty rows.
+                # Placeholders and text rollouts have no records: empty rows.
                 group_policy_epoch_segments.append([])
                 group_kv_epoch_segments.append([])
-            group_completed_epochs.extend(record.policy_epoch[-1][1] for record in turn_records)
-            group_num_evictions.append(sum(record.num_evictions for record in turn_records))
+                group_num_evictions.append(0)
             rollout_status = rollout.rollout_status
             # All empty-trajectory rollouts are placeholders.
             if not rollout.trajectory and rollout_status == 'ok':
@@ -2051,6 +2180,9 @@ def _collect_rollout_pipeline_metrics() -> dict:
         "rollout_pipeline_consume_pending_groups": len(pipeline._consume_pending),
         "rollout_pipeline_ready_batches": pipeline.ready_batches,
         "rollout_pipeline_regen_pending_groups": len(pipeline._regen_tasks),
+        # Drained records not yet joined: turns of in-flight episodes, plus any record no rollout
+        # or evaluation result will ever name (a retried or disconnected call, a judge call).
+        "finished_request_ledger_unjoined_records": len(get_rl_runtime_state().request_ledger),
         "rollout_pipeline_gate_capacity": gate.capacity,
         "rollout_pipeline_gate_held": gate.held,
         "rollout_pipeline_gate_utilization": (
@@ -2528,7 +2660,6 @@ def prepare_data_for_update(
     tokenizer: MegatronTokenizer,
     sequence_packing: bool,
     is_correction: bool,
-    request_ledger: dict[str, FinishedRequestRecord],
 ) -> tuple[RerunDataIterator, RolloutStats, dict]:
     """Extract data for the update from raw rollouts.
 
@@ -2539,7 +2670,6 @@ def prepare_data_for_update(
         tokenizer: Tokenizer to pad/tokenize data.
         sequence_packing: Use sequence packing if True.
         is_correction: Prepare data for IS correction if True.
-        request_ledger: Finished-request records keyed by the completion id.
 
     Returns:
         Tuple of (cycled iterator over dataset batches, group stats, example groups per env).
@@ -2560,7 +2690,9 @@ def prepare_data_for_update(
 
     with nvtx_range("rl/prepare-data-for-update", time=True):
         with nvtx_range("rl/compute-group-stats", time=True):
-            group_stats = compute_group_stats(rollouts, tokenizer, cfg.model.transformer.max_seq_length_per_sample, request_ledger)
+            group_stats = compute_group_stats(
+                rollouts, tokenizer, cfg.model.transformer.max_seq_length_per_sample
+            )
 
         # Now split the rollouts across the data parallel ranks for training
         # This needs to be done at this point because we are about to calculate logprobs
@@ -2893,13 +3025,10 @@ def get_grpo_data_iterator(
             runtime_state.inference_ran += 1
         else:
             runtime_state.inference_skipped += 1
-        rollouts, fresh_ledger = get_environment_rollouts(
+        rollouts = get_environment_rollouts(
             model, inference_model, optimizer, grpo_prompts_per_step, grpo_group_size,
             run_inference=run_inference,
         )
-        # Records persist until their rollout's join pops them (partial rollouts
-        # deliver across window boundaries); never-joined residents are accepted.
-        runtime_state.request_ledger.update(fresh_ledger)
         buffered_rollouts, group_stats, example_groups = prepare_data_for_update(
             model=model,
             ref_state_dict=ref_state_dict,
@@ -2907,7 +3036,6 @@ def get_grpo_data_iterator(
             tokenizer=tokenizer,
             sequence_packing=sequence_packing,
             is_correction=is_correction,
-            request_ledger=runtime_state.request_ledger,
         )
         # The optimizer is offloaded inside colocated_inference,
         # so there is nothing to restore when the inference context switch was skipped.
@@ -2988,8 +3116,27 @@ def evaluate_and_print_results_rl(
                     evaluation_responses = loop.run_until_complete(agent.run_evaluation(request))
                     if not isinstance(evaluation_responses, list):
                         evaluation_responses = [evaluation_responses]
+                eval_completion_ids = [
+                    completion_id
+                    for response in evaluation_responses
+                    for result in response.results
+                    for completion_id in result.completion_ids
+                ]
             else:
                 evaluation_responses = None
+                eval_completion_ids = []
+
+        # Evaluation requests are ledgered like any other; nothing joins them, so rank 0 pops
+        # their records right away. Training stragglers that finished during the evaluation stay.
+        runtime_state = get_rl_runtime_state()
+        runtime_state.request_ledger.update(inference_interface.merge_global_request_ledgers())
+        retire, forget = settle_request_ledger(
+            runtime_state.request_ledger, [], eval_completion_ids
+        )
+        bank = get_rollout_bank()
+        if bank is not None:
+            bank.retire_records(retire)
+        inference_interface.forget_held_prefixes(forget)
 
         dp_eval_results: list[None | list[EvaluationResponse]] = [
             None for _ in range(args.world_size)

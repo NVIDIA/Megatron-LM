@@ -1,28 +1,59 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Parameterized coverage for durable rollout-bank persistence and replay."""
+"""Parameterized coverage for durable rollout-bank persistence and replay, and for the token
+custody the engines keep for a worker-custody harness: held receipts and exact-prefix splices."""
 
 import asyncio
+import dataclasses
+import io
 import json
+import os
+import threading
 from collections import Counter
 from contextlib import aclosing
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
+import msgpack
 import numpy as np
 import pytest
 
-from megatron.rl import rl_utils
+from megatron.core.inference.inference_request import (
+    PREFIX_EOS_TOKEN_ID_FIELD,
+    PREFIX_EXPANDED_TOKEN_COUNT_FIELD,
+    PREFIX_MEDIA_COUNT_FIELD,
+    PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
+    FinishedRequestRecord,
+    OffloadedRequestPayload,
+    RequestPayloadStageResult,
+)
+from megatron.rl import rl_utils, rollout_bank
 from megatron.rl.agent.api import GroupedRolloutRequest, Rollout, RolloutGroup, TokenRollout
 from megatron.rl.agent.rollout_pipeline import RolloutPipeline
 from megatron.rl.agent.weighted_multi_task import AgentConfig, WeightedMultiTask
+from megatron.rl.inference.megatron import MegatronLocal, _check_shared_bank_dir
 from megatron.rl.rollout_bank import (
     _CONSUMED,
     _FORMAT_VERSION,
     _GENERATIONS,
     _LEDGER,
     _MANIFEST,
-    _TOKENS_BIN,
+    _REQUEST_RECORDS,
+    FinishedRequestLedgerWriter,
+    LedgerPayloadStager,
     RolloutBank,
     _segment_name,
+    gather_view,
+    load_finished_request_records,
+    request_record_backup_path,
+    request_record_paths,
+    request_records_dir,
+)
+from megatron.rl.token_custody import (
+    NG_CAPTURE_FIELD,
+    NG_COMMIT_COORDS_FIELD,
+    HeldPrefixPreparer,
+    PrefixStore,
 )
 from megatron.rl.types import Rollout as SharedRollout
 from megatron.rl.types import RolloutGroup as SharedRolloutGroup
@@ -30,46 +61,73 @@ from megatron.rl.types import TokenRollout as SharedTokenRollout
 from tests.unit_tests.rl.test_rollout_generation import MockGenerator, MockInferenceInterface
 
 
-def _token_group(batch_id=0, *, empty=False):
-    members = (
-        [([], [], [])]
-        if empty
-        else [
-            (
-                [[1, 2, 3], [4, 5]],
-                [[-0.1, -0.2, -0.3], [-0.4, -0.5]],
-                [[False, True, True], [True, True]],
-            ),
-            ([[7, 8]], [[-1.5, -2.5]], [[True, True]]),
-        ]
+def _record(prompt=(1,), generated=(2,), log_probs=(-0.5,), routing=None, **stamps):
+    """A finished-request record with its payload; ``stamps`` override the epoch fields."""
+    return FinishedRequestRecord(
+        **{"policy_epoch": [(0, 3)], "kv_cache_epoch": [(0, 3)], "num_evictions": 0, **stamps},
+        payload=OffloadedRequestPayload(
+            prompt_token_ids=list(prompt),
+            generated_token_ids=list(generated),
+            generated_log_probs=list(log_probs),
+            prompt_log_probs=None,
+            routing_indices=routing,
+        ),
     )
-    return RolloutGroup(
-        rollouts=[
-            TokenRollout(
-                trajectory=tokens,
+
+
+def _token_group(batch_id=0, *, empty=False):
+    """A group plus the records that rebuild it: turn tokens == prompt + generation."""
+    turns_per_member = [[]] if empty else [[([1], [2, 3]), ([1, 2, 3], [5])], [([7], [8])]]
+    rollouts, records = [], {}
+    for member, turns in enumerate(turns_per_member):
+        cids = [f"chatcmpl-{batch_id}-{member}-{turn}" for turn in range(len(turns))]
+        logprobs = [[-0.125 * (i + 1) for i in range(len(generated))] for _, generated in turns]
+        for cid, turn, (prompt, generated) in zip(cids, range(len(turns)), turns):
+            records[cid] = _record(
+                prompt,
+                generated,
+                logprobs[turn],
+                kv_cache_epoch=[(0, 3), (2, 4)],
+                num_evictions=turn,
+            )
+        rollouts.append(
+            TokenRollout(  # as a restored (or joined) rollout carries the records' turns and stamps
+                trajectory=[[*prompt, *generated] for prompt, generated in turns],
                 reward=1.0,
                 logprobs=logprobs,
-                generation_mask=mask,
+                generation_mask=[[False] * len(p) + [True] * len(g) for p, g in turns],
                 env_id="test",
                 problem_id="p",
-                completion_ids=[f"completion-{index}" for index in range(len(tokens))],
+                completion_ids=cids,
+                policy_epochs=[[(0, 3)]] * len(turns),
+                kv_cache_epochs=[[(0, 3), (2, 4)]] * len(turns),
+                num_evictions=list(range(len(turns))),
             )
-            for tokens, logprobs, mask in members
-        ],
-        batch_id=batch_id,
-    )
+        )
+    return RolloutGroup(rollouts=rollouts, batch_id=batch_id), records
 
 
 def _text_group():
-    return RolloutGroup(rollouts=[Rollout(trajectory=["hello world"], reward=0.5, env_id="text")])
+    group = RolloutGroup(rollouts=[Rollout(trajectory=["hello world"], reward=0.5, env_id="text")])
+    return group, {}
 
 
 def _empty_group():
-    return RolloutGroup(rollouts=[])
+    return RolloutGroup(rollouts=[]), {}
 
 
 def _empty_token_group():
     return _token_group(empty=True)
+
+
+def _staged_token_group():
+    """The token group as the Megatron interface delivers it: the turns live only in the records."""
+    group, records = _token_group()
+    for rollout in group.rollouts:
+        rollout.trajectory = rollout.generation_mask = rollout.logprobs = None
+        rollout.policy_epochs = rollout.kv_cache_epochs = rollout.num_evictions = None
+        assert not rollout.is_placeholder
+    return group, records
 
 
 def _active_generation(bank_dir):
@@ -82,33 +140,40 @@ def _segment_dir(bank_dir, iteration=3):
 
 
 def _assert_group_matches(actual, expected):
+    """Field-exact: fp32 backups round-trip the engine's fp32 log probs bit-exactly."""
     assert actual.batch_id == expected.batch_id
-    assert len(actual.rollouts) == len(expected.rollouts)
-    for actual_rollout, expected_rollout in zip(actual.rollouts, expected.rollouts, strict=True):
-        assert type(actual_rollout) is type(expected_rollout)
-        assert actual_rollout.trajectory == expected_rollout.trajectory
-        assert actual_rollout.reward == expected_rollout.reward
-        assert actual_rollout.env_id == expected_rollout.env_id
-        if isinstance(expected_rollout, TokenRollout):
-            assert actual_rollout.generation_mask == expected_rollout.generation_mask
-            assert len(actual_rollout.logprobs) == len(expected_rollout.logprobs)
-            for actual_turn, expected_turn in zip(
-                actual_rollout.logprobs, expected_rollout.logprobs, strict=True
-            ):
-                assert np.allclose(actual_turn, expected_turn, atol=1e-3)
+    assert [r.model_dump() for r in actual.rollouts] == [r.model_dump() for r in expected.rollouts]
+
+
+def _backup(bank_dir, window, records, rank=0):
+    """Back records up the way an engine does, into a closed (rotated) window file."""
+    path = request_record_backup_path(str(bank_dir), rank=rank, iteration=window, tag="deadbeef")
+    writer = FinishedRequestLedgerWriter(path)
+    for cid, rec in records.items():
+        writer.append(cid, rec)
+    writer.close()
+    return path
+
+
+def _on_disk(bank_dir):
+    """Every durable record the bank can still reach, by uid."""
+    return load_finished_request_records(request_record_paths(str(bank_dir)))
 
 
 @pytest.mark.parametrize(
     "group_factory",
     [
-        pytest.param(_token_group, id="ragged-token-sidecars"),
+        pytest.param(_token_group, id="ragged-token-group"),
+        pytest.param(_staged_token_group, id="staged-token-group"),
         pytest.param(_text_group, id="inline-text"),
         pytest.param(_empty_group, id="empty-group"),
         pytest.param(_empty_token_group, id="empty-token-trajectory"),
     ],
 )
 def test_rollout_bank_round_trip(tmp_path, group_factory):
-    """All supported payload shapes survive a close/restart round trip."""
+    """All supported payload shapes survive a close/restart round trip. Token groups bank as thin
+    manifests that restore rebuilds from the request records, whether the turns arrived inline or
+    staged with the engine; mismatched completion ids are refused at append."""
     assert (SharedRollout, SharedRolloutGroup, SharedTokenRollout) == (
         Rollout,
         RolloutGroup,
@@ -116,10 +181,15 @@ def test_rollout_bank_round_trip(tmp_path, group_factory):
     )
     assert Rollout(trajectory=["prompt"], reward=None).reward is None
 
-    expected = group_factory()
+    expected, records = group_factory()
     bank = RolloutBank(str(tmp_path))
     bank.set_collection(3)
     uid = bank.append(expected)
+    if group_factory is _token_group:
+        unjoinable, _ = _token_group(batch_id=1)
+        unjoinable.rollouts[0].completion_ids = []
+        with pytest.raises(ValueError, match="completion ids"):
+            bank.append(unjoinable)
     bank.close()
 
     manifest = json.loads((tmp_path / _MANIFEST).read_text())
@@ -129,66 +199,204 @@ def test_rollout_bank_round_trip(tmp_path, group_factory):
     assert manifest["timeline"]
     assert (generation / _CONSUMED).exists()
 
-    restored = RolloutBank(str(tmp_path)).restore(trained_through=0)
+    restored = RolloutBank(str(tmp_path)).restore(trained_through=0, request_records=records)
     assert [group.uid for group in restored] == [uid]
+    if group_factory is _staged_token_group:
+        expected, _ = _token_group()  # the records rebuild what the engine staged
     _assert_group_matches(restored[0], expected)
 
-    if group_factory is _empty_token_group:
+    if group_factory not in (_text_group, _empty_group):
+        # Thin manifest: the reconstructable arrays never reach the bank.
         assert record["kind"] == "token"
-        assert record["tok"]["bytes"] == 0
-        assert not (generation / _segment_name(3) / _TOKENS_BIN).exists()
+        for member in record["group"]["rollouts"]:
+            for field in ("trajectory", "logprobs", "generation_mask", "policy_epochs"):
+                assert field not in member
 
 
-def test_restore_drops_torn_final_ledger_record(tmp_path):
-    """A partial final JSONL append is truncated and does not hide durable records."""
+@pytest.mark.parametrize(
+    "damage, expected_survivors",
+    [
+        pytest.param("torn_ledger_line", 1, id="torn-final-ledger-record"),
+        pytest.param("bad_checksum", 1, id="bad-checksum"),
+        pytest.param("missing_records", 1, id="missing-request-records"),
+        pytest.param("no_records", 0, id="no-request-records"),
+        pytest.param("short_log_probs", 0, id="record-lost-log-probs"),
+    ],
+)
+def test_restore_drops_only_the_damaged_groups(tmp_path, caplog, damage, expected_survivors):
+    """A torn final manifest line or a bad checksum drops that record alone; a token group whose
+    request records did not survive is dropped loudly rather than restored without them."""
+    group_a, records_a = _token_group(batch_id=0)
+    group_b, records_b = _token_group(batch_id=1)
     bank = RolloutBank(str(tmp_path))
     bank.set_collection(3)
-    durable_uid = bank.append(_token_group())
-    bank.append(_token_group())
+    durable_uid = bank.append(group_a)
+    bank.append(group_b)
     bank.close()
 
     ledger = _segment_dir(tmp_path) / _LEDGER
-    lines = ledger.read_bytes().splitlines(keepends=True)
-    ledger.write_bytes(lines[0] + lines[1][: len(lines[1]) // 2])
+    records = {} if damage == "no_records" else records_a  # group_b's records never reached disk
+    if damage == "bad_checksum":
+        records = {**records_a, **records_b}  # only the checksum may drop group_b in this row
+    if damage == "torn_ledger_line":
+        lines = ledger.read_bytes().splitlines(keepends=True)
+        ledger.write_bytes(lines[0] + lines[1][: len(lines[1]) // 2])
+    elif damage == "bad_checksum":
+        manifests = [json.loads(line) for line in ledger.read_text().splitlines()]
+        manifests[-1]["checksum"] = "0" * 32
+        ledger.write_text("".join(json.dumps(m) + "\n" for m in manifests))
+    elif damage == "short_log_probs":
+        # One turn's record kept its tokens but lost its log probs: unusable, not restorable.
+        cid, rec = next(iter(records_a.items()))
+        records = {
+            **records_a,
+            cid: dataclasses.replace(
+                rec, payload=dataclasses.replace(rec.payload, generated_log_probs=[])
+            ),
+        }
 
     restarted = RolloutBank(str(tmp_path))
-    restarted.set_collection(3)
-    assert ledger.read_bytes() == lines[0]
-    assert [group.uid for group in restarted.restore(trained_through=0)] == [durable_uid]
+    restarted.set_collection(3)  # a torn tail is truncated before appends resume
+    if damage == "torn_ledger_line":
+        assert ledger.read_bytes() == lines[0]
+    with caplog.at_level("WARNING", logger="megatron.rl.rollout_bank"):
+        restored = restarted.restore(trained_through=0, request_records=records)
+    assert [group.uid for group in restored] == [durable_uid][:expected_survivors]
+    # Only a group whose records are gone is announced as dropped and regenerated.
+    lost_records = damage in ("missing_records", "no_records", "short_log_probs")
+    assert ("Dropping banked rollout group" in caplog.text) is lost_records
 
 
-def test_restore_drops_record_with_bad_checksum(tmp_path):
-    """Checksum corruption drops only the affected record during recovery."""
-    bank = RolloutBank(str(tmp_path))
-    bank.set_collection(3)
-    durable_uid = bank.append(_token_group())
-    bank.append(_token_group())
-    bank.close()
+def test_record_store(tmp_path, monkeypatch, caplog):
+    """Records round-trip the stager, the writer and the loader with exact fields; a file is read
+    in chunks past msgpack's cap, bad frames and torn tails drop only themselves, folds copy frames
+    verbatim, and a failed write surfaces at rotate() or close() without hanging."""
+    routing = np.arange(12, dtype=np.int64).reshape(4, 3, 1)
+    record = FinishedRequestRecord(
+        policy_epoch=[(0, 3)],
+        kv_cache_epoch=[(0, 3), (5, 4)],
+        num_evictions=2,
+        num_tokens_to_generate=8,
+        finish_reason="stop",
+    )
+    payload = OffloadedRequestPayload(
+        prompt_token_ids=[1, 2, 3],
+        generated_token_ids=[10, 151_643],  # above 2**16, as real vocabularies are
+        generated_log_probs=[float(np.float32(-0.1)), -1.25],  # exact in fp32 only
+        prompt_log_probs=[-1.0, -2.0, -3.0],
+        routing_indices=routing,
+    )
+    plain = FinishedRequestRecord(policy_epoch=None, kv_cache_epoch=None, num_evictions=0)
+    first, second = tmp_path / "a.bin", tmp_path / "b.bin"
+    stager = LedgerPayloadStager(FinishedRequestLedgerWriter(str(first)))
+    assert stager.drain() == {}
+    staged = asyncio.run(
+        asyncio.to_thread(stager.stage, "chatcmpl-0", payload, finished_metadata=record)
+    )
+    assert staged == RequestPayloadStageResult() and record.payload is payload
+    drained = stager.drain()
+    assert drained == {"chatcmpl-0": gather_view(record)}
+    assert stager.drain() == {}
+    with pytest.raises(AssertionError, match="duplicate uid"):
+        stager.stage("chatcmpl-1", payload, finished_metadata=record)
+        stager.stage("chatcmpl-1", payload, finished_metadata=record)
+    stager.rotate(str(second))  # delegated to the writer, like close() below
+    stager.writer.append("chatcmpl-plain", plain)
+    stager.writer.append("chatcmpl-2", record)
+    stager.close()
+    LedgerPayloadStager().rotate(str(second))  # without a writer both are no-ops
+    LedgerPayloadStager().close()
 
-    ledger = _segment_dir(tmp_path) / _LEDGER
-    records = [json.loads(line) for line in ledger.read_text().splitlines()]
-    records[-1]["checksum"] = "0" * 32
-    ledger.write_text("".join(json.dumps(record) + "\n" for record in records))
+    loaded = load_finished_request_records([str(first), str(second)])
+    assert set(loaded) == {"chatcmpl-0", "chatcmpl-1", "chatcmpl-plain", "chatcmpl-2"}
+    durable = loaded["chatcmpl-0"]
+    # Field-exact: stamps back as tuples, fp32 log probs bit-exactly, routing with its dtype.
+    assert np.array_equal(durable.payload.routing_indices, routing)
+    assert durable.payload.routing_indices.dtype == routing.dtype
+    without_routing = dataclasses.replace(payload, routing_indices=None)
+    assert dataclasses.replace(durable.payload, routing_indices=None) == without_routing
+    assert dataclasses.replace(durable, payload=None) == dataclasses.replace(record, payload=None)
+    assert loaded["chatcmpl-plain"] == plain
 
-    assert [group.uid for group in RolloutBank(str(tmp_path)).restore(trained_through=0)] == [
-        durable_uid
-    ]
+    gathered = gather_view(record)
+    assert dataclasses.replace(gathered, payload=None) == dataclasses.replace(record, payload=None)
+    assert gathered.payload == dataclasses.replace(without_routing, prompt_log_probs=None)
+    assert payload.routing_indices is routing  # the stager's own record keeps everything
 
+    second.write_bytes(second.read_bytes()[:-3])  # tear the final record
+    loaded = load_finished_request_records([str(first), str(second), str(tmp_path / "absent.bin")])
+    assert set(loaded) == {"chatcmpl-0", "chatcmpl-1", "chatcmpl-plain"}
 
-def test_restore_drops_record_with_truncated_sidecar(tmp_path):
-    """A short sidecar slice drops its ledger record instead of failing resume."""
-    bank = RolloutBank(str(tmp_path))
-    bank.set_collection(3)
-    durable_uid = bank.append(_token_group())
-    bank.append(_token_group())
-    bank.close()
+    # One backup window holding every kind of frame: two good records, one whose arrays no longer
+    # match its digest, one routing-replay frame just over msgpack's cap, one foreign version.
+    def tampered(uid, **changes):
+        frame = rollout_bank.pack_finished_request_record(uid, _record())
+        return msgpack.packb({**msgpack.unpackb(frame, raw=False), **changes}, use_bin_type=True)
 
-    tokens = _segment_dir(tmp_path) / _TOKENS_BIN
-    tokens.write_bytes(tokens.read_bytes()[:-1])
+    rows = (101 << 20) // (32 * 8 * 8) + 1
+    big_routing = np.arange(rows * 32 * 8, dtype=np.int64).reshape(rows, 32, 8)
+    frames = {
+        "a": rollout_bank.pack_finished_request_record("a", _record(log_probs=[-0.25])),
+        "big": rollout_bank.pack_finished_request_record("big", _record(routing=big_routing)),
+        "small": rollout_bank.pack_finished_request_record("small", _record([1, 2], [3], [-0.25])),
+        "d": rollout_bank.pack_finished_request_record("d", _record(log_probs=[-0.25])),
+    }
+    assert len(frames["big"]) > max(100 << 20, rollout_bank._RECORD_READ_SIZE)
+    flipped = tampered("b", generated_log_probs=b"\xff" * 4)
+    foreign = tampered("c", format_version=_FORMAT_VERSION + 1)
+    window = request_record_backup_path(str(tmp_path), rank=0, iteration=1, tag="deadbeef")
+    os.makedirs(os.path.dirname(window))
+    with open(window, "wb") as f:
+        f.write(frames["a"] + flipped + frames["big"] + foreign + frames["small"] + frames["d"])
+    with caplog.at_level("WARNING", logger="megatron.rl.rollout_bank"):
+        loaded = load_finished_request_records([window])
+    assert set(loaded) == set(frames)
+    assert np.array_equal(loaded["big"].payload.routing_indices, big_routing)
+    assert loaded["small"].payload.generated_log_probs == [-0.25]
+    assert sum("Skipping an unreadable request record" in r.message for r in caplog.records) == 2
+    assert rollout_bank._packed_records([window]) == frames
+    # The engine's writer appends to that window and rotates to the next on the drain.
+    next_window = request_record_backup_path(str(tmp_path), rank=0, iteration=2, tag="deadbeef")
+    stager = LedgerPayloadStager(FinishedRequestLedgerWriter(window))
+    e, f = _record(log_probs=[-0.75]), _record(log_probs=[-1.0])
+    stager.stage("e", e.payload, finished_metadata=e)
+    stager.rotate(next_window)
+    stager.stage("f", f.payload, finished_metadata=f)
+    stager.close()
+    assert set(load_finished_request_records([window])) == {*frames, "e"}
+    assert set(load_finished_request_records([next_window])) == {"f"}
 
-    assert [group.uid for group in RolloutBank(str(tmp_path)).restore(trained_through=0)] == [
-        durable_uid
-    ]
+    # A full disk fails the flush and keeps the bytes in the file object, so closing the file
+    # fails again. close() must still end the writer thread and raise, not wait for it forever.
+    class FullDisk(io.BytesIO):
+        def flush(self):
+            raise OSError("No space left on device")
+
+        close = flush
+
+    with monkeypatch.context() as disk:
+        disk.setattr(rollout_bank, "open", lambda *_args: FullDisk(), raising=False)
+        writer = FinishedRequestLedgerWriter(str(tmp_path / "full.bin"))
+        writer.append("chatcmpl-full", plain)
+        outcome = []
+        closing = threading.Thread(
+            target=lambda: outcome.append(pytest.raises(RuntimeError, writer.close)), daemon=True
+        )
+        closing.start()
+        closing.join(timeout=10)
+    assert outcome, "close() is still waiting for the writer thread"
+
+    def broken(uid, record):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(rollout_bank, "pack_finished_request_record", broken)
+    writer = FinishedRequestLedgerWriter(str(tmp_path / "c.bin"))
+    writer.append("chatcmpl-3", plain)
+    with pytest.raises(RuntimeError, match="writer failed") as info:
+        writer.rotate(str(tmp_path / "d.bin"))
+    assert isinstance(info.value.__cause__, OSError)
+    with pytest.raises(RuntimeError, match="writer failed"):
+        writer.close()
 
 
 @pytest.mark.parametrize(
@@ -199,47 +407,407 @@ def test_restore_drops_record_with_truncated_sidecar(tmp_path):
         pytest.param(1, True, id="consumed-after-checkpoint"),
     ],
 )
-def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, should_restore):
-    """Checkpoint compaction prunes trained groups and preserves future markers."""
+def test_checkpoint_compacts_at_consumption_boundary(
+    tmp_path, monkeypatch, consumed_offset, should_restore
+):
+    """A checkpoint folds only the closed backup windows, never the one the engines hold open,
+    keeps every record still owed to a group, releases reclaimed and retired ones, and stops
+    before publishing when a window cannot be read."""
     checkpoint_iteration = 10
+    group_a, records_a = _token_group(batch_id=0)
+    group_b, records_b = _token_group(batch_id=1)
+    all_records = {**records_a, **records_b}
+
+    # Window 5 is closed: both groups' records, a turn of an in-flight group, a retired request.
+    closed = _backup(
+        tmp_path, 5, {**all_records, "chatcmpl-inflight": _record(), "chatcmpl-retired": _record()}
+    )
+    # Window 10 is the engines' open file (an evaluation created it); declared at each checkpoint.
+    current = _backup(tmp_path, checkpoint_iteration, {"chatcmpl-eval": _record()})
+
     bank = RolloutBank(str(tmp_path))
     bank.set_collection(5)
-    consumed = bank.append(_token_group())
-    never_consumed = bank.append(_token_group())
-    bank.mark_consumed(consumed, checkpoint_iteration + consumed_offset)
+    consumed = bank.append(group_a)
+    never_consumed = bank.append(group_b)
+    bank.mark_consumed_many([consumed], checkpoint_iteration + consumed_offset)
+    bank.retire_records(["chatcmpl-retired", "chatcmpl-later"])  # "later" has no record yet
     old_generation = _active_generation(tmp_path)
 
-    before_checkpoint = {group.uid for group in bank.restore(checkpoint_iteration)}
+    before_checkpoint = {
+        group.uid for group in bank.restore(checkpoint_iteration, request_records=all_records)
+    }
     assert (consumed in before_checkpoint) is should_restore
     assert never_consumed in before_checkpoint
 
-    bank.checkpoint(checkpoint_iteration)
+    def failed_read(*_args, **_kwargs):
+        raise OSError("read failed")
+
+    # A read that fails is not an empty file: the checkpoint stops before it publishes or prunes.
+    with monkeypatch.context() as patched, pytest.raises(OSError, match="read failed"):
+        patched.setattr(os, "pread", failed_read)
+        bank.checkpoint(checkpoint_iteration, open_window=checkpoint_iteration)
+    assert _active_generation(tmp_path) == old_generation and os.path.exists(closed)
+
+    with open(current, "ab") as handle:  # the engine writer's handle stays open across the save
+        bank.checkpoint(checkpoint_iteration, open_window=checkpoint_iteration)
+        handle.write(rollout_bank.pack_finished_request_record("chatcmpl-next-window", _record()))
     manifest = json.loads((tmp_path / _MANIFEST).read_text())
     assert manifest["trained_through"] == checkpoint_iteration
     assert manifest["segments"] == [_segment_name(checkpoint_iteration)]
     assert not old_generation.exists()
+    # Window 5 was folded and pruned, the open window left alone and still appendable. A
+    # reclaimed group releases its records and a retired id is dropped; the in-flight turn is
+    # kept, nobody owns it yet.
+    fold = _active_generation(tmp_path) / _segment_name(checkpoint_iteration) / _REQUEST_RECORDS
+    assert request_record_paths(str(tmp_path)) == [current, str(fold)]
+    owed = set(all_records) if should_restore else set(records_b)
+    assert set(load_finished_request_records([str(fold)])) == owed | {"chatcmpl-inflight"}
+    assert set(load_finished_request_records([current])) == {
+        "chatcmpl-eval",
+        "chatcmpl-next-window",
+    }
 
-    restarted = RolloutBank(str(tmp_path))
-    restored = restarted.restore(checkpoint_iteration)
-    restored_uids = {group.uid for group in restored}
-    assert restored_uids == ({consumed, never_consumed} if should_restore else {never_consumed})
+    restored = RolloutBank(str(tmp_path)).restore(
+        checkpoint_iteration, request_records=_on_disk(tmp_path)
+    )
+    expected_uids = {consumed, never_consumed} if should_restore else {never_consumed}
+    assert {group.uid for group in restored} == expected_uids
     for group in restored:
-        _assert_group_matches(group, _token_group())
-
+        _assert_group_matches(group, _token_group(batch_id=0 if group.uid == consumed else 1)[0])
     markers = [
         json.loads(line)
         for line in (_active_generation(tmp_path) / _CONSUMED).read_text().splitlines()
     ]
-    expected_markers = (
+    assert markers == (
         [{"uid": consumed, "iter": checkpoint_iteration + 1}] if should_restore else []
     )
-    assert markers == expected_markers
 
-    if should_restore:
-        restarted.checkpoint(checkpoint_iteration + 1)
-        assert {group.uid for group in restarted.restore(checkpoint_iteration + 1)} == {
-            never_consumed
-        }
+    # Two windows on: the current window has closed, the retired id's record arrived late, and
+    # rank 0 retired the in-flight turn. Only the never-consumed group's records and the still
+    # unretired evaluation-window records remain.
+    _backup(tmp_path, checkpoint_iteration + 1, {"chatcmpl-later": _record()})
+    bank.retire_records(["chatcmpl-inflight"])
+    bank.checkpoint(checkpoint_iteration + 2, open_window=checkpoint_iteration + 2)
+    assert set(_on_disk(tmp_path)) == set(records_b) | {"chatcmpl-eval", "chatcmpl-next-window"}
+    restored = bank.restore(checkpoint_iteration + 2, request_records=_on_disk(tmp_path))
+    assert {group.uid for group in restored} == {never_consumed}
+
+
+def test_restart_recovers_banked_groups_and_retires_the_dead_runs_records(tmp_path, caplog):
+    """Released and retired call ids are not persisted; recovery rebuilds the groups, drops the
+    dead run's unreferenced records at the next fold and never resurrects its copies of folded
+    ones; an old-format directory is refused with a logged remedy."""
+    group, records = _token_group(batch_id=0)
+    expected, _ = _token_group(batch_id=0)
+    group.rollouts[0].retired_completion_ids = ["chatcmpl-retry"]  # released when banked
+    failed = TokenRollout(
+        trajectory=[], reward=0.0, env_id="test", problem_id="p", completion_ids=["chatcmpl-gone"]
+    )
+    assert failed.is_placeholder
+    bank = RolloutBank(str(tmp_path))
+    bank.set_collection(5)
+    uid = bank.append(RolloutGroup(rollouts=[*group.rollouts, failed]))
+    bank.close()
+    manifest = json.loads((_segment_dir(tmp_path, 5) / _LEDGER).read_text().splitlines()[-1])
+    assert manifest["group"]["rollouts"][-1]["completion_ids"] == []
+    assert "retired_completion_ids" not in manifest["group"]["rollouts"][0]
+    # The dead run's backups: an evaluation record it had retired in memory only (window 5), and
+    # the group's records in a window the new run passes only after it has trained on the group.
+    _backup(tmp_path, 5, {"chatcmpl-eval": next(iter(records.values()))})
+    _backup(tmp_path, 9, records)
+
+    resumed = RolloutBank(str(tmp_path))
+    (restored,) = resumed.recover(5, request_records=_on_disk(tmp_path))
+    assert restored.uid == uid
+    assert restored.rollouts[-1].is_placeholder and restored.rollouts[-1].completion_ids == []
+    assert restored.rollouts[0].retired_completion_ids == []  # a restored group owns none
+    _assert_group_matches(RolloutGroup(rollouts=restored.rollouts[:-1]), expected)
+    resumed.set_collection(5)
+    resumed.checkpoint(7, open_window=6)  # folds the dead run's window-5 file; the eval record goes
+    assert set(_on_disk(tmp_path)) == set(records)
+    # The group is trained on and reclaimed; the dead run's window-9 file closes only afterwards
+    # and must not bring back the copies of the records that recovery had folded.
+    resumed.mark_consumed_many([uid], 8)
+    resumed.checkpoint(8, open_window=8)
+    resumed.checkpoint(10, open_window=10)
+    assert not _on_disk(tmp_path)
+
+    (tmp_path / "old").mkdir()
+    (tmp_path / "old" / "MANIFEST.json").write_text("{}")
+    with (
+        caplog.at_level("ERROR", logger="megatron.rl.rollout_bank"),
+        pytest.raises(ValueError, match="earlier on-disk format"),
+    ):
+        RolloutBank(str(tmp_path / "old"))
+    assert "remove the rollout-bank directory" in caplog.text  # rank 0 raises this alone
+
+
+def _admission(**fields):
+    """A Gym ``token_in`` admission continuing the held call ``u1`` (model call ``c1``)."""
+    return {
+        "capture_key": "r",
+        "model_call_id": "c2",
+        "mode": "token_in",
+        "parent_call_id": "c1",
+        "prev_len": 4,
+        "staging_chain": ["u1"],
+        **fields,
+    }
+
+
+_ROOT_ADMISSION = {"capture_key": "r", "model_call_id": "c1", "mode": "text"}
+_SPLICE_PARAMS = {PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [1, 2, 9, 2], PREFIX_EOS_TOKEN_ID_FIELD: [2]}
+
+
+def _held(call_id, parent_id, prev_len, cum_len, epoch, staging_key):
+    """Gym's ``held`` receipt for one call: ids and lengths only, no digests."""
+    return {
+        "capture_key": "r",
+        "model_call_id": call_id,
+        "parent_call_id": parent_id,
+        "prev_len": prev_len,
+        "delta_len": cum_len - prev_len,
+        "cum_len": cum_len,
+        "weight_version": epoch,
+        "disposition": "held",
+        "staging_key": staging_key,
+    }
+
+
+@pytest.fixture
+def store():
+    master = PrefixStore("127.0.0.1", is_master=True)  # kept alive for the client's lifetime
+    yield PrefixStore("127.0.0.1", master.port)
+
+
+@pytest.mark.parametrize(
+    "parent_generated, media_count",
+    [
+        pytest.param([3, 2], None, id="exact-turn-ends-with-eos"),
+        pytest.param([3], None, id="cut-turn-takes-the-rendered-eos"),
+        pytest.param([3, 2], 1, id="multimodal-prefix"),
+    ],
+)
+def test_held_custody(store, monkeypatch, caplog, parent_generated, media_count):
+    """The stager answers each admission with a held receipt of ids and lengths and publishes the
+    call; the preparer splices the parent's exact tokens, inlines them and keeps the media
+    contract; what either side cannot honor fails closed without failing the completion."""
+    stager, preparer = LedgerPayloadStager(prefix_store=store), HeldPrefixPreparer(store)
+    media = {} if media_count is None else {PREFIX_MEDIA_COUNT_FIELD: media_count}
+    # Spans are (token position, epoch): admitted under epoch 3, continued under epoch 4.
+    parent = _record(
+        [1, 2], parent_generated, [-0.5] * len(parent_generated), policy_epoch=[(0, 3), (2, 4)]
+    )
+    prev_len = 2 + len(parent_generated)
+    result = stager.stage(
+        "u1",
+        parent.payload,
+        finished_metadata=parent,
+        offload_params={NG_CAPTURE_FIELD: _ROOT_ADMISSION},
+    )
+    assert result.response_metadata == {
+        NG_COMMIT_COORDS_FIELD: _held("c1", None, 0, prev_len, 3, "u1")
+    }
+    assert store.get("u1") == ([1, 2], parent_generated)  # published for the next turn's prefix
+
+    params = {NG_CAPTURE_FIELD: _admission(prev_len=prev_len), **_SPLICE_PARAMS, **media}
+    prepared = preparer.prepare_prompt([1, 2, 9, 2, 5], offload_params=params)
+    prefix = [1, 2, *parent_generated]
+    assert prepared.prompt == [1, 2, 3, 2, 5]
+    assert prepared.offload_params[NG_CAPTURE_FIELD]["required_prefix_token_ids"] == prefix
+    assert PREFIX_TEMPLATE_TOKEN_IDS_FIELD not in prepared.offload_params  # spent once spliced
+    assert params[NG_CAPTURE_FIELD].get("required_prefix_token_ids") is None  # input left alone
+    assert prepared.offload_params.get(PREFIX_EXPANDED_TOKEN_COUNT_FIELD) == (
+        prev_len if media else None
+    )
+    child = _record(prepared.prompt, [7], [-0.25], policy_epoch=[(0, 4)])
+    result = stager.stage(
+        "u2", child.payload, finished_metadata=child, offload_params=prepared.offload_params
+    )
+    assert result.response_metadata == {
+        NG_COMMIT_COORDS_FIELD: _held("c2", "c1", prev_len, 6, 4, "u2")
+    }
+
+    # Without an admission the request passes through; a text root sheds the media count so the
+    # engine expands every placeholder itself.
+    passthroughs = (
+        (media, media),
+        ({NG_CAPTURE_FIELD: _ROOT_ADMISSION, **media}, {NG_CAPTURE_FIELD: _ROOT_ADMISSION}),
+    )
+    for passthrough, expected in passthroughs:
+        prepared = preparer.prepare_prompt([7, 8], offload_params=passthrough)
+        assert (prepared.prompt, prepared.offload_params) == ([7, 8], expected)
+    plain = stager.stage("u3", child.payload, finished_metadata=child)
+    assert plain == RequestPayloadStageResult() and store.get("u3") is None
+
+    # The preparer refuses a parent the store does not hold, an admission with neither a prefix
+    # nor a chain, a prefix of the wrong length, missing splice metadata, and a template without
+    # the EOS boundary.
+    refusals = (
+        ({NG_CAPTURE_FIELD: _admission(staging_chain=["absent"])}, LookupError, "does not hold"),
+        ({NG_CAPTURE_FIELD: _admission(staging_chain=[])}, ValueError, "neither a prefix nor"),
+        ({NG_CAPTURE_FIELD: _admission(prev_len=1)}, ValueError, "expects a prefix of 1"),
+        ({PREFIX_TEMPLATE_TOKEN_IDS_FIELD: None}, ValueError, "splice metadata"),
+        ({PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [1, 9]}, ValueError, "EOS"),
+    )
+    for overrides, error, match in refusals:
+        with pytest.raises(error, match=match):
+            preparer.prepare_prompt([1, 2, 9, 2, 5], offload_params={**params, **overrides})
+
+    # The stager answers no coordinates for a token_in call with no inlined prefix to check, a
+    # prefix the prompt does not begin with, Gym's unsupported candidate mode, and a non-dict
+    # admission; a recognised admission is still published for a next turn.
+    record = _record([1, 2, 3, 6], [7])
+    refusals = (
+        ("u4", _admission(), "Custody receipt failed"),
+        ("u5", _admission(required_prefix_token_ids=[9] * 4), "Custody receipt failed"),
+        ("u6", {**_ROOT_ADMISSION, "mode": "candidate"}, "Custody receipt failed"),
+        ("u7", "bogus", "malformed"),
+    )
+    for uid, admission, reason in refusals:
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            result = stager.stage(
+                uid,
+                record.payload,
+                finished_metadata=record,
+                offload_params={NG_CAPTURE_FIELD: admission},
+            )
+        assert result == RequestPayloadStageResult()
+        assert any(reason in message for message in caplog.messages)
+        assert store.get(uid) == (([1, 2, 3, 6], [7]) if isinstance(admission, dict) else None)
+
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError("store down")
+
+    with monkeypatch.context() as dead:  # a store that stopped answering poisons the call only
+        dead.setattr(store, "put", refuse)
+        result = stager.stage(
+            "u8",
+            record.payload,
+            finished_metadata=record,
+            offload_params={NG_CAPTURE_FIELD: _ROOT_ADMISSION},
+        )
+    assert result == RequestPayloadStageResult() and store.get("u8") is None
+    assert set(stager.drain()) == {f"u{n}" for n in range(1, 9)}  # every call stays indexed
+
+    store.forget(["u1", "never"])
+    with pytest.raises(LookupError, match="does not hold"):  # forgotten, no cache
+        preparer.prepare_prompt([1, 2, 9, 2, 5], offload_params=params)
+
+
+class _TwoRankJob:
+    """torch.distributed for a two-rank job as one rank sees it: its own value and the peer's."""
+
+    def __init__(self, rank, peer_failure=None, peer_records=None, peer_sees_bank_dir=True):
+        self.rank, self.peer_failure, self.peer_records = rank, peer_failure, peer_records
+        self.peer_sees_bank_dir = peer_sees_bank_dir
+        self.reported = []
+
+    def get_rank(self):
+        return self.rank
+
+    def get_world_size(self):
+        return 2
+
+    def broadcast_object_list(self, objects, src=0):
+        assert self.rank == src  # rank 0 already holds what it broadcasts
+
+    def all_gather_object(self, object_list, obj):
+        self.reported.append(obj)
+        # The writer-failure agreement gathers None or a repr; the bank-directory probe a bool.
+        peer = self.peer_sees_bank_dir if isinstance(obj, bool) else self.peer_failure
+        object_list[self.rank], object_list[1 - self.rank] = obj, peer
+
+    def gather_object(self, obj, object_gather_list=None, dst=0):
+        if self.rank == dst == 0:
+            object_gather_list[:] = [obj, self.peer_records]
+
+
+def _megatron_local(monkeypatch, tmp_path, job):
+    """A MegatronLocal over a real stager and backup writer (window 5), in a two-rank job."""
+    monkeypatch.setattr("megatron.rl.inference.megatron.dist", job)
+    server = MegatronLocal(host="localhost", port=0)
+    writer = FinishedRequestLedgerWriter(request_record_backup_path(str(tmp_path), job.rank, 5))
+    server._inference_engine = SimpleNamespace(payload_stager=LedgerPayloadStager(writer))
+    server._request_record_backup_dir = str(tmp_path)
+    return server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rank, failure, peer_sees",
+    [
+        pytest.param(0, None, True, id="rank-0-gathers-every-engine"),
+        pytest.param(1, None, True, id="other-ranks-return-nothing"),
+        pytest.param(0, "peer", True, id="peer-writer-failed"),
+        pytest.param(0, "local", True, id="local-writer-failed-and-teardown-completes"),
+        pytest.param(0, None, False, id="node-local-bank-dir-refused-at-launch"),
+    ],
+)
+async def test_ledger_merge_across_ranks(tmp_path, monkeypatch, rank, failure, peer_sees):
+    """Rank 0 probes the bank directory at launch; the drain gathers every engine's records to
+    rank 0 in the joins' form and closes the window; a writer failure on any rank is raised on
+    every rank; and the teardown completes although the stager's close raises again."""
+    peer_failure = "RuntimeError('peer disk full')" if failure == "peer" else None
+    peer = {"chatcmpl-peer": gather_view(_record([7], [8]))}
+    job = _TwoRankJob(rank, peer_failure, peer, peer_sees)
+    server = _megatron_local(monkeypatch, tmp_path, job)
+    stager = server._inference_engine.payload_stager
+    if rank == 0:
+        if peer_sees:
+            _check_shared_bank_dir(str(tmp_path))
+        else:
+            with pytest.raises(RuntimeError, match=r"rank\(s\) \[1\] cannot see"):
+                _check_shared_bank_dir(str(tmp_path))
+        assert os.listdir(request_records_dir(str(tmp_path))) == []  # the probe is gone either way
+        if not peer_sees:
+            stager.close()
+            return
+
+    if failure == "local":
+
+        def broken(uid, record):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(rollout_bank, "pack_finished_request_record", broken)
+    local = _record([1, 2], [3], [-0.25], routing=np.zeros((2, 1, 1), dtype=np.int64))
+    stager.stage("chatcmpl-local", local.payload, finished_metadata=local)
+    if failure:
+        with pytest.raises(
+            RuntimeError, match="peer disk full" if failure == "peer" else "writer failed"
+        ):
+            server.merge_global_request_ledgers(rotate_to=6)
+        if failure == "peer":
+            stager.close()
+            return
+        assert job.reported and job.reported[0] is not None  # this rank's failure reached the peers
+        server._inference_engine.wait_until = AsyncMock()
+        server._client, stop_server = MagicMock(), MagicMock()
+        monkeypatch.setattr(
+            "megatron.core.inference.text_generation_server.dynamic_text_gen_server."
+            "stop_text_gen_server",
+            stop_server,
+        )
+        await server.kill()  # the stager's close raises again here; the teardown still finishes
+        server._client.shutdown_coordinator.assert_called_once_with()
+        server._client.stop.assert_called_once_with()
+        stop_server.assert_called_once_with()
+        return
+
+    merged = server.merge_global_request_ledgers(rotate_to=6)
+    assert set(merged) == ({"chatcmpl-local", "chatcmpl-peer"} if rank == 0 else set())
+    if rank == 0:
+        assert merged["chatcmpl-local"].payload.routing_indices is None  # stays in the backup
+        assert merged["chatcmpl-local"] == gather_view(local)
+    # The drained window is durable and closed; what is staged from here on goes to window 6.
+    closed, current = (request_record_backup_path(str(tmp_path), rank, w) for w in (5, 6))
+    assert set(load_finished_request_records([closed])) == {"chatcmpl-local"}
+    late = _record([4], [5])
+    stager.stage("chatcmpl-late", late.payload, finished_metadata=late)
+    assert set(stager.drain()) == {"chatcmpl-late"}
+    stager.close()
+    assert set(load_finished_request_records([current])) == {"chatcmpl-late"}
 
 
 def _env_group(env_id, problem_id):
@@ -348,7 +916,7 @@ async def test_pipeline_uses_restored_groups_before_fresh_generation(
 
     if bank is not None:
         bank.close()
-        persisted = RolloutBank(str(tmp_path)).restore(trained_through=0)
+        persisted = RolloutBank(str(tmp_path)).restore(trained_through=0, request_records={})
         assert len(persisted) == take_count
         assert {group.uid for group in persisted} == {group.uid for group in produced}
 
