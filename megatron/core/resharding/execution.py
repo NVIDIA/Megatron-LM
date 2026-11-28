@@ -499,8 +499,29 @@ def execute_reshard_plan(
     _prepare_refit_dtypes(plan, src_module, dst_module, group=group, transform=transform)
     src_params = get_refit_tensor_dict(src_module) if src_module is not None else {}
     dst_params = get_refit_tensor_dict(dst_module) if dst_module is not None else {}
-    service.set_plan(plan, transform=transform)
+    _execute_reshard_plan_with_tensors(
+        plan,
+        src_params,
+        dst_params,
+        service,
+        dst_module=dst_module,
+        group=group,
+        transform=transform,
+    )
 
+
+def _execute_reshard_plan_with_tensors(
+    plan: ReshardPlan,
+    src_params: dict[str, torch.Tensor],
+    dst_params: dict[str, torch.Tensor],
+    service: CopyService,
+    *,
+    dst_module: torch.nn.Module | None = None,
+    group=None,
+    transform: Optional[ReshardTransform] = None,
+) -> None:
+    """Execute into live destination views. Their owning process refreshes module caches."""
+    service.set_plan(plan, transform=transform)
     if service.execute_plan(plan, src_params, dst_params, transform=transform):
         logger.info("Executing native reshard plan")
         torch.cuda.synchronize()

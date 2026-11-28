@@ -973,6 +973,29 @@ class DynamicInferenceEngine(
         if not self.use_coordinator:
             self.state = EngineState.SUSPENDED
 
+    def _advance_weight_epoch(self) -> None:
+        self._weight_epoch += 1
+        self._resalt_unprefilled_requests()
+
+    def publish_paused_weights(self) -> None:
+        """Finish a weight update on a paused engine with live requests and allocated KV.
+
+        Call on the engine loop after the weight writes and derived tensor updates complete.
+        Requests with existing KV keep their prefix salt. New prefill uses the updated weights.
+        """
+        if self.state != EngineState.PAUSED:
+            raise RuntimeError("Updating live inference weights requires a paused engine")
+        self._advance_weight_epoch()
+        wrapper = self.controller.inference_wrapped_model
+        if (
+            wrapper.supports_image or wrapper.supports_video
+        ) and not self.allow_stale_multimodal_embeddings:
+            self._invalidate_vision_state()
+            for entry in self.requests.values():
+                request = entry.record[-1]
+                if isinstance(request, DynamicVLMInferenceRequest):
+                    self._refresh_vlm_request_data(request)
+
     def resume(self):
         """Resume engine by reallocating context's GPU state."""
 
@@ -989,8 +1012,7 @@ class DynamicInferenceEngine(
         # already part-way through prefill or decode keeps its original salt, so
         # it republishes under its original generation and is unmatchable by
         # new arrivals.
-        self._weight_epoch += 1
-        self._resalt_unprefilled_requests()
+        self._advance_weight_epoch()
 
         InferenceMode.set_active()
 
