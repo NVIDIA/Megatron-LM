@@ -158,6 +158,43 @@ def test_next_forward_can_discard_events_left_by_a_failed_forward():
     listener.assert_not_called()
 
 
+def test_removal_of_a_block_stored_in_the_same_step_is_published_after_its_storage():
+    context, listener = _context_with_listener()
+    stored = {"block_hashes": [101, 202], "token_ids": [1, 2]}
+
+    context.dynamo_helper.queue_kv_stored_event(stored)
+    context.dynamo_helper.on_kv_blocks_deregistered([3, 4], {101, 202})
+
+    listener.assert_not_called()
+    context.dynamo_helper.publish_pending_kv_stored_events()
+    assert [call.args[0] for call in listener.call_args_list] == ["stored", "removed"]
+    assert listener.call_args_list[0].args[1] == stored
+    assert set(listener.call_args_list[1].args[1]["block_hashes"]) == {101, 202}
+
+
+def test_discarding_a_failed_forward_still_publishes_queued_removals():
+    context, listener = _context_with_listener()
+    context.dynamo_helper.queue_kv_stored_event({"block_hashes": [303]})
+    # Block 101 may have been advertised by an earlier forward pass.
+    context.dynamo_helper.on_kv_blocks_deregistered([3], {101})
+
+    context.dynamo_helper.discard_pending_kv_stored_events()
+    context.dynamo_helper.publish_pending_kv_stored_events()
+
+    listener.assert_called_once_with("removed", {"block_hashes": [101]})
+
+
+def test_cache_clear_supersedes_queued_stores_and_removals():
+    context, listener = _context_with_listener()
+    context.dynamo_helper.queue_kv_stored_event({"block_hashes": [303]})
+    context.dynamo_helper.on_kv_blocks_deregistered([3], {101})
+
+    context.dynamo_helper.notify_kv_cache_cleared()
+    context.dynamo_helper.publish_pending_kv_stored_events()
+
+    listener.assert_called_once_with("cleared", {})
+
+
 @pytest.mark.asyncio
 async def test_async_forward_discards_before_scheduling_and_publishes_after_forward(monkeypatch):
     context, listener = _context_with_listener()
