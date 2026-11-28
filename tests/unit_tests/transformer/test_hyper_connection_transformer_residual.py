@@ -581,7 +581,6 @@ def gpu_model_parallel():
         (None, "none", False),
         (False, "none", False),
         (True, "mhc", False),
-        (True, "selective", False),
         (None, "none", True),
         (False, "none", True),
         (True, "none", True),
@@ -595,7 +594,6 @@ def test_dedicated_shared_schedule_preserves_mhc_policy(
     layer.mhc_checkpoint_input_layernorm = layer.mhc_checkpoint_pre_mlp_layernorm = (
         norm_policy == "mhc"
     )
-    layer.recompute_input_layernorm = layer.recompute_pre_mlp_layernorm = norm_policy == "selective"
     manager = None if terminal is None else CheckpointWithoutOutputManager()
     context = (
         None if manager is None else ResidualStreamRecomputeContext(manager, is_block_end=terminal)

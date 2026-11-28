@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 
+import dataclasses
 import gc
 from unittest.mock import Mock, patch
 
@@ -8,11 +9,18 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.activation_policy import (
+    CheckpointStrategy,
+    CheckpointWithoutOutputStrategy,
+    has_strategy,
+)
+from megatron.core.activation_policy import runtime as activation_runtime
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedTensor
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -123,6 +131,90 @@ class TestParallelTransformerLayer:
 
         num_weights = sum([p.numel() for p in parallel_transformer_layer.parameters()])
         assert num_weights == 1884
+
+    def test_mlp_recompute_is_an_activation_strategy(self):
+        assert not has_strategy(
+            self.parallel_transformer_layer, self.parallel_transformer_layer.mlp, CheckpointStrategy
+        )
+        config = dataclasses.replace(
+            self.parallel_transformer_layer.config,
+            recompute_granularity="selective",
+            recompute_modules=["mlp"],
+        )
+        layer = TransformerLayer(config, get_gpt_layer_with_transformer_engine_submodules())
+        assert layer.recompute_mlp
+        assert has_strategy(layer, layer.mlp, CheckpointStrategy)
+
+    def test_te_router_graph_skips_only_moe_pre_mlp_norm(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            num_moe_experts=2,
+            moe_layer_freq=[0, 1],
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=["moe_router"],
+            recompute_granularity="selective",
+            recompute_modules=["layernorm"],
+            hidden_dropout=0,
+            attention_dropout=0,
+        )
+        for num_experts in (None, 2):
+            layer = TransformerLayer(
+                config, get_gpt_layer_local_submodules(num_experts=num_experts)
+            )
+            assert has_strategy(layer, layer.input_layernorm, CheckpointWithoutOutputStrategy)
+            assert has_strategy(
+                layer, layer.pre_mlp_layernorm, CheckpointWithoutOutputStrategy
+            ) == (num_experts is None)
+
+    def test_layernorm_recompute_is_an_activation_strategy_and_matches(self):
+        def build(recompute):
+            model_parallel_cuda_manual_seed(123)
+            config = TransformerConfig(
+                num_layers=2,
+                hidden_size=12,
+                num_attention_heads=4,
+                use_cpu_initialization=True,
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+                recompute_granularity="selective" if recompute else None,
+                recompute_modules=["layernorm"] if recompute else None,
+            )
+            # The local spec has separate norm modules (the TE spec fuses them into the linears).
+            return TransformerLayer(config, get_gpt_layer_local_submodules()).cuda()
+
+        def run(layer, recompute):
+            x = torch.randn(
+                32, 2, 12, device="cuda", generator=torch.Generator("cuda").manual_seed(0)
+            )
+            x.requires_grad_(True)
+            mask = torch.ones((1, 1, 32, 32), dtype=bool, device="cuda")
+            output, _ = layer(x, attention_mask=mask)
+            installed = activation_runtime._installed(layer)
+            if recompute:
+                # Both norm outputs were released at their residual adds: nothing is pending.
+                assert installed is not None and not installed.pending
+            else:
+                assert installed is None
+            output.sum().backward()
+            grads = {name: p.grad.clone() for name, p in layer.named_parameters()}
+            return output.detach(), x.grad, grads
+
+        reference = build(False)
+        layer = build(True)
+        layer.load_state_dict(reference.state_dict())
+        for norm in (layer.input_layernorm, layer.pre_mlp_layernorm):
+            assert has_strategy(layer, norm, CheckpointWithoutOutputStrategy)
+        ref_out, ref_dx, ref_grads = run(reference, recompute=False)
+        out, dx, grads = run(layer, recompute=True)
+        # The norm outputs went through the strategies, not the in-layer checkpoint.
+        assert not hasattr(layer, "input_layernorm_checkpoint")
+        assert not hasattr(layer, "pre_mlp_norm_checkpoint")
+        assert torch.equal(out, ref_out)
+        assert torch.equal(dx, ref_dx)
+        for name, grad in ref_grads.items():
+            assert torch.equal(grads[name], grad), name
 
     @pytest.mark.parametrize("threshold, is_hash_layer", [(None, False), (0, False), (2, True)])
     def test_function_moe_builder_receives_hash_layer_threshold(self, threshold, is_hash_layer):

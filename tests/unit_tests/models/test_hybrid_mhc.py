@@ -5,6 +5,8 @@ from contextlib import nullcontext
 import pytest
 import torch
 
+from megatron.core.activation_policy import CheckpointWithoutOutputStrategy, installed_strategies
+from megatron.core.activation_policy.runtime import _installed as installed_runtime
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
@@ -496,6 +498,58 @@ class TestHybridStackMHC:
         assert hidden_states.grad is not None
         assert wrapped_layer.hyper_connection.mapping_proj.weight.grad is not None
         assert any(param.grad is not None for param in wrapped_layer.inner_layer.mlp.parameters())
+
+    def test_layernorm_recompute_on_raw_branch_matches(self):
+        """Selective "layernorm" recompute through the wrapper's raw MLP branch is bit-exact,
+        with the wrapper's strategy (released when the raw branch returns) replacing the layer's."""
+
+        def run(recompute: bool):
+            torch.manual_seed(123)
+            model_parallel_cuda_manual_seed(123)
+            kwargs = (
+                dict(recompute_granularity="selective", recompute_modules=["layernorm"])
+                if recompute
+                else {}
+            )
+            config = _get_config(
+                num_layers=1,
+                num_moe_experts=2,
+                moe_ffn_hidden_size=64,
+                moe_grouped_gemm=True,
+                add_bias_linear=False,
+                **kwargs,
+            )
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'pp', 'cp', 'ep', 'expt_tp', 'tp_ep', 'expt_dp']
+            )
+            stack = HybridStack(
+                config=config,
+                submodules=hybrid_stack_spec.submodules,
+                post_layer_norm=False,
+                layer_type_list=[Symbols.MOE],
+                pp_layer_offset=0,
+                pg_collection=pg_collection,
+            ).cuda()
+            torch.manual_seed(0)
+            hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
+            output = stack(hidden_states, attention_mask=None)
+            output.float().sum().backward()
+            grads = {n: p.grad.clone() for n, p in stack.named_parameters() if p.grad is not None}
+            return stack, output.detach(), hidden_states.grad.clone(), grads
+
+        _, ref_out, ref_dx, ref_grads = run(recompute=False)
+        stack, out, dx, grads = run(recompute=True)
+
+        layer = stack.layers[0].inner_layer
+        (strategy,) = installed_strategies(layer)[layer.pre_mlp_layernorm]
+        assert isinstance(strategy, CheckpointWithoutOutputStrategy)
+        assert strategy.release_on.region == layer._forward_mlp_output_with_bias
+        assert not installed_runtime(layer).pending
+        assert torch.equal(out, ref_out)
+        assert torch.equal(dx, ref_dx)
+        assert grads.keys() == ref_grads.keys()
+        for name, grad in ref_grads.items():
+            assert torch.equal(grads[name], grad), name
 
     @pytest.mark.parametrize("recompute_method", ["uniform", "block"])
     def test_full_recompute_real_moe_matches_forward_backward(self, recompute_method):

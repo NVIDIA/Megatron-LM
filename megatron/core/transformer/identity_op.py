@@ -38,3 +38,8 @@ class IdentityFuncOp(IdentityOp):
         Returns a function which returns its first argument unchanged, and discards all others.
         """
         return super().forward
+
+
+def is_identity(module) -> bool:
+    """Whether a submodule slot is empty (``None``, ``IdentityOp`` or ``IdentityFuncOp``)."""
+    return module is None or isinstance(module, IdentityOp)

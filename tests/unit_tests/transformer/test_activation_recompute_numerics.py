@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from megatron.core import recompute as recompute_module
+from megatron.core.activation_policy import strategies as strategies_module
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_mtp_block_spec,
@@ -24,7 +25,6 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import multi_token_prediction as mtp_module
-from megatron.core.transformer import transformer_layer as transformer_layer_module
 from megatron.core.transformer import utils as transformer_utils
 from megatron.core.transformer.moe import moe_layer as moe_layer_module
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
@@ -69,7 +69,7 @@ _RECOMPUTE_CASES = {
     "selective_mlp": (
         "dense",
         {"recompute_granularity": "selective", "recompute_modules": ["mlp"]},
-        {"transformer_layer"},
+        {"activation_policy"},
     ),
     "selective_moe": (
         "moe",
@@ -84,8 +84,8 @@ _RECOMPUTE_CASES = {
 }
 
 _CALL_SITE_MODULES = {
+    "activation_policy": strategies_module,
     "recompute": recompute_module,
-    "transformer_layer": transformer_layer_module,
     "moe_layer": moe_layer_module,
     "multi_token_prediction": mtp_module,
 }

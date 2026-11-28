@@ -11,6 +11,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from megatron.core.activation_policy.runtime import fire_boundary
 from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import CudaGraphModule
@@ -417,13 +418,10 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
             and is_graph_capturing()
             and CudaGraphModule.moe_router in self.config.cuda_graph_modules
         ):
-            if self.recompute_pre_mlp_layernorm:
-                # Register the recompute hooks to all the cudagraph output tensors, because some
-                # tensors are in parallel execution paths and they all need pre_mlp_layernorm to be
-                # recomputed in backward pass. For example, the router path and the shared expert
-                # path. So only register in one path is risky.
-                for tensor in mlp_output_with_bias:
-                    self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
+            # The graph ends before _mlp_bda. A recomputed pre_mlp_layernorm must be rebuilt
+            # before any of the graph outputs is consumed in backward (the router path and the
+            # shared expert path run in parallel), so release it on every output.
+            fire_boundary(self, self._mlp_bda, "exit", list(mlp_output_with_bias))
             return list(mlp_output_with_bias) + [residual]
 
         return None
@@ -627,12 +625,8 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
             if self.config.overlap_moe_expert_parallel_comm:
                 return (residual, *mlp_output_with_bias)
 
-            # If we early returned, layernorm recompute hooks were attached to the output buffer
-            # of the cudagraph, so disable the recompute hooks inside _apply_mlp_bda_step
-            recompute_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm
-            self.recompute_pre_mlp_layernorm = False
+            # Capture already released the norm on the graph outputs; nothing is pending here.
             output = self._apply_mlp_bda_step(mlp_output_with_bias, residual)
-            self.recompute_pre_mlp_layernorm = recompute_pre_mlp_layernorm
         else:
             # If EP overlap is enabled, needs to return same outputs as submodule.attn
             if self.config.overlap_moe_expert_parallel_comm:

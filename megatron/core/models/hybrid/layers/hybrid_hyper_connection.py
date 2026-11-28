@@ -42,6 +42,27 @@ class HyperConnectionHybridLayer(MegatronModule):
         if hasattr(layer, 'tp_group'):
             self.tp_group = layer.tp_group
 
+    def _has_split_transformer_branch(self):
+        layer = self.inner_layer
+        return (
+            isinstance(layer, TransformerLayer)
+            and layer_utils.get_custom_layer_type(layer.config) is None
+            and isinstance(layer.cross_attention, IdentityOp)
+            and isinstance(layer.self_attention, IdentityOp) != isinstance(layer.mlp, IdentityOp)
+        )
+
+    def activation_strategies(self) -> None:
+        """Release the inner layer's recomputed norms when its raw branches return."""
+        layer = self.inner_layer
+        if not self._has_split_transformer_branch():
+            return
+        if hasattr(layer, "input_layernorm_recompute"):
+            layer.input_layernorm_recompute.release_on_exit(
+                layer._forward_self_attention_output_with_bias
+            )
+        if hasattr(layer, "pre_mlp_layernorm_recompute"):
+            layer.pre_mlp_layernorm_recompute.release_on_exit(layer._forward_mlp_output_with_bias)
+
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """Delegate Mamba inference state shape requests to the wrapped layer."""
         if hasattr(self.inner_layer, 'mamba_state_shapes_per_request'):
@@ -117,27 +138,18 @@ class HyperConnectionHybridLayer(MegatronModule):
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
         """Return a raw branch output for split Hybrid TransformerLayer instances.
 
-        Hybrid layers are normally attention-only or MLP/MoE-only. For those
+        Built-in Hybrid TransformerLayer specs are attention-only or MLP/MoE-only. For those
         layers, bypass the inner layer's local residual/BDA and let the mHC BDA
         own that operation directly.
         """
-        if not isinstance(self.inner_layer, TransformerLayer):
-            return None
-        if layer_utils.get_custom_layer_type(self.inner_layer.config) is not None:
+        if not self._has_split_transformer_branch():
             return None
 
         layer = self.inner_layer
         if InferenceMode.is_active() and layer.config.inference_fuse_tp_communication:
             return None
 
-        has_attention = not isinstance(layer.self_attention, IdentityOp)
-        has_cross_attention = not isinstance(layer.cross_attention, IdentityOp)
-        has_mlp = not isinstance(layer.mlp, IdentityOp)
-
-        if has_cross_attention or has_attention == has_mlp:
-            return None
-
-        if has_attention:
+        if not isinstance(layer.self_attention, IdentityOp):
             output_with_bias, attn_norm_manager, residual = (
                 layer._forward_self_attention_output_with_bias(
                     hidden_states=hidden_states,
@@ -162,10 +174,6 @@ class HyperConnectionHybridLayer(MegatronModule):
             input_ids=input_ids,
             mhc_recompute_manager=mhc_recompute_manager,
         )
-        if layer.recompute_pre_mlp_layernorm or (
-            mhc_recompute_manager is not None and layer.mhc_checkpoint_pre_mlp_layernorm
-        ):
-            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(output_with_bias[0])
         if layer.mlp_norm_manager is not None:
             output_with_bias = layer._group_offload_output_with_bias(
                 output_with_bias, layer.mlp_norm_manager, forced_released_tensors=[residual]

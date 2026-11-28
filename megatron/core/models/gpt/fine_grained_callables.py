@@ -5,7 +5,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from megatron.core import tensor_parallel
+from megatron.core.activation_policy.runtime import fire_boundary
 from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.fusions.fused_moe_residual_add import (
@@ -110,19 +110,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                     return hidden_states, None, None, None
                 mlp_norm_manager = off_interface(layer.offload_mlp_norm, hidden_states, "mlp_norm")
                 node.layer_state.mlp_norm_manager = mlp_norm_manager
-                if layer.recompute_pre_mlp_layernorm:
-                    layer.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput(
-                        retain_input_tensors=layer._pre_mlp_layernorm_returns_residual
-                    )
-                    with mlp_norm_manager as hidden_states:
-                        pre_mlp_layernorm_output = layer.pre_mlp_norm_checkpoint.checkpoint(
-                            apply_module(layer.pre_mlp_layernorm), hidden_states
-                        )
-                else:
-                    with mlp_norm_manager as hidden_states:
-                        pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(
-                            hidden_states
-                        )
+                with mlp_norm_manager as hidden_states:
+                    pre_mlp_layernorm_output = apply_module(layer.pre_mlp_layernorm)(hidden_states)
 
                 # When using fused residual norm (e.g. TEFusedResidualRMSNorm),
                 # the layernorm returns (normalized_output, residual). Unpack
@@ -212,10 +201,8 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             tokens_per_expert = token_dispatcher._comm_manager.get_number_of_tokens_per_expert()
             node.layer_state.tokens_per_expert = tokens_per_expert
 
-        if layer.recompute_pre_mlp_layernorm:
-            # discard the output of the pre-mlp layernorm and register the recompute
-            # as a gradient hook of expert_output
-            layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
+        # This schedule skips _mlp_bda: release a recomputed pre-MLP norm output here.
+        fire_boundary(layer, layer._mlp_bda, "exit", [expert_output])
 
         return expert_output
 

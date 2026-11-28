@@ -75,7 +75,6 @@ class RecordingHashMlpTransformerLayer(TransformerLayer):
         self.mlp.router = SimpleNamespace(is_hash_layer=True)
         self.mlp_norm_manager = None
         self.hidden_dropout = 0.0
-        self.recompute_pre_mlp_layernorm = False
         self.mhc_checkpoint_pre_mlp_layernorm = False
         self.calls = []
 
@@ -161,13 +160,12 @@ class PassthroughHyperConnection(torch.nn.Module):
 
 
 def wrap_with_passthrough_mhc(inner_layer):
-    wrapper = HyperConnectionHybridLayer.__new__(HyperConnectionHybridLayer)
-    torch.nn.Module.__init__(wrapper)
-    wrapper.config = SimpleNamespace(fp32_residual_connection=False, params_dtype=None)
-    wrapper.inner_layer = inner_layer
-    wrapper.layer_number = inner_layer.layer_number
-    wrapper.hyper_connection = PassthroughHyperConnection()
-    return wrapper
+    config = SimpleNamespace(fp32_residual_connection=False, params_dtype=None)
+    with mock.patch(
+        "megatron.core.models.hybrid.layers.hybrid_hyper_connection.HyperConnectionModule",
+        return_value=PassthroughHyperConnection(),
+    ):
+        return HyperConnectionHybridLayer(config, inner_layer)
 
 
 def make_stack(layers, **config_overrides):
@@ -252,6 +250,21 @@ def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature
     assert non_transformer_layer.num_calls == 1
 
 
+@pytest.mark.parametrize("extra_branch", ["self_attention", "cross_attention"])
+def test_hybrid_mhc_runs_full_layer_for_multiple_branches(extra_branch):
+    layer = RecordingHashMlpTransformerLayer()
+    setattr(layer, extra_branch, torch.nn.Linear(8, 8))
+    layer.pre_mlp_layernorm_recompute = mock.Mock()
+    layer.forward = mock.Mock(side_effect=lambda value, **kwargs: (value * 2, None))
+    wrapper = wrap_with_passthrough_mhc(layer)
+
+    value = torch.randn(4, 2, 8)
+    output, _ = wrapper(value, attention_mask=None)
+    torch.testing.assert_close(output, value * 2)
+    layer.forward.assert_called_once()
+    layer.pre_mlp_layernorm_recompute.release_on_exit.assert_not_called()
+
+
 def test_hybrid_mhc_wrapper_passes_ids_and_recompute_manager_to_mlp_branch():
     inner_layer = RecordingHashMlpTransformerLayer()
     wrapped_layer = wrap_with_passthrough_mhc(inner_layer)
@@ -266,24 +279,6 @@ def test_hybrid_mhc_wrapper_passes_ids_and_recompute_manager_to_mlp_branch():
     assert output.shape == hidden_states.shape
     assert inner_layer.calls[0]['input_ids'] is input_ids
     assert inner_layer.calls[0]['mhc_recompute_manager'] is manager
-
-
-def test_hybrid_mhc_wrapper_discards_managed_pre_mlp_norm_checkpoint():
-    inner_layer = RecordingHashMlpTransformerLayer()
-    inner_layer.mhc_checkpoint_pre_mlp_layernorm = True
-    inner_layer.pre_mlp_norm_checkpoint = mock.MagicMock()
-    wrapped_layer = wrap_with_passthrough_mhc(inner_layer)
-    manager = SimpleNamespace(is_last_layer_in_recompute_block=False)
-    hidden_states = torch.randn(4, 2, 8, requires_grad=True)
-
-    wrapped_layer(
-        hidden_states,
-        attention_mask=None,
-        mhc_recompute_manager=manager,
-        input_ids=torch.arange(8).reshape(2, 4),
-    )
-
-    inner_layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute.assert_called_once()
 
 
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
