@@ -48,6 +48,10 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import MultiStorageClientFeature, maybe_msc
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.optimizer.distrib_optimizer import get_legacy_grad_dtypes
+from megatron.core.optimizer.optimizer import (
+    get_param_group_identifier_tuple,
+    param_group_identifier_keys,
+)
 from megatron.core.post_training.modelopt.checkpointing import (
     save_modelopt_state,
     save_sharded_modelopt_state,
@@ -2870,6 +2874,76 @@ def _maybe_setup_gpt_to_hybrid_load(
     return layer_maps, load_optim
 
 
+def _snapshot_optimizer_group_lr_bounds(optimizer):
+    """Capture runtime LR policy before loading replaces parameter-group dictionaries."""
+    return [
+        (
+            frozenset(id(param) for param in group.get("params", [])),
+            get_param_group_identifier_tuple(group),
+            (group.get("max_lr"), group.get("min_lr"), group.get("default_config", True)),
+        )
+        for group in optimizer.param_groups
+    ]
+
+
+def _restore_optimizer_group_lr_bounds(optimizer, runtime_groups, optimizer_config):
+    """Restore bounds by live parameter identity, never by parameter-group position.
+
+    Empty alignment groups have no parameter identity. Prefer their full identifier;
+    ignore LR bounds only if all matching runtime groups prescribe the same policy.
+    """
+
+    def without_lr(identifier):
+        return tuple(
+            value
+            for key, value in zip(param_group_identifier_keys, identifier)
+            if key not in ("max_lr", "min_lr")
+        )
+
+    if len(optimizer.param_groups) != len(runtime_groups):
+        raise ValueError(
+            "Optimizer parameter-group topology changed while restoring runtime LR bounds"
+        )
+    restored_bounds = []
+    for group in optimizer.param_groups:
+        params = frozenset(id(param) for param in group.get("params", []))
+        identifier = get_param_group_identifier_tuple(group)
+        if params:
+            matches = {bounds for members, _, bounds in runtime_groups if members == params}
+        else:
+            matches = {
+                bounds for members, key, bounds in runtime_groups if not members and key == identifier
+            }
+            if not matches:
+                matches = {
+                    bounds
+                    for members, key, bounds in runtime_groups
+                    if not members and without_lr(key) == without_lr(identifier)
+                }
+        if len(matches) != 1:
+            raise ValueError(
+                "Cannot unambiguously restore runtime LR bounds: optimizer parameter-group "
+                "membership changed, or empty groups have different LR policies."
+            )
+        max_lr, min_lr, default_config = matches.pop()
+        if default_config:
+            if group.get("is_decoupled_lr", False):
+                max_lr = optimizer_config.decoupled_lr
+                min_lr = optimizer_config.decoupled_min_lr
+            else:
+                max_lr = optimizer_config.lr
+                min_lr = optimizer_config.min_lr
+        restored_bounds.append((max_lr, min_lr, default_config))
+
+    # Validate every correspondence before changing any group's runtime policy.
+    for group, (max_lr, min_lr, default_config) in zip(optimizer.param_groups, restored_bounds):
+        if max_lr is not None:
+            group["max_lr"] = max_lr
+        if min_lr is not None:
+            group["min_lr"] = min_lr
+        group["default_config"] = default_config
+
+
 def load_checkpoint(
     ddp_model,
     optimizer,
@@ -2937,6 +3011,14 @@ def load_checkpoint(
         must not inherit the student's selected iteration, fallback or nonpersistent source).
     """
     cfg = get_run_config()
+    runtime_lr_bounds = (
+        _snapshot_optimizer_group_lr_bounds(optimizer)
+        if restore_training_state
+        and optimizer is not None
+        and not getattr(optimizer, "is_stub_optimizer", False)
+        and getattr(getattr(cfg, "scheduler", None), "override_opt_param_scheduler", False)
+        else None
+    )
     args = get_args()
     checkpoint = cfg.checkpoint
     selector_overrides = {
@@ -3727,7 +3809,7 @@ def load_checkpoint(
 
             # Optimizer state dict can overwrite per-group max_lr/min_lr values.
             # If scheduler override is requested, re-apply runtime lr bounds from
-            # args so scheduler math does not stay pinned to checkpoint lr settings.
+            # the constructed groups so custom schedules survive checkpoint loading.
             if getattr(cfg.scheduler, "override_opt_param_scheduler", False):
                 if (
                     optimizer is None
@@ -3740,17 +3822,7 @@ def load_checkpoint(
                         "and optimizer param_group max_lr/min_lr."
                     )
                 else:
-                    for param_group in optimizer.param_groups:
-                        if param_group.get("is_decoupled_lr", False):
-                            max_lr = getattr(cfg.optimizer, "decoupled_lr", None)
-                            min_lr = getattr(cfg.optimizer, "decoupled_min_lr", None)
-                        else:
-                            max_lr = cfg.optimizer.lr
-                            min_lr = cfg.optimizer.min_lr
-                        if max_lr is not None:
-                            param_group["max_lr"] = max_lr
-                        if min_lr is not None:
-                            param_group["min_lr"] = min_lr
+                    _restore_optimizer_group_lr_bounds(optimizer, runtime_lr_bounds, cfg.optimizer)
                     # Synchronize scheduler num_steps with consumed_train_samples
                     # to ensure lr calculation is based on current training progress
                     if opt_param_scheduler.num_steps != current_train_state.consumed_train_samples:

@@ -1946,6 +1946,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Convert a mapping of parameter names to group metadata to a list of parameter groups."""
         new_param_groups = []
         for group in param_groups:
+            if not group["params"]:
+                # Alignment groups have no FQN from which to recover their policy.
+                new_param_groups.append(group.copy())
+                continue
             new_group = {"params": []}
             for param in group["params"]:
                 param_name = self._param_name(param)
