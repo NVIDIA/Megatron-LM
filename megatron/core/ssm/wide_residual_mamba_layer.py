@@ -171,7 +171,7 @@ class WideResidualMambaLayer(MambaLayer):
     ) -> Tensor:
         """Project the mixer output and write it to the saved wide-residual stream."""
 
-        mixer_out_with_bias = self.mixer.forward_post_core_attn(ssm_output)
+        mixer_out_with_bias = self._project_mixer_output(ssm_output)
         return self._apply_mixer_update(
             mixer_out_with_bias,
             connection_state,

@@ -22,6 +22,44 @@ from megatron.training.config.utils import serialize_dataclass
 from megatron.training.distillation import utils
 
 
+@pytest.mark.parametrize("entrypoint", ["pretrain_gpt", "pretrain_hybrid"])
+def test_loss_entrypoint_passes_global_layout_to_cache_reader(entrypoint, monkeypatch):
+    import importlib
+
+    import torch
+
+    import megatron.training.distillation as distillation
+
+    script = importlib.import_module(entrypoint)
+    cfg = SimpleNamespace(
+        offline_distillation=OfflineDistillationConfig(
+            student_load=LogitsLoadConfig(directory="/cache")
+        ),
+        model=SimpleNamespace(transformer=SimpleNamespace(global_cp_layout="contiguous")),
+        rerun_state_machine=SimpleNamespace(
+            check_for_nan_in_loss=False, check_for_spiky_loss=False
+        ),
+    )
+    captured = {}
+    expected = (torch.tensor(2.0), torch.tensor(4), {})
+
+    def build_reader(**kwargs):
+        captured.update(kwargs)
+        return lambda *args, **kwargs: expected
+
+    monkeypatch.setattr(script, "get_run_config", lambda: cfg)
+    monkeypatch.setattr(script, "get_rerun_state_machine", lambda: None)
+    monkeypatch.setattr(distillation, "LossFuncCallable", build_reader)
+    script._build_cached_logits_loss_func.cache_clear()
+    try:
+        loss, num_tokens, report = script.loss_func(torch.ones(4), torch.zeros(4))
+        assert loss == 2 and num_tokens == 4 and report == {}
+        assert captured["cp_layout"] == "contiguous"
+        assert captured["logprobs_dir"] == "/cache"
+    finally:
+        script._build_cached_logits_loss_func.cache_clear()
+
+
 def _cli_config(*flags):
     parser = _add_logits_distillation_args(ArgumentParser())
     return offline_distillation_config_from_args(parser.parse_args(flags))

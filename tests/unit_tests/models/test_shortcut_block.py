@@ -228,14 +228,13 @@ def test_shortcut_pair_rejects_mixed_mtp_ownership():
 
 
 @pytest.mark.parametrize("residual_replay", [False, True], ids=["eager", "replay"])
-def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
+def test_shortcut_preserves_residual_layout_metadata(monkeypatch, residual_replay):
     config = _shortcut_config()
     attn_layer = _FakeCompute(config)
     moe_layer = _FakeMoE(config)
     block = ShortcutMoEBlock(
         attn_layer, moe_layer, overlap_a2a=False, attn_local_idx=4, moe_local_idx=5
     )
-    calls = []
     observed = {}
     attn_context, moe_context = (
         build_residual_stream_recompute_plan(2, 2) if residual_replay else (None, None)
@@ -244,23 +243,7 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         {"residual_stream_recompute_context": attn_context} if residual_replay else {}
     )
     input_padding_mask = torch.tensor([[False, True]])
-    moe_padding_mask = torch.tensor([[True, False]])
-    masks_by_layout = {"zigzag": moe_padding_mask}
-
-    class RecordingCPLayoutState:
-        def prepare_layer(self, layer_idx, hidden_states):
-            calls.append(("prepare", layer_idx))
-            return hidden_states + layer_idx, f"packed-{layer_idx}"
-
-        def finalize_layer(self, layer_idx, hidden_states):
-            calls.append(("finalize", layer_idx))
-            return hidden_states + layer_idx
-
-        def get_layer_padding_mask(self, layer_idx, padding_mask, padding_mask_by_layout):
-            assert layer_idx == 5
-            assert padding_mask is input_padding_mask
-            assert padding_mask_by_layout is masks_by_layout
-            return moe_padding_mask
+    moe_padding_mask = input_padding_mask
 
     def attn_forward(hidden_states, packed_seq_params=None, **kwargs):
         observed["attn_packed"] = packed_seq_params
@@ -327,22 +310,19 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         packed_seq_params="packed-input",
         padding_mask=input_padding_mask,
         quant_context_factory=quant_context_factory,
-        cp_layout_state=RecordingCPLayoutState(),
         packed_sequence_cp_metadata=cp_metadata,
         attn_recompute_context=attn_context,
         moe_recompute_context=moe_context,
-        padding_mask_by_layout=masks_by_layout,
     )
 
-    assert calls == [("prepare", 4), ("prepare", 5), ("prepare", 5), ("finalize", 5)]
     assert observed == {
-        "attn_packed": "packed-4",
+        "attn_packed": "packed-input",
         "cp_metadata": cp_metadata,
-        "route_packed": "packed-5",
-        "shared_packed": "packed-5",
-        "postprocess_packed": "packed-5",
+        "route_packed": "packed-input",
+        "shared_packed": "packed-input",
+        "postprocess_packed": "packed-input",
     }
-    torch.testing.assert_close(output, hidden_states + 14)
+    torch.testing.assert_close(output, hidden_states)
 
 
 def test_inference_runs_paired_layer_atomically(monkeypatch):

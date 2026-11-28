@@ -16,6 +16,19 @@ from megatron.training.utils import common_utils
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.fixture(autouse=True)
+def release_test_process_groups():
+    """Release test-owned subgroups without rebuilding the default communicator."""
+    existing_groups = set(torch.distributed.distributed_c10d._world.pg_map)
+    yield
+    # MPU cleanup drops references, but c10d retains NCCL groups and their threads.
+    # Iterate the registry in creation order, skipping groups already destroyed by
+    # MPU cleanup. Preserve the session's default group and any inherited groups.
+    for group in list(torch.distributed.distributed_c10d._world.pg_map):
+        if group not in existing_groups and group is not torch.distributed.group.WORLD:
+            torch.distributed.destroy_process_group(group)
+
+
 def _build_tiny_moe_gpt(
     tensor_parallel_size: int,
     expert_parallel_size: int,

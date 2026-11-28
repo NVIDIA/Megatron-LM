@@ -23,6 +23,7 @@ import torch
 from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
+from megatron.core.context_parallel.module import get_cp_boundary_layout
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -92,7 +93,12 @@ BATCH_KEYS = [
 ]
 
 
-def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroupCollection] = None):
+def get_batch(
+    data_iterator,
+    vp_stage=None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    required_cp_layouts=None,
+):
     """Generate a batch."""
 
     cfg = get_run_config()
@@ -119,11 +125,13 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             pg_collection=pg_collection,
             config=cfg.model.transformer,
             return_context_parallel_batch=True,
+            required_cp_layouts=required_cp_layouts,
         )
 
     # The data section's predicates and the dataset's fields; the packing path above needs
     # neither them nor the length.
     cp_size = cfg.model.transformer.context_parallel_size
+    boundary_layout = get_cp_boundary_layout(cfg.model.transformer)
     tp_rank = mpu.get_tensor_model_parallel_rank()
     has_cu_seqlens = cfg.data.has_cu_seqlens()
     # Use the caller's pipeline group when it is given, so a model on its own grid places MTP by
@@ -147,9 +155,9 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         and not has_cu_seqlens
     ):
         return ContextParallelBatch(
-            boundary_layout=cfg.model.transformer.linear_cp_layout,
-            batches_by_layout={cfg.model.transformer.linear_cp_layout: dict.fromkeys(BATCH_KEYS)},
-            packed_seq_params_by_layout={cfg.model.transformer.linear_cp_layout: None},
+            boundary_layout=boundary_layout,
+            batches_by_layout={boundary_layout: dict.fromkeys(BATCH_KEYS)},
+            packed_seq_params_by_layout={boundary_layout: None},
         )
 
     # The dataset's row width (the derived pack width for SFT).
@@ -196,14 +204,19 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         }
 
     additional_layouts = set()
-    if (
-        cp_size > 1
-        and cfg.model.transformer.linear_cp_layout != cfg.model.transformer.attention_cp_layout
-    ):
-        additional_layouts.add(cfg.model.transformer.attention_cp_layout)
-    return get_batches_on_this_cp_rank(
+    if required_cp_layouts is not None:
+        additional_layouts.update(required_cp_layouts)
+    elif cp_size > 1:
+        additional_layouts.update(
+            (
+                cfg.model.transformer.linear_attention_cp_layout,
+                cfg.model.transformer.attention_cp_layout,
+            )
+        )
+    additional_layouts.discard(boundary_layout)
+    cp_batch = get_batches_on_this_cp_rank(
         batch,
-        boundary_layout=cfg.model.transformer.linear_cp_layout,
+        boundary_layout=boundary_layout,
         dynamic_cp=False,
         cp_group=get_context_parallel_group(),
         additional_layouts=additional_layouts,
@@ -220,6 +233,8 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         ),
         tokens_per_sample=seq_length,
     )
+    cp_batch.prepare_module_layouts()
+    return cp_batch
 
 
 @lru_cache(maxsize=1)
@@ -230,6 +245,7 @@ def _build_cached_logits_loss_func(
     kd_loss_alpha,
     ignore_errors,
     ignore_hash,
+    cp_layout="zigzag",
 ):
     """Build (once) the offline knowledge-distillation loss callable for cached logits.
 
@@ -245,6 +261,7 @@ def _build_cached_logits_loss_func(
         kd_loss_alpha=kd_loss_alpha,
         ignore_errors=ignore_errors,
         ignore_hash=ignore_hash,
+        cp_layout=cp_layout,
     )
 
 
@@ -275,6 +292,7 @@ def loss_func(
             kd_loss_alpha=student_load_cfg.loss_alpha,
             ignore_errors=student_load_cfg.ignore_errors,
             ignore_hash=student_load_cfg.ignore_hash,
+            cp_layout=cfg.model.transformer.global_cp_layout,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and is_distillation_model(model):  # [ModelOpt]
@@ -336,7 +354,10 @@ def forward_step(data_iterator, model: HybridModel):
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
         cp_batch = get_batch(
-            data_iterator, vp_stage, pg_collection=get_attr_wrapped_model(model, "pg_collection")
+            data_iterator,
+            vp_stage,
+            pg_collection=get_attr_wrapped_model(model, "pg_collection"),
+            required_cp_layouts=get_attr_wrapped_model(model, "cp_required_layouts"),
         )
         batch = cp_batch.get_batch()
         attention_mask = batch.get("attention_mask")
@@ -442,8 +463,8 @@ if __name__ == "__main__":
     # so its mere presence is a compatible fallback signal for an agent that predates NVRX_CYCLE.
     _NVRX_CYCLE_START = _env_float('NVRX_CYCLE_START_TIME')
     _IS_NVRX_RESTART = (
-        (_NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()) or _NVRX_CYCLE_START is not None
-    )
+        _NVRX_CYCLE not in ('', '0') and _NVRX_CYCLE.isdigit()
+    ) or _NVRX_CYCLE_START is not None
     if _NVRX_LAUNCH_TIME is not None:
         _LAUNCH_SCRIPT_PRESRUN_TIME = None
         if _IS_NVRX_RESTART:

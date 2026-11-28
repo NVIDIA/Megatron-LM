@@ -597,8 +597,7 @@ class TestHybridModel:
         assert self.model.decoder.input_tensor.shape[2] == config.hidden_size
 
     @pytest.mark.parametrize("recompute_method", [None, "uniform", "block"])
-    @pytest.mark.parametrize("convert_cp_layout", [False, True])
-    def test_forward(self, monkeypatch, recompute_method, convert_cp_layout):
+    def test_forward(self, monkeypatch, recompute_method):
         sequence_length = self.model.max_sequence_length
         micro_batch_size = 2
 
@@ -608,19 +607,6 @@ class TestHybridModel:
             decoder.config.recompute_granularity = "full"
             decoder.config.recompute_method = recompute_method
             decoder.config.recompute_num_layers = 2
-        if convert_cp_layout:
-            # Exercise both layout boundaries without requiring a multi-rank CP group.
-            layout_state = SimpleNamespace(
-                prepare_layer=lambda index, tensor: (tensor.roll(1, dims=0), None),
-                get_layer_padding_mask=lambda index, default, masks: default,
-                finalize_layer=lambda index, tensor: tensor.roll(-1, dims=0),
-            )
-            monkeypatch.setattr(
-                decoder,
-                "_cp_layout_manager",
-                SimpleNamespace(build_forward_state=lambda *args, **kwargs: layout_state),
-            )
-
         backward_layers = []
 
         def check_activation_gradient(layer, grad_input, _grad_output):

@@ -78,13 +78,20 @@ def test_unpack_indices_v1_legacy():
 
 @pytest.mark.parametrize("cp_size", [1, 2, 3, 4])
 @pytest.mark.parametrize("chunk_size", [1, 5])
-def test_cp_slice_reassemble_round_trip(cp_size, chunk_size):
+@pytest.mark.parametrize("cp_layout", ["zigzag", "contiguous"])
+def test_cp_slice_reassemble_round_trip(cp_size, chunk_size, cp_layout):
     seq_len = 2 * cp_size * chunk_size
     torch.manual_seed(3)
     full = torch.randn(seq_len, 2, 4)
 
-    shards = [slice_tensor_for_cp_rank(full, rank, cp_size) for rank in range(cp_size)]
-    reassembled = reassemble_cp_sequence(shards)
+    shards = [
+        slice_tensor_for_cp_rank(full, rank, cp_size, cp_layout=cp_layout)
+        for rank in range(cp_size)
+    ]
+    if cp_layout == "contiguous":
+        for rank, shard in enumerate(shards):
+            torch.testing.assert_close(shard, full.chunk(cp_size)[rank], atol=0, rtol=0)
+    reassembled = reassemble_cp_sequence(shards, cp_layout=cp_layout)
     assert torch.equal(reassembled, full)
 
 

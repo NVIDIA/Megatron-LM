@@ -2637,6 +2637,7 @@ def setup_model_and_optimizer(
             p=teacher_save_cfg.top_p,
             min_k=teacher_save_cfg.min_k,
             save_dtype=teacher_save_cfg.dtype,
+            cp_layout=cfg.model.transformer.global_cp_layout,
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 

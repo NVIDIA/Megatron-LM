@@ -2994,6 +2994,10 @@ class DSAttention(MegatronModule):
         self.pg_collection = pg_collection
 
         self.indexer = None
+        if (get_pg_size(pg_collection.cp) > 1 or config.dynamic_context_parallel) and (
+            config.attention_cp_layout != "zigzag"
+        ):
+            raise ValueError("DSAttention CP requires zigzag compute layout")
         if not self.skip_topk:
             self.indexer = build_module(
                 submodules.indexer, config=self.config, pg_collection=self.pg_collection

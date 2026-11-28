@@ -237,8 +237,10 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         msc_prefetch_depth: int = 2,
         ignore_hash: bool = False,
         meta: Optional[Dict[str, Any]] = None,
+        cp_layout: str = "zigzag",
     ):
         self.logprobs_dir = logprobs_dir
+        self.cp_layout = cp_layout
         self.cp_rank = cp_rank
         self.cp_size = cp_size
         self.dp_rank = dp_rank
@@ -287,7 +289,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         # 2*cp_size_load, surfacing later as an opaque per-document
         # ValueError deep in slice_tensor_for_cp_rank. Check it once, up
         # front, with an explanation instead.
-        if self._requires_cu_seqlens:
+        if self._requires_cu_seqlens and self.cp_layout == "zigzag":
             cp_size_save = meta.get("saver", {}).get("cp_size_save")
             if cp_size_save is not None and cp_size_save % self.cp_size != 0:
                 raise ValueError(
@@ -304,11 +306,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                     f"multiple of {self.cp_size}, or load at a CP size that "
                     f"evenly divides {cp_size_save}."
                 )
-            if (
-                cp_size_save is not None
-                and cp_size_save > self.cp_size
-                and safe_get_rank() == 0
-            ):
+            if cp_size_save is not None and cp_size_save > self.cp_size and safe_get_rank() == 0:
                 warnings.warn(
                     "Cached-logits CP resharding from a larger saved "
                     f"context-parallel size ({cp_size_save}) down to this "
@@ -595,11 +593,23 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
             cu_seqlens_list = [None] * len(values_list)
         return (
             [
-                slice_tensor_for_cp_rank(values, self.cp_rank, self.cp_size, cu_seqlens=cu_seqlens)
+                slice_tensor_for_cp_rank(
+                    values,
+                    self.cp_rank,
+                    self.cp_size,
+                    cu_seqlens=cu_seqlens,
+                    cp_layout=self.cp_layout,
+                )
                 for values, cu_seqlens in zip(values_list, cu_seqlens_list)
             ],
             [
-                slice_tensor_for_cp_rank(indices, self.cp_rank, self.cp_size, cu_seqlens=cu_seqlens)
+                slice_tensor_for_cp_rank(
+                    indices,
+                    self.cp_rank,
+                    self.cp_size,
+                    cu_seqlens=cu_seqlens,
+                    cp_layout=self.cp_layout,
+                )
                 for indices, cu_seqlens in zip(indices_list, cu_seqlens_list)
             ],
         )
@@ -649,7 +659,9 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                 _, v_mon, i_mon, cu_mon = entry
                 slices_v.append(v_mon[:, src.row_start : src.row_end])
                 slices_i.append(i_mon[:, src.row_start : src.row_end])
-                slices_cu.append(cu_mon[src.row_start : src.row_end] if cu_mon is not None else None)
+                slices_cu.append(
+                    cu_mon[src.row_start : src.row_end] if cu_mon is not None else None
+                )
 
             # The saver guarantees a single uniform K across all saved
             # microbatches / iterations (= effective_k), so the slices
@@ -770,11 +782,13 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
         msc_prefetch_depth: int = 2,
         ignore_hash: bool = False,
         meta: Optional[Dict[str, Any]] = None,
+        cp_layout: str = "zigzag",
     ):
         # NOTE: intentionally bypass the v2 base ``__init__`` because it
         # demands v2 metadata fields and constructs a LogprobsReshardPlan
         # that the v1 path does not use.
         self.logprobs_dir = logprobs_dir
+        self.cp_layout = cp_layout
         self.cp_rank = cp_rank
         self.cp_size = cp_size
         self.dp_rank = dp_rank
@@ -1039,6 +1053,7 @@ def make_teacher_tar_dataset(
     decode_lookahead: Optional[int] = None,
     msc_prefetch_depth: int = 2,
     ignore_hash: bool = False,
+    cp_layout: str = "zigzag",
 ) -> TeacherTarDataset:
     """Build the right :class:`TeacherTarDataset` for the on-disk format.
 
@@ -1063,6 +1078,7 @@ def make_teacher_tar_dataset(
         msc_prefetch_depth=msc_prefetch_depth,
         ignore_hash=ignore_hash,
         meta=meta,
+        cp_layout=cp_layout,
     )
 
 
@@ -1184,8 +1200,10 @@ class CachedLogitsKDLoss:
         decode_threads: int = 1,
         msc_prefetch_depth: int = 2,
         ignore_hash: bool = False,
+        cp_layout: str = "zigzag",
     ):
         self.logprobs_dir = logprobs_dir
+        self.cp_layout = cp_layout
         self._decode_threads = decode_threads
         self._msc_prefetch_depth = msc_prefetch_depth
         self._ignore_hash = ignore_hash
@@ -1249,6 +1267,7 @@ class CachedLogitsKDLoss:
             decode_threads=self._decode_threads,
             msc_prefetch_depth=self._msc_prefetch_depth,
             ignore_hash=self._ignore_hash,
+            cp_layout=self.cp_layout,
         )
         # Remote shard discovery uses a per-PP-stage collective, so keep the
         # iterable in the main training process (all last-PP ranks participate).
@@ -1409,8 +1428,10 @@ class LossFuncCallable:
         ignore_errors: bool = False,
         msc_prefetch_depth: int = 2,
         ignore_hash: bool = False,
+        cp_layout: str = "zigzag",
     ):
         self.logprobs_dir = logprobs_dir
+        self.cp_layout = cp_layout
         self.decode_threads = decode_threads
         self.msc_prefetch_depth = msc_prefetch_depth
         self.kd_func = None
@@ -1440,6 +1461,7 @@ class LossFuncCallable:
                 decode_threads=self.decode_threads,
                 msc_prefetch_depth=self.msc_prefetch_depth,
                 ignore_hash=self.ignore_hash,
+                cp_layout=self.cp_layout,
             )
 
         # LM loss

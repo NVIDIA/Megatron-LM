@@ -137,6 +137,7 @@ def assert_in_proj_recompute_preserves_norm_gate_view(
         config.calculate_per_token_loss = runtime_cp_size is not None
         config.linear_cp_mode = "chunkwise"
         config.linear_cp_layout = "contiguous"
+        config.linear_attention_cp_layout = "contiguous"
         if fp8_recipe:
             config.fp8 = "e4m3"
         config.gdp_cutedsl_kernel = not HAVE_FLA

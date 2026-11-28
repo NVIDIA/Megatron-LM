@@ -282,11 +282,7 @@ class KimiDeltaAttention(_GDNBase):
         inference_params: Optional[BaseInferenceContext] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run KDA on inputs already arranged in ``config.linear_cp_layout``.
-
-        HybridStack owns layout conversion through ContextParallelLayoutManager,
-        including the packed metadata and output conversion at stack boundaries.
-        """
+        """Run KDA on the compute-branch view selected by the shared CP adapter."""
 
         del attention_mask, sequence_len_offset, kwargs
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -323,7 +319,7 @@ class KimiDeltaAttention(_GDNBase):
             assert not self.config.sequence_parallel
             raise NotImplementedError("KimiDeltaAttention does not support inference for now.")
 
-        if cp_size_headwise > 1 and self.config.linear_cp_layout != "zigzag":
+        if cp_size_headwise > 1 and self.config.linear_attention_cp_layout != "zigzag":
             raise ValueError(
                 "KimiDeltaAttention with headwise CP requires zigzag layout. CP partition "
                 "conversion must be handled before calling KimiDeltaAttention."

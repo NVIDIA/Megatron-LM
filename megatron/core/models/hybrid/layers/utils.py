@@ -1,9 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 
 from torch import Tensor
 
+from megatron.core.context_parallel.module import prepare_module_cp_input
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.kda_layer_config import KDALayerConfig
@@ -150,6 +152,30 @@ def invoke_custom_layer(
     ``input_ids`` is optional and may be None, including in HybridModel's MTP stacks.
     Custom layers must handle missing IDs; token-dependent MTP execution is not supported.
     """
+    # Compatibility boundary for external layers that declare a whole-module layout.
+    # Built-in branches use the same converter inside their residual read/write pair.
+    target_layout = (
+        getattr(layer, "cp_input_layout", None) or layer.config.linear_attention_cp_layout
+    )
+    hidden_states, packed_seq_params, reverse = prepare_module_cp_input(
+        layer,
+        hidden_states,
+        packed_seq_params,
+        target_layout=target_layout,
+        attention_mask=attention_mask,
+    )
+    if reverse is not None:
+        forward = replace(
+            reverse,
+            source_partition_mode=reverse.target_partition_mode,
+            target_partition_mode=reverse.source_partition_mode,
+        )
+        input_ids = forward.convert(input_ids, seq_dim=1)
+        padding_mask = (
+            ~forward.convert(~padding_mask, seq_dim=1) if padding_mask is not None else None
+        )
+        if packed_seq_params is None:
+            packed_seq_params = PackedSeqParams(qkv_format="sbhd", cp_partition_mode=target_layout)
     output = layer(
         hidden_states,
         attention_mask=attention_mask,
@@ -160,7 +186,7 @@ def invoke_custom_layer(
     )
     if not isinstance(output, Tensor) or output.shape != hidden_states.shape:
         raise ValueError("A custom hybrid layer must return a tensor with the input shape.")
-    return output
+    return reverse.convert(output) if reverse is not None else output
 
 
 def validate_shared_rotary_config(

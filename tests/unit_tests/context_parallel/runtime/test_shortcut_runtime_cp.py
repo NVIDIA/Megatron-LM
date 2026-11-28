@@ -51,27 +51,14 @@ def test_shortcut_router_receives_runtime_cp_metadata():
     assert calls == [packed]
 
 
-@pytest.mark.parametrize("with_layout", [False, True])
-def test_shortcut_uses_moe_layout_mask_for_routed_and_shared_paths(with_layout):
+def test_shortcut_preserves_boundary_mask_for_routed_and_shared_paths():
     input_mask = torch.tensor([[False, True]])
-    moe_mask = torch.tensor([[True, False]])
-    masks_by_layout = {"zigzag": moe_mask}
-    input_packed, attn_packed, moe_packed = object(), object(), object()
-    calls = []
-
-    def prepare(layer_idx, hidden):
-        calls.append(("prepare", layer_idx))
-        return hidden, attn_packed if layer_idx == 4 else moe_packed
-
-    def mask_for_layer(layer_idx, padding_mask, padding_mask_by_layout):
-        assert layer_idx == 5
-        assert padding_mask is input_mask and padding_mask_by_layout is masks_by_layout
-        return moe_mask
+    input_packed = object()
 
     def route(shortcut_hidden, padding_mask, packed_seq_params, recompute_context=None):
         assert recompute_context is None
-        assert padding_mask is (moe_mask if with_layout else input_mask)
-        assert packed_seq_params is (moe_packed if with_layout else input_packed)
+        assert padding_mask is input_mask
+        assert packed_seq_params is input_packed
         return shortcut_hidden, shortcut_hidden
 
     def shared(hidden_states, padding_mask, packed_seq_params, recompute_context=None):
@@ -79,7 +66,7 @@ def test_shortcut_uses_moe_layout_mask_for_routed_and_shared_paths(with_layout):
         return torch.zeros_like(hidden_states), None, hidden_states, ()
 
     def attention(hidden_states, packed_seq_params, **kwargs):
-        assert packed_seq_params is (attn_packed if with_layout else input_packed)
+        assert packed_seq_params is input_packed
         return (hidden_states,)
 
     block = SimpleNamespace(
@@ -108,11 +95,6 @@ def test_shortcut_uses_moe_layout_mask_for_routed_and_shared_paths(with_layout):
         _launch_combine=lambda value, **kwargs: value,
         _postprocess=lambda residual, *args, **kwargs: residual,
     )
-    layout = SimpleNamespace(
-        prepare_layer=prepare,
-        get_layer_padding_mask=mask_for_layer,
-        finalize_layer=lambda layer_idx, value: value,
-    )
     hidden = torch.randn(2, 1, 2)
     output = ShortcutMoEBlock.forward(
         block,
@@ -124,8 +106,5 @@ def test_shortcut_uses_moe_layout_mask_for_routed_and_shared_paths(with_layout):
         packed_seq_params=input_packed,
         padding_mask=input_mask,
         quant_context_factory=lambda *args: nullcontext(),
-        cp_layout_state=layout if with_layout else None,
-        padding_mask_by_layout=masks_by_layout,
     )
     torch.testing.assert_close(output, hidden)
-    assert calls == ([("prepare", 4), ("prepare", 5), ("prepare", 5)] if with_layout else [])

@@ -12,6 +12,7 @@ from torch import Tensor
 
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.context_parallel import ContextParallelBatch
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
 from megatron.core.fp8_utils import get_fp8_recipe, is_mxfp8_output_proj_active
@@ -170,6 +171,15 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             raise ValueError(
                 "Hash-routed MoE is supported only by HybridModel because GPTModel does not "
                 "forward token IDs to transformer layers."
+            )
+        if (
+            config.mtp_num_layers
+            and (config.context_parallel_size > 1 or config.dynamic_context_parallel)
+            and config.global_cp_layout != config.attention_cp_layout
+        ):
+            raise ValueError(
+                "GPTModel MTP requires its residual layout to match attention_cp_layout; "
+                "use HybridModel for MTP across different CP layouts"
             )
         if config.rmsnorm_impl != "te":
             raise ValueError("rmsnorm_impl='liger' is supported only by HybridModel.")
@@ -695,6 +705,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
+        cp_batch: Optional[ContextParallelBatch] = None,
     ) -> Any:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -712,7 +723,14 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 decoder hidden states and output-layer helpers, then returns the model output.
             output_processor_context (Any, optional): User-defined context object forwarded to
                 `output_processor`.
+            cp_batch (ContextParallelBatch, optional): Producer-owned layout views, as passed
+                by MIMO. Input tensors must already use this batch's boundary layout.
         """
+        if cp_batch is not None:
+            if cp_batch.boundary_layout != self.config.global_cp_layout:
+                raise ValueError("CP batch boundary must match global_cp_layout")
+            cp_batch.prepare_module_layouts()
+            packed_seq_params = cp_batch.get_packed_seq_params()
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
 

@@ -29,6 +29,7 @@ class PartitionConfig:
     tp_comm_overlap: bool
     max_seq_len: int
     kv_format: str = "sbhd"  # "sbhd" | "thd"
+    global_cp_layout: CPLayout = "zigzag"
     linear_cp_layout: CPLayout = "zigzag"
     attention_cp_layout: CPLayout = "zigzag"
     cp_group: Optional[ProcessGroup] = None
@@ -64,7 +65,8 @@ class PartitionConfig:
             tp_comm_overlap=mp.tp_comm_overlap,
             max_seq_len=max_seq_len,
             kv_format=kv_format,
-            linear_cp_layout=getattr(mp, "linear_cp_layout", "zigzag"),
+            global_cp_layout=getattr(mp, "global_cp_layout", "zigzag"),
+            linear_cp_layout=getattr(mp, "linear_attention_cp_layout", "zigzag"),
             attention_cp_layout=getattr(mp, "attention_cp_layout", "zigzag"),
             cp_group=cp_group,
             tp_group=tp_group,
@@ -94,8 +96,8 @@ class PartitionAdapter:
 
         Decoder embeddings arrive sequence-first as ``[S, B, H]``. Token-aligned metadata is
         batch-first as ``[B, S, ...]`` except multi-axis position IDs, which arrive as
-        ``[rope_dim, B, S]``. Under dual-layout CP, the boundary view follows the linear layer
-        layout and the second view follows the attention/MTP layout.
+        ``[rope_dim, B, S]``. The boundary view follows the global policy; additional
+        views provide the independently selected linear and attention/MTP layouts.
         """
         self._validate_sequence_length(embeddings, is_packed=cu_seqlens is not None)
 
@@ -122,11 +124,13 @@ class PartitionAdapter:
         }
 
         additional_layouts = set()
-        if self.cfg.use_cp and self.cfg.linear_cp_layout != self.cfg.attention_cp_layout:
-            additional_layouts.add(self.cfg.attention_cp_layout)
+        if self.cfg.use_cp:
+            additional_layouts = {self.cfg.linear_cp_layout, self.cfg.attention_cp_layout} - {
+                self.cfg.global_cp_layout
+            }
         cp_batch = get_batches_on_this_cp_rank(
             batch,
-            boundary_layout=self.cfg.linear_cp_layout,
+            boundary_layout=self.cfg.global_cp_layout,
             dynamic_cp=False,
             cp_group=self.cfg.cp_group,
             additional_layouts=additional_layouts,

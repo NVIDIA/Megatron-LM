@@ -508,6 +508,7 @@ def test_hybrid_model_shards_each_layout_padding_mask(
             moe_paged_stash=False,
             moe_num_hash_layers=0,
             sequence_parallel=sequence_parallel,
+            global_cp_layout="contiguous",
             freeze_base_model_for_mtp=False,
         ),
         decoder=decoder,

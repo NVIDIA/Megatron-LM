@@ -22,6 +22,8 @@ import torch
 
 from gpt_builders import gpt_builder
 from megatron.core import mpu
+from megatron.core.context_parallel import ContextParallelBatch, get_batches_on_this_cp_rank
+from megatron.core.context_parallel.module import get_cp_boundary_layout
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
@@ -38,7 +40,6 @@ from megatron.core.utils import (
     StragglerDetector,
     flatten_batch_for_packed_sequences,
     get_attr_wrapped_model,
-    get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_te_version,
     get_torch_version,
@@ -124,6 +125,7 @@ def get_batch(
             dynamic_cp=cfg.model.transformer.dynamic_context_parallel,
             pg_collection=pg_collection,
             config=cfg.model.transformer,
+            return_context_parallel_batch=True,
         )
 
     # The data section's predicates and the dataset's fields; the packing path above needs
@@ -187,35 +189,28 @@ def get_batch(
 
     batch = flatten_batch_for_packed_sequences(batch)
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
-        assert has_cu_seqlens
-        return (
-            None,
-            batch['cu_seqlens'],
-            batch['cu_seqlens_padded'],
-            None,
-            None,
-            None,
-            None,
-            batch['max_seqlen'],
-            None,
-            None,
-        )
-
-    batch = get_batch_on_this_cp_rank(
+    boundary = get_cp_boundary_layout(cfg.model.transformer)
+    cp_batch = get_batches_on_this_cp_rank(
         batch,
+        boundary_layout=boundary,
         dynamic_cp=False,
         cp_group=get_context_parallel_group(),
+        additional_layouts={
+            cfg.model.transformer.attention_cp_layout,
+            cfg.model.transformer.linear_attention_cp_layout,
+        }
+        - {boundary},
         use_per_sequence_balancing=cfg.data.use_per_sequence_balancing(),
+        sequence_parallel=cfg.model.transformer.sequence_parallel,
+        tp_group=mpu.get_tensor_model_parallel_group(),
+        tp_cp_group=(
+            mpu.get_tensor_and_context_parallel_group()
+            if cfg.model.transformer.sequence_parallel
+            else None
+        ),
+        tokens_per_sample=seq_length,
     )
-
-    # Return values in BATCH_KEYS order so callers can unpack into the fixed
-    # names regardless of any provenance fields wrappers like BlendedDataset
-    # add (e.g. "dataset_id"). The for-loop above already populates every
-    # BATCH_KEYS entry on tp_rank 0; other tp_ranks receive a fresh dict from
-    # get_batch_on_this_tp_rank. BATCH_KEYS is already alphabetical, matching
-    # the historical sorted(batch.keys()) order.
-    return [batch[key] for key in BATCH_KEYS]
+    return cp_batch.prepare_module_layouts()
 
 
 @lru_cache(maxsize=1)
@@ -226,6 +221,7 @@ def _build_cached_logits_loss_func(
     kd_loss_alpha,
     ignore_errors,
     ignore_hash,
+    cp_layout="zigzag",
 ):
     """Build (once) the offline knowledge-distillation loss callable for cached logits.
 
@@ -241,6 +237,7 @@ def _build_cached_logits_loss_func(
         kd_loss_alpha=kd_loss_alpha,
         ignore_errors=ignore_errors,
         ignore_hash=ignore_hash,
+        cp_layout=cp_layout,
     )
 
 
@@ -273,6 +270,7 @@ def loss_func(
             kd_loss_alpha=student_load_cfg.loss_alpha,
             ignore_errors=student_load_cfg.ignore_errors,
             ignore_hash=student_load_cfg.ignore_hash,
+            cp_layout=cfg.model.transformer.global_cp_layout,
         )
         loss, num_tokens, report = loss_func_cached_logits(loss_mask, output_tensor, model=model)
     elif has_nvidia_modelopt and is_distillation_model(model):  # [ModelOpt]
@@ -343,7 +341,20 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         cu_seqlens = None
         cu_seqlens_padded = None
 
-        if len(batch) == 7:
+        if isinstance(batch, ContextParallelBatch):
+            values = batch.get_batch()
+            tokens, labels, loss_mask, attention_mask, position_ids = (
+                values.get(key)
+                for key in ("tokens", "labels", "loss_mask", "attention_mask", "position_ids")
+            )
+            padding_mask = values.get("padding_mask")
+            packed_seq_params = batch.get_packed_seq_params()
+            if packed_seq_params is not None:
+                cu_seqlens = values["cu_seqlens"].squeeze(0)
+                cu_seqlens_padded = packed_seq_params.cu_seqlens_q_padded
+                if cfg.model.transformer.sequence_packing_scheduler is None:
+                    update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+        elif len(batch) == 7:
             (
                 tokens,
                 labels,

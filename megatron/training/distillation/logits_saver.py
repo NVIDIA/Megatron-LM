@@ -198,6 +198,7 @@ class LogitsSaverHooks:
         p: Optional[float] = None,
         min_k: int = 1,
         save_dtype: str = 'fp16',
+        cp_layout: str = 'zigzag',
     ):
         assert k > 0, "Number of top log-probabilities to save must be positive"
         assert save_dir is not None, "Save directory must be provided"
@@ -217,6 +218,7 @@ class LogitsSaverHooks:
             )
 
         self.save_dir = save_dir
+        self.cp_layout = cp_layout
         self.k = k
         self.p = p
         self.min_k = min_k
@@ -594,8 +596,12 @@ class LogitsSaverHooks:
             return None
 
         return (
-            reassemble_cp_sequence(values_gather_list, cu_seqlens=cu_seqlens),
-            reassemble_cp_sequence(indices_gather_list, cu_seqlens=cu_seqlens),
+            reassemble_cp_sequence(
+                values_gather_list, cu_seqlens=cu_seqlens, cp_layout=self.cp_layout
+            ),
+            reassemble_cp_sequence(
+                indices_gather_list, cu_seqlens=cu_seqlens, cp_layout=self.cp_layout
+            ),
         )
 
     def _compute_global_topk(

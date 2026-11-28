@@ -44,17 +44,8 @@ from megatron.core.utils import (
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
 
-    try:
-        import transformer_engine_torch as tex
-
-        HAVE_TEX = True
-    except ImportError:
-        tex = None
-        HAVE_TEX = False
 else:
     TEDotProductAttention = None
-    tex = None
-    HAVE_TEX = False
 
 
 IGNORE_INDEX = -100  # ID for labels that should be ignored.
@@ -1139,39 +1130,63 @@ class LLaVAModel(MegatronModule):
         if self.context_parallel_lm > 1:
             batch = dict()
             if self.pre_process:
-                batch["combined_embeddings"] = combined_embeddings
+                batch["decoder_input"] = combined_embeddings
             if self.post_process:
-                batch["expanded_labels"] = expanded_labels
-                batch["expanded_loss_mask"] = expanded_loss_mask
+                batch["labels"] = expanded_labels
+                batch["loss_mask"] = expanded_loss_mask
             # Distribute sequence across CP ranks
             if packed_seq_params is None or packed_seq_params.qkv_format == 'sbhd':
                 from megatron.core.utils import get_batch_on_this_cp_rank
 
                 batch = get_batch_on_this_cp_rank(
-                    batch, dynamic_cp=False, cp_group=self.pg_collection.cp
+                    batch,
+                    dynamic_cp=False,
+                    cp_group=self.pg_collection.cp,
+                    cp_partition_mode=self.config.global_cp_layout,
                 )
             else:
-                assert HAVE_TEX and is_te_min_version(
+                assert HAVE_TE and is_te_min_version(
                     "1.10.0"
                 ), "Please update Transformer Engine to >= 1.10 to use \
                     Context Parallel with THD format data"
-                index = tex.thd_get_partitioned_indices(
-                    packed_seq_params.cu_seqlens_q_padded,
-                    batch[next(iter(batch))].size(1),
-                    self.cp_group.size(),
-                    self.cp_group.rank(),
-                )
-                for key, data in batch.items():
-                    batch[key] = data.index_select(1, index)
+                from megatron.core.context_parallel import get_batches_on_this_cp_rank
+
+                cu = packed_seq_params.cu_seqlens_q
+                cp_batch = get_batches_on_this_cp_rank(
+                    dict(
+                        decoder_input=batch.get("decoder_input"),
+                        labels=batch.get("labels"),
+                        loss_mask=batch.get("loss_mask"),
+                        cu_seqlens=cu.unsqueeze(0),
+                        cu_seqlens_padded=(
+                            packed_seq_params.cu_seqlens_q_padded.unsqueeze(0)
+                            if packed_seq_params.cu_seqlens_q_padded is not None
+                            else None
+                        ),
+                        max_seqlen=torch.tensor(packed_seq_params.max_seqlen_q, device=cu.device),
+                    ),
+                    boundary_layout=self.config.global_cp_layout,
+                    additional_layouts={
+                        self.config.linear_attention_cp_layout,
+                        self.config.attention_cp_layout,
+                    },
+                    dynamic_cp=False,
+                    cp_group=self.pg_collection.cp,
+                    tp_group=self.pg_collection.tp,
+                    tp_cp_group=self.pg_collection.tp_cp,
+                    sequence_parallel=self.sequence_parallel_lm,
+                ).prepare_module_layouts()
+                batch = cp_batch.get_batch()
+                packed_seq_params = cp_batch.get_packed_seq_params()
 
             if self.pre_process:
-                combined_embeddings = batch["combined_embeddings"]  # [B, S/CP, H]
+                combined_embeddings = batch["decoder_input"]  # [B, S/CP, H]
                 combined_embeddings = combined_embeddings.transpose(
                     1, 0
                 ).contiguous()  # [B,S/CP,H] -> [S/CP,B,H]
             if self.post_process:
-                expanded_labels = batch["expanded_labels"]
-                expanded_loss_mask = batch["expanded_loss_mask"]
+                expanded_labels = batch["labels"]
+                expanded_loss_mask = batch["loss_mask"]
 
         if self.sequence_parallel_lm and self.pre_process:
             combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(

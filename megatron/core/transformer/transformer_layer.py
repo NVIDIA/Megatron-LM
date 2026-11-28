@@ -16,6 +16,12 @@ import torch
 import torch.distributed
 from torch import Tensor
 
+from megatron.core.context_parallel.module import (
+    CPLayoutIntermediate,
+    attention_cp_layout,
+    prepare_module_cp_input,
+)
+
 try:
     from nemo.lens.helpers import managed_span as _otel_managed_span
 except ImportError:
@@ -693,6 +699,15 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
             self._set_proj_residual(residual)
 
         nvtx_range_push(suffix="self_attention")
+        input_layernorm_output, packed_seq_params, cp_reverse = prepare_module_cp_input(
+            self,
+            input_layernorm_output,
+            packed_seq_params,
+            target_layout=attention_cp_layout(self),
+            attention_mask=attention_mask,
+            attention_bias=attention_bias,
+            inference_context=inference_context,
+        )
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
@@ -707,12 +722,20 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
         )
         nvtx_range_pop(suffix="self_attention")
 
+        if cp_reverse is not None:
+            attention_output_with_bias = cp_reverse.restore_output(attention_output_with_bias)
+
         if self._input_layernorm_checkpoint_active:
             self.input_layernorm_checkpoint.discard_output_and_register_recompute(
                 attention_output_with_bias[0]
             )
 
         return attention_output_with_bias, self.attn_norm_manager, residual
+
+    @property
+    def cp_input_layout(self):
+        """Compute-branch layout; an MLP-only layer has no attention requirement."""
+        return None if isinstance(self.self_attention, IdentityOp) else attention_cp_layout(self)
 
     def supports_two_stage_attention(self) -> bool:
         """Return whether this is an attention-only layer that supports two-stage execution."""
@@ -829,6 +852,15 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
 
         nvtx_range_push(suffix="self_attention")
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
+            input_layernorm_output, packed_seq_params, cp_reverse = prepare_module_cp_input(
+                self,
+                input_layernorm_output,
+                packed_seq_params,
+                target_layout=attention_cp_layout(self),
+                attention_mask=attention_mask,
+                attention_bias=attention_bias,
+                inference_context=inference_context,
+            )
             attention_output_with_bias = self.self_attention(
                 input_layernorm_output,
                 attention_mask=attention_mask,
@@ -842,6 +874,9 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
                 sequence_len_offset=sequence_len_offset,
             )
         nvtx_range_pop(suffix="self_attention")
+
+        if cp_reverse is not None:
+            attention_output_with_bias = cp_reverse.restore_output(attention_output_with_bias)
 
         return self.attention_bda_and_cross_attention(
             attention_output_with_bias,
@@ -875,6 +910,14 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
 
         nvtx_range_push(suffix="self_attention")
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
+            input_layernorm_output, packed_seq_params, cp_reverse = prepare_module_cp_input(
+                self,
+                input_layernorm_output,
+                packed_seq_params,
+                target_layout=attention_cp_layout(self),
+                attention_mask=attention_mask,
+                attention_bias=attention_bias,
+            )
             attention_intermediate = self.self_attention.forward_pre_attn_and_core_attn(
                 input_layernorm_output,
                 attention_mask=attention_mask,
@@ -885,6 +928,8 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
             )
         nvtx_range_pop(suffix="self_attention")
 
+        if cp_reverse is not None:
+            attention_intermediate = CPLayoutIntermediate(attention_intermediate, cp_reverse)
         return attention_intermediate, residual, context, attn_state
 
     def forward_post_core_attn(
@@ -899,9 +944,15 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
         """Run the training path after core attention."""
         assert self.supports_two_stage_attention()
 
+        cp_reverse = None
+        if isinstance(attention_intermediate, CPLayoutIntermediate):
+            cp_reverse = attention_intermediate.converter
+            attention_intermediate = attention_intermediate.value
         attention_output_with_bias = self.self_attention.forward_post_core_attn(
             attention_intermediate
         )
+        if cp_reverse is not None:
+            attention_output_with_bias = cp_reverse.restore_output(attention_output_with_bias)
         return self.attention_bda_and_cross_attention(
             attention_output_with_bias,
             residual,

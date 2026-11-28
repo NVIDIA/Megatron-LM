@@ -162,6 +162,8 @@ def test_scheduler_loader_preserves_graph_logical_offsets(
         cuda_graph_thd_max_packed_sequences=metadata_capacity,
         max_seqlen_per_dp_cp_rank=16,
         linear_cp_layout="contiguous",
+        global_cp_layout="contiguous",
+        linear_attention_cp_layout="contiguous",
         attention_cp_layout="contiguous",
         sequence_parallel=False,
     )
@@ -218,7 +220,11 @@ def test_scheduler_builds_runtime_cp_layout_views(local_cp_size, expected_layout
         tp=tp_group, pp=pp_group, cp=static_cp_group, dynamic_cp={local_cp_size: runtime_cp_group}
     )
     config = SimpleNamespace(
-        linear_cp_layout="contiguous", attention_cp_layout="zigzag", sequence_parallel=False
+        linear_cp_layout="contiguous",
+        global_cp_layout="contiguous",
+        linear_attention_cp_layout="contiguous",
+        attention_cp_layout="zigzag",
+        sequence_parallel=False,
     )
     tokens = torch.arange(8, dtype=torch.int64)
     batch = {

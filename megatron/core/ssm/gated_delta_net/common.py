@@ -164,6 +164,9 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
     gated_delta_rule: GatedDeltaRuleInterface
 
+    # A new kernel may override this declaration without relaxing every GDN implementation.
+    supported_cp_layouts = {"headwise": ("zigzag",), "chunkwise": ("contiguous",)}
+
     @classmethod
     def _estimate_flops(
         cls, config: TransformerConfig, total_real_tokens_in_batch: float, *, use_gdn2: bool
@@ -247,6 +250,13 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.cp_size = self.pg_collection.cp.size()
+        if self.cp_size > 1 or config.dynamic_context_parallel:
+            supported = self.supported_cp_layouts[config.linear_cp_mode]
+            if config.linear_attention_cp_layout not in supported:
+                raise ValueError(
+                    f"{type(self).__name__} {config.linear_cp_mode} CP supports {supported}; "
+                    "select a kernel that supports the requested layout instead of overriding it"
+                )
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
 
@@ -270,7 +280,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         # Chunkwise KDA partitions tokens and keeps all TP-local heads, so only
         # headwise variants require divisibility by the selected CP group size.
-        if not (isinstance(config, KDALayerConfig) and config.linear_cp_mode == "chunkwise"):
+        if config.linear_cp_mode != "chunkwise":
             _validate_dynamic_cp_head_geometry(
                 config,
                 self.pg_collection,
@@ -398,13 +408,18 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         )
         # TODO: Packed sequence cu_seqlens can vary per batch; cache only static SBHD
         # cp_context entries here and revisit routing metadata lifetime in the CP layout refactor.
-        self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
+        self._chunkwise_cp_context_cache: dict[tuple[int, ...], tuple[torch.Tensor, object]] = {}
 
         self.reset_parameters()
 
     def supports_two_stage_attention(self) -> bool:
         """Recomputation requires the original atomic forward path."""
         return not (self.recompute_norm_out or self.recompute_gdn)
+
+    @property
+    def cp_input_layout(self):
+        """Headwise kernels consume dual chunks; chunkwise kernels consume causal rank order."""
+        return self.config.linear_attention_cp_layout
 
     def forward_post_core_attn(
         self, norm_out: torch.Tensor

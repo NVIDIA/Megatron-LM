@@ -23,6 +23,32 @@ def _mock_group(size, rank=0):
     return group
 
 
+def test_fixed_length_inter_document_batch_keeps_pipeline_shape():
+    """Inter-document masking must not add per-document padding to a fixed PP row."""
+    tokens = torch.arange(8, device="cuda").reshape(1, 8)
+    group = _mock_group(2)
+    with (
+        patch("torch.distributed.get_world_size", side_effect=lambda group: group.size()),
+        patch("torch.distributed.get_rank", side_effect=lambda group: group.rank()),
+    ):
+        result = get_batches_on_this_cp_rank(
+            dict(
+                tokens=tokens,
+                labels=tokens + 1,
+                cu_seqlens=torch.tensor([[0, 3, 8]], device="cuda"),
+                max_seqlen=torch.tensor([5], device="cuda"),
+            ),
+            boundary_layout="zigzag",
+            dynamic_cp=False,
+            cp_group=group,
+            use_per_sequence_balancing=True,
+            tokens_per_sample=8,
+        )
+    assert result.get_batch()["tokens"].shape == (1, 4)
+    assert result.get_packed_seq_params().total_tokens == 8
+    assert result.get_batch()["tokens"].tolist() == [[0, 1, 6, 7]]
+
+
 def test_dynamic_cp_singleton_runtime_group_keeps_the_batch_unsharded():
     """A CP-off microbatch (local_cp_size == 1) resolves and records the singleton group."""
     static_cp_group, singleton = _mock_group(2), _mock_group(1)
@@ -138,7 +164,11 @@ def test_scheduler_builds_static_cp_layout_views(cp_size, linear_cp_layout):
     static_cp_group = _Group(cp_size)
     pg_collection = ProcessGroupCollection(tp=_Group(1), pp=_Group(1), cp=static_cp_group)
     config = SimpleNamespace(
-        linear_cp_layout=linear_cp_layout, attention_cp_layout="zigzag", sequence_parallel=False
+        linear_cp_layout=linear_cp_layout,
+        global_cp_layout=linear_cp_layout,
+        linear_attention_cp_layout=linear_cp_layout,
+        attention_cp_layout="zigzag",
+        sequence_parallel=False,
     )
     tokens = torch.arange(8, dtype=torch.int64)
     batch = {

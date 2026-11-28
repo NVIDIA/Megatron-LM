@@ -2,16 +2,16 @@
 
 """Context-parallel sequence-layout conversion."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Literal
 
 import torch
 
-from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import all_to_all
 
 CPLayout = Literal["contiguous", "zigzag"]
+CpPartitionMode = CPLayout
 
 
 @dataclass(frozen=True)
@@ -356,6 +356,8 @@ def _build_thd_zigzag_metadata(
     cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor | None, cp_size: int, tp_size: int
 ) -> _THDZigzagMetadata:
     """Build padded dual-chunk metadata without Transformer Engine helpers."""
+    if cp_size < 1 or tp_size < 1:
+        raise ValueError("CP and TP sizes must be positive")
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
         raise ValueError("cu_seqlens must be one-dimensional with at least two entries")
     if cu_seqlens.dtype != torch.int32:
@@ -392,12 +394,25 @@ def _build_thd_zigzag_metadata(
 
     # These values must be host-known by the route allocator and PackedSeqParams. Read them back
     # together so target-layout metadata does not add another device synchronization.
-    target_token_count, pad_between_seqs = torch.stack(
+    logical_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    valid_boundaries = (
+        (cu_seqlens[0] == 0)
+        & (source_cu_seqlens[0] == 0)
+        & torch.all(logical_lengths >= 0)
+        & torch.all(source_lengths >= logical_lengths)
+    )
+    target_token_count, pad_between_seqs, valid_boundaries = torch.stack(
         (
             target_cu_seqlens[-1].to(torch.int64),
             torch.any(cu_seqlens != target_cu_seqlens).to(torch.int64),
+            valid_boundaries.to(torch.int64),
         )
     ).tolist()
+    if not valid_boundaries:
+        raise ValueError(
+            "Packed boundaries must start at zero, be nondecreasing, and provide at least "
+            "the logical length of each sequence in physical storage"
+        )
 
     target_positions = torch.arange(target_token_count, dtype=torch.int64, device=cu_seqlens.device)
     sequence_ids = torch.searchsorted(target_cu_seqlens[1:], target_positions, right=True)
@@ -653,167 +668,40 @@ def convert_cp_layout(
     raise ValueError(f"Unsupported CP layout conversion: {source_layout} to {target_layout}")
 
 
-@dataclass(eq=False)
-class ContextParallelLayoutManager:
-    """Manage CP layout transitions across a sequence of layers."""
+def convert_cp_partition_mode(
+    x: torch.Tensor,
+    *,
+    source_partition_mode: CPLayout,
+    target_partition_mode: CPLayout,
+    seq_dim: int = 0,
+    sequence_parallel: bool = False,
+    cp_group: torch.distributed.ProcessGroup | None = None,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    tp_cp_group: torch.distributed.ProcessGroup | None = None,
+    thd_plan: THDCPLayoutPlan | None = None,
+) -> torch.Tensor:
+    """Convert a tensor using the canonical CP or TP x CP redistribution plan.
 
-    layer_layouts: tuple[CPLayout, ...]
-    boundary_layout: CPLayout
-    sequence_parallel: bool
-    cp_group: torch.distributed.ProcessGroup
-    tp_group: torch.distributed.ProcessGroup | None
-    tp_cp_group: torch.distributed.ProcessGroup | None
-    requires_conversion: bool = field(init=False)
-
-    def __post_init__(self) -> None:
-        """Determine whether the layer sequence needs layout conversion."""
-        self.requires_conversion = self.cp_group.size() > 1 and any(
-            layout != self.boundary_layout for layout in self.layer_layouts
-        )
-
-    def _convert_cp_layout(
-        self,
-        hidden_states: torch.Tensor,
-        source_layout: CPLayout,
-        target_layout: CPLayout,
-        thd_plan: THDCPLayoutPlan | None = None,
-    ) -> torch.Tensor:
-        if not self.requires_conversion:
-            return hidden_states
-        return convert_cp_layout(
-            hidden_states,
-            source_layout,
-            target_layout,
-            self.cp_group,
-            self.sequence_parallel,
-            self.tp_group,
-            self.tp_cp_group,
-            thd_plan,
-        )
-
-    def prepare_layer_input(
-        self, layer_index: int, hidden_states: torch.Tensor, thd_plan: THDCPLayoutPlan | None = None
-    ) -> torch.Tensor:
-        """Convert when a layer requires a different layout than its predecessor."""
-        source_layout = (
-            self.boundary_layout if layer_index == 0 else self.layer_layouts[layer_index - 1]
-        )
-        return self._convert_cp_layout(
-            hidden_states, source_layout, self.layer_layouts[layer_index], thd_plan
-        )
-
-    def finalize_layer_output(
-        self, layer_index: int, hidden_states: torch.Tensor, thd_plan: THDCPLayoutPlan | None = None
-    ) -> torch.Tensor:
-        """Restore the boundary layout after the final layer."""
-        if layer_index != len(self.layer_layouts) - 1:
-            return hidden_states
-        return self._convert_cp_layout(
-            hidden_states, self.layer_layouts[layer_index], self.boundary_layout, thd_plan
-        )
-
-    def build_forward_state(
-        self,
-        packed_seq_params: PackedSeqParams | None,
-        packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
-        thd_plan: THDCPLayoutPlan | None = None,
-    ) -> "ContextParallelLayoutState | None":
-        """Build the layout state for one forward pass.
-
-        Args:
-            packed_seq_params: Metadata for the stack's boundary layout.
-            packed_seq_params_by_layout: Prebuilt metadata for each physical layout.
-            thd_plan: Prebuilt route between packed contiguous and zigzag layouts.
-        """
-        if not self.requires_conversion:
-            return None
-
-        if thd_plan is not None and packed_seq_params_by_layout is not None:
-            return ContextParallelLayoutState(
-                manager=self,
-                thd_plan=thd_plan,
-                contiguous_packed_seq_params=packed_seq_params_by_layout["contiguous"],
-                zigzag_packed_seq_params=packed_seq_params_by_layout["zigzag"],
-            )
-
-        if packed_seq_params is not None:
-            raise ValueError(
-                "Packed CP layout conversion requires prebuilt metadata for both layouts"
-            )
-
-        return ContextParallelLayoutState(
-            manager=self,
-            thd_plan=thd_plan,
-            contiguous_packed_seq_params=packed_seq_params,
-            zigzag_packed_seq_params=packed_seq_params,
-        )
-
-
-@dataclass(eq=False)
-class ContextParallelLayoutState:
-    """Per-forward state for CP layout conversion."""
-
-    manager: ContextParallelLayoutManager
-    thd_plan: THDCPLayoutPlan | None
-    contiguous_packed_seq_params: PackedSeqParams | None
-    zigzag_packed_seq_params: PackedSeqParams | None
-    _input_ids_by_layout: dict[CPLayout, torch.Tensor] = field(
-        default_factory=dict, init=False, repr=False
+    This partition-mode spelling shares the implementation of ``convert_cp_layout``.
+    For THD, pass the plan produced by ``get_batches_on_this_cp_rank`` and use that
+    batch's target-layout metadata. Changing a layout name on the source metadata is
+    insufficient: padding can change the physical sequence lengths during conversion.
+    Route construction belongs to batch preparation, never to this conversion edge.
+    """
+    for mode in (source_partition_mode, target_partition_mode):
+        if mode not in ("contiguous", "zigzag"):
+            raise ValueError(f"Expected a concrete CP partition mode, got {mode!r}")
+    if cp_group is None or cp_group.size() == 1 or source_partition_mode == target_partition_mode:
+        return x
+    moved = x.movedim(seq_dim, 0) if seq_dim != 0 else x
+    converted = convert_cp_layout(
+        moved,
+        source_partition_mode,
+        target_partition_mode,
+        cp_group,
+        sequence_parallel,
+        tp_group,
+        tp_cp_group,
+        thd_plan,
     )
-
-    def prepare_layer(
-        self, layer_index: int, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, PackedSeqParams | None]:
-        """Prepare a layer's input and matching packed metadata."""
-        hidden_states = self.manager.prepare_layer_input(layer_index, hidden_states, self.thd_plan)
-        packed_seq_params = (
-            self.zigzag_packed_seq_params
-            if self.manager.layer_layouts[layer_index] == "zigzag"
-            else self.contiguous_packed_seq_params
-        )
-        return hidden_states, packed_seq_params
-
-    def get_layer_input_ids(
-        self, layer_index: int, input_ids: torch.Tensor | None
-    ) -> torch.Tensor | None:
-        """Align batch-first boundary token IDs with a layer's activations.
-
-        Unlike activations, the supplied IDs always start in the boundary layout.
-        Cache converted IDs for this forward, including activation recomputation.
-        """
-        target_layout = self.manager.layer_layouts[layer_index]
-        if input_ids is None or target_layout == self.manager.boundary_layout:
-            return input_ids
-        if target_layout not in self._input_ids_by_layout:
-            self._input_ids_by_layout[target_layout] = (
-                self.manager._convert_cp_layout(
-                    input_ids.transpose(0, 1),
-                    self.manager.boundary_layout,
-                    target_layout,
-                    self.thd_plan,
-                )
-                .transpose(0, 1)
-                .contiguous()
-            )
-        return self._input_ids_by_layout[target_layout]
-
-    def get_layer_padding_mask(
-        self,
-        layer_index: int,
-        default: torch.Tensor | None,
-        padding_masks_by_layout: dict[CPLayout, torch.Tensor | None] | None,
-    ) -> torch.Tensor | None:
-        """Return the token mask whose ordering matches this layer's input.
-
-        Pipeline stages that carry no padding mask may build a batch for the boundary layout
-        only; the boundary ``default`` applies to every layer in that case.
-        """
-        if padding_masks_by_layout is None or all(
-            mask is None for mask in padding_masks_by_layout.values()
-        ):
-            return default
-        return padding_masks_by_layout[self.manager.layer_layouts[layer_index]]
-
-    def finalize_layer(self, layer_index: int, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Finalize a layer's output layout."""
-        return self.manager.finalize_layer_output(layer_index, hidden_states, self.thd_plan)
+    return converted.movedim(0, seq_dim).contiguous() if seq_dim != 0 else converted
