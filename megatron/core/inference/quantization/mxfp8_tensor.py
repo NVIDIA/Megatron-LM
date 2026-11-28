@@ -238,7 +238,8 @@ class MXFP8Tensor:
         assert x.shape[-1] % group_size == 0
         if backend == "flashinfer":
             assert HAVE_FLASHINFER, "FlashInfer not available"
-            data, scale = flashinfer_mxfp8_quantize(x)
+            # FlashInfer requires a contiguous input; contiguous() returns a contiguous x as is.
+            data, scale = flashinfer_mxfp8_quantize(x.contiguous())
             if scale.dtype == torch.float8_e8m0fnu:
                 scale = scale.view(torch.uint8)
             elif scale.dtype != torch.uint8:
