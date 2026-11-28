@@ -78,7 +78,6 @@ try:
             f">= {_GTP_TE_MIN_VERSION} (found {_te_version})."
         )
 
-    import transformer_engine_torch as tex
     from transformer_engine.pytorch.constants import (
         MXFP8_BLOCK_SCALING_SIZE,
         NVFP4_BLOCK_SCALING_SIZE,
@@ -107,7 +106,7 @@ except (ImportError, ModuleNotFoundError):
     # module-level TE reference (a dataclass field annotation) from being evaluated.
     from unittest.mock import MagicMock
 
-    te = tex = MagicMock()
+    te = MagicMock()
     MXFP8_BLOCK_SCALING_SIZE = NVFP4_BLOCK_SCALING_SIZE = None
     _NVFP4AllGatherAsyncHandle = MagicMock()
     gather_along_first_dim = reduce_scatter_along_first_dim = MagicMock()
@@ -2854,7 +2853,7 @@ class _TicketSlot:
 
     key: tuple  # cache key (shape, dtype, ...)
     param: "GTPShardedParam"  # for lazy allocation metadata
-    dtype: object  # torch.dtype or tex.DType
+    dtype: object  # torch.dtype or te.pytorch.DType
     reduce_scatter: bool
     fwd: bool
     chain_id: str = GTPChain.GRAPHED.value  # chain this slot belongs to
@@ -2871,15 +2870,14 @@ class GTPWeightCache:
     """
 
     # Bytes per element for known dtypes (for logging). Add entries when GTP caches buffers of
-    # new quantized dtypes — only DType values the TE pybind bindings expose (verify via
-    # hasattr(tex.DType, ...) before adding speculative entries).
+    # new quantized dtypes supported by TE's public Python DType enum.
     _BYTES_PER_ELEMENT = {
         torch.bfloat16: 2,
         torch.float16: 2,
         torch.float32: 4,
-        tex.DType.kFloat4E2M1: 0.5,
-        tex.DType.kFloat8E4M3: 1,
-        tex.DType.kFloat8E5M2: 1,
+        te.pytorch.DType.kFloat4E2M1: 0.5,
+        te.pytorch.DType.kFloat8E4M3: 1,
+        te.pytorch.DType.kFloat8E5M2: 1,
     }
 
     def __init__(self):

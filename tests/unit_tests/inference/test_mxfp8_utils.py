@@ -1317,12 +1317,12 @@ def _make_te_mxfp8_expert_linear(quantizer, out_features, in_features):
     reason="MXFP8 parameter storage requires Blackwell",
 )
 def test_model_conversion_preserves_bf16_parameters():
-    import transformer_engine_torch as tex
+    import transformer_engine.pytorch as te
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
     from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
 
-    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    quantizer = MXFP8Quantizer(te.DType.kFloat8E4M3, rowwise=True, columnwise=False)
     model = torch.nn.Module()
     model.attention = torch.nn.Linear(128, 64, bias=False, device="cuda", dtype=torch.bfloat16)
     model.mlp = torch.nn.Module()
@@ -1350,12 +1350,12 @@ def test_model_conversion_preserves_bf16_parameters():
     reason="MXFP8 parameter storage requires Blackwell",
 )
 def test_model_conversion_rejects_mixed_expert_precision():
-    import transformer_engine_torch as tex
+    import transformer_engine.pytorch as te
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
     from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
 
-    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    quantizer = MXFP8Quantizer(te.DType.kFloat8E4M3, rowwise=True, columnwise=False)
     model = torch.nn.Module()
     model.num_local_experts = 1
     model.linear_fc1 = _make_te_mxfp8_expert_linear(quantizer, 64, 128)

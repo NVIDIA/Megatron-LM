@@ -2012,7 +2012,7 @@ class TestFusedMLAQUpProjIntegration:
         if mla_module.fused_apply_mla_rope_for_q is None:
             pytest.skip("fused_apply_mla_rope_for_q not available")
 
-        import transformer_engine_torch as tex
+        import transformer_engine.pytorch as te
         from transformer_engine.pytorch.attention.dot_product_attention.utils import (
             mxfp8_quantize_only,
         )
@@ -2038,11 +2038,11 @@ class TestFusedMLAQUpProjIntegration:
 
         x = torch.randn(S * B, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
         w_bf16 = torch.randn(PROJ_DIM, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
-        w_mxfp8 = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)(
+        w_mxfp8 = MXFP8Quantizer(fp8_dtype=te.DType.kFloat8E4M3, rowwise=True, columnwise=False)(
             w_bf16
         )
         x_fused_mxfp8 = MXFP8Quantizer(
-            fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True
+            fp8_dtype=te.DType.kFloat8E4M3, rowwise=True, columnwise=True
         )(x)
 
         # cos/sin in (tokens, QK_ROPE_DIM) — the format both paths expect.
@@ -2063,7 +2063,7 @@ class TestFusedMLAQUpProjIntegration:
         # Step 1: MXFP8 GEMM.  Same as TE Linear's forward under fp8_autocast.
         # layout="TN": A=weight is transposed (transa=True), B=input is not (transb=False).
         # Both are unwrapped from their rowwise MXFP8 data before the cuBLAS call.
-        x_mxfp8 = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)(x)
+        x_mxfp8 = MXFP8Quantizer(fp8_dtype=te.DType.kFloat8E4M3, rowwise=True, columnwise=False)(x)
         q_linear_out = _te_general_gemm(
             w_mxfp8,  # A = weight (PROJ_DIM, Q_LORA_RANK), transposed in GEMM → Q_LORA_RANK rows
             x_mxfp8,  # B = input  (S*B,       Q_LORA_RANK), not transposed
@@ -2087,7 +2087,7 @@ class TestFusedMLAQUpProjIntegration:
         )  # → (S, B, NH, Q_HEAD_DIM) bf16
 
         # Step 3: Quantize.  Same quantizer + format as _QuantizeKVForFusedAttn uses for K/V.
-        q_quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        q_quantizer = MXFP8Quantizer(fp8_dtype=te.DType.kFloat8E4M3, rowwise=True, columnwise=True)
         (query_unfused,) = mxfp8_quantize_only([(query_bf16.contiguous(), q_quantizer)], "sbhd")
 
         # ── Compare ───────────────────────────────────────────────────────────────────

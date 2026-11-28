@@ -35,7 +35,7 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 try:
-    import transformer_engine_torch as tex
+    import transformer_engine.pytorch as te
     from transformer_engine.pytorch.tensor.float8_tensor import (
         Float8CurrentScalingQuantizer,
         Float8Quantizer,
@@ -67,28 +67,28 @@ def _make_quantizer(recipe):
         return Float8Quantizer(
             scale=torch.ones(1, dtype=torch.float32, device="cuda"),
             amax=torch.zeros(1, dtype=torch.float32, device="cuda"),
-            fp8_dtype=tex.DType.kFloat8E4M3,
+            fp8_dtype=te.DType.kFloat8E4M3,
         )
     if recipe == "current":
-        return Float8CurrentScalingQuantizer(fp8_dtype=tex.DType.kFloat8E4M3, device="cuda")
+        return Float8CurrentScalingQuantizer(fp8_dtype=te.DType.kFloat8E4M3, device="cuda")
     if recipe == "mxfp8":
         if _DEVICE_ARCH < 10:
             pytest.skip("MXFP8 requires Blackwell+")
         from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
-        return MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3)
+        return MXFP8Quantizer(fp8_dtype=te.DType.kFloat8E4M3)
     if recipe == "blockwise":
         if _DEVICE_ARCH < 9:
             pytest.skip("Blockwise FP8 requires Hopper+")
         from transformer_engine.pytorch.tensor.float8_blockwise_tensor import Float8BlockQuantizer
 
-        return Float8BlockQuantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        return Float8BlockQuantizer(fp8_dtype=te.DType.kFloat8E4M3, rowwise=True, columnwise=True)
     if recipe == "nvfp4":
         if _DEVICE_ARCH < 10:
             pytest.skip("NVFP4 requires Blackwell+")
         from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer
 
-        return NVFP4Quantizer(fp4_dtype=tex.DType.kFloat4E2M1)
+        return NVFP4Quantizer(fp4_dtype=te.DType.kFloat4E2M1)
     raise ValueError(recipe)
 
 

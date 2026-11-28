@@ -24,10 +24,10 @@ def to_float8(tensor: torch.Tensor) -> Float8Tensor:
     except Exception as e:
         # Handle the case where the method fails (due to API changes in TransformerEngine)
         # https://github.com/NVIDIA/TransformerEngine/commit/544dd14b4301beb47136f273deff3f532cdde181
-        import transformer_engine_torch as tex
+        import transformer_engine.pytorch as te
         from transformer_engine.pytorch.tensor.float8_tensor import Float8Quantizer
 
-        fp8_dtype = tex.DType.kFloat8E4M3
+        fp8_dtype = te.DType.kFloat8E4M3
         scale = 1.0
 
         # Create a quantizer for FP8 conversion

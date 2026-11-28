@@ -137,14 +137,13 @@ def test_gtp_fp8_checkpoint_casts_replay(monkeypatch, legacy):
     if not legacy and not gtp.is_te_min_version("2.20"):
         pytest.skip("native subclass dispatch requires TE >= 2.20")
 
-    import transformer_engine_torch as tex
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
     generator = torch.Generator(device="cuda").manual_seed(1234)
     source, target = torch.randn(
         2, 128, 128, device="cuda", dtype=torch.bfloat16, generator=generator
     )
-    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    quantizer = MXFP8Quantizer(te.DType.kFloat8E4M3, rowwise=True, columnwise=False)
     expected = quantizer(target).dequantize()
     weight = gtp._gtp_reclass_native_fp8_shard(quantizer(source))
     original_type = type(weight)

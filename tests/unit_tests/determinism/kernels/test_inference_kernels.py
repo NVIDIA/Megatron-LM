@@ -489,7 +489,7 @@ def test_mxfp8_quantize_rows_replays():
 )
 def test_mixed_precision_parameter_conversion_replays():
     """Converting MXFP8 storage replays exactly while BF16 parameters remain unchanged."""
-    import transformer_engine_torch as tex
+    import transformer_engine.pytorch as te
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
     from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
@@ -497,7 +497,7 @@ def test_mixed_precision_parameter_conversion_replays():
     seeded()
     attention = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
     expert = torch.randn(64, 128, device="cuda", dtype=torch.bfloat16)
-    quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    quantizer = MXFP8Quantizer(te.DType.kFloat8E4M3, rowwise=True, columnwise=False)
 
     def convert(attention, expert):
         root = torch.nn.Module()

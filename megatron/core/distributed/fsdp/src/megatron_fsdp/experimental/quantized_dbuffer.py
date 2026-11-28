@@ -23,7 +23,7 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
 
 try:
-    import transformer_engine_torch as tex
+    import transformer_engine.pytorch as te
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
 except ImportError as exc:
     # Keep "UnavailableError": .gitlab/scripts/check_imports.py imports this module
@@ -37,7 +37,7 @@ from .dbuffer import DBuffer
 from .layout import GlobalLayout, Shape
 from .placement import BlockAtomic, RowAtomic, ShardLayout
 
-_MXFP8_DTYPE = tex.DType.kFloat8E4M3
+_MXFP8_DTYPE = te.DType.kFloat8E4M3
 _MXFP8_BLOCK_SIZE = 32
 
 

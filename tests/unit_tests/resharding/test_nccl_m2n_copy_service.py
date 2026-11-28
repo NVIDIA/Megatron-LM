@@ -465,7 +465,7 @@ def test_nccl_m2n_refits_selective_mxfp8_from_te(
 ):
     """Keep non-expert weights BF16 while refitting TE MXFP8 experts through M2N."""
     # Only this optional quantized-source test needs TE's MXFP8 quantizer.
-    import transformer_engine_torch as tex
+    import transformer_engine.pytorch as te
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
 
     Utils.initialize_distributed()
@@ -504,7 +504,7 @@ def test_nccl_m2n_refits_selective_mxfp8_from_te(
 
     storage_backend = resolve_mxfp8_backend(grouped_gemm_backend)
     assert storage_backend == "triton"
-    quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    quantizer = MXFP8Quantizer(fp8_dtype=te.DType.kFloat8E4M3, rowwise=True, columnwise=False)
     source_tensors = {}
     destination_tensors = {}
     persistent_buffers = {}

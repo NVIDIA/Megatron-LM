@@ -67,7 +67,7 @@ except:
 
 
 if HAVE_TE:
-    import transformer_engine_torch as tex
+    import transformer_engine.pytorch as te
 
     try:
         from transformer_engine.pytorch.attention import (
@@ -107,7 +107,7 @@ if HAVE_TE:
     from megatron.core.post_training.modelopt.layers import Linear
 else:
     (
-        tex,
+        te,
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
         TELinear,
@@ -135,8 +135,8 @@ class _QuantizeKVForFusedAttn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, key, value):
         """Quantize the k anv v tensors"""
-        kq = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
-        vq = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        kq = MXFP8Quantizer(fp8_dtype=te.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        vq = MXFP8Quantizer(fp8_dtype=te.DType.kFloat8E4M3, rowwise=True, columnwise=True)
         k_mx, v_mx = mxfp8_quantize_only([(key.contiguous(), kq), (value.contiguous(), vq)], "sbhd")
         return k_mx, v_mx
 
@@ -152,7 +152,7 @@ class _QuantizeQueryForFusedAttn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query):
         """Quantize the query"""
-        quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+        quantizer = MXFP8Quantizer(fp8_dtype=te.DType.kFloat8E4M3, rowwise=True, columnwise=True)
         return mxfp8_quantize_only([(query.contiguous(), quantizer)], "sbhd")[0]
 
     @staticmethod
