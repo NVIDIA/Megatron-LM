@@ -71,8 +71,7 @@ def test_mhc_precision(fp32_mixing, input_scale):
         assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
 
 
-@pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
-def test_mhc_fused_rejects_unsupported_precision(flag):
+def test_mhc_fused_rejects_unsupported_precision():
     config = TransformerConfig(
         num_layers=1,
         hidden_size=32,
@@ -81,6 +80,37 @@ def test_mhc_fused_rejects_unsupported_precision(flag):
         use_fused_mhc=True,
     )
     # Keep the module-level guard for configs modified after constructor validation.
-    setattr(config, flag, True)
+    config.mhc_keep_mappings_in_fp32 = True
     with pytest.raises(ValueError, match="Fused mHC does not support"):
         HyperConnectionModule(config, layer_number=1)
+
+
+def test_mhc_fused_accepts_eps_inside_sqrt():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        use_fused_mhc=True,
+        mhc_norm_eps_inside_sqrt=True,
+    )
+    layer = HyperConnectionModule(config, layer_number=1).cuda()
+    with torch.no_grad():
+        layer.mapping_proj.weight.zero_()
+        layer.mapping_proj.weight[:4, 0].fill_(1.0)
+        layer.alpha_pre.fill_(1.0)
+        layer.bias.zero_()
+    residual = torch.zeros(2, 1, 128, device="cuda", dtype=torch.bfloat16)
+    residual[:, :, 0] = 1e-3
+    residual.requires_grad_()
+    pre, _, _ = layer.compute_mappings(residual)
+    # The fixed input gives a pre gate near 0.58 with inside-sqrt epsilon
+    # and near 1 if the fused op reverts to outside-sqrt epsilon.
+    x = residual.detach().float()
+    projected = x[..., :1].expand_as(pre)
+    rms = torch.sqrt(x.square().mean(-1, keepdim=True) + config.layernorm_epsilon)
+    expected = ((projected / rms).sigmoid() + 1e-6).to(pre.dtype)
+    torch.testing.assert_close(pre, expected, atol=1e-3, rtol=1e-3)
+    pre.float().sum().backward()
+    assert torch.isfinite(residual.grad).all()
+    assert torch.isfinite(layer.mapping_proj.weight.grad).all()

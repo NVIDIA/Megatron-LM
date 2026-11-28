@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import warnings
+from contextlib import nullcontext
 from typing import Literal, Optional, Tuple
 
 import torch
@@ -1468,6 +1469,7 @@ if _CUTILE_AVAILABLE:
         n: ConstInt,
         eps: float,
         compute_h_eps: float,
+        EPS_INSIDE_SQRT: ConstInt,
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
         SPLIT_K: ConstInt,
@@ -1510,14 +1512,21 @@ if _CUTILE_AVAILABLE:
         ct.store(PROJ_OUT, index=(bid_m, 0), tile=pre_accum.astype(PROJ_OUT.dtype))
         ct.store(PROJ_OUT, index=(bid_m, 1), tile=post_accum.astype(PROJ_OUT.dtype))
 
-        # 2. Compute r = norm / sqrt(K)
+        # 2. Compute the RMS denominator for the selected epsilon placement.
         denom = ct.full((TILE_SIZE_M, 1), K * 1.0, dtype=ct.float32)
-        r_val = ct.sqrt(ct.truediv(r_accum, denom))
+        mean_sq = ct.truediv(r_accum, denom)
+        if EPS_INSIDE_SQRT:
+            r_val = ct.sqrt(mean_sq + eps)
+        else:
+            r_val = ct.sqrt(mean_sq)
 
         ct.store(R, index=(bid_m, 0), tile=r_val.astype(R.dtype))
 
         # 3. Apply compute_h directly into split outputs.
-        inv_r_eps = 1.0 / (r_val + eps)
+        if EPS_INSIDE_SQRT:
+            inv_r_eps = 1.0 / r_val
+        else:
+            inv_r_eps = 1.0 / (r_val + eps)
         bias_pre = ct.load(Bias, index=(0, 0), shape=(1, n), padding_mode=PAD_ZERO)
         bias_post = ct.load(Bias, index=(0, 1), shape=(1, n), padding_mode=PAD_ZERO)
         bias_pre = ct.astype(bias_pre, ct.float32)
@@ -1625,6 +1634,7 @@ if _CUTILE_AVAILABLE:
         K: int,
         eps: float,
         compute_h_eps: float,
+        eps_inside_sqrt: bool,
         _proj_tile_m: int,
         tile_n: int,
         split_k: int,
@@ -1636,7 +1646,8 @@ if _CUTILE_AVAILABLE:
             h_pre: [M, n] sigmoid-activated pre weights
             h_post: [M, n] 2*sigmoid-activated post weights
             h_res: [M, n*n] residual logits
-            r: [M, 1]  r = norm / sqrt(K)
+            r: [M, 1]  sqrt(mean(x^2) + eps) when eps_inside_sqrt,
+               otherwise norm / sqrt(K)
             proj_reduced: [M, N] reduced projection (for backward)
         """
         dev = proj_acc.device
@@ -1653,9 +1664,8 @@ if _CUTILE_AVAILABLE:
         r_out = torch.empty(M, 1, dtype=out_dtype, device=dev)
         proj_out = torch.empty(M, N, dtype=proj_acc.dtype, device=dev)
 
-        default_tm = _default_reduce_compute_h_tile_m(M)
         cache_key = (M, N, K, n, split_k)
-        cached = _reduce_compute_h_best_cfg.get(cache_key)
+        tm = _reduce_compute_h_best_cfg.get(cache_key)
 
         def _make_args(tm):
             return (
@@ -1676,31 +1686,31 @@ if _CUTILE_AVAILABLE:
                 n,
                 eps,
                 compute_h_eps,
+                int(eps_inside_sqrt),
                 tm,
                 tile_n,
                 split_k,
             )
 
-        if cached is not None or not _CUTILE_EXPERIMENTAL_AVAILABLE:
-            tm = cached if cached is not None else default_tm
-            ct.launch(stream, (math.ceil(M / tm),), _ct_reduce_compute_h_kernel, _make_args(tm))
-        else:
+        if tm is None and _CUTILE_EXPERIMENTAL_AVAILABLE:
             from types import SimpleNamespace
 
             configs = [SimpleNamespace(TILE_M=tm) for tm in _reduce_compute_h_autotune_configs(M)]
-            tuned = ct_experimental.autotune_launch(
-                stream,
-                grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M),),
-                kernel=_ct_reduce_compute_h_kernel,
-                args_fn=lambda cfg: _make_args(cfg.TILE_M),
-                search_space=configs,
-            )
-            best_tm = tuned.tuned_config.TILE_M
-            _reduce_compute_h_best_cfg[cache_key] = best_tm
-            ct.launch(
-                stream, (math.ceil(M / best_tm),), _ct_reduce_compute_h_kernel, _make_args(best_tm)
-            )
+            if configs:
+                tuned = ct_experimental.autotune_launch(
+                    stream,
+                    grid_fn=lambda cfg: (math.ceil(M / cfg.TILE_M),),
+                    kernel=_ct_reduce_compute_h_kernel,
+                    args_fn=lambda cfg: _make_args(cfg.TILE_M),
+                    search_space=configs,
+                )
+                tm = tuned.tuned_config.TILE_M
+                _reduce_compute_h_best_cfg[cache_key] = tm
 
+        # Row counts such as 129 have no candidate divisor and use one-row tiles.
+        if tm is None:
+            tm = _default_reduce_compute_h_tile_m(M)
+        ct.launch(stream, (math.ceil(M / tm),), _ct_reduce_compute_h_kernel, _make_args(tm))
         return h_pre_out, h_post_out, h_res_out, r_out, proj_out
 
     # -- Combined proj_rms + compute_h forward --------------------------------
@@ -1715,6 +1725,7 @@ if _CUTILE_AVAILABLE:
         n: int,
         eps: float,
         compute_h_eps: float,
+        eps_inside_sqrt: bool,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Fused proj_rms + compute_h forward.
 
@@ -1725,7 +1736,7 @@ if _CUTILE_AVAILABLE:
             h_pre: [M, n] activated pre weights
             h_post: [M, n] activated post weights
             h_res: [M, n*n] residual logits
-            r: [M, 1] r = norm / sqrt(K)
+            r: [M, 1] RMS denominator (including eps when eps_inside_sqrt)
             proj_reduced: [M, N] reduced projection (for backward)
         """
         M, K = x.shape
@@ -1866,6 +1877,7 @@ if _CUTILE_AVAILABLE:
             K,
             eps,
             compute_h_eps,
+            eps_inside_sqrt,
             tm,
             TILE_N,
             split_k,
@@ -1896,6 +1908,7 @@ if _CUTILE_AVAILABLE:
         n: ConstInt,
         eps: float,
         compute_h_eps: float,
+        EPS_INSIDE_SQRT: ConstInt,
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
         HAS_GRAD_H_PRE: ConstInt,
@@ -1916,7 +1929,11 @@ if _CUTILE_AVAILABLE:
         r_tile = ct.load(R, index=(tile_m_id, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO)
         r_tile = ct.astype(r_tile, ct.float32)
 
-        r_eps = r_tile + eps
+        if EPS_INSIDE_SQRT:
+            rows = tile_m_id * TILE_SIZE_M + ct.arange(TILE_SIZE_M, dtype=ct.int32)
+            r_eps = ct.where(rows.reshape((TILE_SIZE_M, 1)) < M, r_tile, 1.0)
+        else:
+            r_eps = r_tile + eps
         inv_r_eps = 1.0 / r_eps
         grad_r_from_h = ct.full((TILE_SIZE_M, 1), 0.0, dtype=ct.float32)
 
@@ -2097,6 +2114,7 @@ if _CUTILE_AVAILABLE:
         N: int,
         n: int,
         eps: float,
+        EPS_INSIDE_SQRT: ConstInt,
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
     ):
@@ -2127,7 +2145,12 @@ if _CUTILE_AVAILABLE:
         r_tile = ct.load(R, index=(bid_m, 0), shape=(TILE_SIZE_M, 1), padding_mode=PAD_ZERO)
         r_tile = ct.astype(r_tile, ct.float32)
 
-        r_eps = r_tile + eps
+        if EPS_INSIDE_SQRT:
+            # Padded rows participate in the scalar reduction. Keep their inverse finite.
+            rows = bid_m * TILE_SIZE_M + ct.arange(TILE_SIZE_M, dtype=ct.int32)
+            r_eps = ct.where(rows.reshape((TILE_SIZE_M, 1)) < M, r_tile, 1.0)
+        else:
+            r_eps = r_tile + eps
         inv_r_eps = 1.0 / r_eps
 
         ga_all = grad_h * proj_tile * inv_r_eps
@@ -2337,6 +2360,7 @@ if _CUTILE_AVAILABLE:
         n: int,
         eps: float,
         compute_h_eps: float,
+        eps_inside_sqrt: bool,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Fused compute_h + proj_rms backward.
 
@@ -2397,6 +2421,7 @@ if _CUTILE_AVAILABLE:
                 n,
                 eps,
                 compute_h_eps,
+                int(eps_inside_sqrt),
                 tile_m_precomp,
                 TILE_N,
                 int(has_grad_h_pre),
@@ -2536,6 +2561,7 @@ if _CUTILE_AVAILABLE:
                 N,
                 n,
                 eps,
+                int(eps_inside_sqrt),
                 tile_m_scalar,
                 TILE_N,
             ),
@@ -2734,22 +2760,37 @@ def _torch_proj_rms_compute_h(
     n: int,
     eps: float,
     compute_h_eps: float = 1e-6,
+    eps_inside_sqrt: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     # compute_mappings() hands us activations in the activation dtype while the
     # mapping parameters are keep_in_fp32, so matmul would reject the pair.
     # Compute in the wider of the two, matching the unfused path's fp32 upcast
     # without letting a lower-precision parameter downcast the activations.
-    x = x.to(torch.promote_types(x.dtype, weight.dtype))
-    proj = torch.matmul(x, weight.t())
-    r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
-    alpha = torch.cat(
-        [alpha_pre.expand(n), alpha_post.expand(n), alpha_res.expand(weight.shape[0] - 2 * n)],
-        dim=-1,
+    precision_context = (
+        torch.autocast(device_type=x.device.type, enabled=False)
+        if eps_inside_sqrt
+        else nullcontext()
     )
-    h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
-    h_pre = h[..., :n].sigmoid() + compute_h_eps
-    h_post = h[..., n : 2 * n].sigmoid() * 2
-    h_res = h[..., 2 * n :]
+    with precision_context:
+        promoted_dtype = torch.promote_types(x.dtype, weight.dtype)
+        x = x.to(promoted_dtype)
+        if eps_inside_sqrt:
+            weight = weight.to(promoted_dtype)
+        proj = torch.matmul(x, weight.t())
+        r = (
+            torch.sqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+            if eps_inside_sqrt
+            else x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
+        )
+        alpha = torch.cat(
+            [alpha_pre.expand(n), alpha_post.expand(n), alpha_res.expand(weight.shape[0] - 2 * n)],
+            dim=-1,
+        )
+        denominator = r if eps_inside_sqrt else r + eps
+        h = proj * alpha.unsqueeze(0) / denominator + bias.unsqueeze(0)
+        h_pre = h[..., :n].sigmoid() + compute_h_eps
+        h_post = h[..., n : 2 * n].sigmoid() * 2
+        h_res = h[..., 2 * n :]
     return h_pre, h_post, h_res, r
 
 
@@ -2805,10 +2846,20 @@ if _CUTILE_AVAILABLE:
             n: int,
             eps: float = 1e-6,
             compute_h_eps: float = 1e-6,
+            eps_inside_sqrt: bool = False,
         ):
             """Run fused cuTile projection, RMS normalization, and compute_h forward."""
             h_pre, h_post, h_res, r, proj_reduced = _cutile_proj_rms_compute_h_fwd(
-                x, weight, bias, alpha_pre, alpha_post, alpha_res, n, eps, compute_h_eps
+                x,
+                weight,
+                bias,
+                alpha_pre,
+                alpha_post,
+                alpha_res,
+                n,
+                eps,
+                compute_h_eps,
+                eps_inside_sqrt,
             )
             ctx.save_for_backward(
                 x,
@@ -2826,6 +2877,7 @@ if _CUTILE_AVAILABLE:
             ctx.n = n
             ctx.eps = eps
             ctx.compute_h_eps = compute_h_eps
+            ctx.eps_inside_sqrt = eps_inside_sqrt
             return h_pre, h_post, h_res, r
 
         @staticmethod
@@ -2865,10 +2917,22 @@ if _CUTILE_AVAILABLE:
                     ctx.n,
                     ctx.eps,
                     ctx.compute_h_eps,
+                    ctx.eps_inside_sqrt,
                 )
             )
 
-            return (grad_x, grad_weight, grad_ap, grad_apo, grad_ar, grad_bias, None, None, None)
+            return (
+                grad_x,
+                grad_weight,
+                grad_ap,
+                grad_apo,
+                grad_ar,
+                grad_bias,
+                None,
+                None,
+                None,
+                None,
+            )
 
 
 class FusedHAggregate(torch.autograd.Function):
@@ -2997,13 +3061,23 @@ def fused_proj_rms_compute_h(
     compute_h_eps: float = 1e-6,
     *,
     backend: MHCBackend = "auto",
+    eps_inside_sqrt: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Compute projection, RMS norm, and H outputs using the backend policy."""
     _validate_mhc_backend(backend)
     if _backend_uses_cutile(backend):
         return CutileProjRmsComputeH.apply(
-            x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
+            x,
+            weight,
+            alpha_pre,
+            alpha_post,
+            alpha_res,
+            bias,
+            n,
+            eps,
+            compute_h_eps,
+            eps_inside_sqrt,
         )
     return _torch_proj_rms_compute_h(
-        x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
+        x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps, eps_inside_sqrt
     )

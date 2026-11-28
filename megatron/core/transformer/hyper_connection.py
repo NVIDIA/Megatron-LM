@@ -316,8 +316,8 @@ class HyperConnectionModule(MegatronModule):
         self._proj_rms_op = partial(_proj_rms_impl, eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt)
 
         if config.use_fused_mhc:
-            if config.mhc_norm_eps_inside_sqrt or config.mhc_keep_mappings_in_fp32:
-                raise ValueError("Fused mHC does not support FP32 mixing or epsilon inside sqrt.")
+            if config.mhc_keep_mappings_in_fp32:
+                raise ValueError("Fused mHC does not support FP32 mixing.")
             from megatron.core.fusions.fused_mhc_kernels import (
                 fused_h_aggregate,
                 fused_h_post_bda,
@@ -331,7 +331,11 @@ class HyperConnectionModule(MegatronModule):
             self._sinkhorn_op = partial(fused_sinkhorn, backend=backend)
             self._h_aggregate_op = partial(fused_h_aggregate, backend=backend)
             self._h_post_bda_op = partial(fused_h_post_bda, backend=backend)
-            self._proj_rms_compute_h_op = partial(fused_proj_rms_compute_h, backend=backend)
+            self._proj_rms_compute_h_op = partial(
+                fused_proj_rms_compute_h,
+                backend=backend,
+                eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt,
+            )
         else:
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
