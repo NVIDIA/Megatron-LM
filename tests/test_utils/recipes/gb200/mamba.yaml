@@ -64,6 +64,22 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
+  - test_case: [hybrid_mfsdp_v2_checkpoint_reshard]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_gb200]
+        n_repeat: [1]
+        time_limit: [1800]
+        script:
+          - |-
+            set -euo pipefail
+            cd /opt/megatron-lm
+            uv run --no-sync pytest -q \
+              tests/functional_tests/python_test_utils/test_fsdp_checkpoint_resharding.py \
+              --basetemp={assets_dir}/checkpoint-resharding \
+              --junitxml={assets_dir}/checkpoint-resharding.xml
+
   - test_case: [hybrid_mhc_tp2_pp2_mtp]
     products:
       - environment: [dev]

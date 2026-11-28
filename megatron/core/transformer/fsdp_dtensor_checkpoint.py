@@ -1069,11 +1069,14 @@ def get_global_unique_param_name(model_chunks, param):
     Returns:
         The global unique parameter name.
     """
+
     param_name = None
+    model_chunk = None
     for model in model_chunks:
         for name, p in model.named_parameters():
             if p is param:
                 param_name = name
+                model_chunk = model
                 break
     if param_name is None:
         raise ValueError("Parameter not found in model chunks")
@@ -1081,7 +1084,7 @@ def get_global_unique_param_name(model_chunks, param):
     # Get PP unique parameter name
     if re.search(r"layers\.(\d+)", param_name) and "mtp" not in param_name:
         tf_layer_number = -1
-        for module in model.modules():
+        for module in model_chunk.modules():
             if not isinstance(module, TransformerLayer):
                 continue
             for p in module.parameters():
