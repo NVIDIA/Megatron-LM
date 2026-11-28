@@ -26,7 +26,13 @@ from megatron.core.transformer.moe.fused_a2a import (
     reset_hybrid_ep_buffer,
 )
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_capacity, pad_routing_map
+from megatron.core.transformer.moe.moe_utils import (
+    apply_router_token_dropping,
+    get_capacity,
+    pad_routing_map,
+    permute,
+    topk_routing_with_score_function,
+)
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAlltoAllTokenDispatcher,
     MoEFlexTokenDispatcher,
@@ -1087,6 +1093,44 @@ def test_alltoall_combine_postprocess_releases_router_probs():
     torch.testing.assert_close(output, expected)
     assert dispatcher.probs is None
     assert probs_ref() is None, "the router probs (and their graph) are still referenced"
+
+
+def test_alltoall_drop_and_pad_capacity_above_token_count():
+    """When topk * capacity_factor > num_experts, the expert capacity exceeds the number of
+    local tokens. The router then pads each expert to num_tokens, so the dispatcher must size
+    its drop-and-pad buffers for num_tokens tokens per expert, not for the uncapped capacity.
+    """
+    num_tokens, num_experts, topk, capacity_factor, hidden = 8, 4, 2, 2.5, 16
+    assert get_capacity(num_tokens * topk, num_experts, capacity_factor) > num_tokens
+
+    torch.manual_seed(0)
+    probs, routing_map = topk_routing_with_score_function(
+        torch.randn(num_tokens, num_experts), topk
+    )
+    probs, routing_map = apply_router_token_dropping(
+        probs, routing_map, router_topk=topk, capacity_factor=capacity_factor, pad_to_capacity=True
+    )
+
+    dispatcher = object.__new__(MoEAlltoAllTokenDispatcher)
+    dispatcher.config = SimpleNamespace(moe_router_topk=topk)
+    dispatcher.drop_and_pad = True
+    dispatcher.num_experts = num_experts
+    dispatcher.num_local_experts = num_experts
+    dispatcher.moe_expert_capacity_factor = capacity_factor
+    dispatcher.tp_size = 1
+    dispatcher.ep_size = 1
+    dispatcher.permute_idx_device = "cpu"
+    tokens_per_expert = dispatcher.preprocess(routing_map)
+
+    assert tokens_per_expert.tolist() == routing_map.sum(dim=0).tolist()
+    permuted, _, _, _, _ = permute(
+        torch.randn(num_tokens, hidden),
+        routing_map,
+        probs=probs,
+        num_out_tokens=dispatcher.num_out_tokens,
+        drop_and_pad=True,
+    )
+    assert permuted.shape == (dispatcher.num_out_tokens, hidden)
 
 
 def test_hybridep_dropless_excludes_padding_rows(monkeypatch):

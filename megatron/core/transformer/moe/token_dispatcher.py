@@ -531,10 +531,16 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         if self.drop_and_pad:
             # Drop and pad the input to capacity.
             num_tokens = routing_map.size(0) * self.config.moe_router_topk
-            self.capacity = get_capacity(
-                num_tokens=num_tokens,
-                num_experts=self.num_experts,
-                capacity_factor=self.moe_expert_capacity_factor,
+            # A token is sent to an expert at most once, so the router's
+            # apply_router_token_dropping pads each expert to at most routing_map.size(0)
+            # tokens. Cap the capacity the same way so the buffer sizes below match it.
+            self.capacity = min(
+                get_capacity(
+                    num_tokens=num_tokens,
+                    num_experts=self.num_experts,
+                    capacity_factor=self.moe_expert_capacity_factor,
+                ),
+                routing_map.size(0),
             )
             self.num_out_tokens = self.capacity * self.num_experts
             # [num_local_experts], number of tokens processed by each expert.
