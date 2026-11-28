@@ -650,6 +650,66 @@ def test_te_rmsnorm_parity():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize(
+    "backend",
+    [
+        "triton",
+        pytest.param(
+            "deepgemm",
+            marks=pytest.mark.skipif(not HAVE_DEEPGEMM_BF16, reason="needs DeepGEMM bf16 bindings"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("case", ["fp32_input", "autocast"])
+def test_te_rmsnorm_parity_follows_te_output_dtype(backend, case):
+    """Batch-invariant TE RMSNorm returns TE's dtype, values and gradients for an input in another
+    dtype: an fp32 input (an fp32 residual stream) to a bf16 norm gives bf16, and under autocast
+    an fp32 norm gives the autocast dtype."""
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+
+    cfg = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        params_dtype=torch.float32 if case == "autocast" else torch.bfloat16,
+        normalization="RMSNorm",
+        layernorm_epsilon=1e-5,
+    )
+    torch.manual_seed(789)
+    layer = TENorm(config=cfg, hidden_size=cfg.hidden_size, eps=cfg.layernorm_epsilon).cuda()
+    with torch.no_grad():
+        layer.weight.uniform_(0.5, 1.5)
+
+    x = torch.randn(48, cfg.hidden_size, device="cuda", dtype=torch.float32, requires_grad=True)
+    x_regular = x.detach().clone().requires_grad_(True)
+    autocast = torch.autocast("cuda", dtype=torch.bfloat16, enabled=case == "autocast")
+    with autocast:
+        with set_batch_invariant_mode(False):
+            out_regular = layer(x_regular)
+        with set_batch_invariant_mode(True, backend=backend):
+            out_bik = layer(x)
+
+    assert out_regular.dtype == torch.bfloat16
+    assert out_bik.dtype == out_regular.dtype
+    torch.testing.assert_close(out_bik, out_regular)
+
+    grad_output = torch.randn_like(out_regular)
+    out_regular.backward(grad_output)
+    weight_grad_regular = layer.weight.grad.clone()
+    layer.weight.grad = None
+    out_bik.backward(grad_output)
+
+    assert x.grad.dtype == x_regular.grad.dtype == torch.float32
+    torch.testing.assert_close(x.grad, x_regular.grad, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(layer.weight.grad, weight_grad_regular, atol=1e-1, rtol=1e-2)
+
+    Utils.destroy_model_parallel()
+
+
 def test_te_layernorm_linear_parity():
     """Test that batch-invariant and regular fused LayerNorm+Linear produce same results."""
     torch.backends.cuda.matmul.allow_tf32 = False
