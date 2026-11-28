@@ -78,8 +78,9 @@ def _causal_conv1d_varlen_kernel(
         src = t_off - (WIDTH - 1) + j  # (BLOCK_T,)
         in_seq = src >= req_start  # (BLOCK_T,) — True if source is within the sequence
 
-        # Load from x for in-sequence positions (mask out out-of-bounds)
-        src_safe = tl.maximum(src, 0)
+        # Load from x for in-sequence positions (mask out out-of-bounds). Token offsets
+        # reach 2^31 elements once total_tokens * conv_dim does, so form them in int64.
+        src_safe = tl.maximum(src, 0).to(tl.int64)
         x_val = tl.load(
             x_ptr + src_safe[:, None] * conv_dim + c_off[None, :],
             mask=t_mask[:, None] & c_mask[None, :] & in_seq[:, None],
@@ -89,14 +90,15 @@ def _causal_conv1d_varlen_kernel(
         )  # (BLOCK_T, BLOCK_C)
 
         if HAS_INITIAL_STATES:
-            # For tokens where src < req_start, load from initial_states
+            # For tokens where src < req_start, load from initial_states. The request offset
+            # is int64: it reaches 2^31 elements once num_requests * initial_states_stride_req does.
             state_col = (WIDTH - 1) - (req_start - src)  # (BLOCK_T,)
             valid_state = (~in_seq) & (state_col >= 0)  # (BLOCK_T,)
             state_col_safe = tl.maximum(state_col, 0)
 
             state_val = tl.load(
                 initial_states_ptr
-                + req_id[:, None] * initial_states_stride_req
+                + req_id.to(tl.int64)[:, None] * initial_states_stride_req
                 + c_off[None, :] * initial_states_stride_dim
                 + state_col_safe[:, None],
                 mask=t_mask[:, None] & c_mask[None, :] & valid_state[:, None],
@@ -117,7 +119,7 @@ def _causal_conv1d_varlen_kernel(
 
     # Store output (cast back to input dtype)
     tl.store(
-        out_ptr + t_off[:, None] * conv_dim + c_off[None, :],
+        out_ptr + t_off.to(tl.int64)[:, None] * conv_dim + c_off[None, :],
         result,
         mask=t_mask[:, None] & c_mask[None, :],
     )
@@ -316,7 +318,9 @@ def _causal_conv1d_carry_states_kernel(
     over `D_CONV`, so the index arithmetic lands in registers and needs no
     precomputed plan.
     """
-    pid_req = tl.program_id(0)
+    # int64, as the request offsets below reach 2^31 elements once num_requests * conv_dim *
+    # d_conv does.
+    pid_req = tl.program_id(0).to(tl.int64)
     pid_c = tl.program_id(1)
 
     c_off = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -336,11 +340,12 @@ def _causal_conv1d_carry_states_kernel(
         # `where` is about to discard. An out-of-range column that is *not*
         # discarded reads zero rather than a neighbouring request's token: that
         # is a caller bug, and folding a foreign token into the state would hide
-        # it.
+        # it. The token offset is formed in int64: it reaches 2^31 elements once
+        # total_tokens * x_stride_token does.
         token = start + offset
         token_ok = (token >= 0) & (token < total_tokens)
         slice_val = tl.load(
-            x_ptr + tl.maximum(token, 0) * x_stride_token + c_off * x_stride_dim,
+            x_ptr + tl.maximum(token, 0).to(tl.int64) * x_stride_token + c_off * x_stride_dim,
             mask=c_mask & token_ok,
             other=0.0,
         )
