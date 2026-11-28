@@ -109,3 +109,73 @@ def test_uniform_top_one_sampling_with_speculative_row_mapping():
 
     assert result is output
     torch.testing.assert_close(result, logits[gather].argmax(dim=-1), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(argnames="dtype", argvalues=[torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize(
+    argnames="device",
+    argvalues=[
+        torch.device("cpu"),
+        pytest.param(
+            torch.device("cuda"),
+            marks=pytest.mark.skipif(
+                condition=not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ],
+)
+class TestTemperatureScaling:
+    @pytest.mark.parametrize(
+        argnames="values,temperature,top_p,expected",
+        argvalues=[((26.625, 26.375), 0.1, 0.9, (1.0, 0.0)), ((1.0, 2.0), 1e-5, 0.0, (0.0, 1.0))],
+        ids=["nucleus-boundary", "fp16-overflow"],
+    )
+    def test_sampling_distribution(
+        self,
+        dtype: torch.dtype,
+        device: torch.device,
+        values: tuple[float, float],
+        temperature: float,
+        top_p: float,
+        expected: tuple[float, float],
+    ) -> None:
+        logits = torch.tensor([values], dtype=dtype, device=device)
+        rng = torch.Generator(device=device).manual_seed(123)
+        sampling = TorchSampling(rng=rng, vocab_size=2)
+        context: SimpleNamespace = _make_context(
+            temperature=torch.tensor([temperature]),
+            top_k=torch.tensor([0]),
+            top_p=torch.tensor([top_p]),
+        )
+
+        torch.testing.assert_close(
+            actual=sampling.log_probs_kernel(logits=logits, context=context).exp(),
+            expected=torch.tensor([expected], dtype=torch.float32, device=device),
+            rtol=0,
+            atol=0,
+        )
+        sampled: torch.Tensor = TorchSampling.sample_from_logits(
+            last_token_logits=logits.repeat((256, 1)),
+            temperature=temperature,
+            top_k=0,
+            top_p=top_p,
+            generator=rng,
+            vocab_size=2,
+        )
+        assert (sampled == expected.index(1.0)).all()
+
+    @pytest.mark.parametrize(
+        argnames="temperature,top_k,top_p",
+        argvalues=[(1.0, 0, 0.0), (0.1, 0, 0.0), (1.0, 2, 0.0), (1.0, 0, 0.75)],
+    )
+    def test_filter_preserves_input(
+        self, dtype: torch.dtype, device: torch.device, temperature: float, top_k: int, top_p: float
+    ) -> None:
+        logits = torch.tensor([[0.0, 2.0, 1.0]], dtype=dtype, device=device)
+        original = logits.clone()
+
+        TorchSampling.filter_logits(
+            last_token_logits=logits, temperature=temperature, top_k=top_k, top_p=top_p
+        ).zero_()
+
+        torch.testing.assert_close(actual=logits, expected=original, rtol=0, atol=0)
