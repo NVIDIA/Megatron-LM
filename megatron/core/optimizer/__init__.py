@@ -889,6 +889,10 @@ def _get_megatron_emerging_optimizer(
             config, model_chunks, config_overrides, pg_collection, param_group_process_group
         )
 
+    ddp_config = getattr(model_chunks[0], 'ddp_config', None)
+    if use_layer_wise and ddp_config is not None and not ddp_config.use_megatron_fsdp:
+        config.validate_ddp_optimizer_instances(ddp_config.num_distributed_optimizer_instances)
+
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
             f"emerging-optimizers package is required for optimizer='{eopt_name}'. "
@@ -961,21 +965,10 @@ def _get_megatron_emerging_optimizer(
     # with ``use_distributed_optimizer=True`` (i.e. the layout-based path); in
     # legacy ping-pong mode all params share one unpadded DDP buffer that
     # DistOpt cannot manage, so we keep non-Muon params inside LayerWise.
-    ddp_uses_distributed_optimizer = (
-        bool(getattr(model_chunks[0], 'ddp_config', None))
-        and model_chunks[0].ddp_config.use_distributed_optimizer
-    )
+    ddp_uses_distributed_optimizer = ddp_config is not None and ddp_config.use_distributed_optimizer
     distopt_process_groups = None
     distopt_per_model_buffers = None
     use_separate_distributed_optimizer = ddp_uses_distributed_optimizer and use_layer_wise
-    if use_separate_distributed_optimizer:
-        ddp_config = model_chunks[0].ddp_config
-        assert ddp_config.num_distributed_optimizer_instances == 1, (
-            "Layer-wise + DistributedOptimizer split path does not yet support "
-            "num_distributed_optimizer_instances > 1: distributed_optimizer_instance_id "
-            "is hardcoded to 0 in this path. Disable use_layer_wise_param_layout to "
-            "fall back to the legacy LayerWise ping-pong path."
-        )
     if use_separate_distributed_optimizer and any(
         # A separate DistributedOptimizer with byte-level sharding handles any group
         # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
