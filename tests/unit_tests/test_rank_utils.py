@@ -257,3 +257,77 @@ def test_warn_single_rank_does_not_rearm_other_warnings():
                 warn_single_rank("job-level message")
 
     assert len([w for w in seen if w.category is FutureWarning]) == 1
+
+
+def test_warn_single_rank_does_not_rearm_other_warnings_before_distributed_init(monkeypatch):
+    """The pre-initialization branch must leave the global warning filters alone too.
+
+    Before torch distributed is up, ``warn_single_rank`` has to find the rank from the
+    environment. Doing that under ``warnings.catch_warnings`` bumps the filter version and
+    re-arms every warning that already printed, so setup-time call sites repeated them.
+    """
+    monkeypatch.setenv("RANK", "5")
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("default")
+        with patch(
+            "megatron.core._rank_utils.torch.distributed.is_initialized", return_value=False
+        ):
+            for _ in range(3):
+                _emit_unrelated_future_warning()
+                # Rank 5 is not a default log rank, so this call itself stays silent.
+                warn_single_rank("job-level message")
+
+    assert len([w for w in seen if w.category is FutureWarning]) == 1
+
+
+def test_warn_single_rank_does_not_rearm_other_warnings_without_a_launcher(monkeypatch):
+    """With no launcher variables the rank defaults to 0 without touching the filters."""
+    for name in ("RANK", "SLURM_PROCID", "SLURM_JOB_ID", "SLURM_NTASKS", "SLURM_STEP_ID"):
+        monkeypatch.delenv(name, raising=False)
+
+    with warnings.catch_warnings(record=True) as seen:
+        warnings.simplefilter("default")
+        with patch(
+            "megatron.core._rank_utils.torch.distributed.is_initialized", return_value=False
+        ):
+            for _ in range(3):
+                _emit_unrelated_future_warning()
+                warn_single_rank("job-level message")
+
+    assert len([w for w in seen if w.category is FutureWarning]) == 1
+    # Rank 0 is a default log rank, so the job-level message is the only UserWarning (the
+    # default filter shows it once for its location). The "could not determine rank" fallback
+    # warning must not leak out of warn_single_rank.
+    assert [str(w.message) for w in seen if w.category is UserWarning] == ["job-level message"]
+
+
+@pytest.mark.parametrize(
+    "env, expected_rank",
+    [
+        ({"RANK": "3"}, 3),
+        ({"RANK": "3", "SLURM_PROCID": "7"}, 3),
+        ({"SLURM_PROCID": "7", "SLURM_JOB_ID": "1", "SLURM_NTASKS": "8"}, 7),
+        ({}, 0),
+    ],
+)
+def test_warn_single_rank_resolves_pre_init_rank_like_safe_get_rank(
+    monkeypatch, restore_default_log_ranks, env, expected_rank
+):
+    for name in ("RANK", "SLURM_PROCID", "SLURM_JOB_ID", "SLURM_NTASKS", "SLURM_STEP_ID"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    set_default_log_ranks([expected_rank])
+
+    with patch("megatron.core._rank_utils.torch.distributed.is_initialized", return_value=False):
+        with warnings.catch_warnings(record=True) as raised:
+            warnings.simplefilter("always")
+            warn_single_rank("job-level message")
+        # A rank outside the default ranks stays quiet.
+        set_default_log_ranks([expected_rank + 1])
+        with warnings.catch_warnings(record=True) as quiet:
+            warnings.simplefilter("always")
+            warn_single_rank("job-level message")
+
+    assert [str(w.message) for w in raised] == ["job-level message"]
+    assert quiet == []
