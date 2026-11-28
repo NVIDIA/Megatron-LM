@@ -201,8 +201,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             from megatron.core.models.hybrid.hybrid_layer_specs import (
                 hybrid_stack_spec as default_hybrid_stack_spec,
             )
+            from megatron.core.models.hybrid.hybrid_layer_specs import with_norm_backend
 
-            hybrid_stack_spec = default_hybrid_stack_spec
+            hybrid_stack_spec = with_norm_backend(default_hybrid_stack_spec, config.rmsnorm_impl)
         # Snapshot the container immediately. If the root config is also used as a layer entry,
         # detach it before applying model-level normalization so that entry remains caller-owned.
         hybrid_layer_config_list_snapshot = (

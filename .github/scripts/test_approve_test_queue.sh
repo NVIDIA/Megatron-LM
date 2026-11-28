@@ -156,25 +156,30 @@ class Response:
 
 def load(responses):
     """Run the workflow helpers against a scripted sequence of API responses."""
-    state = SimpleNamespace(requests=[], sleeps=[])
+    state = SimpleNamespace(requests=[], sleeps=[], tokens=[])
 
-    def send(*args, **kwargs):
-        state.requests.append(args[0])
-        return responses.pop(0)
+    def sender(method):
+        def send(*args, **kwargs):
+            state.requests.append(args[0])
+            state.tokens.append((method, kwargs["headers"]["Authorization"]))
+            return responses.pop(0)
+
+        return send
 
     def fail_exit(code=0):
         raise SystemExit(code)
 
     fake_requests = SimpleNamespace(
-        get=send,
-        post=send,
+        get=sender("GET"),
+        post=sender("POST"),
         exceptions=SimpleNamespace(
             ConnectionError=ConnectionError, Timeout=TimeoutError, RequestException=RequestException
         ),
     )
     fake_time = SimpleNamespace(time=lambda: 1000, sleep=state.sleeps.append)
     state.ns = {
-        "GITHUB_TOKEN": "token",
+        "READ_TOKEN": "read-token",
+        "APPROVAL_TOKEN": "approval-token",
         "API_BASE": "https://api.example",
         "INTERNAL_SERVICE_ACCOUNTS": set(),
         "sso_users": {},
@@ -223,6 +228,12 @@ assert state.ns["make_request"]("x") == {"ok": True} and state.sleeps == [1, 2]
 response = Response(200, body={"ok": True})
 assert load([response]).ns["make_request"]("x", return_response=True) is response
 assert load([Response(200, body=[1])]).ns["make_request"]("x", method="POST", data={}) == [1]
+
+# Reads use the job token; only the approval POST uses the PAT.
+state = load([Response(200, body={}), Response(200, body=[1])])
+state.ns["make_request"]("x")
+state.ns["make_request"]("x", method="POST", data={})
+assert state.tokens == [("GET", "token read-token"), ("POST", "token approval-token")]
 
 
 def pr(number, base="main", labels=()):
@@ -295,6 +306,7 @@ def approvals(prs, queued=(), running=(), waiting=(), branch="main", contributor
         return SimpleNamespace(status_code=200, links={}, json=lambda: data, raise_for_status=lambda: None)
 
     def get(url, **kwargs):
+        assert kwargs["headers"]["Authorization"] == "token read", url
         if "actions/runs?" in url:
             status = re.search(r"status=([^&]+)", url).group(1)
             return response({"workflow_runs": by_status[status]})
@@ -308,11 +320,12 @@ def approvals(prs, queued=(), running=(), waiting=(), branch="main", contributor
         raise AssertionError(url)
 
     def post(url, **kwargs):
+        assert kwargs["headers"]["Authorization"] == "token pat", url
         approved.append(runs[int(url.split("/runs/")[1].split("/")[0])])
         return response([{"state": "approved"}])
 
     sso = {author: {"org_roles": ["NVIDIA:Member"]} for author, _ in prs.values()} if contributor == "internal" else {}
-    env = {"GITHUB_TOKEN": "test", "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
+    env = {"APPROVAL_TOKEN": "pat", "READ_TOKEN": "read", "GITHUB_REPOSITORY": "NVIDIA/Megatron-LM",
            "CONTRIBUTOR_TYPE": contributor, "MAX_CONCURRENCY": str(limit * 2),
            "MAX_CONCURRENCY_EXTERNAL": str(limit), "SSO_USERS_FILE": "sso.json",
            "TARGET_BRANCH": branch,

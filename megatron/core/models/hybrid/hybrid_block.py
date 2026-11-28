@@ -88,6 +88,7 @@ class HybridStackSubmodules:
     moe_layer: ModuleSpec | type | None = None
     mtp_block_spec: ModuleSpec | None = None
     mtp_stack_submodules: "HybridStackSubmodules | None" = None
+    final_norm: ModuleSpec | type = TENorm
 
 
 class HybridStack(MegatronModule):
@@ -417,7 +418,8 @@ class HybridStack(MegatronModule):
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
-            self.final_norm = TENorm(
+            self.final_norm = build_module(
+                submodules.final_norm,
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,

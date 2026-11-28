@@ -31,6 +31,10 @@ jobs:
   approve-queue:
     runs-on: ubuntu-latest
     environment: main
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
     if: github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
@@ -69,7 +73,8 @@ jobs:
 
       - name: Approve waiting deployments
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT }}
+          APPROVAL_TOKEN: ${{ secrets.PAT }}
+          READ_TOKEN: ${{ github.token }}
           MAX_CONCURRENCY: ${{ vars.MAX_CONCURRENCY || 1 }}
           MAX_CONCURRENCY_DEV: ${{ vars.MAX_CONCURRENCY_DEV }}
           MAX_CONCURRENCY_OTHERS: ${{ vars.MAX_CONCURRENCY_OTHERS }}
@@ -88,7 +93,8 @@ jobs:
           import time
 
           # GitHub API configuration
-          GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+          APPROVAL_TOKEN = os.environ["APPROVAL_TOKEN"]
+          READ_TOKEN = os.environ["READ_TOKEN"]
           REPO = os.environ["GITHUB_REPOSITORY"]
           CONTRIBUTOR_TYPE = os.environ["CONTRIBUTOR_TYPE"]
           INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}
@@ -121,11 +127,12 @@ jobs:
               sso_users = json.load(f)
 
           # Headers for GitHub API
-          headers = {
-              "Authorization": f"token {GITHUB_TOKEN}",
+          read_headers = {
+              "Authorization": f"token {READ_TOKEN}",
               "Accept": "application/vnd.github.v3+json",
               "X-GitHub-Api-Version": "2022-11-28",
           }
+          approval_headers = {**read_headers, "Authorization": f"token {APPROVAL_TOKEN}"}
 
           MAX_RATE_LIMIT_WAIT = 60
 
@@ -145,9 +152,9 @@ jobs:
               for attempt in range(max_retries):
                   try:
                       if method == "GET":
-                          response = requests.get(url, headers=headers, timeout=30)
+                          response = requests.get(url, headers=read_headers, timeout=30)
                       else:
-                          response = requests.post(url, headers=headers, json=data, timeout=30)
+                          response = requests.post(url, headers=approval_headers, json=data, timeout=30)
                       wait = get_rate_limit_wait(response)
                       if wait is None and response.status_code == 429:
                           wait = 2 ** attempt

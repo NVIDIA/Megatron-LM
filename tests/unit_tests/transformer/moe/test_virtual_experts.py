@@ -62,7 +62,7 @@ from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualEx
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.determinism.utils import RacingStreams
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, te_reads_legacy_grouped_env
 
 pytestmark = pytest.mark.internal
 
@@ -94,7 +94,10 @@ def hybridep_kernel_cache(tmp_path_factory):
 @pytest.fixture(autouse=True)
 def virtual_expert_environment(monkeypatch, hybridep_kernel_cache):
     """Keep the recipe's kernel/offload settings local to these tests."""
-    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+    # The HybridEP buffer is process-global; one left by another file's test keeps its EP layout.
+    fused_a2a.reset_hybrid_ep_buffer()
+    if te_reads_legacy_grouped_env():
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
     monkeypatch.setenv("NVTE_USE_CUTLASS_GROUPED_GEMM", "0")
     monkeypatch.setenv("NVTE_CPU_OFFLOAD_V1", "1")
     monkeypatch.setenv("HYBRID_EP_CACHE_DIR", str(hybridep_kernel_cache))
@@ -317,7 +320,8 @@ def _assert_bitwise_parity(actual, expected, name):
 )
 def test_virtual_expert_hybrid_training_parity(monkeypatch, egtp_size):
     """Match HybridEP losses, gradients and updates with repeated MTP, GTP/EGTP and offload."""
-    monkeypatch.setenv('NVTE_GROUPED_LINEAR_SINGLE_PARAM', '0')
+    if te_reads_legacy_grouped_env():
+        monkeypatch.setenv('NVTE_GROUPED_LINEAR_SINGLE_PARAM', '0')
     # Compare dispatch paths without nondeterministic TE dactivation/dprob accumulation.
     monkeypatch.setenv('NVTE_ALLOW_NONDETERMINISTIC_ALGO', '0')
     # Compile once per shape/process, including that first compilation in the time budget.
@@ -648,7 +652,8 @@ def test_bf16_virtual_expert_routing_parity(monkeypatch, use_op_fuser):
         '__init__',
         partialmethod(fused_a2a.HybridEPBuffer.__init__, load_cached_kernels=True),
     )
-    monkeypatch.setenv('NVTE_GROUPED_LINEAR_SINGLE_PARAM', '0')
+    if te_reads_legacy_grouped_env():
+        monkeypatch.setenv('NVTE_GROUPED_LINEAR_SINGLE_PARAM', '0')
     Utils.initialize_model_parallel(expert_model_parallel_size=2)
     pg = ProcessGroupCollection.use_mpu_process_groups()
     group = ps.get_model_parallel_group()
@@ -998,7 +1003,8 @@ def test_virtual_expert_recompute_offload_scopes(
     from megatron.core.tensor_parallel import checkpoint
     from megatron.core.transformer.spec_utils import get_submodules
 
-    monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
+    if te_reads_legacy_grouped_env():
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "0")
     monkeypatch.setattr(
         fused_a2a.HybridEPBuffer,
         "__init__",

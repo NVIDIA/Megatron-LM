@@ -171,6 +171,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 "Hash-routed MoE is supported only by HybridModel because GPTModel does not "
                 "forward token IDs to transformer layers."
             )
+        if config.rmsnorm_impl != "te":
+            raise ValueError("rmsnorm_impl='liger' is supported only by HybridModel.")
         if config.context_parallel_size > 1 and config.attention_cp_layout == "contiguous":
             raise ValueError("GPTModel does not support contiguous attention CP.")
         super().__init__(config=config, pg_collection=pg_collection)
