@@ -47,7 +47,6 @@ from megatron.training.config import (
     PretrainConfigContainer,
     ProfilingConfig,
     RerunStateMachineConfig,
-    RLConfig,
     RNGConfig,
     SchedulerConfig,
     StragglerDetectionConfig,
@@ -1222,7 +1221,7 @@ def offline_distillation_config_from_args(args: Namespace) -> OfflineDistillatio
     """Translate the existing logits CLI flags once, at the run-config boundary."""
     teacher_save = None
     student_load = None
-    if getattr(args, "logits_save_dir", None) is not None:
+    if args.logits_save_dir is not None:
         teacher_save = LogitsSaveConfig(
             directory=args.logits_save_dir,
             top_k=args.logits_save_top_k,
@@ -1230,7 +1229,14 @@ def offline_distillation_config_from_args(args: Namespace) -> OfflineDistillatio
             min_k=args.logits_save_top_p_min_k,
             dtype=args.logits_save_dtype,
         )
-    if getattr(args, "logits_load_dir", None) is not None:
+        if not args.freeze_all_layers:
+            warn_rank_0(
+                '--logits-save-dir without --freeze-all-layers: the LM loss is still computed and '
+                'gradients will update the model while logits are dumped. This is intended only '
+                'when dumping logits during active training; for a frozen-teacher dump pass '
+                '--freeze-all-layers.'
+            )
+    if args.logits_load_dir is not None:
         student_load = LogitsLoadConfig(
             directory=args.logits_load_dir,
             loss_alpha=args.logits_load_kd_loss_alpha,
@@ -1293,11 +1299,9 @@ def pretrain_cfg_container_from_args(
         checkpoint=checkpoint_config_from_args(args),
         profiling=profiling_config_from_args(args),
         tokenizer=tokenizer_config_from_args(args),
-        rl=_default_config_from_args(RLConfig, args),
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
         fault_tolerance=fault_tolerance_config_from_args(args),
-        offline_distillation=offline_distillation_config_from_args(args),
     )
 
     return cfg

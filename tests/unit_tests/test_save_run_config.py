@@ -23,6 +23,7 @@ from megatron.training.config.utils import serialize_value
 from megatron.training.global_vars import set_args
 from megatron.training.utils.checkpoint_utils import (
     get_checkpoint_run_config_filename,
+    read_root_config,
     read_run_config,
 )
 from tests.unit_tests.dist_checkpointing import TempNamedDir
@@ -71,6 +72,7 @@ def _model_and_states(ckpt_format):
 def _assert_saved_config(ckpt_dir, run_config, checkpoint):
     run_config_filename = get_checkpoint_run_config_filename(str(ckpt_dir))
     assert os.path.exists(run_config_filename)
+    # The run config's sections: the root container's training member.
     loaded_config = read_run_config(run_config_filename)
     assert loaded_config["train"]["global_batch_size"] == 8
     # The saved checkpoint section describes the policy of this save.
@@ -119,7 +121,8 @@ def test_save_checkpoint_without_optimizer(
         cfg = InferenceConfigContainer(
             model=None, checkpoint=checkpoint, inference=InferenceSetupConfig()
         )
-        monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+        monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+        global_vars.set_run_config(cfg)
         model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
         save_checkpoint(123, [model], None, None, 0)
 
@@ -130,9 +133,12 @@ def test_save_checkpoint_without_optimizer(
         assert "optimizer" not in saved
         assert "opt_param_scheduler" not in saved
         assert (save_dir / "latest_checkpointed_iteration.txt").read_text().strip() == "123"
-        saved_config = read_run_config(get_checkpoint_run_config_filename(str(ckpt_dir)))
-        assert saved_config["_target_"].endswith(".InferenceConfigContainer")
-        assert "optimizer" not in saved_config
+        saved_config = read_root_config(get_checkpoint_run_config_filename(str(ckpt_dir)))
+        # An inference run's root container holds only its inference member.
+        assert saved_config["_target_"].endswith(".RootConfigContainer")
+        assert set(saved_config) == {"_target_", "inference"}
+        assert saved_config["inference"]["_target_"].endswith(".InferenceConfigContainer")
+        assert "optimizer" not in saved_config["inference"]
 
 
 def test_save_checkpoint_writes_run_config_release(

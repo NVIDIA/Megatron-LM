@@ -17,6 +17,7 @@ except ImportError:
 
 from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.training.config.container import RootConfigContainer
 from megatron.training.config.instantiate_utils import (
     _DISALLOWED_CANONICAL_TARGETS,
     InstantiationException,
@@ -178,8 +179,17 @@ def _prepare_run_config(config_dict: Any) -> dict[str, Any]:
     return apply_run_config_backward_compat(config_dict)
 
 
-def read_run_config(run_config_filename: str) -> dict[str, Any]:
-    """Read the run configuration from a YAML file (rank 0 only).
+def read_run_config(run_config_filename: str) -> Optional[dict[str, Any]]:
+    """Read a checkpoint's run config: the sections of the container the saving process ran on.
+
+    The result is the same for a root container's document and for a document saved before
+    the root container. `read_root_config` returns the whole document.
+    """
+    return run_config_sections(read_root_config(run_config_filename))
+
+
+def read_root_config(run_config_filename: str) -> dict[str, Any]:
+    """Read the saved run configuration document from a YAML file (rank 0 only).
 
     Reads the file on rank 0 and broadcasts the result to other ranks.
 
@@ -187,7 +197,7 @@ def read_run_config(run_config_filename: str) -> dict[str, Any]:
         run_config_filename: Path to the run config YAML file.
 
     Returns:
-        A dictionary containing the run configuration.
+        A dictionary containing the whole saved document.
 
     Raises:
         ImportError: If PyYAML is not installed.
@@ -260,6 +270,17 @@ def _sanitize_run_config_object(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_sanitize_run_config_object(item) for item in obj]
     return obj
+
+
+def run_config_sections(run_config: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Return the run config's sections from a checkpoint's saved configuration."""
+    if isinstance(run_config, dict) and str(run_config.get("_target_", "")).endswith(
+        "." + RootConfigContainer.__qualname__
+    ):
+        # A root container: the sections of the member the saving process ran on.
+        training = run_config.get("training")
+        return training if training is not None else run_config.get("inference")
+    return run_config
 
 
 def apply_run_config_backward_compat(config_dict: dict[str, Any]) -> dict[str, Any]:

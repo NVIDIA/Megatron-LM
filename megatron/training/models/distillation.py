@@ -24,7 +24,7 @@ def load_distillation_loss_yaml(path: str) -> dict[str, Any]:
 class DistillationConfig:
     """ModelOpt knowledge distillation: the teacher and the distillation loss.
 
-    Lives on the training run container (``PretrainConfigContainer.distillation``). The teacher
+    An algorithm section of the run (``AlgorithmConfigContainer.distillation``). The teacher
     is built, and the student converted into a ``DistillationModel``, by
     ``megatron.post_training.model_hooks.kd_convert_hook``; the teacher's weights are loaded
     after wrapping by ``megatron.post_training.checkpointing.load_kd_teacher_checkpoint``.

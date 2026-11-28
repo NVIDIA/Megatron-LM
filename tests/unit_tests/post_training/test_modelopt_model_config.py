@@ -16,7 +16,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.post_training import model_config as mc
 from megatron.post_training import model_hooks
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
-from megatron.training.config import CheckpointConfig
+from megatron.training.config import AlgorithmConfigContainer, CheckpointConfig
 from megatron.training.models.base import ModelConfig, compose_hooks
 from megatron.training.models.distillation import DistillationConfig, validate_distillation_student
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig, default_layer_spec
@@ -309,7 +309,7 @@ class TestModelOptModelConfigFromArgs:
     def test_training_installs_setup_and_kd_hooks_around_config_hooks(
         self, monkeypatch, run_config, builder_cls
     ):
-        from megatron.training import training
+        from megatron.training import global_vars, training
 
         events = []
         for name in (
@@ -348,7 +348,10 @@ class TestModelOptModelConfigFromArgs:
 
         config.pre_wrap_hooks.append(freeze)
         run_config.model = config
-        run_config.distillation = distillation
+        # The section of the registered root container, next to `run_config`.
+        global_vars.get_root_config_container().algorithm = AlgorithmConfigContainer(
+            distillation=distillation
+        )
         run_config.checkpoint = CheckpointConfig(load="/ckpt/student", ckpt_format="torch_dist")
 
         class ReachedBuilder(Exception):

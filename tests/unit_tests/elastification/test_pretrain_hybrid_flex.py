@@ -68,12 +68,11 @@ def test_modelopt_stage_binds_the_tokenizer_vocab_size():
     model_config = SimpleNamespace(
         vocab_size=None, pre_wrap_hooks=[], get_builder_cls=lambda: lambda config: builder
     )
-    run_config = SimpleNamespace(
-        tokenizer=SimpleNamespace(padded_vocab_size=128), checkpoint=None, distillation=None
-    )
+    run_config = SimpleNamespace(tokenizer=SimpleNamespace(padded_vocab_size=128), checkpoint=None)
 
     with (
         patch.object(module, "get_run_config", return_value=run_config),
+        patch.object(module, "get_distillation_config", return_value=None),
         patch.object(module, "hybrid_config_from_args"),
         patch.object(module, "apply_modelopt_model_config", return_value=model_config, create=True),
         patch.object(module, "modelopt_setup_hooks", return_value=[], create=True),

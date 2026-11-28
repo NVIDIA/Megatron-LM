@@ -4,8 +4,6 @@ import argparse
 from dataclasses import dataclass, field
 from typing import Literal
 
-from megatron.core.inference.shards_spec import spec_declares_disaggregation
-
 SubmissionGranularity = Literal["R", "G", "B"]
 ConsumptionGranularity = Literal["G", "B"]
 
@@ -128,20 +126,6 @@ class RLConfig:
     rl_training_cuda_graphs: bool = field(default=False, metadata=_BOOL_OPTIONAL)
     """If set, do not toggle CUDA graphs on/off between inference and training phases."""
 
-    rl_inference_tensor_model_parallel_size: int | None = None
-    """Degree of tensor model parallelism for inference for RL."""
-
-    rl_inference_pipeline_model_parallel_size: int | None = None
-    """Degree of pipeline model parallelism for inference for RL."""
-
-    rl_inference_expert_model_parallel_size: int | None = None
-    """Degree of expert model parallelism for inference for RL."""
-
-    rl_inference_expert_tensor_model_parallel_size: int | None = None
-    """Degree of expert tensor model parallelism for inference for RL. For MoE models, this controls
-    the TP size for expert layers specifically. Defaults to training expert_tensor_parallel_size if
-    not specified."""
-
     rl_inference_model_unified_memory_level: Literal[0, 1] = 0
     """Allocate the separate RL inference model parameters from a unified virtual memory (UVM) CUDA
     mempool. Level 0 disables UVM (default). Level 1 enables UVM allocation so the inference model
@@ -262,20 +246,6 @@ class RLConfig:
             and not self.rl_training_cuda_graphs
         )
 
-    def uses_separate_inference_model(
-        self, *, context_parallel_size: int, inference_shards: str | None
-    ) -> bool:
-        """Whether rollouts run on their own copy of the model: disaggregated shards, any
-        --rl-inference-* parallelism override, or CP>1 (RL inference does not support CP)."""
-        return (
-            spec_declares_disaggregation(inference_shards)
-            or self.rl_inference_tensor_model_parallel_size is not None
-            or self.rl_inference_pipeline_model_parallel_size is not None
-            or self.rl_inference_expert_model_parallel_size is not None
-            or self.rl_inference_expert_tensor_model_parallel_size is not None
-            or context_parallel_size > 1
-        )
-
     def validate_run(
         self,
         *,
@@ -288,7 +258,6 @@ class RLConfig:
         load_optim: bool,
         save_interval: int | None,
         exit_interval: int | None,
-        separate_inference_model: bool | None,
     ) -> None:
         """Check this section against the rest of the run it belongs to."""
         if not self.perform_rl_step:
@@ -348,10 +317,3 @@ class RLConfig:
                 "--rl-offload-optimizer-during-inference has nothing to offload."
             )
 
-        # Offloading inference weights that are the training weights would be a no-op.
-        if separate_inference_model is False and self.rl_offload_inference_model_weights:
-            raise ValueError(
-                "--rl-offload-inference-model-weights requires a separate inference model. "
-                "This flag is only useful when doing refit since the weights are shared with "
-                "the training model."
-            )

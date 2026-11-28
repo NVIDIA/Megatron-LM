@@ -98,7 +98,12 @@ def _calculate_padded_vocab_size_cached(
 
 def build_tokenizer_and_pad_vocab_size(config: TokenizerConfig, make_vocab_size_divisible_by: int | None = None, tensor_model_parallel_size: int = 1):
     tokenizer = build_tokenizer(config)
-    
+    resolve_padded_vocab_size(config, tokenizer, make_vocab_size_divisible_by, tensor_model_parallel_size)
+    return tokenizer
+
+
+def resolve_padded_vocab_size(config: TokenizerConfig, tokenizer, make_vocab_size_divisible_by: int | None = None, tensor_model_parallel_size: int = 1) -> None:
+    """Derive ``config.padded_vocab_size`` from the tokenizer's vocabulary, unless it is configured."""
     if config.pad_vocab_size:
         if config.padded_vocab_size is None:
             assert isinstance(make_vocab_size_divisible_by, int), "must provide value for 'make_vocab_size_divisible_by' if 'pad_vocab_size' is set."
@@ -109,5 +114,3 @@ def build_tokenizer_and_pad_vocab_size(config: TokenizerConfig, make_vocab_size_
             )
         else:
             print_rank_0("padded_vocab_size already configured on TokenizerConfig. Skipping divisibility padding calculation and update.")
-
-    return tokenizer

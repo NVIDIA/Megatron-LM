@@ -286,7 +286,7 @@ def test_config_activation_storage_reuses_warmed_backward(tp_group, add_bias, fp
 
 @pytest.fixture
 def pretrain_until_warmup(monkeypatch, run_config):
-    from megatron.training import training
+    from megatron.training import global_vars, training
 
     class WarmupReached(Exception):
         pass
@@ -307,8 +307,7 @@ def pretrain_until_warmup(monkeypatch, run_config):
             raise WarmupReached
 
         monkeypatch.setattr(kernel_warmup, "_warmup_training_kernels", observe)
-        # Only what pretrain() touches before the warmup call; validate() and finalize() are
-        # no-ops here.
+        # Only what pretrain() touches before the warmup call.
         cfg = Namespace(
             model=model_config,
             data=Namespace(dataset=None),
@@ -316,8 +315,13 @@ def pretrain_until_warmup(monkeypatch, run_config):
             checkpoint=run_config.checkpoint,
             train=Namespace(micro_batch_size=9),
             logger=Namespace(log_progress=False, tensor_metrics=[]),
-            validate=lambda: None,
-            finalize=lambda: None,
+        )
+        # pretrain() validates and finalizes the registered root container, not its argument:
+        # a stand-in root over `cfg`, with both calls no-ops.
+        monkeypatch.setattr(
+            global_vars,
+            "_GLOBAL_ROOT_CONFIG_CONTAINER",
+            Namespace(run_config=cfg, validate=lambda: None, finalize=lambda: None),
         )
         with pytest.raises(WarmupReached):
             training.pretrain(cfg, None, None, None, pg_collection=Namespace(tp=tp_group))

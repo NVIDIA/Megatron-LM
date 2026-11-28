@@ -19,6 +19,7 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 from megatron.core.distributed.torch_fully_sharded_data_parallel_config import (
     TorchFullyShardedDataParallelConfig,
 )
+from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
     get_current_global_batch_size,
@@ -52,6 +53,7 @@ from megatron.training.config.training_config import (
     ValidationConfig,
 )
 from megatron.training.config.utils import (
+    _resolve_target_class,
     sanitize_dataclass_config,
     serialize_dataclass,
     serialize_value,
@@ -140,6 +142,16 @@ class ConfigContainerBase:
 
         assert "_target_" in config_dict
 
+        # Name the document's own container before the key checks below hide the mismatch.
+        target = config_dict["_target_"]
+        target_cls = _resolve_target_class(target) if isinstance(target, str) else None
+        if isinstance(target_cls, type) and not issubclass(target_cls, cls):
+            name = target_cls.__qualname__
+            raise TypeError(
+                f"Expected {cls.__qualname__}, got {name}; load this document with "
+                f"{name}.from_dict or {name}.from_yaml."
+            )
+
         # Apply backward compatibility: remove init=False fields that may have been
         # serialized by older versions (these are computed in __post_init__)
         config_dict = sanitize_dataclass_config(config_dict)
@@ -159,7 +171,12 @@ class ConfigContainerBase:
 
         # Use instantiate to create the object
         instance = instantiate(config_dict, mode=mode)
-
+        if not isinstance(instance, cls):
+            name = type(instance).__qualname__
+            raise TypeError(
+                f"Expected {cls.__qualname__}, got {name}; load this document with "
+                f"{name}.from_dict or {name}.from_yaml."
+            )
         return instance
 
     @classmethod
@@ -309,16 +326,16 @@ class PretrainConfigContainer(ConfigContainerBase):
     checkpoint: CheckpointConfig
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
-    rl: RLConfig = field(default_factory=RLConfig)
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
     fault_tolerance: FaultToleranceConfig = field(default_factory=FaultToleranceConfig)
-    distillation: DistillationConfig | None = None
-    """ModelOpt knowledge distillation (teacher and loss). ``None`` disables it."""
 
-    offline_distillation: OfflineDistillationConfig | None = None
-    """Offline logits KD: exactly one of teacher_save or student_load. None disables it."""
+    @staticmethod
+    def upgrade_cfg_dict(section: dict) -> dict:
+        """Drop the `rl` section of a document saved while this container carried it
+        (``sanitize_dataclass_config`` hook)."""
+        return {key: value for key, value in section.items() if key != "rl"}
 
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""
@@ -470,7 +487,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 
     def validate(self) -> None:
-        """Validate each section and the cross-config GTP, batch-size, and RL policies."""
+        """Validate each section and the cross-config GTP and batch-size policies."""
         if self.model is None:
             raise ValueError("Training requires a model config")
         if getattr(self.model, "transformer", None) is None:
@@ -519,13 +536,10 @@ class PretrainConfigContainer(ConfigContainerBase):
         effective._validate_checkpoint()
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
-        self._validate_distillation()
-        self._validate_offline_distillation()
         if self.train.freeze_all_layers and transformer.freeze_base_model_for_mtp:
             raise ValueError("freeze_all_layers cannot be combined with freeze_base_model_for_mtp.")
-        global_batch_size, _, _ = self._resolve_batch_sizes()
+        self._resolve_batch_sizes()
         effective._validate_ddp_config()
-        self._validate_rl_config(global_batch_size)
         optimizer.validate_run(
             ddp_config=self.ddp,
             use_torch_fsdp2=isinstance(self.ddp, TorchFullyShardedDataParallelConfig),
@@ -535,45 +549,16 @@ class PretrainConfigContainer(ConfigContainerBase):
             moe_single_grouped_weight=transformer.moe_single_grouped_weight,
             virtual_pipeline_model_parallel_size=transformer.virtual_pipeline_model_parallel_size,
         )
+        # Finalizing a sample-based horizon derives train_iters from train_samples
+        # (update_train_iters); the horizon rule checks the one the user chose.
+        derived_train_iters = self._finalized and bool(self.train.train_samples)
         self.scheduler.validate_run(
-            train_iters=self.train.train_iters,
+            train_iters=None if derived_train_iters else self.train.train_iters,
             train_samples=self.train.train_samples,
             skip_train=self.validation.skip_train,
             weight_decay=self.optimizer.weight_decay,
         )
         self._validate_data_section()
-
-    def _validate_distillation(self) -> None:
-        """Check distillation against the student model and training settings.
-
-        Runs after ``super().validate()``, so the teacher config is known to be resolved.
-        """
-        if self.distillation is None:
-            return
-        if self.model is not None:
-            validate_distillation_student(self.distillation, self.model)
-        if self.train.manual_gc:
-            raise ValueError("ModelOpt distillation is incompatible with manual_gc.")
-
-    def _validate_offline_distillation(self) -> None:
-        """Check offline KD against the training, checkpoint, distillation and data sections."""
-        offline_kd_cfg = self.offline_distillation
-        if offline_kd_cfg is None:
-            return
-        if (
-            self.train.rampup_batch_size is not None
-            or self.train.step_batch_size_schedule is not None
-        ):
-            raise ValueError("Offline distillation requires a fixed global batch size.")
-        if offline_kd_cfg.teacher_save is not None:
-            if not self.checkpoint.async_save or not self.checkpoint.use_persistent_ckpt_worker:
-                raise ValueError(
-                    "teacher_save requires checkpoint.async_save and use_persistent_ckpt_worker."
-                )
-        elif self.distillation is not None:
-            raise ValueError("student_load cannot be combined with online ModelOpt distillation.")
-        if self.data.dataset is None:
-            raise ValueError("Offline distillation requires cfg.data.dataset for cache identity.")
 
     def _validate_checkpoint(self) -> None:
         """Check the checkpoint format and optimizer policy against the sections that own the
@@ -615,7 +600,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Check wrapper requirements without deriving or mutating other configs."""
         # DDP's copy is derived during finalization; recipes only set optimizer policy.
         if self.optimizer.reuse_grad_buf_for_mxfp8_param_ag and not self.ddp.use_megatron_fsdp:
-            if self.ddp.grad_buffer_offload or self.rl.requires_grad_buffer_offload:
+            if self.ddp.grad_buffer_offload:
                 raise ValueError(
                     "Gradient-buffer offload is incompatible with "
                     "--reuse-grad-buf-for-mxfp8-param-ag: "
@@ -689,24 +674,6 @@ class PretrainConfigContainer(ConfigContainerBase):
                 "Manual FSDP registration requires Megatron FSDP v1 with NCCL user buffers."
             )
 
-    def _validate_rl_config(self, global_batch_size: int | None) -> None:
-        """Check RL policy against the supplied or resolved training batch size."""
-        transformer = getattr(self.model, "transformer", None)
-        cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
-        self.rl.validate_run(
-            cuda_graph_impl=cuda_graph_impl,
-            micro_batch_size=self.train.micro_batch_size,
-            global_batch_size=global_batch_size,
-            train_iters=self.train.train_iters,
-            train_samples=self.train.train_samples,
-            skip_train=self.validation.skip_train,
-            load_optim=self.checkpoint.load_optim,
-            save_interval=self.checkpoint.save_interval,
-            exit_interval=self.train.exit_interval,
-            # The rollout deployment (inference shards, model CP) is not a pretrain section;
-            # validate_args checks that rule from the launch arguments.
-            separate_inference_model=None,
-        )
 
     def _validate_data_section(self) -> None:
         """Cross-section checks for the data section, placed by their inputs.
@@ -919,9 +886,8 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
 
     def _finalize(self) -> None:
-        # Checkpoint derivations first: the RL check below reads the derived load_optim. The
-        # conditions are validate_args', and the warning fires only when a value changes, so a CLI
-        # run, whose arguments validate_args already normalized, stays silent.
+        # The conditions are validate_args', and the warning fires only when a value changes, so a
+        # CLI run, whose arguments validate_args already normalized, stays silent.
         if self.checkpoint.ckpt_convert_format is not None:
             # A conversion run exits instead of training from random weights.
             self.checkpoint.exit_on_missing_checkpoint = True
@@ -976,7 +942,6 @@ class PretrainConfigContainer(ConfigContainerBase):
                         f"cover one physical sample ({input_length})."
                     )
         batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
-        self._validate_rl_config(batch_sizes[0])
         # Resolve RNG and model settings before deriving optimizer precision.
         super()._finalize()
         optimizer = self._optimizer_with_model_precision()
@@ -1110,8 +1075,6 @@ class PretrainConfigContainer(ConfigContainerBase):
                 getattr(transformer, "dynamic_context_parallel", False)
             )
         self.data.finalize()
-        if self.rl.requires_grad_buffer_offload:
-            self.ddp.grad_buffer_offload = True
         self.ddp.finalize()
 
 
@@ -1144,7 +1107,7 @@ def update_train_iters(train: TrainingConfig) -> None:
 
 @dataclass(kw_only=True)
 class InferenceConfigContainer(ConfigContainerBase):
-    """Top-level container for inference entry points.
+    """Container for inference entry points.
 
     This is the inference counterpart to :class:`PretrainConfigContainer`. It holds only the
     configs that inference actually needs and is intentionally shaped differently from the
@@ -1160,7 +1123,8 @@ class InferenceConfigContainer(ConfigContainerBase):
     """Model to load, or None for args-only entrypoints without model inputs."""
 
     checkpoint: CheckpointConfig
-    """Checkpoint configuration used to load model weights."""
+    """Checkpoint configuration used to load model weights; ``load=None`` for a deployment whose
+    weights come from an in-process training model (the RL rollout engine)."""
 
     inference: InferenceSetupConfig
     """Declarative inference settings (the serializable, args-shaped layer). Use
@@ -1179,3 +1143,251 @@ class InferenceConfigContainer(ConfigContainerBase):
             # A conversion run (the checkpoint converters bootstrap through this container) exits
             # instead of loading random weights, as validate_args derives it.
             self.checkpoint.exit_on_missing_checkpoint = True
+
+
+# Transformer fields in which an RL rollout deployment's layout can differ from training's:
+# the overridable parallelism, plus the CP that context-parallel training forces to 1.
+ROLLOUT_LAYOUT_FIELDS = (
+    "tensor_model_parallel_size",
+    "pipeline_model_parallel_size",
+    "expert_model_parallel_size",
+    "expert_tensor_parallel_size",
+    "context_parallel_size",
+)
+
+
+def rollout_model_is_separate(
+    inference_container: InferenceConfigContainer, training_model_cfg: ModelConfig | None
+) -> bool:
+    """Whether rollouts need their own model instead of the training model.
+
+    True for disaggregated shards, or for a deployment layout that differs from the training
+    model's in TP, PP, EP, expert TP or CP. When either side has no transformer section, a
+    distinct model config object counts as separate.
+    """
+    if spec_declares_disaggregation(inference_container.inference.inference_shards):
+        return True
+    deployment, training = inference_container.model, training_model_cfg
+    layouts = (getattr(deployment, "transformer", None), getattr(training, "transformer", None))
+    if None in layouts:
+        return deployment is not training
+    return any(
+        getattr(layouts[0], name) != getattr(layouts[1], name) for name in ROLLOUT_LAYOUT_FIELDS
+    )
+
+
+@dataclass(kw_only=True)
+class AlgorithmConfigContainer(ConfigContainerBase):
+    """Container for the algorithm sections a run adds on top of `training`.
+
+    The root container holds each section's rules against the run's other containers.
+    """
+
+    rl: RLConfig | None = None
+    """The RL loop's section; `None` for a run without RL."""
+
+    distillation: DistillationConfig | None = None
+    """ModelOpt knowledge distillation (teacher and loss). `None` disables it."""
+
+    offline_distillation: OfflineDistillationConfig | None = None
+    """Offline logits KD: exactly one of teacher_save or student_load. `None` disables it."""
+
+    def to_dict(self, **section_overrides: Mapping[str, Any]) -> dict[str, Any]:
+        """The document holds only the sections the run has, as the root holds only its members."""
+        document = super().to_dict(**section_overrides)
+        return {key: value for key, value in document.items() if value is not None}
+
+
+@dataclass(kw_only=True)
+class RootConfigContainer(ConfigContainerBase):
+    """Container of config containers: a run's whole configuration, saved as `run_config.yaml`.
+
+    Each member is itself a container (the other containers hold config sections).
+    A training run sets `training`, an inference run sets `inference`,
+    an RL run sets `training`, `inference`, and `algorithm`,
+    a distillation run sets `training` and `algorithm`.
+
+    A run config saved before this type, one container serialized flat, still loads through
+    `megatron.training.utils.checkpoint_utils.run_config_sections` (backwards compatibility).
+    """
+
+    training: PretrainConfigContainer | None = None
+    """The training sections; for a training or RL run, the run config the loop reads."""
+
+    inference: InferenceConfigContainer | None = None
+    """An inference or converter process's sections, or an RL run's rollout engine deployment."""
+
+    algorithm: AlgorithmConfigContainer | None = None
+    """The algorithm sections a run adds on top of `training` (RL, distillation)."""
+
+    def validate(self) -> None:
+        """Validate every member and check the rules between them."""
+        if self.training is None and self.inference is None:
+            raise ValueError("A root container needs a training or an inference container.")
+        if self.algorithm is not None and self.training is None:
+            raise ValueError("Algorithm sections apply to a training container.")
+        self._validate_rl()
+        super().validate()
+        # After the members: the distillation section's own validation resolves the teacher.
+        self._validate_distillation()
+        self._validate_offline_distillation()
+
+    def _finalize(self) -> None:
+        """Apply the derivations between the members, then finalize the members."""
+        self._finalize_rl()
+        # Training last: an RL run finalizes its rollout deployment before training.
+        for member in (self.inference, self.algorithm, self.training):
+            if member is not None:
+                member.finalize()
+
+    def _validate_rl(self, global_batch_size: int | None = None) -> None:
+        """Check the RL section against the training container and the rollout deployment,
+        with the supplied or the configured training batch size."""
+        rl = None if self.algorithm is None else self.algorithm.rl
+        if rl is None:
+            return
+        training, inference = self.training, self.inference
+        if inference is None:
+            raise ValueError("An RL run needs an inference container for its rollout engine.")
+        if not inference.tokenizer.same_tokenizer(training.tokenizer):
+            # For now, the rollout engine's token ids and log probabilities feed the training loss.
+            raise ValueError("The rollout deployment's tokenizer must match the training one.")
+        # What the rollout model builders (`megatron.rl.training_setup`) rely on.
+        if inference.checkpoint.load is not None:
+            raise ValueError(
+                "The rollout deployment serves the training weights: leave its "
+                "checkpoint.load unset."
+            )
+        layouts = (
+            getattr(inference.model, "transformer", None),
+            getattr(training.model, "transformer", None),
+        )
+        if None not in layouts:
+            if spec_declares_disaggregation(inference.inference.inference_shards):
+                # Each shard takes its layout from the shard specification.
+                if any(
+                    getattr(layouts[0], name) != getattr(layouts[1], name)
+                    for name in ROLLOUT_LAYOUT_FIELDS
+                ):
+                    raise ValueError(
+                        "Disaggregated inference shards set each rank's parallelism: the "
+                        "rollout deployment's model must keep the training layout."
+                    )
+            elif layouts[0].context_parallel_size > 1:
+                raise ValueError(
+                    "Rollout inference does not support context parallelism: the rollout "
+                    "deployment's model needs context_parallel_size=1."
+                )
+        if global_batch_size is None:
+            global_batch_size = training.train.global_batch_size
+        # The offload `_finalize_rl` will request, checked like the offload the DDP section
+        # requests (`PretrainConfigContainer._validate_ddp_config`).
+        if (
+            rl.requires_grad_buffer_offload
+            and training.optimizer.reuse_grad_buf_for_mxfp8_param_ag
+            and not training.ddp.use_megatron_fsdp
+        ):
+            raise ValueError(
+                "Gradient-buffer offload is incompatible with "
+                "--reuse-grad-buf-for-mxfp8-param-ag: "
+                "parameters share the gradient-buffer storage that offload releases."
+            )
+        transformer = getattr(training.model, "transformer", None)
+        cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
+        rl.validate_run(
+            cuda_graph_impl=cuda_graph_impl,
+            micro_batch_size=training.train.micro_batch_size,
+            global_batch_size=global_batch_size,
+            train_iters=training.train.train_iters,
+            train_samples=training.train.train_samples,
+            skip_train=training.validation.skip_train,
+            load_optim=training.checkpoint.load_optim,
+            save_interval=training.checkpoint.save_interval,
+            exit_interval=training.train.exit_interval,
+        )
+        if rl.rl_offload_inference_model_weights and not rollout_model_is_separate(
+            inference, training.model
+        ):
+            raise ValueError(
+                "--rl-offload-inference-model-weights requires a separate inference model: "
+                "disaggregated --inference-shards or a rollout layout that differs from "
+                "training's (an --rl-inference-* value equal to training's shares the model)."
+            )
+
+    def _finalize_rl(self) -> None:
+        """Apply the RL section to the training container, before the members finalize."""
+        rl = None if self.algorithm is None else self.algorithm.rl
+        if rl is None:
+            return
+        training = self.training
+        global_batch_size, _, _ = training._resolve_batch_sizes(training.get_batch_parallel_size())
+        self._validate_rl(global_batch_size)
+        if rl.requires_grad_buffer_offload:
+            # Applied before the training container finalizes its DDP section.
+            training.ddp.grad_buffer_offload = True
+
+    def _validate_distillation(self) -> None:
+        """Check distillation against the student model and training settings."""
+        distillation = None if self.algorithm is None else self.algorithm.distillation
+        if distillation is None:
+            return
+        training = self.training
+        if training.model is not None:
+            validate_distillation_student(distillation, training.model)
+        if training.train.manual_gc:
+            raise ValueError("ModelOpt distillation is incompatible with manual_gc.")
+
+    def _validate_offline_distillation(self) -> None:
+        """Check offline KD against the training, checkpoint, distillation and data sections."""
+        algorithm = self.algorithm
+        offline_kd_cfg = None if algorithm is None else algorithm.offline_distillation
+        if offline_kd_cfg is None:
+            return
+        training = self.training
+        if (
+            training.train.rampup_batch_size is not None
+            or training.train.step_batch_size_schedule is not None
+        ):
+            raise ValueError("Offline distillation requires a fixed global batch size.")
+        if offline_kd_cfg.teacher_save is not None:
+            checkpoint = training.checkpoint
+            if not checkpoint.async_save or not checkpoint.use_persistent_ckpt_worker:
+                raise ValueError(
+                    "teacher_save requires checkpoint.async_save and use_persistent_ckpt_worker."
+                )
+        elif algorithm.distillation is not None:
+            raise ValueError("student_load cannot be combined with online ModelOpt distillation.")
+        if training.data.dataset is None:
+            raise ValueError("Offline distillation requires cfg.data.dataset for cache identity.")
+
+    @classmethod
+    def wrap(cls, run_config: ConfigContainerBase) -> "RootConfigContainer":
+        """Return a run's root container: a root as is, a lone run config as the matching member."""
+        if isinstance(run_config, cls):
+            return run_config
+        if isinstance(run_config, PretrainConfigContainer):
+            return cls(training=run_config)
+        if isinstance(run_config, InferenceConfigContainer):
+            return cls(inference=run_config)
+        raise TypeError(
+            "A run config is a PretrainConfigContainer or an InferenceConfigContainer, "
+            f"got {type(run_config).__qualname__}"
+        )
+
+    @property
+    def run_config(self) -> PretrainConfigContainer | InferenceConfigContainer | None:
+        """The container the process runs on: `training`, else `inference`."""
+        return self.training if self.training is not None else self.inference
+
+    def to_dict(self, **section_overrides: Mapping[str, Any]) -> dict[str, Any]:
+        """The document holds only the members the run has. Section overrides (a checkpoint save's
+        own directory and format) reach the member that is the run config."""
+        document = {key: value for key, value in super().to_dict().items() if value is not None}
+        if section_overrides:
+            if self.run_config is None:
+                raise ValueError(
+                    "RootConfigContainer has no run config member to apply overrides to"
+                )
+            owner = "training" if self.training is not None else "inference"
+            document[owner] = self.run_config.to_dict(**section_overrides)
+        return document

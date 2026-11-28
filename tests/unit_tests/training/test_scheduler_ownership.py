@@ -276,9 +276,11 @@ def test_constant_weight_decay_is_derived_from_optimizer_at_finalize(finalizable
     assert run_config.scheduler.end_weight_decay == 0.05
 
 
-def test_validation_is_repeatable_after_finalize(finalizable, run_config):
+@pytest.mark.parametrize("horizon", [{"train_iters": 10}, {"train_samples": 80}])
+def test_validation_is_repeatable_after_finalize(finalizable, run_config, horizon):
     run_config.optimizer.weight_decay = 0.05
-    run_config.train = TrainingConfig(train_iters=10, micro_batch_size=1)
+    # A sample-based horizon gets its train_iters at finalize; validation must still pass.
+    run_config.train = TrainingConfig(micro_batch_size=1, **horizon)
     run_config.scheduler = SchedulerConfig(weight_decay_incr_style="constant")
     run_config.finalize()
     # An in-process restart re-enters pretrain, which validates the finalized config again.

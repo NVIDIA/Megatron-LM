@@ -12,6 +12,7 @@ from megatron.training.utils.checkpoint_utils import (
     CONFIG_FILE,
     apply_run_config_backward_compat,
     get_checkpoint_run_config_filename,
+    read_root_config,
     read_run_config,
 )
 
@@ -63,6 +64,20 @@ class TestReadRunConfigNonDistributed:
         loaded = read_run_config(str(run_config_path))
 
         assert loaded == data
+
+    @pytest.mark.parametrize("members", [("training",), ("inference",), ("training", "inference")])
+    def test_root_document_reads_as_the_run_config_sections(self, tmp_path, members):
+        """A root container's document reads as the sections of the member the process ran on
+        (training, else inference); ``read_root_config`` returns the whole document."""
+        document = {"_target_": "megatron.training.config.container.RootConfigContainer"}
+        for name in members:
+            document[name] = {"_target_": "some.Config", "model": {"saved_by": name}}
+        run_config_path = tmp_path / "run_config.yaml"
+        with open(run_config_path, "w") as f:
+            yaml.safe_dump(document, f)
+
+        assert read_run_config(str(run_config_path)) == document[members[0]]
+        assert read_root_config(str(run_config_path)) == document
 
     def test_missing_file_raises_runtime_error(self, tmp_path):
         missing_path = tmp_path / "does_not_exist.yaml"
