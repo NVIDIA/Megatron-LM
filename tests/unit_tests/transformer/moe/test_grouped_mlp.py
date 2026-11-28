@@ -1715,6 +1715,35 @@ class TestTEGroupedMLP:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
+    def test_gpu_unweighted_forward_backward_matches_unit_probs(self):
+        """permuted_probs=None is bitwise the multiply by FP32 ones and the cast back it skips."""
+        self.grouped_mlp.cuda()
+        experts = self.grouped_mlp.experts
+        num_tokens = 64
+        tokens_per_expert = torch.tensor([24, 40], dtype=torch.int32)
+        hidden_states = torch.rand(
+            (num_tokens, self.hidden_size), dtype=torch.bfloat16, device="cuda"
+        )
+        unit_probs = torch.ones(num_tokens, dtype=torch.float32, device="cuda")
+
+        results = []
+        for permuted_probs in (unit_probs, None):
+            experts.zero_grad()
+            hidden = hidden_states.clone().requires_grad_()
+            output, _ = experts(
+                hidden, tokens_per_expert=tokens_per_expert, permuted_probs=permuted_probs
+            )
+            output.float().square().sum().backward()
+            grads = [param.grad.clone() for param in experts.parameters()]
+            results.append([output, hidden.grad, *grads])
+
+        weighted, unweighted = results
+        assert len(weighted) > 2
+        for weighted_result, unweighted_result in zip(weighted, unweighted):
+            assert torch.equal(weighted_result, unweighted_result)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     def test_gpu_make_fused_ops_constructs_with_real_te(self):
         """Verify `_make_fused_ops` builds a working TE op-fuser pipeline.
 
@@ -2898,3 +2927,244 @@ def test_moe_act_recompute_paths_are_numerically_equivalent(monkeypatch):
         nograd_output, _, _ = _run_moe_act_forward(monkeypatch)
 
     torch.testing.assert_close(grad_output.detach(), nograd_output)
+
+
+def _build_unfused_module(**config_overrides):
+    """The unfused stub without moe_act recompute, with config fields overridden."""
+    module = _build_moe_act_recompute_module()
+    module.activation_recompute = False
+    for name, value in config_overrides.items():
+        setattr(module.config, name, value)
+    module.activation_func = module.config.activation_func
+    return module
+
+
+def _grad_fn_names(tensor):
+    """Names of the autograd nodes behind a tensor."""
+    names, pending, seen = [], [tensor.grad_fn], set()
+    while pending:
+        node = pending.pop()
+        if node is None or node in seen:
+            continue
+        seen.add(node)
+        names.append(node.name())
+        pending.extend(next_node for next_node, _ in node.next_functions)
+    return names
+
+
+def _forward_and_input_grad(module, hidden_states, permuted_probs):
+    hidden_states = hidden_states.clone().requires_grad_()
+    output, _ = module.forward(hidden_states, torch.tensor([3, 1]), permuted_probs)
+    output.square().sum().backward()
+    return output, hidden_states.grad
+
+
+# Activations that multiply by the probs eagerly; fused weighted kernels are covered below.
+_EAGERLY_WEIGHTED_ACTIVATIONS = {
+    "default": {},
+    "default_glu": {"gated_linear_unit": True, "activation_func": F.silu},
+    "te_activation": {"use_te_activation_func": True, "activation_func": torch.nn.GELU()},
+    "interleaved_glu": {
+        "bias_activation_fusion": True,
+        "gated_linear_unit": True,
+        "activation_func": F.silu,
+        "moe_mlp_glu_interleave_size": 2,
+    },
+}
+
+
+@pytest.mark.parametrize("activation", sorted(_EAGERLY_WEIGHTED_ACTIVATIONS))
+@pytest.mark.parametrize("recompute", [False, True])
+def test_unweighted_forward_matches_unit_probs(monkeypatch, activation, recompute):
+    """permuted_probs=None is bitwise the multiply by ones and the cast back that it skips."""
+    monkeypatch.setattr(
+        experts_module.tensor_parallel, "CheckpointWithoutOutput", _RecordingCheckpoint
+    )
+    module = _build_unfused_module(**_EAGERLY_WEIGHTED_ACTIVATIONS[activation])
+    module.activation_recompute = recompute
+    hidden_states = torch.randn(4, 8)
+    # Probs wider than the activation, as with an FP32 router and BF16 experts.
+    unit_probs = torch.ones(4, dtype=torch.float64)
+
+    weighted, weighted_grad = _forward_and_input_grad(module, hidden_states, unit_probs)
+    unweighted, unweighted_grad = _forward_and_input_grad(module, hidden_states, None)
+
+    assert unweighted.dtype == hidden_states.dtype
+    assert torch.equal(unweighted, weighted)
+    assert torch.equal(unweighted_grad, weighted_grad)
+
+
+@pytest.mark.parametrize("activation", ["default", "te_activation"])
+def test_unweighted_forward_skips_the_multiply_and_cast(activation):
+    module = _build_unfused_module(**_EAGERLY_WEIGHTED_ACTIVATIONS[activation])
+    hidden_states = torch.randn(4, 8, requires_grad=True)
+    tokens_per_expert = torch.tensor([3, 1])
+
+    weighted, _ = module.forward(
+        hidden_states, tokens_per_expert, torch.ones(4, dtype=torch.float64)
+    )
+    unweighted, _ = module.forward(hidden_states, tokens_per_expert, None)
+
+    # The stub's fc1 and fc2 are one multiply each.
+    assert _grad_fn_names(weighted).count("MulBackward0") == 3
+    assert "ToCopyBackward0" in _grad_fn_names(weighted)
+    assert _grad_fn_names(unweighted).count("MulBackward0") == 2
+    assert "ToCopyBackward0" not in _grad_fn_names(unweighted)
+
+
+@pytest.mark.parametrize("activation", sorted(_EAGERLY_WEIGHTED_ACTIVATIONS))
+def test_apply_probs_on_input_runs_the_experts_unweighted(activation):
+    """Probs applied on the input are not multiplied in again as ones after the activation."""
+    overrides = _EAGERLY_WEIGHTED_ACTIVATIONS[activation]
+    module = _build_unfused_module(moe_apply_probs_on_input=True, **overrides)
+    hidden_states = torch.randn(4, 8)
+    probs = torch.rand(4, dtype=torch.float64)
+
+    hidden = hidden_states.clone().requires_grad_()
+    output, _ = module.forward(hidden, torch.tensor([3, 1]), probs)
+    output.square().sum().backward()
+
+    # The reference scales the input itself and then weights the activation by ones.
+    reference_module = _build_unfused_module(**overrides)
+    reference_hidden = hidden_states.clone().requires_grad_()
+    scaled_hidden = (probs.unsqueeze(-1) * reference_hidden).to(hidden_states.dtype)
+    reference, _ = reference_module.forward(
+        scaled_hidden, torch.tensor([3, 1]), torch.ones_like(probs)
+    )
+    reference.square().sum().backward()
+
+    assert torch.equal(output, reference)
+    assert torch.equal(hidden.grad, reference_hidden.grad)
+    # One multiply fewer than the reference, and only the input scaling casts.
+    multiplies = _grad_fn_names(reference).count("MulBackward0")
+    assert _grad_fn_names(output).count("MulBackward0") == multiplies - 1
+    assert _grad_fn_names(output).count("ToCopyBackward0") == 1
+
+
+def _record_fused_weighted_activations(monkeypatch):
+    """Swap the fused weighted activations for eager ones that record their weights."""
+    recorded = []
+
+    def weighted_swiglu(intermediate, bias, weights, *args, **kwargs):
+        recorded.append(weights)
+        gate, linear = torch.chunk(intermediate, 2, dim=-1)
+        return (F.silu(gate) * linear * weights).to(intermediate.dtype)
+
+    def weighted_squared_relu(intermediate, weights, tanh_clamp_scale):
+        recorded.append(weights)
+        return (squared_relu(intermediate) * weights).to(intermediate.dtype)
+
+    monkeypatch.setattr(experts_module, "weighted_bias_swiglu_impl", weighted_swiglu)
+    monkeypatch.setattr(experts_module, "weighted_squared_relu_impl", weighted_squared_relu)
+    return recorded
+
+
+_FUSED_WEIGHTED_ACTIVATIONS = {
+    "swiglu": {
+        "bias_activation_fusion": True,
+        "gated_linear_unit": True,
+        "activation_func": F.silu,
+    },
+    "squared_relu": {"activation_func": squared_relu, "use_fused_weighted_squared_relu": True},
+}
+
+
+@pytest.mark.parametrize("activation", sorted(_FUSED_WEIGHTED_ACTIVATIONS))
+def test_apply_probs_on_input_keeps_unit_probs_for_fused_weighted_activations(
+    monkeypatch, activation
+):
+    """A fused weighted activation takes the probs as an operand, so it still gets ones."""
+    recorded = _record_fused_weighted_activations(monkeypatch)
+    module = _build_unfused_module(
+        moe_apply_probs_on_input=True, **_FUSED_WEIGHTED_ACTIVATIONS[activation]
+    )
+
+    module.forward(torch.randn(4, 8), torch.tensor([3, 1]), torch.rand(4, dtype=torch.float64))
+
+    (weights,) = recorded
+    assert weights.shape == (4, 1) and weights.dtype == torch.float64
+    assert torch.equal(weights, torch.ones_like(weights))
+
+
+@pytest.mark.parametrize("activation", sorted(_FUSED_WEIGHTED_ACTIVATIONS))
+def test_unweighted_forward_gives_fused_weighted_activations_unit_probs(monkeypatch, activation):
+    recorded = _record_fused_weighted_activations(monkeypatch)
+    module = _build_unfused_module(**_FUSED_WEIGHTED_ACTIVATIONS[activation])
+    hidden_states = torch.randn(4, 8)
+
+    unweighted, _ = module.forward(hidden_states, torch.tensor([3, 1]), None)
+    weighted, _ = module.forward(hidden_states, torch.tensor([3, 1]), torch.ones(4))
+
+    assert recorded[0].shape == (4, 1) and recorded[0].dtype == hidden_states.dtype
+    assert torch.equal(recorded[0], torch.ones_like(recorded[0]))
+    assert torch.equal(unweighted, weighted)
+
+
+def test_apply_probs_on_input_requires_probs():
+    module = _build_unfused_module(moe_apply_probs_on_input=True)
+
+    with pytest.raises(ValueError, match="requires the router probabilities"):
+        module.forward(torch.randn(4, 8), torch.tensor([3, 1]), None)
+
+
+def test_unweighted_forward_is_rejected_by_the_op_fuser():
+    module = _build_unfused_module()
+    module._with_fused_impl = True
+
+    with pytest.raises(ValueError, match="operation fuser"):
+        module.forward(torch.randn(4, 8), torch.tensor([3, 1]), None)
+
+
+def test_unweighted_forward_pads_only_the_hidden_states(monkeypatch):
+    module = _build_unfused_module(fp8="e4m3")
+    monkeypatch.setattr(experts_module, "skip_routed_expert_padding", lambda _config: False)
+    padded = []
+
+    def quantization_padding(tensor, tokens_per_expert):
+        padded.append(tensor)
+        return tensor, tokens_per_expert
+
+    module.quantization_padding = quantization_padding
+    module.quantization_unpadding = lambda output, tokens_per_expert: output
+    hidden_states = torch.randn(4, 8)
+
+    module.forward(hidden_states, torch.tensor([3, 1]), None)
+
+    assert len(padded) == 1 and padded[0] is hidden_states
+
+
+def test_apply_bias_adds_per_expert_bias_unscaled_without_probs():
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=False)
+    intermediate = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32)
+    bias_parallel = [torch.tensor([10.0, 20.0]), torch.tensor([100.0, 200.0])]
+    tokens_per_expert = [2, 1]
+    expected = torch.tensor([[11.0, 22.0], [13.0, 24.0], [105.0, 206.0]], dtype=torch.float32)
+
+    output = module._apply_bias(intermediate, bias_parallel, tokens_per_expert, None)
+
+    assert torch.equal(output, expected)
+    unit_probs = torch.ones(3, 1, dtype=torch.float64)
+    assert torch.equal(
+        output, module._apply_bias(intermediate, bias_parallel, tokens_per_expert, unit_probs)
+    )
+
+
+@pytest.mark.parametrize("paged_stash", [False, True])
+def test_apply_bias_adds_packed_bias_unscaled_without_probs(monkeypatch, paged_stash):
+    module = TEGroupedMLP.__new__(TEGroupedMLP)
+    module.config = SimpleNamespace(moe_paged_stash=paged_stash)
+    marked = []
+    monkeypatch.setattr(te_ext, "_te_mark_grouped_tensor", lambda *args: marked.append(args))
+    intermediate = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    packed_bias = torch.tensor([[10.0, 20.0], [100.0, 200.0]], requires_grad=True)
+    tokens_per_expert = torch.tensor([2, 1], dtype=torch.int64)
+    expected = torch.tensor([[11.0, 22.0], [13.0, 24.0], [105.0, 206.0]])
+
+    output = module._apply_bias(intermediate, packed_bias, tokens_per_expert, None)
+    output.sum().backward()
+
+    assert torch.equal(output, expected)
+    assert torch.equal(packed_bias.grad, torch.tensor([[2.0, 2.0], [1.0, 1.0]]))
+    # Without the multiply by the probs, autograd saves no token-shaped operand to mark.
+    assert marked == []

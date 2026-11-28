@@ -512,7 +512,7 @@ class TEGroupedMLP(MegatronModule):
         hidden_size = shape[-1]
         output_dtype = intermediate_parallel.dtype
         flat_output = intermediate_parallel.view(-1, hidden_size).float()
-        flat_probs = permuted_probs.reshape(-1, 1).float()
+        flat_probs = None if permuted_probs is None else permuted_probs.reshape(-1, 1).float()
         if self.config.moe_paged_stash:
             # The multiply below saves these two token-shaped operands. The additive output
             # operand is not saved by autograd and does not need a marker.
@@ -534,6 +534,8 @@ class TEGroupedMLP(MegatronModule):
         bias_per_token = torch.repeat_interleave(
             packed_bias.float(), tokens_per_expert, dim=0, output_size=flat_output.size(0)
         )
+        if flat_probs is None:
+            return (flat_output + bias_per_token).view(shape).to(output_dtype)
         if self.config.moe_paged_stash:
             _mark_te_grouped_tensor(bias_per_token)
         return (flat_output + bias_per_token * flat_probs).view(shape).to(output_dtype)
@@ -560,20 +562,20 @@ class TEGroupedMLP(MegatronModule):
 
         shape = intermediate_parallel.shape
         flat_output = intermediate_parallel.view(-1, shape[-1])
-        return (
-            torch.cat(
-                [
-                    t + b * p
-                    for t, b, p in zip(
-                        torch.split(flat_output, tokens_per_expert),
-                        bias_parallel,
-                        torch.split(permuted_probs, tokens_per_expert),
-                    )
-                ]
-            )
-            .view(shape)
-            .to(intermediate_parallel.dtype)
-        )
+        if permuted_probs is None:
+            biased = [
+                t + b for t, b in zip(torch.split(flat_output, tokens_per_expert), bias_parallel)
+            ]
+        else:
+            biased = [
+                t + b * p
+                for t, b, p in zip(
+                    torch.split(flat_output, tokens_per_expert),
+                    bias_parallel,
+                    torch.split(permuted_probs, tokens_per_expert),
+                )
+            ]
+        return torch.cat(biased).view(shape).to(intermediate_parallel.dtype)
 
     def _is_fused_impl_supported(self) -> bool:
         """Check if the TE op fuser supports implementing this module."""
@@ -1044,25 +1046,48 @@ class TEGroupedMLP(MegatronModule):
         x = x.view(shape)
         return x
 
+    def _activation_takes_probs(self) -> bool:
+        """Whether the unfused activation is a fused kernel that takes the probs as an operand."""
+        if self.config.use_te_activation_func:
+            return False
+        with_glu_interleaving = (
+            self.config.gated_linear_unit and self.config.moe_mlp_glu_interleave_size is not None
+        )
+        if self.config.bias_activation_fusion and not with_glu_interleaving:
+            return True
+        return self.activation_func == squared_relu and self.config.use_fused_weighted_squared_relu
+
     def _unfused_forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor | list[int],
-        permuted_probs: torch.Tensor,
+        permuted_probs: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Run FC1, activation, and FC2 without the TE operation fuser."""
+        """Run FC1, activation, and FC2 without the TE operation fuser.
+
+        The experts run unweighted when ``permuted_probs`` is None.
+        """
         if self.config.moe_apply_probs_on_input:
             assert (
                 self.config.moe_router_topk == 1
             ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
+            if permuted_probs is None:
+                raise ValueError("`moe_apply_probs_on_input` requires the router probabilities.")
             # MulBackward saves both operands before GroupedLinear sees the scaled input.
             if self.config.moe_paged_stash:
                 _mark_te_grouped_tensor(permuted_local_hidden_states, permuted_probs)
             original_dtype = permuted_local_hidden_states.dtype
             permuted_local_hidden_states = permuted_probs * permuted_local_hidden_states
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
-            # Probs already applied, so reset to 1.
-            permuted_probs = torch.ones_like(permuted_probs)
+            # Probs already applied, so the experts run unweighted from here. A fused weighted
+            # activation still takes the probs as an operand and gets ones.
+            permuted_probs = (
+                torch.ones_like(permuted_probs) if self._activation_takes_probs() else None
+            )
+        elif permuted_probs is None and self._activation_takes_probs():
+            permuted_probs = permuted_local_hidden_states.new_ones(
+                (*permuted_local_hidden_states.shape[:-1], 1)
+            )
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
             if self.config.moe_paged_stash:
@@ -1154,9 +1179,10 @@ class TEGroupedMLP(MegatronModule):
                             intermediate_parallel, tanh_clamp_scale
                         )
                     intermediate_parallel = self.activation_func(intermediate_parallel)
-                original_dtype = intermediate_parallel.dtype
-                intermediate_parallel = intermediate_parallel * permuted_probs
-                intermediate_parallel = intermediate_parallel.to(original_dtype)
+                if permuted_probs is not None:
+                    original_dtype = intermediate_parallel.dtype
+                    intermediate_parallel = intermediate_parallel * permuted_probs
+                    intermediate_parallel = intermediate_parallel.to(original_dtype)
             return intermediate_parallel
 
         # Only set up the checkpoint when a backward pass will actually follow.
@@ -1241,7 +1267,7 @@ class TEGroupedMLP(MegatronModule):
         self,
         permuted_local_hidden_states: torch.Tensor,
         tokens_per_expert: torch.Tensor,
-        permuted_probs: torch.Tensor,
+        permuted_probs: Optional[torch.Tensor],
         output_buffer: Optional[torch.Tensor] = None,
         grad_input_buffer: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -1251,7 +1277,9 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states (torch.Tensor): The permuted input hidden states of the
             local experts.
             tokens_per_expert (torch.Tensor): The number of tokens per expert.
-            permuted_probs (torch.Tensor): The permuted probs of each token produced by the router.
+            permuted_probs (torch.Tensor, optional): The permuted probs of each token produced by
+            the router. None runs the experts unweighted, for a caller that applies the routing
+            weights itself; the TE op-fuser path does not support it.
             output_buffer (torch.Tensor, optional): Preallocated buffer to write the fc2 output into
             (NCCL-EP zero-copy fwd combine); only the fused op-fuser path supports it.
             grad_input_buffer (torch.Tensor, optional): Preallocated buffer to write the fc1 dgrad
@@ -1263,6 +1291,11 @@ class TEGroupedMLP(MegatronModule):
 
         # Call fused impl if enabled
         if self._with_fused_impl:
+            if permuted_probs is None:
+                raise ValueError(
+                    "Unweighted experts (permuted_probs=None) are not supported by the TE "
+                    "operation fuser."
+                )
             output = self._fused_forward(
                 permuted_local_hidden_states,
                 tokens_per_expert,
@@ -1278,7 +1311,8 @@ class TEGroupedMLP(MegatronModule):
 
         # Apply padding if needed
         unpadded_tokens_per_expert = None
-        permuted_probs = permuted_probs.unsqueeze(-1)
+        if permuted_probs is not None:
+            permuted_probs = permuted_probs.unsqueeze(-1)
         # The token buffer may already contain per-expert padding when padding was performed
         # before expert compute:
         #   * router padding modified the routing map before dispatch;
@@ -1299,9 +1333,10 @@ class TEGroupedMLP(MegatronModule):
             permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                 permuted_local_hidden_states, tokens_per_expert
             )
-            permuted_probs, _ = self.quantization_padding(
-                permuted_probs, unpadded_tokens_per_expert
-            )
+            if permuted_probs is not None:
+                permuted_probs, _ = self.quantization_padding(
+                    permuted_probs, unpadded_tokens_per_expert
+                )
 
         if self._use_grouped_tensor:
             if not isinstance(tokens_per_expert, torch.Tensor):
