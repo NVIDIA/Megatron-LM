@@ -457,7 +457,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
         "Global-batch QB also compares histograms and the compact-output compatibility fallback. "
         "Fused aux_loss, seq_aux_loss and global_aux_loss replay their logged scalar, "
-        "input and router-weight gradients with fused TopK routing, and compare to the unfused reference.",
+        "input and router-weight gradients with fused TopK routing, and compare to the unfused reference. "
+        "moe_router_fused_aux_scores (TE fused_topk_with_aux_loss_scores: per-token warp math, "
+        "integer-atomic token counts) replays compact probs, indices, expert-bias counts and gradients.",
     ),
     KernelEntry(
         name="moe_token_dispatchers",
