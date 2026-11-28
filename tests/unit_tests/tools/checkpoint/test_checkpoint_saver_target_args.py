@@ -25,6 +25,8 @@ def test_target_derived_weight_shard_args_are_not_loaded_from_source_checkpoint(
         gtp_weight_remat_size=1,
         expert_tensor_parallel_num_weight_shards=1,
         expert_gtp_weight_remat_size=1,
+        tensor_parallel_num_sequence_shards=1,
+        gtp_remat_num_sequence_shards=1,
         num_layers=24,
     )
     target_args = SimpleNamespace(
@@ -32,6 +34,8 @@ def test_target_derived_weight_shard_args_are_not_loaded_from_source_checkpoint(
         gtp_weight_remat_size=2,
         expert_tensor_parallel_num_weight_shards=8,
         expert_gtp_weight_remat_size=2,
+        tensor_parallel_num_sequence_shards=4,
+        gtp_remat_num_sequence_shards=1,
         num_layers=12,
     )
     saver = MegatronCheckpointSaverBase(args=None, queue=None)
@@ -43,7 +47,28 @@ def test_target_derived_weight_shard_args_are_not_loaded_from_source_checkpoint(
     assert result.gtp_weight_remat_size == 2
     assert result.expert_tensor_parallel_num_weight_shards == 8
     assert result.expert_gtp_weight_remat_size == 2
+    assert result.tensor_parallel_num_sequence_shards == 4
+    assert result.gtp_remat_num_sequence_shards == 1
     assert result.num_layers == 24
+
+
+def test_source_sequence_shards_do_not_reach_a_sequence_parallel_target():
+    """A TP=1 source checkpoint must not force its resolved sequence shards onto the target.
+
+    The loader parses its own arguments at TP=1, so validate_args records
+    tensor_parallel_num_sequence_shards=1. Copying that into a TP=4
+    sequence-parallel target made validate_args raise:
+    "tensor_parallel_num_sequence_shards (1) must be positive and divisible by the
+    sequence-parallel size (4)".
+    """
+    source_args = SimpleNamespace(tensor_parallel_num_sequence_shards=1)
+    target_args = SimpleNamespace(tensor_parallel_num_sequence_shards=4)
+    saver = MegatronCheckpointSaverBase(args=None, queue=None)
+    saver.md = SimpleNamespace(checkpoint_args=source_args)
+
+    result = saver._load_checkpoint_args(target_args)
+
+    assert result.tensor_parallel_num_sequence_shards == 4
 
 
 @pytest.mark.parametrize(

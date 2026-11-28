@@ -63,6 +63,10 @@ class MegatronCheckpointSaverBase:
             args_to_keep = ['tensor_model_parallel_size', 'pipeline_model_parallel_size', 'expert_model_parallel_size', 'world_size', 'params_dtype',
                             'tensor_parallel_num_weight_shards', 'gtp_weight_remat_size',
                             'expert_tensor_parallel_num_weight_shards', 'expert_gtp_weight_remat_size',
+                            # Resolved from the target parallelism in validate_args; a source
+                            # checkpoint saved at TP=1 carries 1 and would fail validation
+                            # against a TP>1 sequence-parallel target.
+                            'tensor_parallel_num_sequence_shards', 'gtp_remat_num_sequence_shards',
                             'num_layers_per_virtual_pipeline_stage', 'virtual_pipeline_model_parallel_size',
                             'masked_softmax_fusion', 'bias_gelu_fusion', 'bias_dropout_fusion',
                             'sequence_parallel',
