@@ -1,5 +1,6 @@
 # Adapted from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/08035723e7a86f94fc54a7f4473bd0519f2ac941/scripts/conversion/utils.py
 # Source license: Apache-2.0.
+# Follow-up fixes from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/c209ed397fb36272c2216053058cda4e37802f2d/scripts/conversion/utils.py
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -199,12 +200,26 @@ def prepare_output_directory(
     return output_path
 
 
+def _pad_vocab_for_tensor_parallelism(model_config, tp: int) -> None:
+    """Pad the vocabulary when tensor parallelism does not divide it.
+
+    Megatron splits the embedding and output layer across tensor-parallel ranks, so a vocabulary
+    that ``tp`` does not divide fails with ``AssertionError: <vocab> is not divisible by <tp>``.
+    Import pads those rows and export trims them again, so the checkpoint round-trips exactly.
+    Vocabularies that ``tp`` divides stay unpadded.
+    """
+    vocab_size = getattr(model_config, "vocab_size", None)
+    if vocab_size and vocab_size % tp and hasattr(model_config, "should_pad_vocab"):
+        model_config.should_pad_vocab = True
+
+
 def _configure_model_config(
     model_config, *, tp: int, pp: int, ep: int, etp: int, dtype: torch.dtype, use_cpu: bool = False
 ) -> None:
     """Apply distributed parallelism and dtype settings to a builder config."""
     transformer = model_config.transformer
     transformer.tensor_model_parallel_size = tp
+    _pad_vocab_for_tensor_parallelism(model_config, tp)
     transformer.pipeline_model_parallel_size = pp
     transformer.expert_model_parallel_size = ep
     transformer.expert_tensor_parallel_size = etp
