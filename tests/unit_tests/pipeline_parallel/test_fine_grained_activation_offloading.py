@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -780,12 +781,13 @@ def _build_gpt_model(
     attention_backend: AttnBackend = AttnBackend.unfused,
     qk_layernorm: bool = True,
     fine_grained_offloading_buffer_size_gib: float = 0.0,
+    config_overrides: Optional[dict] = None,
 ) -> GPTModel:
     """Build a GPTModel that uses TE-based transformer layer spec."""
     model_parallel_cuda_manual_seed(seed)
     torch.manual_seed(seed)
     ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
-    transformer_config = ConfigClass(
+    config_kwargs = dict(
         num_layers=num_layers,
         hidden_size=hidden_size,
         num_attention_heads=num_attention_heads,
@@ -806,13 +808,15 @@ def _build_gpt_model(
         activation_offload_fraction=activation_offload_fraction,
         fine_grained_offloading_buffer_size_gib=fine_grained_offloading_buffer_size_gib,
     )
+    config_kwargs.update(config_overrides or {})
+    transformer_config = ConfigClass(**config_kwargs)
     gpt_model = GPTModel(
         config=transformer_config,
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
-            num_experts=num_experts,
-            moe_grouped_gemm=num_experts is not None,
-            multi_latent_attention=is_mla,
-            qk_layernorm=qk_layernorm and not is_mla,
+            num_experts=transformer_config.num_moe_experts,
+            moe_grouped_gemm=transformer_config.moe_grouped_gemm,
+            multi_latent_attention=transformer_config.multi_latent_attention,
+            qk_layernorm=transformer_config.qk_layernorm,
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
@@ -905,9 +909,18 @@ def _run_one_iter_and_capture(
     # Keep warmup-created grad buffers resident so the peak-memory check still
     # compares the steady-state allocator footprint, but remove accumulated
     # warmup values before capturing correctness grads.
-    for p in model.parameters():
-        if p.grad is not None:
-            p.grad.zero_()
+    for parameter in model.parameters():
+        if getattr(parameter, "grad_added_to_main_grad", False):
+            parameter.grad = None
+        if model.config.gradient_accumulation_fusion:
+            if not hasattr(parameter, "main_grad"):
+                parameter.main_grad = torch.zeros_like(parameter, dtype=torch.float32)
+                parameter.overwrite_main_grad = False
+                parameter.zero_out_wgrad = False
+            parameter.main_grad.zero_()
+            parameter.grad_added_to_main_grad = False
+        if parameter.grad is not None:
+            parameter.grad.zero_()
 
     torch.cuda.reset_peak_memory_stats()
     logits = model(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask)
@@ -918,8 +931,13 @@ def _run_one_iter_and_capture(
 
     # capture all gradients for correctness
     grads: Dict[str, torch.Tensor] = {}
-    for name, p in model.named_parameters():
-        grads[name] = p.grad.detach().float().cpu() if p.grad is not None else None
+    for name, parameter in model.named_parameters():
+        grad = (
+            parameter.main_grad
+            if getattr(parameter, "grad_added_to_main_grad", False)
+            else parameter.grad
+        )
+        grads[name] = grad.detach().float().cpu() if grad is not None else None
 
     return logits.detach().float().cpu(), grads, peak_bytes
 
@@ -1047,23 +1065,65 @@ def test_partial_offload_warmup_preserves_attention_output(monkeypatch, attentio
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
-    "is_moe, is_mla, offload_modules, activation_offload_fraction, buffer_size_gib",
+    "is_moe, is_mla, offload_modules, activation_offload_fraction, buffer_size_gib, config_overrides",
     [
         # Dense GPT modules
-        (False, True, ["attn_norm"], 1.0, 0.0),
-        (True, False, ["qkv_linear"], 1.0, 0.0),
-        (True, False, ["core_attn"], 1.0, 0.0),
+        (False, True, ["attn_norm"], 1.0, 0.0, None),
+        (True, False, ["qkv_linear"], 1.0, 0.0, None),
+        (True, False, ["core_attn"], 1.0, 0.0, None),
         # # attn_proj depends on core_attn (validated in TransformerConfig.__post_init__)
-        (True, True, ["core_attn", "attn_proj"], 1.0, 0.0),
-        (True, False, ["mlp_norm"], 1.0, 0.0),
-        (True, False, ["expert_fc1"], 1.0, 0.0),
-        (True, False, ["moe_act"], 1.0, 0.0),
+        (True, True, ["core_attn", "attn_proj"], 1.0, 0.0, None),
+        (True, False, ["mlp_norm"], 1.0, 0.0, None),
+        (True, False, ["expert_fc1"], 1.0, 0.0, None),
+        (True, False, ["moe_act"], 1.0, 0.0, None),
         # One eager partial-offload case across attention and MoE groups.
-        (True, False, ["core_attn", "attn_proj", "expert_fc1"], 0.5, 0.0),
+        (True, False, ["core_attn", "attn_proj", "expert_fc1"], 0.5, 0.0, None),
         # Non-power-of-two pinned storage with fixed and variable activation shapes.
-        (False, True, ["attn_norm"], 1.0, 1.5),
-        (True, False, ["moe_act"], 1.0, 1.5),
-        (True, False, ["core_attn", "attn_proj", "expert_fc1"], 1.0, 1.5),
+        (False, True, ["attn_norm"], 1.0, 1.5, None),
+        (True, False, ["moe_act"], 1.0, 1.5, None),
+        (True, False, ["core_attn", "attn_proj", "expert_fc1"], 1.0, 1.5, None),
+        (
+            True,
+            False,
+            ["fused_moe_op"],
+            1.0,
+            0.0,
+            {
+                "moe_megakernel_backend": "te",
+                "expert_model_parallel_size": 2,
+                "expert_tensor_parallel_size": 1,
+                "params_dtype": torch.bfloat16,
+                "gated_linear_unit": True,
+                "activation_func": F.silu,
+                "add_bias_linear": False,
+                "moe_router_dtype": "fp32",
+                "moe_single_grouped_weight": True,
+                "gradient_accumulation_fusion": True,
+                "recompute_modules": ["layernorm"],
+            },
+        ),
+        (
+            True,
+            False,
+            ["fused_moe_op"],
+            1.0,
+            0.0,
+            {
+                "moe_megakernel_backend": "te",
+                "expert_model_parallel_size": 2,
+                "expert_tensor_parallel_size": 1,
+                "params_dtype": torch.bfloat16,
+                "gated_linear_unit": True,
+                "activation_func": F.silu,
+                "add_bias_linear": False,
+                "moe_router_dtype": "fp32",
+                "moe_single_grouped_weight": True,
+                "gradient_accumulation_fusion": True,
+                "recompute_modules": ["layernorm"],
+                "fp8": "e4m3",
+                "fp8_recipe": "mxfp8",
+            },
+        ),
     ],
 )
 def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
@@ -1072,11 +1132,12 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     offload_modules: List[str],
     activation_offload_fraction: float,
     buffer_size_gib: float,
+    config_overrides: Optional[dict],
 ):
     """
     Initialize a GPTModel and verify:
     - forward output correctness under each offload_modules setting
-    - backward gradient correctness (subset)
+    - backward gradient correctness (all parameters)
     - peak GPU memory is reduced roughly as expected (based on recorded offload bytes)
     """
     # setup distributed/model-parallel (same pattern as other UTs)
@@ -1084,7 +1145,16 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     os.environ.pop("NVTE_FLASH_ATTN", None)
     os.environ.pop("NVTE_UNFUSED_ATTN", None)
     # os.environ["NVTE_FLASH_ATTN"] = "1"
-    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    config_overrides = config_overrides or {}
+    expert_parallel_size = config_overrides.get("expert_model_parallel_size", 1)
+    is_te_moe = config_overrides.get("moe_megakernel_backend") == "te"
+    if Utils.world_size % expert_parallel_size:
+        pytest.skip(f"Requires a world size divisible by EP={expert_parallel_size}")
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        expert_model_parallel_size=expert_parallel_size,
+    )
 
     seed = 123
     # Choose shapes large enough to make memory deltas stable but still fast.
@@ -1120,6 +1190,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             offload_modules=None,
             min_offloaded_tensor_size=1024 * 1024,
             is_mla=is_mla,
+            config_overrides=config_overrides,
         ).cuda()
         base_model.train()
         base_params = _capture_params(base_model)
@@ -1157,6 +1228,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             offload_modules=offload_modules,
             min_offloaded_tensor_size=1024,  # force offloading for UT determinism
             is_mla=is_mla,
+            config_overrides=config_overrides,
             activation_offload_fraction=activation_offload_fraction,
             fine_grained_offloading_buffer_size_gib=buffer_size_gib,
         ).cuda()
@@ -1180,6 +1252,8 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
 
         mgr = PipelineOffloadManager.get_instance()
         expected_offload_bytes = _expected_unique_offload_bytes(mgr, offload_modules)
+        if is_te_moe:
+            assert expected_offload_bytes > 0
         expected_offload_mib = expected_offload_bytes / (1024**2)
         pool = mgr.cpu_tensor_pool
         assert pool.uses_fixed_buffer == bool(buffer_size_gib)
@@ -1209,7 +1283,9 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             if gb is None or go is None:
                 assert gb is None and go is None, f"Grad None mismatch for {name}"
                 continue
-            assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), f"Grad mismatch for {name}"
+            torch.testing.assert_close(
+                go, gb, rtol=1e-3, atol=1e-3, msg=lambda message: f"{name}: {message}"
+            )
 
         # 4) Memory checks (peak allocated over forward+backward)
         saved_mib = (base_peak - off_peak) / (1024**2)

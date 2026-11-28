@@ -813,8 +813,7 @@ class TestTransformerConfig:
 
 
 def test_offload_modules_fused_group_mlp_excludes_unfused_expert_knobs():
-    """fused_group_mlp and expert_fc1 + moe_act are equivalent spellings, so combining them is
-    rejected as redundant."""
+    """Native expert offloading rejects redundant selections and the TE-only MoE option."""
     common = dict(
         num_layers=1,
         hidden_size=8,
@@ -828,6 +827,8 @@ def test_offload_modules_fused_group_mlp_excludes_unfused_expert_knobs():
     TransformerConfig(offload_modules=["expert_fc1", "moe_act"], **common)
     with pytest.raises(ValueError, match="cannot be combined with expert_fc1 or moe_act"):
         TransformerConfig(offload_modules=["fused_group_mlp", "moe_act"], **common)
+    with pytest.raises(ValueError, match="requires moe_megakernel_backend='te'"):
+        TransformerConfig(offload_modules=["fused_moe_op"], **common)
 
 
 @requires_te_2_9

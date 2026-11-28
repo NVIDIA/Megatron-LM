@@ -476,7 +476,7 @@ class OffloadTensorGroup:
         # Using memory pool is for the compatibility with cuda graph.
         # Variable MoE shapes bypass the shape/dtype cache. ChunkOffloadHandler
         # overrides this when the pool has fixed byte storage for cross-shape reuse.
-        if name in ("expert_fc1", "moe_act", "fused_group_mlp"):
+        if name in ("expert_fc1", "moe_act", "fused_group_mlp", "fused_moe_op"):
             self.use_cpu_pool = False
         else:
             self.use_cpu_pool = True

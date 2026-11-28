@@ -13,7 +13,16 @@ Contributed in collaboration with RedNote.
 
 Fine-grained activation offloading reduces GPU memory by asynchronously transferring activations to CPU at the granularity of individual submodules within a transformer layer. Unlike layer-level offloading, it allows precise control over which activations to offload, enabling a tradeoff between memory savings and PCIe bandwidth overhead.
 
-Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, and `"shortcut_post_norm"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`.
+Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, `"fused_group_mlp"`, `"fused_moe_op"`, and `"shortcut_post_norm"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `fused_group_mlp` requires `--use-transformer-engine-op-fuser` and offloads the whole fused grouped MLP, so it cannot be combined with `expert_fc1` or `moe_act`. `shortcut_post_norm` requires `--moe-shortcut-connection`.
+
+For the TE MegaMoE backend (`--moe-megakernel-backend te`), use
+`--offload-modules fused_moe_op`. This does not require
+`--use-transformer-engine-op-fuser` or select a particular TE fusion.
+The offload context covers eligible saved activations from dispatch, expert
+computation, and combine; routing and shared experts remain outside it.
+`fused_group_mlp`, `expert_fc1`, and `moe_act` retain their meanings for existing
+grouped-MLP paths and are not accepted for TE MegaMoE expert offloading.
+`fused_moe_op` offloading and `--moe-paged-stash` are mutually exclusive.
 
 ## User Guide
 
@@ -24,13 +33,14 @@ Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `
 --fine-grained-activation-offloading
 
 # Modules whose inputs are offloaded (refer to your training script for list or delimiter syntax).
-# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "shortcut_post_norm".
+# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "fused_moe_op", "shortcut_post_norm".
 --offload-modules core_attn attn_proj expert_fc1
 ```
 
 ### Offloadable Modules
 
-Each module offloads its **input** activation to CPU during forward and reloads it before backward:
+Module input activations, or eligible saved activations for a whole-operation group,
+are offloaded to CPU during forward and reloaded before backward:
 
 | Module | Description | Notes |
 |---|---|---|
@@ -42,6 +52,7 @@ Each module offloads its **input** activation to CPU during forward and reloads 
 | `expert_fc1` | First FC layer in MoE experts | MoE models only |
 | `moe_act` | Activation function in MoE experts | MoE models only |
 | `fused_group_mlp` | Whole fused grouped MLP | Requires `--use-transformer-engine-op-fuser`; cannot be combined with `expert_fc1` or `moe_act` |
+| `fused_moe_op` | Saved activations of the complete TE MoE operation | Requires `--moe-megakernel-backend te`; independent of TE fusion boundaries; excludes routing and shared experts |
 | `shortcut_post_norm` | Shortcut post-combine normalization | Requires `--moe-shortcut-connection` |
 
 When selective `residual_stream` replay is active, its shared checkpoint manager owns the
@@ -102,7 +113,7 @@ from all configured offload modules after those filters.
 ### Fixed Pinned Buffer
 
 By default, fixed-shape groups reuse pinned tensors cached by shape and dtype, while the
-variable-shape MoE groups (`expert_fc1`, `moe_act`, `fused_group_mlp`) allocate from the
+variable-shape MoE groups (`expert_fc1`, `moe_act`, `fused_group_mlp`, `fused_moe_op`) allocate from the
 PyTorch pinned host allocator. That allocator rounds each request up to a power of two and
 keeps freed blocks for reuse, so as routing varies its cache keeps growing and new sizes pin
 more host memory during the step. `--fine-grained-offloading-buffer-size-gib`

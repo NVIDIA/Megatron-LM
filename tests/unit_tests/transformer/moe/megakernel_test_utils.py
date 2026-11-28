@@ -16,7 +16,7 @@ def drop_padding_routes(
     (``MegakernelBackend.forward``). The router keeps padding tokens in its routes and excludes
     them only from its statistics; the backend gives them no routes, so their routed output and
     their probs gradient are zero. The shared expert is separate and not masked here. MOK drops
-    these routes during route compaction (``routing_map_to_mok_inputs`` with ``padding_mask``)
+    these routes during route compaction (``routing_map_to_indices`` with ``padding_mask``)
     without materializing masked copies; the tests compare it with this function.
 
     Args:
