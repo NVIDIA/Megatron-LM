@@ -425,6 +425,7 @@ def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(track_paused_re
             ("non-decode", False),
         ),
         (AsyncScheduleMode.LEGACY, DecodeOnly(consumed=True, launched=True), ("decode", True)),
+        (AsyncScheduleMode.LEGACY, DecodeOnly(consumed=None, launched=None), ("idle", None)),
         (
             AsyncScheduleMode.ASYNC,
             DecodeOnly(consumed=False, launched=False),
