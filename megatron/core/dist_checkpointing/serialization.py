@@ -10,17 +10,15 @@ loading the sharded tensors.
 
 import io
 import logging
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
 
-from megatron.core.msc_utils import maybe_msc
-
 from . import ShardedTensor
-from .core import CheckpointingConfig, save_config
+from .core import CheckpointingConfig, CheckpointingException, save_config
 from .dict_utils import merge
+from .filesystem import resolve_filesystem
 from .mapping import (
     CommonStateDict,
     ShardedObject,
@@ -34,6 +32,9 @@ from .strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
     _get_filesystem_reader,
+    require_nvrx_filesystem_support,
+    strategy_filesystem_kwargs,
+    validate_filesystem_strategy,
 )
 from .utils import (
     extract_sharded_base,
@@ -83,6 +84,8 @@ def load(
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
     verify_integrity: bool = False,
     process_group: Optional[torch.distributed.ProcessGroup] = None,
+    *,
+    filesystem=None,
 ) -> Union[StateDict, Tuple[StateDict, Set[str], Set[str]]]:
     """Loading entrypoint.
 
@@ -120,17 +123,21 @@ def load(
             `verify_integrity=True`.
         process_group (ProcessGroup, optional): ranks that collectively describe
             one complete sharded state dict. Defaults to the global process group.
+        filesystem: DCP-compatible checkpoint filesystem used for all checkpoint I/O.
+            Defaults to local storage, or MSC when its legacy feature flag is enabled.
 
     Returns:
         StateDict or Tuple[StateDict, Set[str], Set[str]]: in most cases only
             the loaded state dict is returned. If `strict` flag was set to
     """
 
-    verify_checkpoint(checkpoint_dir)
-    if verify_integrity:
-        verify_integrity_manifest(checkpoint_dir)
     if sharded_strategy is None:
         sharded_strategy = TorchDistLoadShardedStrategy()
+    strategy_kwargs = strategy_filesystem_kwargs(sharded_strategy, "load", filesystem)
+    filesystem = resolve_filesystem(strategy_kwargs.get("filesystem", filesystem))
+    verify_checkpoint(checkpoint_dir, filesystem=filesystem)
+    if verify_integrity:
+        verify_integrity_manifest(checkpoint_dir, filesystem=filesystem)
 
     # Dequantize all FP8 tensors in the state dict into their corresponding high-precision tensors.
     # Retaining FP8 tensors in the state dict can cause issues in the following two cases:
@@ -161,7 +168,9 @@ def load(
     # Common (non-tensor) data is stored either as a single ShardedObject inside the
     # torch_dist checkpoint (current format) or in a legacy common.pt.
     common_state_dict = load_common_state_dict(
-        checkpoint_dir, cache_metadata=getattr(sharded_strategy, "cache_metadata", False)
+        checkpoint_dir,
+        cache_metadata=getattr(sharded_strategy, "cache_metadata", False),
+        filesystem=filesystem,
     )
     merge(common_state_dict, nonpersistent_state_dict)
 
@@ -173,7 +182,9 @@ def load(
     local_metadata, global_metadata = None, None
     strict = parse_strict_flag(strict)
     if StrictHandling.requires_explicit_ckpt_mismatch_check(strict):
-        ckpt_sharded_metadata = load_sharded_metadata(str(checkpoint_dir), sharded_strategy)
+        ckpt_sharded_metadata = load_sharded_metadata(
+            checkpoint_dir, sharded_strategy, **strategy_kwargs
+        )
         # common_state is an internal format key loaded separately by load_common_state_dict();
         # exclude it so it doesn't surface as a spurious missing key during strict validation.
         ckpt_sharded_metadata = {
@@ -193,7 +204,7 @@ def load(
         ckpt_sharded_metadata,
     )
 
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir)
+    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, **strategy_kwargs)
 
     merge(common_state_dict, loaded_state_dict)
 
@@ -205,14 +216,14 @@ def load(
         return common_state_dict
 
 
-def _legacy_common_state_exists(checkpoint_dir: str) -> bool:
+def _legacy_common_state_exists(checkpoint_dir: str, *, filesystem) -> bool:
     """Check whether the checkpoint stores common data in a legacy common.pt file."""
-    path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
-    return maybe_msc.Path(path).exists()
+    path = filesystem.concat_path(checkpoint_dir, COMMON_STATE_FNAME)
+    return filesystem.exists(path)
 
 
 def load_common_state_dict(
-    checkpoint_dir: Union[str, Path], cache_metadata: bool = False
+    checkpoint_dir: Union[str, Path], cache_metadata: bool = False, *, filesystem=None
 ) -> StateDict:
     """Load common (non-sharded) objects state dict from the checkpoint.
 
@@ -231,17 +242,20 @@ def load_common_state_dict(
         StateDict: state dict with non-sharded objects from the checkpoint
     """
 
-    verify_checkpoint(str(checkpoint_dir))
+    filesystem = resolve_filesystem(filesystem)
+    verify_checkpoint(checkpoint_dir, filesystem=filesystem)
 
     # Legacy checkpoints keep common data in a separate common.pt file.
-    if _legacy_common_state_exists(checkpoint_dir):
-        return load_common(checkpoint_dir)
+    if _legacy_common_state_exists(checkpoint_dir, filesystem=filesystem):
+        return load_common(checkpoint_dir, filesystem=filesystem)
 
     unique_key = ShardedObject("common_state", None, (1,), (0,)).unique_key
     pyt_state_dict = {unique_key: io.BytesIO()}
     torch.distributed.checkpoint.load(
         pyt_state_dict,
-        storage_reader=_get_filesystem_reader(checkpoint_dir, cache_metadata=cache_metadata),
+        storage_reader=_get_filesystem_reader(
+            checkpoint_dir, cache_metadata=cache_metadata, filesystem=filesystem
+        ),
         no_dist=True,
     )
 
@@ -253,7 +267,7 @@ def load_common_state_dict(
 
 
 def load_tensors_metadata(
-    checkpoint_dir: str, sharded_strategy: TorchDistLoadShardedStrategy = None
+    checkpoint_dir: str, sharded_strategy: TorchDistLoadShardedStrategy = None, *, filesystem=None
 ) -> CkptShardedMetadata:
     """Load tensors metadata from the checkpoint.
 
@@ -277,14 +291,18 @@ def load_tensors_metadata(
         CkptShardedMetadata: flat state dict without data describing ShardedTensors
             in the checkpoint
     """
-    verify_checkpoint(checkpoint_dir)
     if sharded_strategy is None:
         sharded_strategy = TorchDistLoadShardedStrategy()
-    return sharded_strategy.load_tensors_metadata(Path(checkpoint_dir))
+    strategy_kwargs = strategy_filesystem_kwargs(
+        sharded_strategy, "load_tensors_metadata", filesystem
+    )
+    filesystem = resolve_filesystem(strategy_kwargs.get("filesystem", filesystem))
+    verify_checkpoint(checkpoint_dir, filesystem=filesystem)
+    return sharded_strategy.load_tensors_metadata(checkpoint_dir, **strategy_kwargs)
 
 
 def load_sharded_metadata(
-    checkpoint_dir: str, sharded_strategy: TorchDistLoadShardedStrategy = None
+    checkpoint_dir: str, sharded_strategy: TorchDistLoadShardedStrategy = None, *, filesystem=None
 ) -> CkptShardedMetadata:
     """Load sharded metadata from the checkpoint.
 
@@ -310,14 +328,18 @@ def load_sharded_metadata(
         CkptShardedMetadata: flat state dict without data describing ShardedTensors
             and ShardedObjects in the checkpoint
     """
-    verify_checkpoint(checkpoint_dir)
     if sharded_strategy is None:
         sharded_strategy = TorchDistLoadShardedStrategy()
-    sharded_metadata = sharded_strategy.load_sharded_metadata(checkpoint_dir)
+    strategy_kwargs = strategy_filesystem_kwargs(
+        sharded_strategy, "load_sharded_metadata", filesystem
+    )
+    filesystem = resolve_filesystem(strategy_kwargs.get("filesystem", filesystem))
+    verify_checkpoint(checkpoint_dir, filesystem=filesystem)
+    sharded_metadata = sharded_strategy.load_sharded_metadata(checkpoint_dir, **strategy_kwargs)
     return sharded_metadata
 
 
-def load_plain_tensors(checkpoint_dir: str) -> StateDict:
+def load_plain_tensors(checkpoint_dir: str, *, filesystem=None) -> StateDict:
     """Load checkpoint tensors without any sharding and plain structure.
 
     NOTE: common state dict is NOT included.
@@ -328,14 +350,20 @@ def load_plain_tensors(checkpoint_dir: str) -> StateDict:
     Returns:
         StateDict: checkpoint state dict containing only torch.Tensors.
     """
-    sharded_state_dict = load_tensors_metadata(checkpoint_dir)
+    filesystem = resolve_filesystem(filesystem)
+    sharded_state_dict = load_tensors_metadata(checkpoint_dir, filesystem=filesystem)
     # Don't validate integrity because shards will be overlapped
     # if world_size > 1 (all processes load whole tensors)
-    return load(sharded_state_dict, checkpoint_dir, validate_access_integrity=False)
+    return load(
+        sharded_state_dict, checkpoint_dir, validate_access_integrity=False, filesystem=filesystem
+    )
 
 
 def load_content_metadata(
-    checkpoint_dir: Optional[str] = None, *, preloaded_state_dict: Optional[StateDict] = None
+    checkpoint_dir: Optional[str] = None,
+    *,
+    preloaded_state_dict: Optional[StateDict] = None,
+    filesystem=None,
 ) -> Optional[dict]:
     """Load content metadata stored in the checkpoint with `save(..., content_metadata=...)`.
 
@@ -351,14 +379,17 @@ def load_content_metadata(
     if preloaded_state_dict is None:
         if checkpoint_dir is None:
             raise ValueError('Both checkpoint_dir and loaded_state_dict cannot be None')
-        preloaded_state_dict = load_common_state_dict(checkpoint_dir)
+        preloaded_state_dict = load_common_state_dict(checkpoint_dir, filesystem=filesystem)
     return preloaded_state_dict.get(_CONTENT_METADATA_KEY)
 
 
-def remove_sharded_tensors(checkpoint_dir: str, key_prefix: str):
+def remove_sharded_tensors(checkpoint_dir: str, key_prefix: str, *, filesystem=None):
     """determine the appropriate sharding strategy and delegate removal to the sharded strategy"""
-    verify_checkpoint(checkpoint_dir)
-    TorchDistLoadShardedStrategy().remove_sharded_tensors(checkpoint_dir, key_prefix)
+    filesystem = resolve_filesystem(filesystem)
+    verify_checkpoint(checkpoint_dir, filesystem=filesystem)
+    TorchDistLoadShardedStrategy().remove_sharded_tensors(
+        checkpoint_dir, key_prefix, filesystem=filesystem
+    )
 
 
 def save(
@@ -372,6 +403,8 @@ def save(
     ] = None,
     content_metadata: Optional[dict] = None,
     verify_integrity: bool = False,
+    *,
+    filesystem=None,
 ) -> Optional[AsyncRequest]:
     """Saving entrypoint.
 
@@ -420,6 +453,8 @@ def save(
             later be verified on load with `load(..., verify_integrity=True)`.
             Adds I/O overhead proportional to the total checkpoint size (one extra
             read pass over all files on rank 0).
+        filesystem: DCP-compatible checkpoint filesystem used for all checkpoint I/O.
+            An explicit filesystem takes precedence over the legacy MSC flag.
 
     Returns:
         AsyncRequest (optional): if `async_sharded_save` is True, returns
@@ -428,20 +463,30 @@ def save(
     """
     from .strategies.fully_parallel import FullyParallelSaveStrategyWrapper
 
-    if torch.distributed.get_rank() == 0:
-        checkpoint_dir_path = maybe_msc.Path(str(checkpoint_dir))
-
-        if next(checkpoint_dir_path.iterdir(), None) is not None:
-            # Don't throw exception here since this could cause a cascade of failures
-            # without human intervention in cases where multiple jobs are queued up.
-            if torch.distributed.get_rank() == 0:
-                logger.warning("Overwriting old incomplete / corrupted checkpoint...")
-
+    if filesystem is not None:
+        if sharded_strategy is not None:
+            validate_filesystem_strategy(
+                sharded_strategy, "async_save" if async_sharded_save else "save"
+            )
+        if async_sharded_save:
+            require_nvrx_filesystem_support()
     if not (
         isinstance(sharded_strategy, TorchDistSaveShardedStrategy)
         or isinstance(sharded_strategy, FullyParallelSaveStrategyWrapper)
     ):
         sharded_strategy = TorchDistSaveShardedStrategy()
+
+    strategy_kwargs = strategy_filesystem_kwargs(
+        sharded_strategy, "async_save" if async_sharded_save else "save", filesystem
+    )
+    filesystem = resolve_filesystem(strategy_kwargs.get("filesystem", filesystem))
+
+    def check_directory():
+        if filesystem.exists(checkpoint_dir):
+            if next(iter(filesystem.listdir(checkpoint_dir)), None) is not None:
+                logger.warning("Overwriting old incomplete / corrupted checkpoint...")
+
+    _run_on_rank_zero(check_directory)
 
     if content_metadata is not None:
         sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata
@@ -459,27 +504,39 @@ def save(
     )
 
     def metadata_finalize_fn():
-        if torch.distributed.get_rank() == 0:
-            save_config(
-                CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
-                checkpoint_dir,
-            )
-        torch.distributed.barrier()
+        _run_on_rank_zero(
+            save_config,
+            CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
+            checkpoint_dir,
+            filesystem=filesystem,
+        )
 
     def integrity_finalize_fn():
-        if torch.distributed.get_rank() == 0:
-            save_integrity_manifest(checkpoint_dir)
-        torch.distributed.barrier()
+        _run_on_rank_zero(save_integrity_manifest, checkpoint_dir, filesystem=filesystem)
 
     if not async_sharded_save:
-        sharded_strategy.save(sharded_state_dict, checkpoint_dir)
+        sharded_strategy.save(sharded_state_dict, checkpoint_dir, **strategy_kwargs)
         metadata_finalize_fn()
         if verify_integrity:
             integrity_finalize_fn()
         return None
 
-    async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir)
+    async_request = sharded_strategy.async_save(
+        sharded_state_dict, checkpoint_dir, **strategy_kwargs
+    )
     async_request.finalize_fns.append(metadata_finalize_fn)
     if verify_integrity:
         async_request.finalize_fns.append(integrity_finalize_fn)
     return async_request
+
+
+def _run_on_rank_zero(function, *args, **kwargs):
+    error = [None]
+    if torch.distributed.get_rank() == 0:
+        try:
+            function(*args, **kwargs)
+        except Exception as exc:
+            error[0] = f"{type(exc).__name__}: {exc}"
+    torch.distributed.broadcast_object_list(error, src=0)
+    if error[0] is not None:
+        raise CheckpointingException(error[0])

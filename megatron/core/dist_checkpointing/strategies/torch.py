@@ -5,7 +5,6 @@
 import dataclasses
 import inspect
 import io
-import os
 import pickle
 import warnings
 from collections import ChainMap, defaultdict
@@ -45,6 +44,14 @@ from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
 from ..core import CheckpointingException
 from ..dict_utils import nested_values
+from ..filesystem import (
+    create_write_stream,
+    is_default_filesystem,
+    is_msc_filesystem,
+    make_filesystem_reader,
+    make_filesystem_writer,
+    resolve_filesystem,
+)
 from ..mapping import (
     ShardedBase,
     ShardedObject,
@@ -83,8 +90,6 @@ try:
     HAVE_DTENSOR = True
 except ImportError:
     HAVE_DTENSOR = False
-
-from megatron.core.msc_utils import MultiStorageClientFeature
 
 MSC_PREFIX = "msc://"
 
@@ -791,7 +796,7 @@ class TorchDistSaveShardedStrategy:
 
         self.validated_loaded_metadata_reuse = False
 
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path, *, filesystem=None):
         """Sync save always uses PyTorch's built-in synchronous saving mechanism.
 
         Unlike `async_save`, this doesn't touch any nvrx (or mcore) async modules,
@@ -811,7 +816,9 @@ class TorchDistSaveShardedStrategy:
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, False)
 
-        writer = _get_filesystem_writer(checkpoint_dir, thread_count=self.thread_count)
+        writer = _get_filesystem_writer(
+            checkpoint_dir, thread_count=self.thread_count, filesystem=filesystem
+        )
 
         checkpoint.save(
             pyt_state_dict,
@@ -824,7 +831,7 @@ class TorchDistSaveShardedStrategy:
         )
 
     def async_save(
-        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path
+        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path, *, filesystem=None
     ) -> AsyncRequest:
         """Translates MCore ShardedTensors to PyT ShardedTensors & saves in PyT Distributed format.
 
@@ -834,6 +841,9 @@ class TorchDistSaveShardedStrategy:
 
         Returns: None
         """
+        filesystem = resolve_filesystem(filesystem)
+        if not is_default_filesystem(filesystem):
+            require_nvrx_filesystem_support()
         if HAVE_NVRX:
             # Import needed nvrx modules
             from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (  # pylint: disable=line-too-long
@@ -882,11 +892,14 @@ class TorchDistSaveShardedStrategy:
             state_dict_saver_kwargs["metadata_cache"] = self._metadata_cache
 
             # Use PyT saving mechanism
+            if "filesystem" in inspect.signature(FileSystemWriterAsync.__init__).parameters:
+                async_writer_kwargs["filesystem"] = filesystem
+            else:
+                async_writer_kwargs["use_msc"] = is_msc_filesystem(filesystem)
             writer = FileSystemWriterAsync(
                 checkpoint_dir,
                 separation_hint=self.separation_hint,
                 thread_count=self.thread_count,
-                use_msc=MultiStorageClientFeature.is_enabled(),
                 **async_writer_kwargs,
             )
 
@@ -932,38 +945,77 @@ class TorchDistSaveShardedStrategy:
 
 
 def _get_filesystem_writer(
-    checkpoint_dir: Union[str, Path], thread_count: int = 1
+    checkpoint_dir: Union[str, Path], thread_count: int = 1, *, filesystem=None
 ) -> FileSystemWriter:
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        return msc.torch.MultiStorageFileSystemWriter(checkpoint_dir, thread_count=thread_count)
-
-    return FileSystemWriter(checkpoint_dir, thread_count=thread_count)
+    return make_filesystem_writer(
+        checkpoint_dir, resolve_filesystem(filesystem), thread_count=thread_count
+    )
 
 
 def _get_filesystem_reader(
-    checkpoint_dir: Union[str, Path], cache_metadata: bool = False
+    checkpoint_dir: Union[str, Path], cache_metadata: bool = False, *, filesystem=None
 ) -> FileSystemReader:
-    if MultiStorageClientFeature.is_enabled():
-        msc = MultiStorageClientFeature.import_package()
-        if cache_metadata:
-            warnings.warn(
-                "MSC is enabled: returning msc.torch.MultiStorageFileSystemReader instead of "
-                "CachedMetadataFileSystemReader. The cache_metadata=True request "
-                "(e.g. ckpt_assume_constant_structure=True) will be ignored and metadata "
-                "will be re-read on every load. Pass --enable-msc only when this is intended.",
-                stacklevel=2,
-            )
-        return msc.torch.MultiStorageFileSystemReader(checkpoint_dir, thread_count=2)
-
+    filesystem = resolve_filesystem(filesystem)
     if cache_metadata:
         from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
             CachedMetadataFileSystemReader,
         )
 
-        return CachedMetadataFileSystemReader(checkpoint_dir, cache_metadata=cache_metadata)
+        if "filesystem" in inspect.signature(CachedMetadataFileSystemReader.__init__).parameters:
+            return CachedMetadataFileSystemReader(checkpoint_dir, filesystem=filesystem)
+        if not is_default_filesystem(filesystem):
+            raise RuntimeError(
+                "Installed nvidia-resiliency-ext does not support filesystem injection in "
+                "cached readers. Update nvidia-resiliency-ext or disable cache_metadata."
+            )
+        if not is_msc_filesystem(filesystem):
+            return CachedMetadataFileSystemReader(checkpoint_dir)
+        warnings.warn(
+            "Installed nvidia-resiliency-ext cannot cache MSC metadata; cache_metadata is ignored.",
+            stacklevel=2,
+        )
+    return make_filesystem_reader(checkpoint_dir, filesystem)
 
-    return FileSystemReader(checkpoint_dir)
+
+def require_nvrx_filesystem_support():
+    """Reject unsupported async injection before checkpoint preparation changes state."""
+    if HAVE_NVRX:
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
+            FileSystemWriterAsync,
+        )
+
+        if "filesystem" in inspect.signature(FileSystemWriterAsync.__init__).parameters:
+            return
+    raise RuntimeError(
+        "Async checkpoint filesystem injection requires a newer nvidia-resiliency-ext. "
+        "Install a version whose FileSystemWriterAsync accepts filesystem."
+    )
+
+
+def validate_filesystem_strategy(strategy, method):
+    """Check the strategy chain before an injected save or load mutates state."""
+    from .fully_parallel import FullyParallelLoadStrategyWrapper, FullyParallelSaveStrategyWrapper
+
+    if isinstance(strategy, (FullyParallelLoadStrategyWrapper, FullyParallelSaveStrategyWrapper)):
+        validate_filesystem_strategy(strategy.base_strategy, method)
+    elif not isinstance(strategy, (TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy)):
+        raise TypeError("Filesystem injection requires a torch_dist checkpoint strategy")
+    implementation = getattr(strategy, method, None)
+    if implementation is None or "filesystem" not in inspect.signature(implementation).parameters:
+        raise TypeError(f"{type(strategy).__name__}.{method} does not accept filesystem")
+    if method == "load_sharded_metadata":
+        validate_filesystem_strategy(strategy, "load_tensors_metadata")
+
+
+def strategy_filesystem_kwargs(strategy, method, filesystem=None):
+    """Preserve legacy strategy signatures only when no filesystem was supplied."""
+    try:
+        validate_filesystem_strategy(strategy, method)
+    except TypeError:
+        if filesystem is not None:
+            raise
+        return {}
+    return {"filesystem": resolve_filesystem(filesystem)}
 
 
 class TorchDistLoadShardedStrategy:
@@ -986,7 +1038,9 @@ class TorchDistLoadShardedStrategy:
         # enable it.
         self.stream_ckpt_dequant = stream_ckpt_dequant
 
-    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+    def load(
+        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path, *, filesystem=None
+    ) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
 
         Args:
@@ -1014,7 +1068,9 @@ class TorchDistLoadShardedStrategy:
         )
         pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
         # Load PyT Distributed format
-        fsr = _get_filesystem_reader(checkpoint_dir, cache_metadata=self.cache_metadata)
+        fsr = _get_filesystem_reader(
+            checkpoint_dir, cache_metadata=self.cache_metadata, filesystem=filesystem
+        )
         checkpoint.load(
             pyt_state_dict,
             fsr,
@@ -1044,10 +1100,14 @@ class TorchDistLoadShardedStrategy:
         _restore_dict_types(mcore_state_dict, orig_sharded_state_dict)
         return mcore_state_dict
 
-    def load_tensors_metadata(self, checkpoint_dir: Path, metadata: Metadata = None):
+    def load_tensors_metadata(
+        self, checkpoint_dir: Path, metadata: Metadata = None, *, filesystem=None
+    ):
         """Uses tensors metadata stored in the metadata file."""
         if metadata is None:
-            fs_reader = _get_filesystem_reader(checkpoint_dir, cache_metadata=self.cache_metadata)
+            fs_reader = _get_filesystem_reader(
+                checkpoint_dir, cache_metadata=self.cache_metadata, filesystem=filesystem
+            )
             metadata = fs_reader.read_metadata()
 
         mcore_data = getattr(metadata, 'mcore_data', {})
@@ -1062,9 +1122,13 @@ class TorchDistLoadShardedStrategy:
             ).without_data()
         return sharded_metadata
 
-    def load_sharded_metadata(self, checkpoint_dir: Path) -> ShardedStateDict:
+    def load_sharded_metadata(self, checkpoint_dir: Path, *, filesystem=None) -> ShardedStateDict:
         """Uses tensors and objects metadata stored in the metadata file."""
-        fs_reader = _get_filesystem_reader(checkpoint_dir, cache_metadata=self.cache_metadata)
+        metadata_kwargs = strategy_filesystem_kwargs(self, "load_tensors_metadata", filesystem)
+        filesystem = resolve_filesystem(metadata_kwargs.get("filesystem", filesystem))
+        fs_reader = _get_filesystem_reader(
+            checkpoint_dir, cache_metadata=self.cache_metadata, filesystem=filesystem
+        )
         metadata = fs_reader.read_metadata()
 
         sharded_metadata = {}
@@ -1074,10 +1138,12 @@ class TorchDistLoadShardedStrategy:
             sh_obj = ShardedObject.empty_from_unique_key(metadata_key)
             sharded_metadata[sh_obj.unique_key] = sh_obj
 
-        sharded_metadata.update(self.load_tensors_metadata(checkpoint_dir, metadata))
+        sharded_metadata.update(
+            self.load_tensors_metadata(checkpoint_dir, metadata, **metadata_kwargs)
+        )
         return sharded_metadata
 
-    def remove_sharded_tensors(self, checkpoint_dir: str, key_prefix: str):
+    def remove_sharded_tensors(self, checkpoint_dir: str, key_prefix: str, *, filesystem=None):
         """Removes checkpoint files whose keys have the given prefix.
 
         Performs the following steps:
@@ -1093,7 +1159,8 @@ class TorchDistLoadShardedStrategy:
             "2.3.0"
         ), f'torch >= 2.3.0 is required for remove_sharded_tensors'
 
-        distckpt_files = [f for f in os.listdir(checkpoint_dir) if f.endswith("distcp")]
+        filesystem = resolve_filesystem(filesystem)
+        distckpt_files = [f for f in filesystem.listdir(checkpoint_dir) if f.endswith("distcp")]
         files_to_remove = [f for f in distckpt_files if f.startswith(key_prefix)]
 
         if not files_to_remove:
@@ -1103,7 +1170,7 @@ class TorchDistLoadShardedStrategy:
             )
             return
 
-        fs_reader = FileSystemReader(checkpoint_dir)
+        fs_reader = _get_filesystem_reader(checkpoint_dir, filesystem=filesystem)
         original_metadata = fs_reader.read_metadata()
 
         new_state_dict_metadata = {}
@@ -1130,34 +1197,34 @@ class TorchDistLoadShardedStrategy:
             planner_data=new_planner_data,
             storage_data=new_storage_data,
         )
-        fs_writer = FileSystemWriter(checkpoint_dir)
-        metadata_filename = cast(Path, fs_writer.fs.concat_path(fs_writer.path, _metadata_fn))
-        tmp_path = cast(
-            metadata_filename,  # type: ignore[valid-type]
-            fs_writer.fs.concat_path(fs_writer.path, f"{_metadata_fn}.tmp"),
-        )
-        old_path = cast(
-            metadata_filename,  # type: ignore[valid-type]
-            fs_writer.fs.concat_path(fs_writer.path, f"{_metadata_fn}.bck"),
-        )
+        metadata_filename = filesystem.concat_path(checkpoint_dir, _metadata_fn)
+        tmp_path = filesystem.concat_path(checkpoint_dir, f"{_metadata_fn}.tmp")
+        old_path = filesystem.concat_path(checkpoint_dir, f"{_metadata_fn}.bck")
         ## save the new metadata
-        with fs_writer.fs.create_stream(tmp_path, "wb") as metadata_file:
+        with create_write_stream(filesystem, tmp_path) as metadata_file:
             pickle.dump(metadata, metadata_file)
-            try:
-                os.fsync(metadata_file.fileno())
-            except AttributeError:
-                os.sync()
         ## move the old metadata
-        fs_writer.fs.rename(metadata_filename, old_path)
+        filesystem.rename(metadata_filename, old_path)
         try:
             ## rename the new metadata
-            fs_writer.fs.rename(tmp_path, metadata_filename)
+            filesystem.rename(tmp_path, metadata_filename)
 
             ## finally, remove the files we want to drop
             for f in files_to_remove:
-                fs_writer.fs.rm_file(Path(checkpoint_dir) / f)
+                filesystem.rm_file(filesystem.concat_path(checkpoint_dir, f))
         except Exception as e:
-            fs_writer.fs.rename(old_path, metadata_filename)
+            filesystem.rename(old_path, metadata_filename)
             raise e
         else:
-            fs_writer.fs.rm_file(old_path)
+            filesystem.rm_file(old_path)
+            try:
+                from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
+                    CachedMetadataFileSystemReader,
+                )
+            except ModuleNotFoundError:
+                return
+            clear_cache = CachedMetadataFileSystemReader.clear_metadata_cache
+            if "filesystem" in inspect.signature(clear_cache).parameters:
+                clear_cache(checkpoint_dir, filesystem=filesystem)
+            else:
+                clear_cache(checkpoint_dir)

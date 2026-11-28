@@ -1,14 +1,13 @@
 # Copyright (c) 2022-2023, NVIDIA CORPORATION.  All rights reserved.
 
-""" Module for managing distributed checkpoints metadata. """
+"""Module for managing distributed checkpoints metadata."""
 
 import dataclasses
 import json
-import os
 from dataclasses import asdict, dataclass
 from typing import Optional
 
-from megatron.core.msc_utils import maybe_msc
+from .filesystem import create_write_stream, resolve_filesystem
 
 CONFIG_FNAME = 'metadata.json'
 
@@ -34,7 +33,7 @@ class CheckpointingConfig:
     sharded_backend_version: int = 1
 
 
-def check_is_distributed_checkpoint(checkpoint_dir):
+def check_is_distributed_checkpoint(checkpoint_dir, *, filesystem=None):
     """Checks if `metadata.json` exists in the checkpoint and is a valid config.
 
     Args:
@@ -43,10 +42,10 @@ def check_is_distributed_checkpoint(checkpoint_dir):
     Returns:
         bool: True if `metadata.json` exists in the checkpoint and is a valid config.
     """
-    return maybe_load_config(checkpoint_dir) is not None
+    return maybe_load_config(checkpoint_dir, filesystem=filesystem) is not None
 
 
-def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:
+def maybe_load_config(checkpoint_dir: str, *, filesystem=None) -> Optional[CheckpointingConfig]:
     """Returns checkpoint config if `checkpoint_dir` is a distributed checkpoint and None otherwise
 
     Args:
@@ -55,18 +54,19 @@ def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:
     Returns:
         CheckpointingConfig (optional): None if checkpoint is not a valid distributed checkpoint
     """
-    config_path = os.path.join(checkpoint_dir, CONFIG_FNAME)
+    filesystem = resolve_filesystem(filesystem)
     if checkpoint_dir:
-        if not maybe_msc.os.path.exists(config_path):
+        config_path = filesystem.concat_path(checkpoint_dir, CONFIG_FNAME)
+        if not filesystem.exists(config_path):
             return None
-        with maybe_msc.open(config_path) as f:
-            config_dict = json.load(f)
+        with filesystem.create_stream(config_path, "rb") as f:
+            config_dict = json.loads(f.read().decode("utf-8"))
         known_fields = {f.name for f in dataclasses.fields(CheckpointingConfig)}
         return CheckpointingConfig(**{k: v for k, v in config_dict.items() if k in known_fields})
     return None
 
 
-def save_config(config: CheckpointingConfig, checkpoint_dir: str):
+def save_config(config: CheckpointingConfig, checkpoint_dir: str, *, filesystem=None):
     """Save given config to checkpoint directory.
 
     Args:
@@ -76,6 +76,7 @@ def save_config(config: CheckpointingConfig, checkpoint_dir: str):
     Returns:
         None
     """
-    config_path = os.path.join(checkpoint_dir, CONFIG_FNAME)
-    with maybe_msc.open(config_path, 'w') as f:
-        json.dump(asdict(config), f)
+    filesystem = resolve_filesystem(filesystem)
+    config_path = filesystem.concat_path(checkpoint_dir, CONFIG_FNAME)
+    with create_write_stream(filesystem, config_path) as f:
+        f.write(json.dumps(asdict(config)).encode("utf-8"))
