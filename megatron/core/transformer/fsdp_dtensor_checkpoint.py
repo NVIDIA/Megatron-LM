@@ -213,6 +213,144 @@ def expert_param_local_key(key: str, num_experts: int | None = None) -> str:
     return key
 
 
+# A ``layers.<index>.`` path segment, at the start of a path or after a ``.``.
+_LAYER_INDEX_SEGMENT = re.compile(r'(?<![^.])layers\.\d+\.')
+
+
+def _rename_layer_prefix(path, prefix_map):
+    """Rewrite the longest ``...layers.<index>.`` prefix of ``path`` found in ``prefix_map``."""
+    longest = None
+    for match in _LAYER_INDEX_SEGMENT.finditer(path):
+        if path[: match.end()] in prefix_map:
+            longest = path[: match.end()]
+    if longest is None:
+        return path
+    return prefix_map[longest] + path[len(longest) :]
+
+
+def _rename_pp_layer_key(key, prefix_map):
+    """Rename the layer prefix of a state dict ``key``, keeping its wrapper prefix."""
+    path = _strip_wrapper_prefixes(key)
+    return key[: len(key) - len(path)] + _rename_layer_prefix(path, prefix_map)
+
+
+def get_pp_global_layer_prefixes(model):
+    """Map this pipeline stage's local layer key prefixes to the global ones used on disk.
+
+    ``TransformerBlock``, ``HybridStack`` and ``MultiTokenPredictionBlock`` hold only the
+    layers of their own pipeline stage, so ``state_dict()`` and ``named_parameters()`` number
+    them from 0 on every stage. Their ``sharded_state_dict`` stores entry ``i`` of the
+    ``layers`` list under ``layers.<layer_number - 1>.`` instead; this applies the same rule
+    to the plain module paths used by ``fsdp_dtensor`` checkpoints. A nested ``layers`` list
+    is renamed under its already renamed parent.
+
+    Args:
+        model: The model, possibly wrapped in ``module.``/``model.`` wrappers.
+
+    Returns:
+        dict: ``'<path>.layers.<local index>.'`` to ``'<path>.layers.<layer_number - 1>.'``,
+        both without wrapper prefixes, for every layer whose two names differ. Empty without
+        pipeline parallelism.
+    """
+    prefix_map = {}
+    # Parents are visited before their children, so a nested list sees its parent's rename.
+    for name, module in model.named_modules():
+        layers = getattr(module, 'layers', None)
+        if not isinstance(layers, torch.nn.ModuleList):
+            continue
+        path = _strip_wrapper_prefixes(name)
+        parent = _rename_layer_prefix(f'{path}.', prefix_map) if path else ''
+        local_base = f'{path}.layers.' if path else 'layers.'
+        global_base = f'{parent}layers.'
+        for local_index, layer in enumerate(layers):
+            layer_number = getattr(layer, 'layer_number', None)
+            if not isinstance(layer_number, int) or isinstance(layer_number, bool):
+                continue
+            local_prefix = f'{local_base}{local_index}.'
+            global_prefix = f'{global_base}{layer_number - 1}.'
+            if global_prefix != local_prefix:
+                prefix_map[local_prefix] = global_prefix
+    return prefix_map
+
+
+def rename_pp_layer_keys(state_dict, prefix_map):
+    """Rename the layer prefixes of ``state_dict``'s keys, keeping each key's wrapper prefix.
+
+    Args:
+        state_dict (dict): Mapping keyed by state dict or parameter names.
+        prefix_map (dict): Layer prefix mapping without wrapper prefixes, e.g. from
+            :func:`get_pp_global_layer_prefixes` or its inverse.
+
+    Returns:
+        dict: A renamed copy of ``state_dict``.
+
+    Raises:
+        CheckpointingException: If two keys are renamed to the same name.
+    """
+    renamed = {}
+    for key, value in state_dict.items():
+        new_key = key
+        if prefix_map and isinstance(key, str):
+            new_key = _rename_pp_layer_key(key, prefix_map)
+        if new_key in renamed:
+            raise CheckpointingException(
+                f"Pipeline-parallel layer renaming maps two state dict entries to {new_key!r}."
+            )
+        renamed[new_key] = value
+    return renamed
+
+
+def handle_pp_layers_in_state_dict(model, model_state_dict, optimizer_state_dict):
+    """Rename stage-local layer keys to the global layer indices used on disk.
+
+    Each pipeline stage numbers its own layers from 0, so without this every stage saves
+    ``layers.0``, ``layers.1``, ...: Torch DCP keeps a single copy of each colliding key as
+    if it were replicated, and a load at another pipeline-parallel size restores the wrong
+    layers. Keys are renamed by :func:`get_pp_global_layer_prefixes`, matching
+    ``sharded_state_dict`` and therefore ``torch_dist`` checkpoints.
+
+    Must run after the handlers that resolve keys against live module paths, which are
+    stage-local. Optimizer state is expected in the stage-local naming produced by
+    :func:`localize_pp_layers_in_optimizer_state_dict`.
+
+    No-op without pipeline parallelism.
+    """
+    prefix_map = get_pp_global_layer_prefixes(model)
+    if not prefix_map:
+        return model_state_dict, optimizer_state_dict
+
+    model_state_dict = rename_pp_layer_keys(model_state_dict, prefix_map)
+    if optimizer_state_dict is not None and len(optimizer_state_dict.get("state", {})) != 0:
+        optimizer_state_dict = optimizer_state_dict.copy()
+        optimizer_state_dict["state"] = rename_pp_layer_keys(
+            optimizer_state_dict["state"], prefix_map
+        )
+    return model_state_dict, optimizer_state_dict
+
+
+def localize_pp_layers_in_optimizer_state_dict(model, model_state_dict, optimizer_state_dict):
+    """Rename global layer indices in optimizer state keys to stage-local ones.
+
+    Optimizer FQNs are globally unique (see :func:`get_global_unique_param_name`), while the
+    state dict handlers resolve keys against live, stage-local module paths. This runs before
+    them; :func:`handle_pp_layers_in_state_dict` renames the keys back to global afterwards.
+
+    No-op without pipeline parallelism.
+    """
+    prefix_map = get_pp_global_layer_prefixes(model)
+    if (
+        not prefix_map
+        or optimizer_state_dict is None
+        or len(optimizer_state_dict.get("state", {})) == 0
+    ):
+        return model_state_dict, optimizer_state_dict
+
+    inverse_map = {global_prefix: local for local, global_prefix in prefix_map.items()}
+    optimizer_state_dict = optimizer_state_dict.copy()
+    optimizer_state_dict["state"] = rename_pp_layer_keys(optimizer_state_dict["state"], inverse_map)
+    return model_state_dict, optimizer_state_dict
+
+
 def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     """
     Handle SWiGLU in model and optimizer state dicts.
@@ -996,7 +1134,9 @@ def validate_fsdp_dtensor_model_load(
         "because of a fused vs. unfused module variant or a renamed submodule. "
         "fsdp_dtensor checkpoints bypass sharded_state_dict(), so key remapping "
         "implemented there does not apply; add the mapping to "
-        "preprocess_fsdp_dtensor_state_dict instead."
+        "preprocess_fsdp_dtensor_state_dict instead. A checkpoint saved with pipeline "
+        "parallelism before its layer keys used global layer indices also fails here; such "
+        "checkpoints lost layers to key collisions when saved and cannot be loaded."
     )
 
     if strict in (
@@ -1075,21 +1215,13 @@ def get_global_unique_param_name(model_chunks, param):
             if p is param:
                 param_name = name
                 break
+        if param_name is not None:
+            break
     if param_name is None:
         raise ValueError("Parameter not found in model chunks")
 
-    # Get PP unique parameter name
-    if re.search(r"layers\.(\d+)", param_name) and "mtp" not in param_name:
-        tf_layer_number = -1
-        for module in model.modules():
-            if not isinstance(module, TransformerLayer):
-                continue
-            for p in module.parameters():
-                if p is param:
-                    tf_layer_number = module.layer_number
-                    break
-        if tf_layer_number != -1:
-            param_name = re.sub(r"layers\.(\d+)", f"layers.{tf_layer_number - 1}", param_name)
+    # Get PP unique parameter name, with the global layer indices of the model state dict.
+    param_name = _rename_pp_layer_key(param_name, get_pp_global_layer_prefixes(model))
 
     # Get EP unique parameter name
     num_experts = model_chunks[0].config.num_moe_experts if model_chunks else None
