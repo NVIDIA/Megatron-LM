@@ -404,7 +404,7 @@ def validate_sharding_integrity(
 
 
 def _validate_sharding_for_key(
-    rank_sharding: List[Tuple[int, ShardedTensor]]
+    rank_sharding: List[Tuple[int, ShardedTensor]],
 ) -> List[CheckpointingException]:
     some_rank_shard = rank_sharding[0][1]
     global_shape = some_rank_shard.global_shape
@@ -602,7 +602,9 @@ def verify_integrity_manifest(checkpoint_dir: str) -> None:
         if torch.distributed.get_rank() == 0:
             try:
                 _verify_integrity_manifest_impl(checkpoint_dir)
-            except CheckpointingException as exc:
+            except Exception as exc:
+                # Manifest reads and JSON decoding can raise other exceptions too.
+                # Report them collectively so peers do not wait in the broadcast.
                 error_payload = [str(exc)]
         torch.distributed.broadcast_object_list(error_payload, src=0)
         if error_payload[0] is not None:
