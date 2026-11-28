@@ -41,7 +41,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbu
 
 def _make_mlp(device):
     kwargs = {"params_dtype": torch.bfloat16, "device": device}
-    return nn.Sequential(te.Linear(64, 128, **kwargs), nn.GELU(), te.Linear(128, 32, **kwargs))
+    return nn.Sequential(te.Linear(128, 128, **kwargs), nn.GELU(), te.Linear(128, 32, **kwargs))
 
 
 class _RecomputedMLP(nn.Module):
@@ -50,7 +50,7 @@ class _RecomputedMLP(nn.Module):
     def __init__(self, device, use_reentrant: bool | None) -> None:
         super().__init__()
         kwargs = {"params_dtype": torch.bfloat16, "device": device}
-        self.fc1 = te.Linear(64, 128, **kwargs)
+        self.fc1 = te.Linear(128, 128, **kwargs)
         self.fc2 = te.Linear(128, 32, **kwargs)
         self.use_reentrant = use_reentrant
 
@@ -72,7 +72,7 @@ class _RecomputedBlockWithOwnedProj(nn.Module):
 
     def __init__(self, device, use_reentrant: bool | None) -> None:
         super().__init__()
-        self.proj = te.Linear(64, 64, params_dtype=torch.bfloat16, device=device)
+        self.proj = te.Linear(128, 128, params_dtype=torch.bfloat16, device=device)
         self.mlp = _make_mlp(device)
         self.use_reentrant = use_reentrant
 
@@ -155,7 +155,7 @@ def _check_recompute_matches_no_recompute(distributed_setup, recipe, build, use_
     ``build(use_reentrant)`` returns a fully sharded model and its optimizer.
     """
     torch.manual_seed(1234 + distributed_setup.rank)
-    inputs = torch.randn(3, 32, 64, dtype=torch.bfloat16, device=distributed_setup.device)
+    inputs = torch.randn(3, 32, 128, dtype=torch.bfloat16, device=distributed_setup.device)
 
     def train(model, optimizer):
         """Return per-step losses and sharded gradients, and the final sharded weights."""
@@ -231,7 +231,7 @@ def _check_mxfp8_mlp_matches_reference(
             parameter.clear_high_precision_init_val()
     # Different rank inputs make an incorrect gradient reduction observable.
     torch.manual_seed(1234 + distributed_setup.rank)
-    inputs = torch.randn(5, num_microbatches, 32, 64, dtype=torch.bfloat16, device=device)
+    inputs = torch.randn(5, num_microbatches, 32, 128, dtype=torch.bfloat16, device=device)
     targets = torch.randn(5, num_microbatches, 32, 32, dtype=torch.bfloat16, device=device)
 
     def train(model, optimizer):
@@ -278,7 +278,7 @@ def _check_mxfp8_mlp_matches_reference(
 def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements, shard_layout):
     """MXFP8 MLP losses track an independently trained unsharded model.
 
-    With ``ShardLayout.UNPADDED`` the two weights (128x64 and 32x128) pack into 12288 elements
+    With ``ShardLayout.UNPADDED`` the two weights (128x128 and 32x128) pack into 20480 elements
     split at 32-row block boundaries, so on 8 ranks some ranks own no weight rows at all.
     """
     if distributed_setup.world_size < 2:
@@ -358,7 +358,7 @@ def test_mxfp8_unshard_gathers_rowwise_for_forward_and_columnwise_for_backward(d
     model.fc1.register_forward_pre_hook(check_forward)
     model.fc2.register_full_backward_pre_hook(check_backward)
 
-    x = torch.randn(32, 64, dtype=torch.bfloat16, device=device)
+    x = torch.randn(32, 128, dtype=torch.bfloat16, device=device)
     with te.autocast(recipe=recipe):
         output = model(x)
     output.float().square().mean().backward()
@@ -424,7 +424,7 @@ def test_mxfp8_recorded_order_prefetches_rowwise_for_recompute(distributed_setup
         fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
 
     # Reentrant checkpointing produces gradients only for inputs requiring grad.
-    x = torch.randn(32, 64, dtype=torch.bfloat16, device=device, requires_grad=True)
+    x = torch.randn(32, 128, dtype=torch.bfloat16, device=device, requires_grad=True)
 
     def train_step():
         with te.autocast(recipe=recipe):
@@ -497,7 +497,7 @@ def test_mxfp8_backward_unshard_gathers_rowwise_for_recompute_inside_fsdp_module
         fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS, schedule_policy=policy)
 
     # Reentrant checkpointing produces gradients only for inputs requiring grad.
-    x = torch.randn(32, 64, dtype=torch.bfloat16, device=device, requires_grad=True)
+    x = torch.randn(32, 128, dtype=torch.bfloat16, device=device, requires_grad=True)
     with te.autocast(recipe=recipe):
         output = model(x)
     loss = output.float().square().mean()

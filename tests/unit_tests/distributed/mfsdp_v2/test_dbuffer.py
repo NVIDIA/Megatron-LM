@@ -987,9 +987,11 @@ def test_block_atomic_rejects_shards_that_split_blocks(distributed_setup):
         DBuffer(mesh, [BlockAtomic(8)], layout, torch.float32, distributed_setup.device)
 
 
-@pytest.mark.parametrize("rows_per_rank", [16, 32])
-def test_quantized_dbuffer_validates_replicated_layout_alignment(distributed_setup, rows_per_rank):
-    """MXFP8 checks block boundaries even when its current placement is Replicate.
+@pytest.mark.parametrize("rows_per_rank, columns", [(16, 128), (32, 128), (32, 64)])
+def test_quantized_dbuffer_validates_replicated_layout_alignment(
+    distributed_setup, rows_per_rank, columns
+):
+    """MXFP8 checks column alignment and replicated layouts' block boundaries.
 
     Only allocate the physical planes, so this does not require MXFP8 compute support.
     """
@@ -1000,9 +1002,14 @@ def test_quantized_dbuffer_validates_replicated_layout_alignment(distributed_set
     )
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     layout = layout_builder.build_for_row_atomic(
-        [(rows_per_rank * mesh.size(), 32)], dp_size=mesh.size()
+        [(rows_per_rank * mesh.size(), columns)], dp_size=mesh.size()
     )
-    if rows_per_rank == 16:
+    if columns % 128:
+        with pytest.raises(ValueError, match="columns divisible by 128"):
+            quantized_dbuffer.QuantizedDBuffer(
+                mesh, [Replicate()], layout, distributed_setup.device
+            )
+    elif rows_per_rank == 16:
         with pytest.raises(ValueError, match="Rank offsets.*incompatible with alignment"):
             quantized_dbuffer.QuantizedDBuffer(
                 mesh, [Replicate()], layout, distributed_setup.device
