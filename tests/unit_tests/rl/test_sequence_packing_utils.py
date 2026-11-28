@@ -149,6 +149,28 @@ def test_sequence_packing_with_generation_masks():
     assert packed_trajs.shape[1] == bin_size
 
 
+def test_sequence_packing_with_explicit_lengths():
+    pad = 42
+    packer = sequence_packing_utils.SequencePacker(bin_size=8, pad_token=pad)
+    trajs = torch.tensor([[7, pad, pad, pad], [7, pad, pad, pad], [pad] * 4])
+    masks = torch.tensor([[True, False, False, False]] * 2 + [[False] * 4])
+
+    _, positions, loss_mask, info = packer.pack_sequences(trajs, masks, seq_lengths=[2, 3, 0])
+
+    assert info.seq_lengths == [2, 3, 0]
+    assert positions.tolist() == [[0, 1, 2, 0, 1, 0, 0, 0]]
+    assert loss_mask.tolist() == [[1, 0, 0, 1, 0, 0, 0, 0]]
+
+
+@pytest.mark.parametrize(
+    "lengths", [[1], [-1, 1], [1, 5]], ids=["row-count", "negative", "too-long"]
+)
+def test_sequence_packing_rejects_invalid_lengths(lengths):
+    packer = sequence_packing_utils.SequencePacker(bin_size=8, pad_token=42)
+    with pytest.raises(ValueError):
+        packer.pack_sequences(torch.ones(2, 4, dtype=torch.long), seq_lengths=lengths)
+
+
 def test_sequence_packing_empty_bins():
     args = arguments.parse_args(ignore_unknown_args=True)
     setattr(args, 'seq_length', 8)

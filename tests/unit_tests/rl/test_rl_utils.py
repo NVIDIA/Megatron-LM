@@ -16,6 +16,8 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenizers import Tokenizer, models
+from transformers import PreTrainedTokenizerFast
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
@@ -41,6 +43,7 @@ from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
@@ -1625,7 +1628,70 @@ class TestRLUtils:
         )
         assert get_num_microbatches() == expected_microbatches
 
-    def test_prepare_trajectories(self):
+    @pytest.mark.parametrize("initialize_model_parallel", [(1, 1)], indirect=True)
+    @pytest.mark.parametrize("packing", [False, True], ids=["unpacked", "packed"])
+    @pytest.mark.parametrize("shared_pad_eod", [True, False], ids=["shared", "distinct"])
+    def test_generated_pad_token_is_a_training_target(
+        self, initialize_model_parallel, monkeypatch, packing, shared_pad_eod
+    ):
+        """A sampled PAD is an action even when generation stops at the token cap."""
+        _, dp, tp, pp = initialize_model_parallel
+        self.create_test_args(
+            micro_batch_size=1,
+            seq_length=10,
+            tensor_model_parallel_size=tp,
+            pipeline_model_parallel_size=pp,
+            global_batch_size=2 * dp,
+            grpo_prompts_per_step=dp,
+            grpo_group_size=2,
+            rl_use_sequence_packing=packing,
+            rl_sequence_packing_max_sequences_per_bin=2,
+        )
+        tokenizer = MockTokenizer()
+        if shared_pad_eod:
+            tokenizer.pad = tokenizer.eod
+        monkeypatch.setattr("megatron.rl.sequence_packing_utils.get_tokenizer", lambda: tokenizer)
+        rollouts = [
+            [
+                make_token_rollout(
+                    [[5, tokenizer.pad] + [7] * (1 + group_idx % 2) + [tokenizer.pad]],
+                    [[-0.5]],
+                    [[False] * (3 + group_idx % 2) + [True]],
+                    reward=reward,
+                )
+                for reward in (0.0, 1.0)
+            ]
+            for group_idx in range(dp)
+        ]
+        lengths = []
+        for rollout in itertools.chain.from_iterable(rollouts):
+            rollout.generation_cap = 1
+            lengths.append(len(rollout.trajectory[0]))
+        batches, _, _ = rl_utils.prepare_data_for_update(
+            [MockModel()],
+            {},
+            rollouts,
+            tokenizer,
+            packing,
+            False,
+            request_ledger=_ledger_for(*(r for group in rollouts for r in group)),
+        )
+        if packing:
+            (bin_idx,) = next(batches)
+            context = rl_utils.get_rl_runtime_state().packing_context
+            assert context.packing_info.seq_lengths == lengths
+            first, second = context.packing_info.bin_seq_indices[bin_idx.item()]
+            mask = rl_utils.load_packed_data_by_index(bin_idx.item(), context, False)[3]
+            assert mask[0].nonzero().flatten().tolist() == [
+                lengths[first] - 2,
+                lengths[first] + lengths[second] - 2,
+            ]
+        else:
+            shifted_mask = next(batches)[3][0, 1:]
+            assert shifted_mask.nonzero().flatten().tolist() == [lengths[2 * dist.get_rank()] - 2]
+
+    @pytest.mark.parametrize("shared_zero", [False, True], ids=["distinct", "shared-zero"])
+    def test_prepare_trajectories(self, shared_zero, tmp_path):
         """Every row kind becomes one padded training row in a single batch: a single-turn
         rollout (one contiguous generated region), a multi-turn rollout collapsed to its final
         sequence (multi-region mask with a gap at the observation, per-turn logprobs
@@ -1634,6 +1700,15 @@ class TestRLUtils:
         seq_length = 8
         self.create_test_args(rl_skip_bos_token=False, micro_batch_size=1, seq_length=seq_length)
         tokenizer = MockTokenizer()
+        if shared_zero:
+            vocab = {"<eod>": 0, "<unk>": 1, **{str(i): i for i in range(2, 10)}}
+            backend = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
+            PreTrainedTokenizerFast(
+                tokenizer_object=backend, eos_token="<eod>", pad_token="<eod>", unk_token="<unk>"
+            ).save_pretrained(tmp_path)
+            tokenizer = MegatronTokenizer.from_pretrained(
+                str(tmp_path), metadata_path={"library": "huggingface"}
+            )
         eod, pad = tokenizer.eod, tokenizer.pad
 
         # Single-turn rollout: one contiguous generated region.
@@ -1658,17 +1733,18 @@ class TestRLUtils:
         # Non-prefix rollout: turn 1 is not a prefix-extension of turn 0, so it is trained as
         # per-turn fallback rows (rollout, turn_idx) -- each on its own tokens/mask.
         non_prefix = make_token_rollout(
-            [[1, 2, 3, eod], [7, 8, 9, eod]],
+            [[1, 2, 3, eod], [7, 8, 9, eod, pad]],
             [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
-            [[False, True, True, True], [False, True, True, True]],
+            [[False, True, True, True], [False, True, True, True, False]],
             problem_id="3",
         )
 
         rows = [single, multi, (non_prefix, 0), (non_prefix, 1), rl_utils.PAD_ROW]
-        trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
+        trajs, genmask, inference_logprobs, seq_lengths = rl_utils.prepare_trajectories(
             rows, tokenizer, seq_length, skip_bos_token=False
         )
 
+        assert seq_lengths == [4, 7, 4, 5, 0]
         expected_trajs = torch.tensor(
             [
                 [1, 2, 3, eod] + [pad] * 4,
