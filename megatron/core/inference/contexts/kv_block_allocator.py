@@ -412,7 +412,7 @@ class KVBlockAllocator:
         earlier writer requested.
 
         Args:
-            block_ids: Block ID of each row, shape `[R]`.
+            block_ids: Block ID of each row, shape `[R]`. Rows must be grouped by block.
             slots: Source position of each row within its block, shape `[R]`.
             log_probs: Selected-token log-prob of each row, shape `[R]`.
             top_n_log_probs: Top-N log-probs of each row, shape `[R, top_n]`.
@@ -421,14 +421,21 @@ class KVBlockAllocator:
         """
         block_size = self.context.block_size_tokens
         top_n = top_n_log_probs.shape[1]
-        for block_id in np.unique(block_ids).tolist():
+        unique_blocks, first_rows, row_counts = np.unique(
+            block_ids, return_index=True, return_counts=True
+        )
+        num_runs = int(block_ids.size > 0) + np.count_nonzero(block_ids[1:] != block_ids[:-1])
+        assert len(unique_blocks) == num_runs, "Prompt log-prob rows must be grouped by block"
+        for block_id, first_row, row_count in zip(
+            unique_blocks.tolist(), first_rows.tolist(), row_counts.tolist()
+        ):
             entry = self.pc_state.block_prompt_logprobs.get(block_id)
             if entry is None or entry.top_n < top_n:
                 entry = PromptLogprobsBlock(block_size, top_n)
                 self.pc_state.block_prompt_logprobs[block_id] = entry
             elif entry.top_n > top_n:
                 continue
-            rows = block_ids == block_id
+            rows = slice(first_row, first_row + row_count)
             block_slots = slots[rows]
             entry.log_probs[block_slots] = log_probs[rows]
             entry.top_n_log_probs[block_slots] = top_n_log_probs[rows]
