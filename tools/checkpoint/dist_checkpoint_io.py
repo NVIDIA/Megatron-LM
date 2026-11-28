@@ -265,5 +265,20 @@ def write_latest_iteration_marker(save_dir, iteration):
     parent = os.path.dirname(save_dir.rstrip('/')) or save_dir
     if os.path.basename(save_dir.rstrip('/')).startswith('iter_'):
         tracker = os.path.join(parent, 'latest_checkpointed_iteration.txt')
-        with open(tracker, 'w') as f:
-            f.write(str(iteration))
+        # Write via a temp file + atomic rename (same pattern as
+        # tools/checkpoint/weighted_merge.py): a crash mid-write must not
+        # leave a torn tracker behind, or every restart would fail to
+        # load the checkpoint (gh-9713).
+        tmp_tracker = tracker + f'.tmp-{os.getpid()}'
+        try:
+            with open(tmp_tracker, 'w') as f:
+                f.write(str(iteration))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_tracker, tracker)
+        except BaseException:
+            try:
+                os.unlink(tmp_tracker)
+            except OSError:
+                pass
+            raise
