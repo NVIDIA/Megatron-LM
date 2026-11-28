@@ -129,6 +129,7 @@ def validate_integrity_and_strict_load(
     local_metadata: Optional[_LocalMetadata] = None,
     global_metadata: Optional[_GlobalMetadata] = None,
     ckpt_sharded_metadata: Optional["CkptShardedMetadata"] = None,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> Tuple[ShardedStateDict, Set[str], Set[str]]:
     """Validates sharding integrity and potential mismatches with the checkpoint.
 
@@ -195,7 +196,7 @@ def validate_integrity_and_strict_load(
             raise CheckpointingException(
                 "Cannot check sharding intergrity without global_metadata (None)."
             )
-        validate_sharding_integrity(global_metadata)
+        validate_sharding_integrity(global_metadata, process_group=process_group)
 
     return sharded_state_dict, missing_keys, unexpected_keys
 
@@ -326,7 +327,10 @@ def maybe_report_missing_and_unexpected_keys(
         logger.warning(error_msg)
 
 
-def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
+def _validate_common_state_dict(
+    common_state_dict: CommonStateDict,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> None:
     """Validate consistancy across ranks for the common state dict
 
     We save the common state dict only on rank 0. We validate to make sure that the common dict is consistent across ranks before saving.
@@ -339,10 +343,11 @@ def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
 
     # Broadcast the common state dict from rank 0 to all other ranks
     # Each rank will do a comparison with its local rank vs the broadcasted state dict from rank 0
-    rank = torch.distributed.get_rank()
+    rank = torch.distributed.get_rank(group=process_group)
+    source = 0 if process_group is None else torch.distributed.get_global_rank(process_group, 0)
 
     object_list = [common_state_dict] if rank == 0 else [None]
-    torch.distributed.broadcast_object_list(object_list, src=0)
+    torch.distributed.broadcast_object_list(object_list, src=source, group=process_group)
     rank0_state_dict = object_list[0]
 
     # Skip comparing rank 0 with itself
@@ -361,7 +366,9 @@ def _validate_common_state_dict(common_state_dict: CommonStateDict) -> None:
 
 
 def validate_sharding_integrity(
-    global_metadata: _GlobalMetadata, common_state_dict: CommonStateDict = None
+    global_metadata: _GlobalMetadata,
+    common_state_dict: CommonStateDict = None,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """Validate if the ShardedTensors and ShardedObjects from multiple processes define correct sharding.
 
@@ -382,9 +389,9 @@ def validate_sharding_integrity(
     """
 
     if common_state_dict is not None:
-        _validate_common_state_dict(common_state_dict)
+        _validate_common_state_dict(common_state_dict, process_group=process_group)
 
-    if torch.distributed.get_rank() != 0:
+    if torch.distributed.get_rank(group=process_group) != 0:
         return
 
     key_shardings = defaultdict(list)
@@ -404,7 +411,7 @@ def validate_sharding_integrity(
 
 
 def _validate_sharding_for_key(
-    rank_sharding: List[Tuple[int, ShardedTensor]]
+    rank_sharding: List[Tuple[int, ShardedTensor]],
 ) -> List[CheckpointingException]:
     some_rank_shard = rank_sharding[0][1]
     global_shape = some_rank_shard.global_shape
@@ -587,7 +594,9 @@ def _verify_integrity_manifest_impl(checkpoint_dir: str) -> None:
     logger.info("Checkpoint integrity verified: %d file(s) OK in %s", len(manifest), checkpoint_dir)
 
 
-def verify_integrity_manifest(checkpoint_dir: str) -> None:
+def verify_integrity_manifest(
+    checkpoint_dir: str, process_group: Optional[torch.distributed.ProcessGroup] = None
+) -> None:
     """Verify checkpoint files against their recorded SHA-256 hashes.
     Args:
         checkpoint_dir: checkpoint directory to verify.
@@ -597,14 +606,18 @@ def verify_integrity_manifest(checkpoint_dir: str) -> None:
     """
     import torch
 
-    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+    if (
+        torch.distributed.is_initialized()
+        and torch.distributed.get_world_size(group=process_group) > 1
+    ):
         error_payload = [None]
-        if torch.distributed.get_rank() == 0:
+        if torch.distributed.get_rank(group=process_group) == 0:
             try:
                 _verify_integrity_manifest_impl(checkpoint_dir)
             except CheckpointingException as exc:
                 error_payload = [str(exc)]
-        torch.distributed.broadcast_object_list(error_payload, src=0)
+        source = 0 if process_group is None else torch.distributed.get_global_rank(process_group, 0)
+        torch.distributed.broadcast_object_list(error_payload, src=source, group=process_group)
         if error_payload[0] is not None:
             raise CheckpointingException(error_payload[0])
     else:
