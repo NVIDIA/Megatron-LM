@@ -10,6 +10,8 @@ try:
     import triton
     import triton.language as tl
 
+    from megatron.core.inference.triton_pdl import gdc_wait, pdl_kwargs
+
     HAVE_TRITON = True
 except ImportError:
     triton = MagicMock()
@@ -77,8 +79,11 @@ def _multimem_all_gather_kernel(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     BARRIER_BEFORE: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """Single-tensor multicast all-gather kernel."""
+    if USE_PDL:
+        gdc_wait()
     if BARRIER_BEFORE:
         # Ensure every rank has finished reading the previous contents before
         # this all-gather reuses the symmetric buffer. The usual RS -> AG
@@ -183,11 +188,14 @@ def _multimem_reduce_scatter_kernel(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     REDUCE_F32: tl.constexpr = False,
+    USE_PDL: tl.constexpr = False,
 ):
     """
     Triton kernel to perform multicast reduce-scatter over nvlink using multimem instructions.
     When REDUCE_F32=True, uses fp32 reduction instead of bf16x2 reduction.
     """
+    if USE_PDL:
+        gdc_wait()
     symm_mem_sync(
         signal_pad_ptrs,
         None,
@@ -295,6 +303,7 @@ def multimem_all_gather(
         WORLD_SIZE=symm_mem_hdl.world_size,
         BARRIER_BEFORE=barrier_before,
         num_warps=config["num_warps"],
+        **pdl_kwargs(),
     )
 
     return output_tensor
@@ -396,6 +405,7 @@ def multimem_reduce_scatter(
         WORLD_SIZE=symm_mem_hdl.world_size,
         num_warps=config["num_warps"],
         REDUCE_F32=reduce_f32,
+        **pdl_kwargs(),
     )
 
     return output_tensor

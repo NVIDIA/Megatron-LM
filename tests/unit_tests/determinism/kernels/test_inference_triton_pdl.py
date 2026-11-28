@@ -9,9 +9,12 @@ producer that lets its dependents launch at once and writes the kernel's input o
 spin, with the kernel's outputs filled with garbage beforehand, and its result is compared byte
 for byte with the kernel launched without PDL on the same data, both eagerly and inside a CUDA
 graph, under torch.inference_mode(). A kernel that read its input or wrote its output before
-waiting would see the garbage or be overwritten by the producer.
+waiting would see the garbage or be overwritten by the producer. The NVLS symmetric-memory
+collectives are checked the same way on every rank of a launch with two or more ranks (skipped
+otherwise).
 """
 
+import importlib
 from typing import Callable, Optional, Sequence
 
 import pytest
@@ -90,6 +93,7 @@ def assert_pdl_launch_bit_exact(
     reset: Optional[Callable[[], None]] = None,
     replays: int = 3,
     what: str = "kernel",
+    group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> None:
     """Assert ``call`` gives the same bytes launched with PDL after a late producer as without PDL.
 
@@ -102,42 +106,55 @@ def assert_pdl_launch_bit_exact(
         reset: restores in-place state (e.g. a recurrent state) before every run.
         replays: runs per mode (reference, eager, CUDA graph).
         what: label for failure messages.
+        group: for a collective, its process group. Every rank runs the check in step, and the
+            ranks barrier before and after each reset, so that no peer reads or writes this
+            rank's buffers while they are reset.
     """
     reset = reset or (lambda: None)
     staging = torch.empty_like(root)
+
+    def barrier():
+        if group is not None:
+            torch.cuda.synchronize()
+            torch.distributed.barrier(group)
+
+    def prepare(i: int, late: bool) -> None:
+        barrier()
+        staging.copy_(make_input(i))
+        _fill_garbage((root, *outputs))
+        reset()
+        if not late:
+            root.copy_(staging)
+        barrier()
+
     with torch.inference_mode():  # PDL applies only under inference mode
         monkeypatch.setattr(triton_pdl, "_enabled", False)
         references = []
         for i in range(replays):
-            staging.copy_(make_input(i))
-            root.copy_(staging)
-            _fill_garbage(outputs)
-            reset()
+            prepare(i, late=False)
             references.append([out.clone() for out in call()])
         torch.cuda.synchronize()
 
         monkeypatch.setattr(triton_pdl, "_enabled", True)
         for i in range(replays):
-            staging.copy_(make_input(i))
-            _fill_garbage((root, *outputs))
-            reset()
+            prepare(i, late=True)
             _late_copy(staging, root)
             _assert_same(call(), references[i], f"{what} (eager, replay {i})")
 
+        prepare(0, late=True)
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):  # compile and warm up outside the capture
             _late_copy(staging, root)
             call()
         torch.cuda.current_stream().wait_stream(stream)
+        prepare(0, late=True)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             _late_copy(staging, root)
             graph_outputs = call()
         for i in range(replays):
-            staging.copy_(make_input(i))
-            _fill_garbage((root, *outputs))
-            reset()
+            prepare(i, late=True)
             graph.replay()
             _assert_same(graph_outputs, references[i], f"{what} (CUDA graph, replay {i})")
 
@@ -379,6 +396,150 @@ def _gdp_decode_prepare():
     return dict(call=call, root=packed, make_input=lambda i: seeded_randn(packed, i))
 
 
+# --- vLLM MoE kernels --------------------------------------------------------------------------
+#
+# Each input (the producer's target) stays near 1 MiB: the producer writes 1 KiB per block, and
+# most of a much larger input would be written before the kernel launches, hiding a missing wait.
+
+_MOE_TOKENS, _MOE_TOPK, _MOE_EXPERTS, _MOE_LOCAL, _MOE_LOCAL_START = 256, 6, 128, 16, 16
+_MOE_HIDDEN, _MOE_FFN, _MOE_VALID = 2688, 1856, 200
+
+
+def _routing_map(seed: int) -> torch.Tensor:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    scores = torch.rand(_MOE_TOKENS, _MOE_EXPERTS, generator=generator, device="cuda")
+    return scores.topk(_MOE_TOPK, dim=1).indices
+
+
+def _vllm_fused_moe_module():
+    # The package re-exports the vllm_fused_moe function under the submodule's name, so
+    # ``from megatron.core.inference.moe import vllm_fused_moe`` binds the function.
+    return importlib.import_module("megatron.core.inference.moe.vllm_fused_moe")
+
+
+def _moe_align_parallel():
+    m = _vllm_fused_moe_module()
+
+    # Launched directly with persistent outputs: the wrapper's fallback buffers are fresh
+    # torch.empty tensors whose unwritten tail would differ between runs.
+    block_m = 16
+    max_pairs = _MOE_TOKENS * _MOE_TOPK
+    max_sorted = max_pairs + block_m * (_MOE_LOCAL + 1)
+    routing_map = torch.empty(_MOE_TOKENS, _MOE_TOPK, device="cuda", dtype=torch.int64)
+    valid = _dev_scalar(_MOE_VALID)
+    sorted_ids = torch.empty(max_sorted, device="cuda", dtype=torch.int32)
+    expert_ids = torch.empty(triton.cdiv(max_sorted, block_m), device="cuda", dtype=torch.int32)
+    num_post_padded = torch.empty(1, device="cuda", dtype=torch.int32)
+    num_ctas = max(
+        1,
+        min(
+            triton.cdiv(max_pairs, m._PARALLEL_ALIGN_CHUNK),
+            torch.cuda.get_device_properties(0).multi_processor_count,
+        ),
+    )
+
+    def call():
+        m._parallel_align_block_size_kernel[(num_ctas,)](
+            routing_map,
+            valid,
+            sorted_ids,
+            expert_ids,
+            num_post_padded,
+            _MOE_LOCAL_START,
+            max_pairs,
+            max_pairs,
+            topk=_MOE_TOPK,
+            num_local_experts=_MOE_LOCAL,
+            BLOCK_SIZE_M=block_m,
+            NUM_BINS=m._align_expert_bins(_MOE_LOCAL),
+            FIRST_HIST_CHUNK=1024,
+            HIST_CHUNK=1024,
+            CHUNK=m._PARALLEL_ALIGN_CHUNK,
+            num_warps=m._PARALLEL_ALIGN_NUM_WARPS,
+            **triton_pdl.pdl_kwargs(),
+        )
+        return [sorted_ids, expert_ids, num_post_padded]
+
+    return dict(
+        call=call,
+        root=routing_map,
+        make_input=_routing_map,
+        outputs=(sorted_ids, expert_ids, num_post_padded),
+    )
+
+
+def _fused_moe_gemm():
+    m = _vllm_fused_moe_module()
+
+    # FC1 with the fused squared ReLU, as in decode, on static expert tables.
+    config, _ = m._get_launch_configs(
+        _MOE_TOKENS, _MOE_LOCAL, _MOE_TOPK, _MOE_FFN, _MOE_HIDDEN, torch.device("cuda")
+    )
+    block_m = config["BLOCK_SIZE_M"]
+    align_args = (_routing_map(3), block_m, _MOE_LOCAL, _MOE_LOCAL_START, _dev_scalar(_MOE_VALID))
+    if block_m < 128 and _MOE_TOKENS * _MOE_TOPK <= m._PARALLEL_ALIGN_MAX_PAIRS:
+        tables = m._moe_align_block_size_parallel(*align_args, _MOE_TOKENS * _MOE_TOPK)
+    else:
+        tables = m._moe_align_block_size_cuda_graphable(*align_args)
+    sorted_ids, expert_ids, num_post_padded = [t.clone() for t in tables]
+    generator = torch.Generator(device="cuda").manual_seed(61)
+    probs = torch.rand(_MOE_TOKENS * _MOE_TOPK, generator=generator, device="cuda")
+    a = torch.empty(_MOE_TOKENS, _MOE_HIDDEN, device="cuda", dtype=torch.bfloat16)
+    weight = seeded_randn(
+        torch.empty(_MOE_LOCAL, _MOE_FFN, _MOE_HIDDEN, dtype=torch.bfloat16), 62, 0.02
+    )
+    out = torch.empty(_MOE_TOKENS * _MOE_TOPK, _MOE_FFN, device="cuda", dtype=torch.bfloat16)
+    num_pid_m = triton.cdiv(_MOE_TOKENS * _MOE_TOPK + block_m * _MOE_LOCAL, block_m)
+
+    def call():
+        m._invoke_fused_moe_kernel(
+            a,
+            weight,
+            out,
+            probs,
+            sorted_ids,
+            expert_ids,
+            num_post_padded,
+            mul_routed_weight=False,
+            top_k=_MOE_TOPK,
+            config=config,
+            grid_size=num_pid_m * triton.cdiv(_MOE_FFN, config["BLOCK_SIZE_N"]),
+            fuse_squared_relu=True,
+        )
+        return [out]
+
+    return dict(call=call, root=a, make_input=lambda i: seeded_randn(a, i), outputs=(out,))
+
+
+def _moe_sum_tiled():
+    m = _vllm_fused_moe_module()
+
+    routing, valid = _routing_map(3), _dev_scalar(_MOE_VALID)
+    hidden = 384
+    generator = torch.Generator(device="cuda").manual_seed(64)
+    probs = torch.rand(_MOE_TOKENS, _MOE_TOPK, generator=generator, device="cuda")
+    inp = torch.empty(_MOE_TOKENS * _MOE_TOPK, hidden, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(_MOE_TOKENS, hidden, device="cuda", dtype=torch.float32)
+
+    def call():
+        m._moe_sum(
+            inp,
+            probs,
+            _MOE_TOKENS,
+            _MOE_TOPK,
+            hidden,
+            valid,
+            routing,
+            _MOE_LOCAL_START,
+            _MOE_LOCAL,
+            out=out,
+            apply_weights=False,
+        )
+        return [out[:_MOE_VALID]]
+
+    return dict(call=call, root=inp, make_input=lambda i: seeded_randn(inp, i), outputs=(out,))
+
+
 # --- Streamwise residual ops -------------------------------------------------------------------
 
 
@@ -421,6 +582,11 @@ _STREAMWISE_CASES = {
     "streamwise_sigmoid_read": lambda: _streamwise_sigmoid("read"),
     "streamwise_sigmoid_write": lambda: _streamwise_sigmoid("write"),
 }
+_VLLM_MOE_CASES = {
+    "moe_align_block_size_parallel": _moe_align_parallel,
+    "fused_moe_gemm_fc1": _fused_moe_gemm,
+    "moe_sum_tiled": _moe_sum_tiled,
+}
 _CASES = {
     "zero_padding_rows": _zero_padding_rows,
     "mask_routing_padding": _mask_routing_padding,
@@ -428,6 +594,7 @@ _CASES = {
     "mxfp8_quantize_into": _mxfp8_quantize_into,
     "mxfp8_quantize_rows": _mxfp8_quantize_rows,
     "append_key_value_cache": _append_key_value_cache,
+    **_VLLM_MOE_CASES,
     **_SSM_CASES,
     **_STREAMWISE_CASES,
 }
@@ -444,3 +611,139 @@ def test_pdl_launch_is_bit_exact(case, monkeypatch):
         monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
     seeded()
     assert_pdl_launch_bit_exact(monkeypatch, **_CASES[case](), what=case)
+
+
+# --- Multi-rank symmetric-memory collectives -------------------------------------------------
+#
+# The NVLS collectives synchronise ranks through symmetric-memory barriers. Each rank launches
+# its collective with PDL after a producer that writes the collective's input late; a missing
+# wait would publish this rank's stale (garbage) data to its peers.
+
+_LOCAL_TOKENS, _HIDDEN = 16, 2688
+_SYMM_KEYS = ("pdl_test_0", "pdl_test_1", "pdl_test_2")
+
+
+@pytest.fixture
+def nvls_group():
+    from megatron.core import parallel_state
+    from megatron.core.inference.communication.torch_symm_triton import is_device_nvls_capable
+    from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+    from tests.unit_tests.test_utilities import Utils
+
+    if Utils.world_size < 2:
+        pytest.skip("multi-rank PDL cases need at least two ranks")
+    if not is_device_nvls_capable(torch.device("cuda")):
+        pytest.skip("NVLS multicast is unavailable")
+    Utils.initialize_model_parallel(tensor_model_parallel_size=Utils.world_size)
+    group = parallel_state.get_tensor_model_parallel_group()
+    buffers = [
+        SymmetricMemoryManager.get_buffer(key, process_group=group, size_mb=64)
+        for key in _SYMM_KEYS
+    ]
+    try:
+        if any(b.symm_mem_hdl is None for b in buffers):
+            pytest.skip(f"symmetric memory unavailable: {buffers[0].init_failure_reason}")
+        yield group, buffers
+    finally:
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        for key in _SYMM_KEYS:
+            SymmetricMemoryManager.destroy(key)
+        Utils.destroy_model_parallel()
+
+
+def _collective_case(name, group, buffers):
+    from megatron.core.inference.communication import torch_symm_triton as st
+
+    rank, world = torch.distributed.get_rank(group), torch.distributed.get_world_size(group)
+    bf16 = torch.bfloat16
+
+    def symm(index, shape, dtype=bf16):
+        result = buffers[index].maybe_get_tensor(list(shape), dtype)
+        return result["tensor"], result["handle"]
+
+    def rank_input(like):
+        return lambda i: seeded_randn(like, 1000 * rank + i)
+
+    if name == "all_gather":
+        out, hdl = symm(0, (_LOCAL_TOKENS * world, _HIDDEN))
+        inp = torch.empty(_LOCAL_TOKENS, _HIDDEN, device="cuda", dtype=bf16)
+        return dict(
+            call=lambda: [st.multimem_all_gather(out, inp, hdl)],
+            root=inp,
+            make_input=rank_input(inp),
+            outputs=(out,),
+        )
+
+    if name == "reduce_scatter":
+        inp, hdl = symm(0, (_LOCAL_TOKENS * world, _HIDDEN))
+        out = torch.empty(_LOCAL_TOKENS, _HIDDEN, device="cuda", dtype=bf16)
+        return dict(
+            call=lambda: [st.multimem_reduce_scatter(out, inp, hdl)],
+            root=inp,
+            make_input=rank_input(inp),
+            outputs=(out,),
+        )
+
+    # Variable-count EP collectives: rank r holds 8 + 2r tokens (at most per_rank_max).
+    counts = [8 + 2 * r for r in range(world)]
+    per_rank_max = max(counts)
+    offset = _dev_scalar(sum(counts[:rank]))
+    ep_max = _dev_scalar(per_rank_max)
+    local, total = counts[rank], sum(counts)
+
+    if name == "reduce_scatter_v":
+        inp, hdl = symm(0, (per_rank_max * world, _HIDDEN))
+        out = torch.empty(local, _HIDDEN, device="cuda", dtype=bf16)
+
+        def call():
+            st.multimem_reduce_scatter_v(out, inp, hdl, offset, ep_max, per_rank_max)
+            return [out]
+
+        return dict(call=call, root=inp, make_input=rank_input(inp), outputs=(out,))
+
+    if name == "all_gather_v_3tensor":
+        topk = 8
+        out_h, hdl_h = symm(0, (per_rank_max * world, _HIDDEN))
+        out_r, hdl_r = symm(1, (per_rank_max * world, topk), torch.int64)
+        out_p, hdl_p = symm(2, (per_rank_max * world, topk), torch.float32)
+        hidden = torch.empty(local, _HIDDEN, device="cuda", dtype=bf16)
+        generator = torch.Generator(device="cuda").manual_seed(90 + rank)
+        routing = torch.randint(0, 128, (local, topk), generator=generator, device="cuda")
+        probs = torch.rand(local, topk, generator=generator, device="cuda")
+
+        def call():
+            st.multimem_all_gatherv_3tensor(
+                out_h,
+                out_r,
+                out_p,
+                hidden,
+                routing,
+                probs,
+                hdl_h,
+                hdl_r,
+                hdl_p,
+                rank_token_offset=offset,
+                ep_max_tokens=ep_max,
+                per_rank_max_tokens=per_rank_max,
+            )
+            return [out_h[:total], out_r[:total], out_p[:total]]
+
+        return dict(
+            call=call, root=hidden, make_input=rank_input(hidden), outputs=(out_h, out_r, out_p)
+        )
+
+    raise ValueError(name)
+
+
+@pytest.mark.parametrize(
+    "case", ["all_gather", "reduce_scatter", "reduce_scatter_v", "all_gather_v_3tensor"]
+)
+def test_pdl_collective_launch_is_bit_exact(case, monkeypatch, nvls_group):
+    """Every rank launches its NVLS collective with PDL right after a producer that writes the
+    collective's input late; all ranks match the non-PDL launch byte for byte."""
+    group, buffers = nvls_group
+    seeded()
+    assert_pdl_launch_bit_exact(
+        monkeypatch, **_collective_case(case, group, buffers), what=case, group=group
+    )

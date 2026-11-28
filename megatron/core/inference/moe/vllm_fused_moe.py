@@ -21,6 +21,8 @@ try:
     import triton.language as tl
     from triton.language.extra import libdevice
 
+    from megatron.core.inference.triton_pdl import gdc_wait, pdl_kwargs
+
     HAVE_TRITON = True
 except ImportError:
     HAVE_TRITON = False
@@ -167,6 +169,7 @@ def _fused_moe_kernel(
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """Fused MoE grouped GEMM with indirect token addressing.
 
@@ -181,6 +184,8 @@ def _fused_moe_kernel(
     size (rare prefill spikes), each CTA strides over multiple tiles via
     the outer `tl.range` loop.
     """
+    if USE_PDL:
+        gdc_wait()
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
 
     num_tokens_post_padded = tl.load(num_tokens_post_padded_ptr)
@@ -559,6 +564,7 @@ def _parallel_align_block_size_kernel(
     FIRST_HIST_CHUNK: tl.constexpr,
     HIST_CHUNK: tl.constexpr,
     CHUNK: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """Multi-CTA, atomics-free build of the vLLM indirection tables.
 
@@ -580,6 +586,8 @@ def _parallel_align_block_size_kernel(
     independently, so results do not depend on it). The grid does not depend
     on the token-count hint, so an underestimated hint costs no parallelism.
     """
+    if USE_PDL:
+        gdc_wait()
     pid = tl.program_id(0)
     num_ctas = tl.num_programs(0)
     bins = tl.arange(0, NUM_BINS)
@@ -707,6 +715,7 @@ def _moe_align_block_size_parallel(
         HIST_CHUNK=1024,
         CHUNK=_PARALLEL_ALIGN_CHUNK,
         num_warps=_PARALLEL_ALIGN_NUM_WARPS,
+        **pdl_kwargs(),
     )
     return sorted_token_ids, expert_ids, num_tokens_post_padded
 
@@ -776,6 +785,7 @@ def _invoke_fused_moe_kernel(
         GROUP_SIZE_M=config['GROUP_SIZE_M'],
         num_warps=config['num_warps'],
         num_stages=config['num_stages'],
+        **pdl_kwargs(),
     )
 
 
@@ -866,6 +876,7 @@ def _moe_sum_tiled_kernel(
     BLOCK_T: tl.constexpr,
     BLOCK_K: tl.constexpr,
     APPLY_WEIGHTS: tl.constexpr = True,
+    USE_PDL: tl.constexpr = False,
 ):
     """Reduce topk dimension with routing weight application.
 
@@ -890,6 +901,8 @@ def _moe_sum_tiled_kernel(
     Persistent grid: the CTAs stride over the tiles of valid_tokens.
     CUDA-graph safe (grid is static); the loop bound is loaded device-side.
     """
+    if USE_PDL:
+        gdc_wait()
     pid = tl.program_id(0)
     num_programs = tl.num_programs(0)
     valid_tokens = tl.load(valid_tokens_ptr)
@@ -1010,6 +1023,7 @@ def _moe_sum(
         BLOCK_T=BLOCK_T,
         BLOCK_K=BLOCK_K,
         APPLY_WEIGHTS=apply_weights,
+        **pdl_kwargs(),
     )
     return out
 

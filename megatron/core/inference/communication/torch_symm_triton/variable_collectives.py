@@ -24,6 +24,8 @@ try:
     import triton
     import triton.language as tl
 
+    from megatron.core.inference.triton_pdl import gdc_wait, pdl_kwargs
+
     HAVE_TRITON = True
 except ImportError:
     triton = MagicMock()
@@ -165,6 +167,7 @@ def _multimem_reduce_scatter_v_kernel(
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     REDUCE_F32: tl.constexpr = False,
+    USE_PDL: tl.constexpr = False,
 ):
     """Variable-count multicast reduce-scatter kernel. One CTA processes one token.
 
@@ -192,6 +195,8 @@ def _multimem_reduce_scatter_v_kernel(
         RANK: this rank's index (constexpr).
         WORLD_SIZE: total number of ranks (constexpr).
     """
+    if USE_PDL:
+        gdc_wait()
     pid = tl.program_id(axis=0)
 
     # Exit before the barrier if this CTA's pid exceeds the iteration maximum.
@@ -344,6 +349,7 @@ def multimem_reduce_scatter_v(
         WORLD_SIZE=symm_mem_hdl.world_size,
         REDUCE_F32=reduce_f32,
         num_warps=num_warps,
+        **pdl_kwargs(),
     )
 
     return output_tensor
@@ -376,6 +382,7 @@ def _multimem_all_gatherv_3tensor_kernel(
     BITS_2: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """Variable-count multicast all-gather for three tensors in a single kernel.
 
@@ -411,6 +418,8 @@ def _multimem_all_gatherv_3tensor_kernel(
         RANK: this rank's index (constexpr).
         WORLD_SIZE: total number of ranks (constexpr).
     """
+    if USE_PDL:
+        gdc_wait()
     pid = tl.program_id(axis=0)
 
     ep_max_tokens = tl.load(ep_max_tokens_ptr)
@@ -762,6 +771,7 @@ def multimem_all_gatherv_3tensor(
         RANK=symm_mem_hdl_0.rank,
         WORLD_SIZE=symm_mem_hdl_0.world_size,
         num_warps=num_warps,
+        **pdl_kwargs(),
     )
 
     return output_tensor_0, output_tensor_1, output_tensor_2
