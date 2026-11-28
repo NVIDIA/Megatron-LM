@@ -19,6 +19,12 @@ from torch.distributed import ProcessGroup
 
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
+from megatron.core.transformer.moe.megakernel.factory import split_megakernel_backend_config
+from megatron.core.transformer.moe.megakernel.mok.package import (
+    cutemok_api,
+    mok_modules,
+    resolve_mok_backend,
+)
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import (
     _gate_up_main_grad_arguments,
@@ -65,6 +71,13 @@ class _MainGradArguments:
         return self.data_ptrs == tuple(map(torch.Tensor.data_ptr, self.main_grads))
 
 
+def _address_table(tensors) -> torch.Tensor:
+    """CuTe MoK's main-grad storage table: per-expert base addresses, int64 [E_local] on device."""
+    return torch.tensor(
+        [t.data_ptr() for t in tensors], dtype=torch.int64, device=tensors[0].device
+    )
+
+
 class MoKMegakernel(MegakernelBackend):
     """Execute MOK using trainable parameters owned by native MCore modules."""
 
@@ -73,27 +86,37 @@ class MoKMegakernel(MegakernelBackend):
         config: TransformerConfig,
         ep_group: ProcessGroup,
         routed_experts: nn.Module,
-        shared_experts: nn.Module,
+        shared_experts: nn.Module | None,
         num_local_experts: int,
     ) -> None:
         super().__init__()
+        # "cutemok": cuDNN frontend's CuTe MoK, an optimized version of MOK, called through its
+        # public API: https://github.com/NVIDIA/cudnn-frontend/pull/2767
+        # "mok" (deprecated; runs as "cutemok" when available): our MCore-integration version of
+        # MOK: https://github.com/QiZhangNV/mixture-of-kittens/tree/qizhang/mcore-integration
+        backend = getattr(config, "moe_megakernel_backend", None)
+        self._use_cutemok = resolve_mok_backend(backend) == "cutemok"
         try:
-            # This adapter targets our MCore-integration version of MOK rather than the
-            # upstream package API:
-            # https://github.com/QiZhangNV/mixture-of-kittens/tree/qizhang/mcore-integration
-            from mok.functional import MoKConfig
+            if self._use_cutemok:
+                MoKConfig = cutemok_api().CuteMoKConfig
+            else:
+                MoKConfig = mok_modules()[0].MoKConfig
         except ImportError as exc:
             raise ImportError(
-                "moe_megakernel_backend='mok' requires the MCore integration fork of "
-                "mixture-of-kittens; see the MOK installation instructions in "
-                "megatron/core/transformer/moe/README.md"
+                "moe_megakernel_backend='cutemok' requires cuDNN frontend with CuTe MoK "
+                "(cudnn.moe_ep.cutemok, NVIDIA/cudnn-frontend#2767); see the CuTe MoK "
+                "installation instructions in megatron/core/transformer/moe/README.md"
+                if self._use_cutemok
+                else "moe_megakernel_backend='mok' requires cuDNN frontend with CuTe MoK or the "
+                "MCore integration fork of mixture-of-kittens; see the MOK installation "
+                "instructions in megatron/core/transformer/moe/README.md"
             ) from exc
 
         if not config.gradient_accumulation_fusion:
             raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
         if config.moe_mlp_glu_interleave_size is not None:
             raise ValueError("MOK requires non-interleaved native MCore routed FC1 weights")
-        if config.moe_shared_expert_glu_interleave_size is not None:
+        if shared_experts is not None and config.moe_shared_expert_glu_interleave_size is not None:
             raise ValueError("MOK requires non-interleaved native shared FC1 weights")
         if config.moe_pad_expert_input_to_capacity:
             raise ValueError(
@@ -102,10 +125,10 @@ class MoKMegakernel(MegakernelBackend):
             )
         self.ep_group = ep_group
         self.num_local_experts = num_local_experts
-        self.hidden_size = config.hidden_size
+        self.hidden_size = config.moe_latent_size or config.hidden_size
         self.intermediate_size = config.moe_ffn_hidden_size
         shared_intermediate_size = config.moe_shared_expert_intermediate_size
-        if shared_intermediate_size != self.intermediate_size:
+        if shared_experts is not None and shared_intermediate_size != self.intermediate_size:
             raise ValueError(
                 "MOK requires routed and shared experts to use the same intermediate "
                 f"size, got routed={self.intermediate_size}, "
@@ -113,12 +136,21 @@ class MoKMegakernel(MegakernelBackend):
             )
         self.topk = config.moe_router_topk
         self.swiglu_limit = config.activation_func_clamp_value
+        self.situ_beta = (
+            (
+                config.activation_func_tanh_clamp_scale,
+                config.activation_func_tanh_clamp_scale_linear,
+            )
+            if config.activation_func_tanh_clamp_scale is not None
+            else None
+        )
         self.use_mxfp8_weights = bool(
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
         )
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
+        _, backend_options = split_megakernel_backend_config(config)
         try:
-            self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
+            self.mok_config = MoKConfig(**backend_options)
         except TypeError as exc:
             raise ValueError(f"Invalid MOK option in moe_megakernel_backend_config: {exc}") from exc
 
@@ -163,7 +195,14 @@ class MoKMegakernel(MegakernelBackend):
             self._routed_fc1_parameter_names = tuple(self._routed_fc1_parameter_names)
             self._routed_fc2_parameter_names = tuple(self._routed_fc2_parameter_names)
 
-        self._register_shared_weights(shared_experts, use_output_gate=config.moe_shared_expert_gate)
+        if shared_experts is None:
+            self.register_parameter("shared_fc1_weight", None)
+            self.register_parameter("shared_fc2_weight", None)
+            self.register_parameter("shared_output_gate_weight", None)
+        else:
+            self._register_shared_weights(
+                shared_experts, use_output_gate=config.moe_shared_expert_gate
+            )
 
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
@@ -206,6 +245,11 @@ class MoKMegakernel(MegakernelBackend):
         return groups
 
     @property
+    def cutemok(self):
+        """cuDNN frontend's CuTe MoK module for the "cutemok" backend, else None ("mok")."""
+        return cutemok_api() if getattr(self, "_use_cutemok", False) else None
+
+    @property
     def routed_fc1_parameters(self) -> tuple[nn.Parameter, ...]:
         """Return the MCore-owned routed FC1 parameters."""
         return self._routed_parameter_groups()[0]
@@ -244,7 +288,9 @@ class MoKMegakernel(MegakernelBackend):
 
         routed = self.autograd_routed_parameters
         parameters = (self.shared_fc1_weight, self.shared_fc2_weight, *routed)
-        main_grads = tuple(_main_grad_buffer(param) for param in parameters)
+        main_grads = tuple(
+            _main_grad_buffer(param) if param is not None else None for param in parameters
+        )
         num_routed_fc1 = len(self.routed_fc1_parameters)
         fc1_main_grads = main_grads[2 : 2 + num_routed_fc1]
         fc2_main_grads = main_grads[2 + num_routed_fc1 :]
@@ -252,15 +298,18 @@ class MoKMegakernel(MegakernelBackend):
         if self.native_single_grouped_weights:
             arguments = (logical_main_grads, None)
         else:
-            from mok import ops
-
-            fc1_table = ops.make_routed_d_weight_storage_table(list(fc1_main_grads))
-            fc2_table = ops.make_routed_d_weight_storage_table(list(fc2_main_grads))
+            make_table = (
+                _address_table
+                if self.cutemok is not None
+                else mok_modules()[1].make_routed_d_weight_storage_table
+            )
+            fc1_table = make_table(list(fc1_main_grads))
+            fc2_table = make_table(list(fc2_main_grads))
             arguments = (logical_main_grads, (fc1_table, fc2_table))
         cached = _MainGradArguments(
-            parameters=parameters,
-            main_grads=main_grads,
-            data_ptrs=tuple(grad.data_ptr() for grad in main_grads),
+            parameters=tuple(param for param in parameters if param is not None),
+            main_grads=tuple(grad for grad in main_grads if grad is not None),
+            data_ptrs=tuple(grad.data_ptr() for grad in main_grads if grad is not None),
             arguments=arguments,
             mok_arguments=_gate_up_main_grad_arguments(*arguments, self.intermediate_size),
         )
@@ -274,6 +323,8 @@ class MoKMegakernel(MegakernelBackend):
         tensor objects on every call and validates them only once.
         """
         shared_fc1 = self.shared_fc1_weight
+        if shared_fc1 is None:
+            return None, None
         cached = self._shared_fc1_gate_up_cache
         if cached is not None and cached[0] is shared_fc1 and cached[1] == shared_fc1.data_ptr():
             return cached[2]
@@ -433,12 +484,15 @@ class MoKMegakernel(MegakernelBackend):
                 use_mxfp8=self.use_mxfp8_weights,
                 cached_view=cached_view,
             )
+        # The mok package's call is unchanged; CuTe MoK builds its CuteMoKSplitWeight instead.
+        api_kwargs = {} if self.cutemok is None else {"api": self.cutemok}
         return _native_split_weight_view(
             parameters,
             rows=rows,
             columns=columns,
             use_mxfp8=self.use_mxfp8_weights,
             cached_view=cached_view,
+            **api_kwargs,
         )
 
     # Checkpoint contract: native MCore expert modules own the canonical parameters,
@@ -511,7 +565,7 @@ class MoKMegakernel(MegakernelBackend):
         routing_map: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Run the fused MoE megakernel (dispatch, routed/shared experts, combine).
+        """Run dispatch, routed experts, optional fused shared experts, and combine.
 
         Args:
             hidden_states: Input activations of shape ``[..., hidden_size]``.

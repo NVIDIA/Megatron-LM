@@ -8,7 +8,7 @@ from typing import Optional, Protocol
 
 import torch
 
-from megatron.core import utils
+from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
@@ -22,6 +22,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection, resolve_
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.megakernel import (
     build_megakernel_backend,
+    megakernel_fuses_shared_expert,
     megakernel_shared_expert_init_context,
     prepare_megakernel_shared_expert_config,
 )
@@ -427,11 +428,15 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
             comm_manager.bind_experts(self.experts)
 
         # Initialize shared experts
+        self.megakernel_fuses_shared_expert = (
+            self.config.moe_megakernel_backend is not None
+            and megakernel_fuses_shared_expert(self.config)
+        )
         if self.use_shared_expert:
             assert (
                 self.submodules.shared_experts is not None
             ), "Shared experts builder is not provided in the module spec."
-            if self.config.moe_megakernel_backend is None:
+            if not self.megakernel_fuses_shared_expert:
                 self.shared_experts = self.submodules.shared_experts(
                     config=self.config,
                     pg_collection=pg_collection,
@@ -459,7 +464,7 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
                 config=self.config,
                 ep_group=self.ep_group,
                 routed_experts=self.experts,
-                shared_experts=self.shared_experts,
+                shared_experts=self.shared_experts if self.megakernel_fuses_shared_expert else None,
                 num_local_experts=self.num_local_experts,
             )
 
@@ -571,6 +576,19 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
             self._delayed_wgrad_event = torch.cuda.Event()
             self._delayed_wgrad_stream = torch.cuda.Stream(device="cuda")
 
+    def _align_megakernel_metadata(self, value, hidden_states):
+        """Align batch-first metadata with the local sequence-parallel tokens."""
+        if (
+            self.config.sequence_parallel
+            and value is not None
+            and value.shape[1] != hidden_states.shape[0]
+        ):
+            value = tensor_parallel.scatter_to_sequence_parallel_region(
+                value.transpose(0, 1).contiguous(), group=self.tp_group
+            )
+            value = value.transpose(0, 1).contiguous()
+        return value
+
     @maybe_skip_or_early_return_by_te_cuda_graph("route")
     def route(
         self,
@@ -587,9 +605,14 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
         routing consumes it sequence-first to align with ``hidden_states``. With routing replay,
         ``replay_topk_idx`` ([num_tokens, topk]) replaces the micro-batch's indices for this call.
         """
+        if self.config.moe_megakernel_backend is not None and self.config.sequence_parallel:
+            # MOK consumes local SP tokens directly. Batch-first routing metadata
+            # may still describe the full sequence, so shard it with the owning TP group.
+            padding_mask = self._align_megakernel_metadata(padding_mask, hidden_states)
+            input_ids = self._align_megakernel_metadata(input_ids, hidden_states)
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
-        if self.token_dispatcher is not None:
+        if self.config.moe_megakernel_backend is None:
             hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
         with RouterReplay.replay_indices_for_call(
             getattr(self.router, "router_replay", None), replay_topk_idx
@@ -646,20 +669,21 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
         # Project the hidden_states from hidden dimension down to latent dimension.
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
-        if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
-            # Only the flex dispatcher takes the mask (dropless HybridEP and NCCL EP exclude
-            # padded rows) and the packed-sequence metadata.
-            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-                hidden_states,
-                routing_map,
-                probs,
-                padding_mask=padding_mask,
-                packed_seq_params=packed_seq_params,
-            )
-        else:
-            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-                hidden_states, routing_map, probs
-            )
+        if self.config.moe_megakernel_backend is None:
+            if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
+                # Only the flex dispatcher takes the mask (dropless HybridEP and NCCL EP exclude
+                # padded rows) and the packed-sequence metadata.
+                hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                    hidden_states,
+                    routing_map,
+                    probs,
+                    padding_mask=padding_mask,
+                    packed_seq_params=packed_seq_params,
+                )
+            else:
+                hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                    hidden_states, routing_map, probs
+                )
         return hidden_states, probs
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
@@ -747,7 +771,8 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
         shared-expert overlap). It is populated in preprocess and joined here, after
         fc2_latent_proj, so the dimensions match the full hidden dim."""
 
-        output = self.token_dispatcher.combine_postprocess(output)
+        if self.config.moe_megakernel_backend is None:
+            output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             if self.config.moe_use_norm_before_up_proj:
                 output = apply_module(self.fc2_norm)(output)
@@ -764,7 +789,9 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
             torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
             output = output + self._latent_shared_expert_output
             self._latent_shared_expert_output = None
-        return self.token_dispatcher.finalize_layer_output(output)
+        if self.config.moe_megakernel_backend is None:
+            output = self.token_dispatcher.finalize_layer_output(output)
+        return output
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):
         """This method is a combined method of route and preprocess. Deprecated."""
@@ -819,6 +846,10 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
                 )
 
             def megakernel_forward(hidden_states, padding_mask):
+                padding_mask = self._align_megakernel_metadata(padding_mask, hidden_states)
+                shared_output = None
+                if not self.megakernel_fuses_shared_expert:
+                    shared_output = self.shared_experts_compute(hidden_states)
                 probs, routing_map = self.route(
                     hidden_states,
                     padding_mask,
@@ -828,9 +859,15 @@ class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
                 )
                 # Like dropless HybridEP, the megakernel gives padding tokens no routes and skips
                 # them.
-                return apply_module(self.megakernel_experts)(
+                if self.megakernel_fuses_shared_expert:
+                    return apply_module(self.megakernel_experts)(
+                        hidden_states, probs, routing_map, padding_mask
+                    )
+                hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                output = apply_module(self.megakernel_experts)(
                     hidden_states, probs, routing_map, padding_mask
                 )
+                return self.postprocess(output, shared_output)
 
             if self.moe_layer_recompute and self.training:
                 output = precision_aware_checkpoint(

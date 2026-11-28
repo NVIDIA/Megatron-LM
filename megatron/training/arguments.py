@@ -982,7 +982,9 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
-    if args.moe_megakernel_backend == "mok" and (args.use_megatron_fsdp or args.use_torch_fsdp2):
+    if args.moe_megakernel_backend in ("mok", "cutemok") and (
+        args.use_megatron_fsdp or args.use_torch_fsdp2
+    ):
         raise ValueError("MOK has not been validated with Megatron-FSDP or Torch FSDP2")
 
     if args.use_megatron_fsdp:
@@ -2357,7 +2359,8 @@ def _add_network_size_args(parser):
         type=json.loads,
         default=None,
         metavar="JSON",
-        help="Backend-specific MoE megakernel options as a JSON object.",
+        help="MCore common options (shared_expert_mode) and backend-specific MoE "
+        "megakernel options as a JSON object.",
     )
 
     group = parser.add_argument_group(title='network size')

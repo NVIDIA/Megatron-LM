@@ -31,6 +31,7 @@ def test_megakernel_forward_preserves_packed_routing_metadata(monkeypatch, recom
     layer.attn_tp_group = SimpleNamespace(size=lambda: 1)
     layer.tp_group = object()
     layer.moe_layer_recompute = recompute
+    layer.megakernel_fuses_shared_expert = True
     hidden = torch.ones(4, 1, 8)
     padding_mask = torch.zeros(1, 4, dtype=torch.bool)
     input_ids = torch.arange(4).view(1, 4)
@@ -141,7 +142,8 @@ def _assert_accumulate_grad_steals_sentinel(param, backward_context=nullcontext)
     seen = []
     # MCore DDP registers its hook on the AccumulateGrad node the same way; the hook's extra
     # reference must still let AccumulateGrad steal the sentinel instead of copying it.
-    grad_accumulator = param.expand_as(param).grad_fn.next_functions[0][0]
+    param_tmp = param.expand_as(param)
+    grad_accumulator = param_tmp.grad_fn.next_functions[0][0]
 
     def hook(*unused):
         seen.append((type(param.grad), param.grad.data_ptr(), param.grad_added_to_main_grad))
@@ -779,6 +781,7 @@ def test_output_gate_autograd_preserves_native_main_grad(monkeypatch, gated, mai
     module.mok_config = module.ep_group = object()
     module.num_local_experts = module.topk = 2
     module.swiglu_limit = None
+    module.situ_beta = None
     parameters = tuple(module.parameters())
     for parameter in parameters:
         parameter.main_grad = torch.zeros_like(parameter, dtype=main_grad_dtype)
@@ -898,6 +901,7 @@ def _split_module_with_main_grads(monkeypatch):
         return object()
 
     fake_mok = types.ModuleType("mok")
+    fake_mok.functional = types.ModuleType("mok.functional")
     fake_mok.ops = SimpleNamespace(
         make_routed_d_weight_storage_table=make_routed_d_weight_storage_table
     )
@@ -1017,6 +1021,7 @@ def test_mok_autograd_saves_only_backward_inputs_and_grads_every_routed_paramete
     module.ep_group = None
     module.num_local_experts = 2
     module.swiglu_limit = None
+    module.situ_beta = None
     monkeypatch.setattr(mok_backend, "_native_split_weight_view", lambda *a, **k: object())
 
     def forward(config, workspace, schedule, x, router_weights, *weights, swiglu_limit):
@@ -1058,7 +1063,16 @@ def test_mok_autograd_saves_only_backward_inputs_and_grads_every_routed_paramete
         assert param.grad is not None and param.grad.data_ptr() == buffer.data_ptr()
 
 
-def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False, **config_extra):
+def _mock_backend(
+    monkeypatch,
+    *,
+    single_grouped=False,
+    gated=True,
+    mxfp8=False,
+    situ=False,
+    routed_only=False,
+    **config_extra,
+):
     """Build the actual adapter while keeping these contract tests independent of MOK."""
     if mxfp8:
         from megatron.core import fp8_utils
@@ -1097,19 +1111,32 @@ def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False,
         moe_shared_expert_glu_interleave_size=None,
         moe_pad_expert_input_to_capacity=False,
         moe_shared_expert_gate=gated,
-        hidden_size=8,
+        hidden_size=16 if routed_only else 8,
+        moe_latent_size=8 if routed_only else None,
         moe_ffn_hidden_size=4,
-        moe_shared_expert_intermediate_size=4,
+        moe_shared_expert_intermediate_size=12 if routed_only else 4,
         moe_router_topk=2,
         activation_func_clamp_value=None,
+        activation_func=torch.nn.functional.silu,
+        activation_func_tanh_clamp_scale=2.0 if situ else None,
+        activation_func_tanh_clamp_scale_linear=8.0 if situ else None,
         fp8="hybrid" if mxfp8 else None,
         fp8_recipe="mxfp8",
         fp8_param=mxfp8,
         moe_single_grouped_weight=single_grouped,
-        moe_megakernel_backend_config=None,
+        moe_megakernel_backend_config={
+            "shared_expert_mode": "native" if routed_only else "auto",
+            "fwd_num_comm_sms": 32,
+            "bwd_num_comm_sms": 40,
+        },
         **config_extra,
     )
-    module = mok_backend.MoKMegakernel(config, object(), experts, shared, 2)
+    original_options = config.moe_megakernel_backend_config.copy()
+    module = mok_backend.MoKMegakernel(
+        config, object(), experts, None if routed_only else shared, 2
+    )
+    assert config.moe_megakernel_backend_config == original_options
+    assert vars(module.mok_config) == {"fwd_num_comm_sms": 32, "bwd_num_comm_sms": 40}
     return module, shared, functional
 
 
@@ -1287,25 +1314,36 @@ def test_register_shared_output_gate_rejects_non_bf16_parameter(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mxfp8, single_grouped, gated, main_grad_dtype",
+    "mxfp8, single_grouped, gated, main_grad_dtype, situ",
     [
-        pytest.param(False, False, True, torch.float32, id="bf16-split-g-fp32"),
-        pytest.param(True, False, True, torch.bfloat16, id="mxfp8-split-g-bf16"),
-        pytest.param(True, True, True, torch.float32, id="mxfp8-single-g-fp32"),
-        pytest.param(False, True, False, torch.bfloat16, id="bf16-single-u-bf16"),
+        pytest.param(False, False, True, torch.float32, True, id="bf16-split-g-fp32"),
+        pytest.param(True, False, True, torch.bfloat16, False, id="mxfp8-split-g-bf16"),
+        pytest.param(True, True, True, torch.float32, True, id="mxfp8-single-g-fp32"),
+        pytest.param(False, True, False, torch.bfloat16, False, id="bf16-single-u-bf16"),
+        pytest.param(False, True, None, torch.float32, True, id="routed-only-bf16"),
+        pytest.param(True, False, None, torch.bfloat16, True, id="routed-only-mxfp8"),
     ],
 )
 def test_gate_autograd_accumulation_and_ddp_hooks(
-    monkeypatch, single_grouped, gated, mxfp8, main_grad_dtype
+    monkeypatch, single_grouped, gated, mxfp8, main_grad_dtype, situ
 ):
     from megatron.core.distributed import distributed_data_parallel as ddp_module
 
     module, shared, functional = _mock_backend(
-        monkeypatch, single_grouped=single_grouped, gated=gated, mxfp8=mxfp8
+        monkeypatch,
+        single_grouped=single_grouped,
+        gated=gated,
+        mxfp8=mxfp8,
+        situ=situ,
+        routed_only=gated is None,
     )
     gate = shared.gate_weight
     assert module.shared_output_gate_weight is gate
     parameters = tuple(module.parameters())
+    if gated is None:
+        assert module.hidden_size == 8  # Routed weights use latent size, not model hidden size.
+        assert module.shared_fc1_weight is module.shared_fc2_weight is None
+        assert not {id(p) for p in shared.parameters()} & {id(p) for p in parameters}
     for parameter in parameters:
         parameter.main_grad = torch.zeros_like(parameter, dtype=main_grad_dtype)
     expected = torch.full((1, 8), 0.25, dtype=main_grad_dtype)
@@ -1323,8 +1361,11 @@ def test_gate_autograd_accumulation_and_ddp_hooks(
     gate_keys = {"shared_output_gate_weight"} if gated else set()
 
     def forward(*args, **kwargs):
-        assert set(kwargs) == {"swiglu_limit"} | gate_keys
+        assert set(kwargs) == {"swiglu_limit"} | gate_keys | ({"situ_beta"} if situ else set())
+        assert kwargs.get("situ_beta") == ((2.0, 8.0) if situ else None)
         assert kwargs.get("shared_output_gate_weight") is gate
+        if gated is None:
+            assert args[5:8] == (None, None, None)
         return args[3].clone(), object()
 
     def backward(*args, **kwargs):
@@ -1333,6 +1374,8 @@ def test_gate_autograd_accumulation_and_ddp_hooks(
             keys.add("shared_output_gate_main_grad")
         assert set(kwargs) == keys
         assert kwargs.get("shared_output_gate_weight") is gate
+        if gated is None:
+            assert kwargs["main_grads"][::2] == (None, None, None)
         gate_grad = kwargs.get("shared_output_gate_main_grad")
         if gated:
             assert gate_grad is gate_main_grad and gate_grad.dtype == main_grad_dtype
