@@ -2,7 +2,7 @@
 
 """Configuration for producing or consuming an offline teacher-logits cache."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 
@@ -10,8 +10,10 @@ from typing import Literal
 class LogitsSaveConfig:
     """Teacher-side cache generation; independent of whether the model is frozen."""
 
-    directory: str
-    """Directory or MSC URL to write teacher log-probability shards."""
+    directory: str | None = field(
+        default=None, metadata={"argparse_meta": {"arg_names": ["--logits-save-dir"]}}
+    )
+    """Directory or MSC URL to write teacher log-probability shards. Required."""
 
     top_k: int = 128
     """Maximum number of vocabulary entries to retain per token."""
@@ -19,7 +21,9 @@ class LogitsSaveConfig:
     top_p: float | None = None
     """Optional nucleus threshold applied after top-k selection."""
 
-    min_k: int = 1
+    min_k: int = field(
+        default=1, metadata={"argparse_meta": {"arg_names": ["--logits-save-top-p-min-k"]}}
+    )
     """Minimum entries retained per token when top-p truncation is enabled."""
 
     dtype: Literal["fp16", "bf16", "fp32"] = "fp16"
@@ -43,10 +47,14 @@ class LogitsSaveConfig:
 class LogitsLoadConfig:
     """Student-side cache reading and offline KD loss."""
 
-    directory: str
-    """Directory or MSC URL containing the teacher log-probability shards."""
+    directory: str | None = field(
+        default=None, metadata={"argparse_meta": {"arg_names": ["--logits-load-dir"]}}
+    )
+    """Directory or MSC URL containing the teacher log-probability shards. Required."""
 
-    loss_alpha: float = 1.0
+    loss_alpha: float = field(
+        default=1.0, metadata={"argparse_meta": {"arg_names": ["--logits-load-kd-loss-alpha"]}}
+    )
     """Loss mixture: alpha * KD loss + (1 - alpha) * language-model loss."""
 
     decode_threads: int = 4

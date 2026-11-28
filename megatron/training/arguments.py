@@ -1709,16 +1709,6 @@ def validate_args(args, defaults={}):
             'restored by load_state_dict); use tensorwise, mxfp8, blockwise or nvfp4.'
         )
 
-    # The other --logits-save-dir/--logits-load-dir rules live in OfflineDistillationConfig.
-    if args.logits_save_dir is not None:
-        if not args.freeze_all_layers:
-            warn_rank_0(
-                '--logits-save-dir without --freeze-all-layers: the LM loss is still computed and '
-                'gradients will update the model while logits are dumped. This is intended only '
-                'when dumping logits during active training; for a frozen-teacher dump pass '
-                '--freeze-all-layers.'
-            )
-
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
             warn_rank_0(
@@ -3686,46 +3676,17 @@ def _add_varlen_dataset_args(parser):
     return parser
 
 def _add_logits_distillation_args(parser):
-    group = parser.add_argument_group(title='Logits Distillation')
-    # -- Teacher saving --
-    group.add_argument('--logits-save-dir', type=str, default=None,
-                       help='Directory to save logits.')
-    group.add_argument('--logits-save-top-k', type=int, default=128,
-                       help='Number of top logits to save.')
-    group.add_argument('--logits-save-top-p', type=float, default=None,
-                       help='Top-P (nucleus) threshold applied after top-K '
-                            'selection when saving logits. Only the smallest '
-                            'set of entries whose cumulative probability mass '
-                            'reaches this threshold is kept. Must be in (0, 1].')
-    group.add_argument('--logits-save-top-p-min-k', type=int, default=1,
-                       help='Minimum number of entries kept per token when '
-                            'top-P masking is active, regardless of '
-                            'cumulative mass. Default: 1.')
-    group.add_argument('--logits-save-dtype', type=str, default='fp16',
-                       choices=['fp16', 'bf16', 'fp32'],
-                       help='Dtype for on-disk top-K log-probabilities.')
-    # -- Student loading --
-    group.add_argument('--logits-load-dir', type=str, default=None,
-                       help='Directory to load logits.')
-    group.add_argument('--logits-load-decode-threads', type=int, default=4,
-                       help='Number of decode threads for cached-logits zstd '
-                            'decompression and torch.load processing.')
-    group.add_argument('--logits-load-msc-prefetch-depth', type=int, default=2,
-                       help='For MSC/object-storage logits tar shards, number '
-                            'of whole tar shards to prefetch into the MSC '
-                            'cache ahead of sequential tar consumption.')
-    group.add_argument('--logits-load-kd-loss-alpha', type=float, default=1.0,
-                       help='KD loss alpha for loading logits. Total loss is calculated as '
-                            'alpha * kd_loss + (1 - alpha) * lm_loss.')
-    group.add_argument('--logits-load-ignore-errors', action='store_true',
-                       default=False,
-                       help='When set, KD loss errors are logged as warnings and '
-                            'training falls back to LM-only loss instead of crashing.')
-    group.add_argument('--logits-load-ignore-hash', action='store_true',
-                       default=False,
-                       help='When set, skip cached-logits tar metadata hash validation. '
-                            'Use only when intentionally loading logits saved with an '
-                            'older or otherwise incompatible dataset hash.')
+    from megatron.training.config.offline_distillation_config import (
+        LogitsLoadConfig,
+        LogitsSaveConfig,
+    )
+
+    ArgumentGroupFactory(LogitsSaveConfig, prefix="logits_save").build_group(
+        parser, "offline distillation: teacher logits saving"
+    )
+    ArgumentGroupFactory(LogitsLoadConfig, prefix="logits_load").build_group(
+        parser, "offline distillation: cached logits loading"
+    )
     return parser
 
 

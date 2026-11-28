@@ -563,9 +563,16 @@ class PretrainConfigContainer(ConfigContainerBase):
         if (
             self.train.rampup_batch_size is not None
             or self.train.step_batch_size_schedule is not None
+            or self.train.decrease_batch_size_if_needed
         ):
-            raise ValueError("Offline distillation requires a fixed global batch size.")
+            raise ValueError(
+                "Offline distillation requires a fixed global batch size (no rampup_batch_size, "
+                "step_batch_size_schedule or decrease_batch_size_if_needed)."
+            )
         if offline_kd_cfg.teacher_save is not None:
+            # Logits are flushed with each checkpoint save, and resuming reads progress from save.
+            if self.checkpoint.save is None:
+                raise ValueError("teacher_save requires checkpoint.save.")
             if not self.checkpoint.async_save or not self.checkpoint.use_persistent_ckpt_worker:
                 raise ValueError(
                     "teacher_save requires checkpoint.async_save and use_persistent_ckpt_worker."
@@ -1019,6 +1026,18 @@ class PretrainConfigContainer(ConfigContainerBase):
                 )
             for name in enabled:
                 setattr(self.optimizer, name, False)
+        offline_kd_cfg = self.offline_distillation
+        if (
+            offline_kd_cfg is not None
+            and offline_kd_cfg.teacher_save is not None
+            and not self.train.freeze_all_layers
+        ):
+            logger.warning(
+                "offline_distillation.teacher_save without train.freeze_all_layers: the LM loss "
+                "is still computed and gradients update the model while logits are saved. This "
+                "is intended only when saving logits during active training; for a frozen "
+                "teacher, set train.freeze_all_layers (--freeze-all-layers)."
+            )
         self.ddp.overlap_param_gather = self.optimizer.overlap_param_gather
         self.ddp.reuse_grad_buf_for_mxfp8_param_ag = (
             self.optimizer.reuse_grad_buf_for_mxfp8_param_ag
