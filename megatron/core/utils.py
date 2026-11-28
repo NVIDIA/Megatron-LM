@@ -296,6 +296,13 @@ def experimental_cls(introduced_with_version: str):
     return validator
 
 
+@functools.lru_cache(maxsize=None)
+def _parsed_version(version: str):
+    """Parse a version string once; the is_*_min_version checks run on hot paths (for example
+    every CheckpointWithoutOutput through is_graph_safe_cuda_rng_tracker) with constant strings."""
+    return PkgVersion(version)
+
+
 def get_te_version():
     """Get TE version from __version__; if not available use pip's. Use caching."""
     if not HAVE_PACKAGING:
@@ -335,8 +342,8 @@ def is_te_min_version(version, check_equality=True):
         )
 
     if check_equality:
-        return get_te_version() >= PkgVersion(version)
-    return get_te_version() > PkgVersion(version)
+        return get_te_version() >= _parsed_version(version)
+    return get_te_version() > _parsed_version(version)
 
 
 def get_torch_version():
@@ -353,8 +360,8 @@ def is_torch_min_version(version, check_equality=True):
             "packaging is not installed. Please install it with `pip install packaging`."
         )
     if check_equality:
-        return get_torch_version() >= PkgVersion(version)
-    return get_torch_version() > PkgVersion(version)
+        return get_torch_version() >= _parsed_version(version)
+    return get_torch_version() > _parsed_version(version)
 
 
 def get_fa_version():
@@ -385,8 +392,8 @@ def is_fa_min_version(version, check_equality=True):
             "packaging is not installed. Please install it with `pip install packaging`."
         )
     if check_equality:
-        return get_fa_version() >= PkgVersion(version)
-    return get_fa_version() > PkgVersion(version)
+        return get_fa_version() >= _parsed_version(version)
+    return get_fa_version() > _parsed_version(version)
 
 
 def get_mamba_version():
@@ -417,8 +424,8 @@ def is_mamba_min_version(version, check_equality=True):
             "packaging is not installed. Please install it with `pip install packaging`."
         )
     if check_equality:
-        return get_mamba_version() >= PkgVersion(version)
-    return get_mamba_version() > PkgVersion(version)
+        return get_mamba_version() >= _parsed_version(version)
+    return get_mamba_version() > _parsed_version(version)
 
 
 def get_causal_conv1d_version():
@@ -449,8 +456,8 @@ def is_causal_conv1d_min_version(version, check_equality=True):
             "packaging is not installed. Please install it with `pip install packaging`."
         )
     if check_equality:
-        return get_causal_conv1d_version() >= PkgVersion(version)
-    return get_causal_conv1d_version() > PkgVersion(version)
+        return get_causal_conv1d_version() >= _parsed_version(version)
+    return get_causal_conv1d_version() > _parsed_version(version)
 
 
 def get_flashinfer_version():
@@ -487,8 +494,8 @@ def is_flashinfer_min_version(version, check_equality=True):
     if (flashinfer_version := get_flashinfer_version()) is None:
         return False
     if check_equality:
-        return flashinfer_version >= PkgVersion(version)
-    return flashinfer_version > PkgVersion(version)
+        return flashinfer_version >= _parsed_version(version)
+    return flashinfer_version > _parsed_version(version)
 
 
 def get_emerging_optimizers_version():
@@ -520,8 +527,8 @@ def is_emerging_optimizers_min_version(version, check_equality=True):
             "packaging is not installed. Please install it with `pip install packaging`."
         )
     if check_equality:
-        return get_emerging_optimizers_version() >= PkgVersion(version)
-    return get_emerging_optimizers_version() > PkgVersion(version)
+        return get_emerging_optimizers_version() >= _parsed_version(version)
+    return get_emerging_optimizers_version() > _parsed_version(version)
 
 
 # Values that select a fused kernel backend and therefore carry optional dependencies.
