@@ -7,13 +7,15 @@ main-gradient dtype when it is unset, independently of the compute-gradient dtyp
 training must still track an unsharded baseline in either reduction dtype.
 """
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 import torch.distributed as dist
 import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Partial, Replicate, Shard
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard
 from transformer_engine.common.recipe import MXFP8BlockScaling
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
@@ -21,6 +23,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     GradientFinalizationMode,
     Placements,
     RuntimePolicy,
+    SchedulePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
@@ -32,6 +35,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.quantized_dbu
     QuantizedDBuffer,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import complete_fsdp_unit_backward
 
 
 class TinyModel(nn.Module):
@@ -375,3 +379,94 @@ def test_local_accumulation_scaling_matches_reference(distributed_setup, grad_co
 
     actual = model.weight.grad.to_local().reshape(8, 4096)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def _shard_unit(setup, model) -> None:
+    """Shard one unit with caller-managed execution and gradient synchronization."""
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    with fully_shard_context(FsdpContext(device=setup.device)):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=_default_placements(),
+            schedule_policy=SchedulePolicy(register_hooks=False),
+        )
+
+
+def _forward_backward(model, inputs, node, *, sharded: bool) -> torch.Tensor:
+    """Run one node, explicitly unsharding and resharding for the sharded model."""
+    if sharded:
+        model.context.allgather_stream.wait_stream(model.context.current_stream())
+        model.unshard()
+    loss = model[node](inputs).square().mean()
+    loss.backward()
+    if sharded:
+        model.reshard()
+    return loss.detach()
+
+
+def _full_tensor(tensor: DTensor) -> torch.Tensor:
+    # DTensor.full_tensor() assumes the standard Shard(0) sizes.
+    local = tensor.to_local().detach()
+    group = tensor.device_mesh.get_group()
+    local_rows = local.new_tensor([local.shape[0]], dtype=torch.int64)
+    rows_per_rank = local.new_empty((group.size(),), dtype=torch.int64)
+    dist.all_gather_into_tensor(rows_per_rank, local_rows, group=group)
+    shards = [local.new_empty((rows, *local.shape[1:])) for rows in rows_per_rank.tolist()]
+    dist.all_gather(shards, local, group=group)
+    return torch.cat(shards, dim=0)
+
+
+def test_multiple_backward_calls_match_baseline(distributed_setup):
+    """Match dense losses, gradients, and updates with multiple backward calls per microbatch."""
+    setup = distributed_setup
+    torch.manual_seed(0)
+    baseline = nn.Sequential(nn.Linear(16, 16, bias=False), nn.Linear(16, 16, bias=False)).to(
+        setup.device
+    )
+    model = nn.Sequential(nn.Linear(16, 16, bias=False), nn.Linear(16, 16, bias=False)).to(
+        setup.device
+    )
+    model.load_state_dict(baseline.state_dict())
+    _shard_unit(setup, model)
+
+    # One layer contributes twice and the other once, in separate backward calls.
+    nodes = (0, 1, 0)
+    modes = (GradientFinalizationMode.SKIP_OUTER, GradientFinalizationMode.REDUCE_OUTER)
+    torch.manual_seed(123 + setup.rank)
+    steps = torch.randn(2, len(modes), len(nodes), 4, 16, device=setup.device)
+
+    def train(module, *, sharded: bool):
+        optimizer = torch.optim.SGD(module.parameters(), lr=0.1)
+        context = module.context if sharded else None
+        if sharded:
+            fully_shard_optimizer(optimizer)
+        losses, gradients, weights = [], [], []
+        for microbatches in steps:
+            optimizer.zero_grad()
+            for mode, inputs in zip(modes, microbatches):
+                with context.finalize_gradients(mode) if sharded else nullcontext():
+                    for node, node_inputs in zip(nodes, inputs):
+                        losses.append(_forward_backward(module, node_inputs, node, sharded=sharded))
+                    if sharded:
+                        complete_fsdp_unit_backward(module)
+            if sharded:
+                context.finish_grad_sync()
+            for parameter in module.parameters():
+                if sharded:
+                    gradients.append(_full_tensor(parameter.grad))
+                else:
+                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
+                    gradients.append(parameter.grad.detach().clone())
+            optimizer.step()
+            weights.extend(
+                _full_tensor(parameter) if sharded else parameter.detach().clone()
+                for parameter in module.parameters()
+            )
+        return losses, gradients, weights
+
+    baseline_losses, baseline_gradients, baseline_weights = train(baseline, sharded=False)
+    sharded_losses, sharded_gradients, sharded_weights = train(model, sharded=True)
+    torch.testing.assert_close(sharded_losses, baseline_losses)
+    torch.testing.assert_close(sharded_gradients, baseline_gradients)
+    torch.testing.assert_close(sharded_weights, baseline_weights)

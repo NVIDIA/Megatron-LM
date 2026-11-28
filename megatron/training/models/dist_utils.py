@@ -28,6 +28,7 @@ except ImportError:
     HAVE_FSDP2 = False
 
 from megatron.core.enums import ModelType
+from megatron.core.pipeline_parallel.combined_1f1b import setup_mfsdp_v2_ep_overlap
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule, TransformerConfig
 from megatron.core.transformer.module import Float16Module
@@ -40,6 +41,7 @@ except ImportError:
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -390,6 +392,7 @@ def _ddp_wrap(
         construction_context = (
             fully_shard_context(
                 FsdpContext(
+                    gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
@@ -450,6 +453,12 @@ def _ddp_wrap(
                     **chunk_kwargs,
                 )
                 wrapped_model.append(wrapped_chunk)
+        if is_mfsdp_v2:
+            overlap_chunks = [
+                chunk for chunk in wrapped_model if chunk.config.overlap_moe_expert_parallel_comm
+            ]
+            if overlap_chunks:
+                setup_mfsdp_v2_ep_overlap(overlap_chunks)
         model = wrapped_model
 
     # Ensure side-stream initialization completes before touching params on the current stream.

@@ -31,11 +31,10 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import log_single_rank
+from megatron.core.utils import log_single_rank, unwrap_model
 
 __all__ = ["FullyShardedDataParallelV2"]
 
@@ -314,9 +313,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         super().__init__(config=config, module=module)
 
-        if config.overlap_moe_expert_parallel_comm:
-            register_combined_1f1b_hooks(self.module)
-
     def load_state_dict(self, state_dict, strict=True):
         """Load main weights and refresh the buffers used for forward compute."""
         super().load_state_dict(state_dict, strict=strict)
@@ -366,6 +362,29 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 "MFSDP v2 does not support residual_stream recomputation (#7777). "
                 "Remove it from recompute_modules and clear residual_stream_recompute_num_layers."
             )
+
+        mtp_number_layers = 0 if config.mtp_num_layers is None else config.mtp_num_layers
+        model = unwrap_model(module)
+        if config.overlap_moe_expert_parallel_comm and getattr(
+            model, "share_embeddings_and_output_weights", False
+        ):
+            # Use the model-wide flag so every PP rank rejects before FSDP setup.
+            raise ValueError(
+                "MFSDP v2 with MoE EP overlap does not currently support tied embedding and "
+                "output weights. Set share_embeddings_and_output_weights=False."
+            )
+
+        if config.pipeline_model_parallel_size > 1 and mtp_number_layers > 0:
+            if getattr(model, "share_embeddings_and_output_weights", False):
+                # Check global topology, rather than rank-local mtp_process, so
+                # every PP rank rejects before constructing FSDP collective state.
+                # TODO: Remove after GPTModel/HybridModel stop allocating an unused
+                # tied MTP output weight (https://github.com/NVIDIA/Megatron-LM/pull/8330).
+                raise ValueError(
+                    "MFSDP v2 does not currently support PP > 1 with MTP and tied embeddings. "
+                    "The last MTP stage allocates an unused output weight that never receives "
+                    "a gradient. See https://github.com/NVIDIA/Megatron-LM/pull/8330."
+                )
 
         if config.mtp_detach_heads:
             # Detached MTP heads are tagged into a separate gradient-norm group, which

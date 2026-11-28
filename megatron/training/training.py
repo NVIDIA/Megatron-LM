@@ -106,6 +106,7 @@ from megatron.core.parallel_state import (
     update_pg_timeout,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.combined_1f1b import setup_mfsdp_v2_ep_overlap
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
     get_pp_last_rank,
@@ -2163,6 +2164,8 @@ def wrap_model_chunks_with_ddp(
                     **chunk_kwargs,
                 )
             )
+    if is_mfsdp_v2 and config.overlap_moe_expert_parallel_comm:
+        setup_mfsdp_v2_ep_overlap(wrapped)
     return wrapped
 
 

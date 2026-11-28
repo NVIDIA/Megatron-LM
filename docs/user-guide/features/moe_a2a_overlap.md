@@ -490,6 +490,8 @@ need to register parameter hooks.
 For v2, the Combined 1F1B scheduler explicitly unshards and reshards
 `FsdpModule` units to match its execution order. This integration does not use
 v1's fine-grained parameter-gather mechanism.
+See [M-FSDP v2 EP overlap integration](../../../megatron/core/distributed/fsdp/src/docs/ep_overlap_integration.md)
+for the module hooks, per-microbatch callbacks, and gradient-completion boundaries.
 
 The v2 restrictions still apply: disable gradient accumulation fusion, FP4, and
 non-MXFP8 FP8 recipes. Its buffer settings and compatibility constraints are

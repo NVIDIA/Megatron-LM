@@ -13,6 +13,7 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoad
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.combined_1f1b import setup_mfsdp_v2_ep_overlap
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
@@ -99,6 +100,8 @@ class TestMFSDPv2EPOverlapCudaGraph:
                 module=model,
                 pg_collection=process_group_collection,
             )
+            if config.overlap_moe_expert_parallel_comm:
+                setup_mfsdp_v2_ep_overlap([model])
             # Like MCore training, the schedule finishes gradient synchronization.
             config.no_sync_func = model.no_sync
             config.finalize_model_grads_func = finalize_model_grads

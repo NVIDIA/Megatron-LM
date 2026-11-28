@@ -45,6 +45,7 @@ established here.
 - [Optimizer](optimizer.md)
 - [Muon](muon.md)
 - [Runtime schedule](runtime_schedule.md)
+- [EP overlap integration](ep_overlap_integration.md)
 
 # API
 
