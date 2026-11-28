@@ -144,7 +144,7 @@ class TestCrossEntropyFollowsTheConfig:
             with pytest.raises(AssertionError, match="TransformerEngine >= 2.7.0"):
                 get_backend_from_config(config).vocab_parallel_cross_entropy()
 
-    @pytest.mark.parametrize("cuda_graph_impl", [None, "full_iteration"])
+    @pytest.mark.parametrize("cuda_graph_impl", [None, "full_iteration", "chunk_wise"])
     def test_te_receives_the_graph_capture_setting(self, cuda_graph_impl):
         config = _config(
             cross_entropy_loss_fusion=True,
@@ -153,7 +153,9 @@ class TestCrossEntropyFollowsTheConfig:
         )
         with patch("megatron.core.models.backends.is_te_min_version", return_value=True):
             target = get_backend_from_config(config).vocab_parallel_cross_entropy()
-        assert target.keywords["cuda_graph_capturable"] == (cuda_graph_impl == "full_iteration")
+        # The loss is captured by full-iteration graphs and by the post-process block of
+        # chunk-wise graphs.
+        assert target.keywords["cuda_graph_capturable"] == (cuda_graph_impl is not None)
 
 
 class TestBertLmHeadNormDoesNotFollowTransformerImpl:

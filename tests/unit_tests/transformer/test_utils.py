@@ -582,8 +582,9 @@ def test_precision_aware_checkpoint_uses_te_checkpoint_under_chunk_wise_cuda_gra
 
     assert output == 6
     assert calls == [(False, tp_group, (3,), {"factor": 2})]
-    # No graphs, per-layer TE graphs and local graphs keep mcore's checkpoint for BF16.
-    for impl in ("none", "transformer_engine", "local"):
+    # No graphs, per-layer TE graphs, local graphs and full-iteration graphs keep mcore's
+    # checkpoint for BF16.
+    for impl in ("none", "transformer_engine", "local", "full_iteration"):
         assert not transformer_utils.use_te_checkpoint(
             SimpleNamespace(fp8=None, fp4=None, cuda_graph_impl=impl)
         )
@@ -625,6 +626,8 @@ class TestCoreAttentionCheckpointPolicy:
             (dict(fp4="e2m1"), False),
             (dict(fp8="e4m3", cuda_graph_impl="transformer_engine"), False),
             (dict(fp8="e4m3", cuda_graph_impl="local"), False),
+            (dict(cuda_graph_impl="full_iteration"), False),
+            (dict(fp8="e4m3", cuda_graph_impl="full_iteration"), False),
             (dict(cuda_graph_impl="chunk_wise"), True),
             (dict(fp8="e4m3", cuda_graph_impl="chunk_wise"), True),
         ],
@@ -660,3 +663,108 @@ class TestCoreAttentionCheckpointPolicy:
         backend, distribute, args = calls[0]
         assert backend == ("te" if expects_te else "mcore")
         assert distribute is False and len(args) == 2
+
+
+@pytest.mark.internal
+class TestGatedDeltaNetRecomputeCheckpointPolicy:
+    """The ``gdn`` recompute of GDN, GDN2 and KDA picks its checkpoint at the call site: TE's
+    for a quantized model and inside chunk-wise graphs, Megatron's everywhere else."""
+
+    @staticmethod
+    def _stand_in(**config_overrides):
+        """The state the three forwards read on the way to their checkpoint dispatch."""
+        config = dict(
+            fp8=None,
+            fp4=None,
+            cuda_graph_impl="none",
+            distribute_saved_activations=False,
+            linear_cp_mode="headwise",
+            cp_partition_mode="zigzag",
+            sequence_parallel=False,
+            deterministic_mode=False,
+        )
+        config.update(config_overrides)
+        tp_group = object()
+        return SimpleNamespace(
+            config=SimpleNamespace(**config),
+            pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: 1), tp=tp_group),
+            tp_group=tp_group,
+            sp_size=1,
+            recompute_gdn=True,
+            training=True,
+            # GatedDeltaNet / KimiDeltaAttention checkpoint this.
+            _forward_compute=lambda hidden_states, *_args: (hidden_states + 1, None),
+            # _GDNBase.forward (GDN2) checkpoints these two.
+            forward_pre_attn_and_core_attn=lambda hidden_states, *_args, **_kw: hidden_states + 1,
+            forward_post_core_attn=lambda norm_out: (norm_out, None),
+        )
+
+    @pytest.mark.parametrize("variant", ["gdn", "gdn2", "kda"])
+    @pytest.mark.parametrize(
+        "config_overrides, expects_te",
+        [
+            (dict(), False),
+            (dict(cuda_graph_impl="transformer_engine"), False),
+            (dict(cuda_graph_impl="local"), False),
+            (dict(cuda_graph_impl="full_iteration"), False),
+            (dict(cuda_graph_impl="chunk_wise"), True),
+            (dict(fp8="e4m3"), True),
+            (dict(fp4="e2m1"), True),
+            (dict(fp8="e4m3", cuda_graph_impl="full_iteration"), True),
+            (dict(fp8="e4m3", cuda_graph_impl="chunk_wise"), True),
+        ],
+        ids=[
+            "bf16",
+            "bf16-transformer_engine",
+            "bf16-local",
+            "bf16-full_iteration",
+            "bf16-chunk_wise",
+            "fp8",
+            "fp4",
+            "fp8-full_iteration",
+            "fp8-chunk_wise",
+        ],
+    )
+    def test_gdn_recompute_checkpoint_dispatch(
+        self, monkeypatch, variant, config_overrides, expects_te
+    ):
+        """A chunk-wise capture records the recompute with the block, which Megatron's
+        checkpoint would skip while the graph is captured (keeping the activations resident);
+        full-iteration graphs and BF16 without chunk graphs keep Megatron's checkpoint."""
+        import megatron.core.extensions.transformer_engine as te_ext
+        from megatron.core.ssm.gated_delta_net import (
+            GatedDeltaNet,
+            GatedDeltaNet2,
+            KimiDeltaAttention,
+        )
+        from megatron.core.ssm.gated_delta_net.common import _GDNBase
+
+        # GDN2 inherits the base forward; GDN and KDA dispatch in their own training forward.
+        assert GatedDeltaNet2.forward is _GDNBase.forward
+        forward = {
+            "gdn": GatedDeltaNet._forward_training,
+            "gdn2": GatedDeltaNet2.forward,
+            "kda": KimiDeltaAttention.forward,
+        }[variant]
+
+        calls = []
+
+        def fake_te_checkpoint(function, distribute, get_rng_tracker, tp_group, *args):
+            calls.append(("te", distribute, tp_group))
+            return function(*args)
+
+        def fake_mcore_checkpoint(function, distribute, *args):
+            calls.append(("mcore", distribute))
+            return function(*args)
+
+        monkeypatch.setattr(te_ext, "te_checkpoint", fake_te_checkpoint)
+        monkeypatch.setattr(transformer_utils.tensor_parallel, "checkpoint", fake_mcore_checkpoint)
+        module = self._stand_in(**config_overrides)
+        hidden_states = torch.ones(4, 1, 2)
+
+        output, bias = forward(module, hidden_states, None)
+
+        assert torch.equal(output, hidden_states + 1)
+        assert bias is None
+        expected = ("te", False, module.pg_collection.tp) if expects_te else ("mcore", False)
+        assert calls == [expected]

@@ -5,6 +5,9 @@
 Every recompute path that routes through ``precision_aware_checkpoint`` -- full-layer
 recompute, selective MLP / MoE / shared-expert recompute, and MTP recompute -- must
 reproduce the baseline loss and every parameter gradient under BF16, MXFP8, and NVFP4.
+The selective core-attention recompute (``core_attention_checkpoint``) is covered as well,
+also with the graph-safe TE RNG tracker, where only ``tensor_parallel.checkpoint`` replays
+the forward's attention-dropout mask.
 """
 
 import gc
@@ -23,6 +26,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import attention as attention_module
 from megatron.core.transformer import multi_token_prediction as mtp_module
 from megatron.core.transformer import transformer_layer as transformer_layer_module
 from megatron.core.transformer import utils as transformer_utils
@@ -80,6 +84,17 @@ _RECOMPUTE_CASES = {
         "moe_shared_experts",
         {"recompute_granularity": "selective", "recompute_modules": ["shared_experts"]},
         {"moe_layer"},
+    ),
+    # Core attention goes through core_attention_checkpoint, not precision_aware_checkpoint:
+    # tensor_parallel.checkpoint for every precision outside chunk-wise CUDA graphs. With
+    # attention_dropout > 0 this case fails if the core-attention recompute is routed through
+    # TE's te_checkpoint outside cuda_graph_impl='chunk_wise': TE restores the graph-safe RNG
+    # states from live generator handles (a no-op with te_rng_tracker=True), so the recompute
+    # draws a different dropout mask than the forward and the gradients diverge.
+    "selective_core_attn": (
+        "dense",
+        {"recompute_granularity": "selective", "recompute_modules": ["core_attn"]},
+        {"attention"},
     ),
 }
 
@@ -172,6 +187,9 @@ class TestActivationRecomputeNumerics:
         # No DDP here: let Transformer Engine write .grad instead of a fused main_grad.
         args.gradient_accumulation_fusion = False
         args.save_tokenizer_assets = False
+        # Explicitly the non-graph path: the recompute primitives asserted below are the ones
+        # every cuda_graph_impl other than 'chunk_wise' must use.
+        args.cuda_graph_impl = "none"
 
         if model_kind in ("moe", "moe_shared_experts"):
             args.num_experts = 4
@@ -206,9 +224,11 @@ class TestActivationRecomputeNumerics:
         return args
 
     @staticmethod
-    def build_model(args):
+    def build_model(args, te_rng_tracker: bool = False):
         config = core_transformer_config_from_args(args)
-        model_parallel_cuda_manual_seed(_SEED)
+        # force_reset_rng: the tracker class is a process-wide singleton, so pick it per case
+        # (TE's graph-safe tracker or the default) instead of inheriting it from earlier tests.
+        model_parallel_cuda_manual_seed(_SEED, te_rng_tracker=te_rng_tracker, force_reset_rng=True)
         layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=args.num_experts, moe_grouped_gemm=args.moe_grouped_gemm
         )
@@ -298,6 +318,18 @@ class TestActivationRecomputeNumerics:
 
             monkeypatch.setattr(module, "precision_aware_checkpoint", spy)
 
+        # The selective core-attention recompute has its own dispatcher (no
+        # distribute_saved_activations): record it as the "attention" site.
+        real_core_attention_checkpoint = transformer_utils.core_attention_checkpoint
+
+        def core_attention_spy(function, config, tp_group, /, *args):
+            calls.append(
+                {"site": "attention", "tp_group": tp_group, "distribute_saved_activations": False}
+            )
+            return real_core_attention_checkpoint(function, config, tp_group, *args)
+
+        monkeypatch.setattr(attention_module, "core_attention_checkpoint", core_attention_spy)
+
         real_tp_checkpoint = transformer_utils.tensor_parallel.checkpoint
 
         def tp_checkpoint_spy(*args, **kwargs):
@@ -340,7 +372,21 @@ class TestActivationRecomputeNumerics:
             pytest.fail("At least one distributed rank failed this recompute parity case.")
         pytest.fail(f"Rank {rank} failed this recompute parity case:\n{local_error}")
 
-    def run_parity_case(self, precision: str, case: str, monkeypatch) -> None:
+    @staticmethod
+    def expected_primitive(precision: str, site: str) -> str:
+        """The checkpoint primitive a recompute site must use outside chunk-wise CUDA graphs.
+
+        FP8 and FP4 recompute must go through TE's checkpoint; everything else through
+        tensor_parallel.checkpoint. The core attention is never quantized and keeps
+        tensor_parallel.checkpoint for every precision (see ``core_attention_checkpoint``).
+        """
+        if site != "attention" and precision in ("mxfp8", "nvfp4"):
+            return "te_checkpoint"
+        return "tensor_parallel.checkpoint"
+
+    def run_parity_case(
+        self, precision: str, case: str, monkeypatch, te_rng_tracker: bool = False
+    ) -> None:
         model_kind, recompute_args, expected_sites = _RECOMPUTE_CASES[case]
         local_passed = True
         local_error = ""
@@ -350,7 +396,7 @@ class TestActivationRecomputeNumerics:
             batch = self.get_batch()
             calls, primitives = self.spy_on_checkpoint(monkeypatch)
 
-            baseline_model = self.build_model(baseline_args)
+            baseline_model = self.build_model(baseline_args, te_rng_tracker)
             baseline_loss, baseline_grads = self.forward_backward(baseline_model, batch)
             assert (
                 not calls and not primitives
@@ -361,7 +407,8 @@ class TestActivationRecomputeNumerics:
             # Same process groups; only the recompute configuration changes.
             recompute_args_ns = self.create_test_args(precision, model_kind, recompute_args)
             Utils.initialize_model_parallel(tensor_model_parallel_size=_TP)
-            recompute_model = self.build_model(recompute_args_ns)
+            recompute_model = self.build_model(recompute_args_ns, te_rng_tracker)
+            assert recompute_model.config.cuda_graph_impl == "none"
             recompute_model.load_state_dict(baseline_state)
             recompute_loss, recompute_grads = self.forward_backward(recompute_model, batch)
 
@@ -374,13 +421,12 @@ class TestActivationRecomputeNumerics:
                 call["distribute_saved_activations"] == want_distributed for call in calls
             ), f"unexpected distribute_saved_activations: {calls}"
             assert all(call["tp_group"] is not None for call in calls), "missing TP group"
-            # FP8 and FP4 recompute must go through TE's checkpoint; everything else
-            # through tensor_parallel.checkpoint -- one primitive call per checkpoint.
-            expected_primitive = (
-                "te_checkpoint" if precision in ("mxfp8", "nvfp4") else "tensor_parallel.checkpoint"
-            )
-            # ...and must forward distribute_saved_activations unchanged.
-            expected_primitives = [(expected_primitive, want_distributed)] * len(calls)
+            # One primitive call per checkpoint, chosen per site and precision (see
+            # expected_primitive), forwarding distribute_saved_activations unchanged.
+            expected_primitives = [
+                (self.expected_primitive(precision, call["site"]), want_distributed)
+                for call in calls
+            ]
             assert (
                 primitives == expected_primitives
             ), f"expected {expected_primitives}, got {primitives}"
@@ -407,3 +453,19 @@ class TestActivationRecomputeNumerics:
         """Loss and every gradient with recompute must match the no-recompute baseline."""
         _skip_if_unsupported(precision)
         self.run_parity_case(precision, case, monkeypatch)
+
+    @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
+    def test_selective_core_attn_recompute_with_te_rng_tracker(self, precision, monkeypatch):
+        """Core-attention recompute with the graph-safe TE RNG tracker and attention dropout.
+
+        Transformer Engine's tracker hands out live generator handles, so a checkpoint that
+        "restores" those states without cloning them (TE's te_checkpoint) replays nothing: the
+        recompute draws a fresh attention-dropout mask and the gradients drift from the
+        baseline. Outside cuda_graph_impl='chunk_wise' the core attention must therefore stay on
+        tensor_parallel.checkpoint, which clones the graph-safe states before the recompute. This
+        case fails if core_attention_checkpoint dispatches to te_checkpoint for cuda_graph_impl
+        other than 'chunk_wise'.
+        """
+        _skip_if_unsupported(precision)
+        pytest.importorskip("transformer_engine")
+        self.run_parity_case(precision, "selective_core_attn", monkeypatch, te_rng_tracker=True)

@@ -565,6 +565,18 @@ def _validate_forward_observation_model(
             raise NotImplementedError(
                 "Forward tensor metrics do not yet support full-iteration CUDA graphs."
             )
+        if cuda_graph_impl == "chunk_wise":
+            # A replay runs no Python inside the captured decoder block, nor inside the
+            # post-process captured with packed sequences; only an eager post-process still
+            # notifies its observations.
+            post_process_is_captured = (
+                getattr(config, "sequence_packing_scheduler", None) is not None
+            )
+            if post_process_is_captured or not source_kinds <= {"output_logits", "mtp_logits"}:
+                raise NotImplementedError(
+                    "Forward tensor metrics do not yet support the blocks captured by "
+                    "chunk-wise CUDA graphs."
+                )
         if source_kinds.isdisjoint(
             {"router_logits", "router_scores", "router_diagnostics"}
         ) or cuda_graph_impl not in {"local", "transformer_engine"}:

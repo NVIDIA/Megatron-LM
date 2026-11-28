@@ -2666,9 +2666,9 @@ class CompressedSparseAttention(MegatronModule):
                     self.compress_ratio, sq, str(x.device)
                 )
                 valid = (topk_indices_compressed >= 0) & (topk_indices_compressed < n_valid_per_pos)
-                compress_topk_idxs = torch.where(
-                    valid, topk_indices_compressed + offset, torch.tensor(-1, device=x.device)
-                )
+                # A scalar rather than a host tensor upload: this forward is recorded into CUDA
+                # graphs, where a copy from pageable host memory raises.
+                compress_topk_idxs = torch.where(valid, topk_indices_compressed + offset, -1)
             else:
                 compress_topk_idxs = get_compress_topk_idxs(
                     self.compress_ratio, b, sq, offset, query.device

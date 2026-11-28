@@ -607,8 +607,8 @@ def is_layer_window_attention(
 def use_te_checkpoint(config: 'TransformerConfig') -> bool:
     """Whether activation checkpointing goes through Transformer Engine's ``checkpoint``.
 
-    Quantized (FP8/FP4) recompute of the MLP / MoE / MTP regions keeps dev's policy of using TE's
-    checkpoint (``precision_aware_checkpoint``). Chunk-wise Transformer Engine CUDA graphs
+    Quantized (FP8/FP4) recompute of the MLP / MoE / MTP regions uses TE's checkpoint
+    (``precision_aware_checkpoint``). Chunk-wise Transformer Engine CUDA graphs
     (``cuda_graph_impl == "chunk_wise"``) use it for every precision: the captured block contains
     the checkpointed forward and its recompute as one unit, whereas ``tensor_parallel.checkpoint``
     runs the function without a checkpoint node while a graph is warmed up or captured, which

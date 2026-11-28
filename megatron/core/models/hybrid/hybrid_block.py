@@ -18,7 +18,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
-from megatron.core.fp4_utils import get_fp4_context
+from megatron.core.fp4_utils import get_fp4_context, get_layer_fp4_context
 from megatron.core.fp8_utils import get_fp8_context, get_layer_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -818,7 +818,9 @@ class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
         elif use_fp4_context:
 
             def get_inner_quant_context(config, layer_number):
-                return get_fp4_context(config, layer_number)
+                # Same under NVFP4: BF16 boundary layers opt out of the block-wide capture
+                # autocast, MTP layers open the NVFP4 context themselves.
+                return get_layer_fp4_context(config, layer_number, is_mtp_layer=self.is_mtp_layer)
 
         else:
 

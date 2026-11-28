@@ -91,15 +91,16 @@ def select_cross_entropy(
     if cross_entropy_fusion_impl == "native":
         return _fused_ce
 
-    # Full-iteration CUDA graphs capture the loss too, which TE only supports from 2.7.0.
-    capturable = cuda_graph_impl == "full_iteration"
+    # Full-iteration CUDA graphs capture the loss too, as do chunk-wise graphs of packed
+    # sequences (the post-process block), which TE only supports from 2.7.0.
+    capturable = cuda_graph_impl in ("full_iteration", "chunk_wise")
     if capturable and not is_te_min_version("2.7.0"):
         from megatron.core.utils import get_te_version
 
         raise AssertionError(
             "CUDA graph compatible cross entropy requires TransformerEngine >= 2.7.0, but "
             f"found version {get_te_version()}. Please upgrade TransformerEngine or set "
-            "cuda_graph_impl to a value other than 'full_iteration'."
+            "cuda_graph_impl to a value other than 'full_iteration' and 'chunk_wise'."
         )
     return partial(te_cross_entropy, cuda_graph_capturable=capturable)
 

@@ -1547,7 +1547,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         if (
             self.is_moe_layer
-            and self.config.cuda_graph_impl in ("transformer_engine", "chunk_wise")
+            and self.config.cuda_graph_impl == "transformer_engine"
             and self.training
             and is_graph_capturing()
             and CudaGraphModule.moe_router in self.config.cuda_graph_modules

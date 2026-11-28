@@ -175,7 +175,9 @@ def paged_stash_pop_kernel(
 
     With ``ZERO_PADDED_TOKENS`` the rows in ``[num_tokens, MAX_NUM_TOKENS)`` are zero-filled as
     well: a static-shape (CUDA graph) consumer reads the full ``MAX_NUM_TOKENS`` rows of the
-    reloaded buffer, which is otherwise uninitialised memory.
+    reloaded buffer, which is otherwise uninitialised memory. ``MAX_NUM_TOKENS`` is read only
+    then; as a compile-time constant it selects the kernel specialization, so callers that do
+    not zero-fill leave it at 0.
 
     Inverse of paged_stash_copy_kernel. Uses a custom Triton kernel for the same
     reasons: runtime token count and stash metadata live on device, so the reload,

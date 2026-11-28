@@ -2127,13 +2127,19 @@ def _build_gpt_model_with_cuda_graph(
     activation_offload_fraction: float = 1.0,
     enable_hyper_connections: bool = False,
     num_residual_streams: int = 4,
+    position_embedding_type: str = "learned_absolute",
+    config_attrs: Optional[Dict[str, object]] = None,
+    **config_overrides,
 ) -> GPTModel:
-    """Build a GPTModel with CUDA Graph support and fine-grained activation offloading."""
+    """Build a GPTModel with CUDA Graph support and fine-grained activation offloading.
+
+    ``config_overrides`` are applied last on top of the defaults below; ``config_attrs`` are set
+    on the built config (yarn's parameters are attributes, not TransformerConfig fields)."""
     model_parallel_cuda_manual_seed(seed)
     torch.manual_seed(seed)
     ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
     recompute_modules = ["layernorm", "moe_act"] if num_experts is not None else ["layernorm"]
-    transformer_config = ConfigClass(
+    config_kwargs = dict(
         num_layers=num_layers,
         hidden_size=hidden_size,
         num_attention_heads=num_attention_heads,
@@ -2163,6 +2169,10 @@ def _build_gpt_model_with_cuda_graph(
         enable_hyper_connections=enable_hyper_connections,
         num_residual_streams=num_residual_streams,
     )
+    config_kwargs.update(config_overrides)
+    transformer_config = ConfigClass(**config_kwargs)
+    for name, value in (config_attrs or {}).items():
+        setattr(transformer_config, name, value)
     gpt_model = GPTModel(
         config=transformer_config,
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
@@ -2174,6 +2184,7 @@ def _build_gpt_model_with_cuda_graph(
         ),
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
+        position_embedding_type=position_embedding_type,
     ).bfloat16()
     return gpt_model
 
@@ -3051,6 +3062,35 @@ def test_mhc_recompute_with_non_conflicting_offload_modules():
         Utils.destroy_model_parallel()
 
 
+def _block_capture_group_fn():
+    """``group(x, name, weight, forced_released_tensors=None)``: one offload group (start,
+    saved-tensor hooks, commit)."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        fine_grained_offloading_group_offload,
+        fine_grained_offloading_group_start,
+    )
+
+    def group(x, name, weight, forced_released_tensors=None):
+        x = fine_grained_offloading_group_start(x, name)
+        with PipelineOffloadManager.get_instance():
+            y = torch.nn.functional.gelu(torch.nn.functional.linear(x, weight))
+        return fine_grained_offloading_group_offload(
+            y, name, forced_released_tensors=forced_released_tensors
+        )
+
+    return group
+
+
+def _block_capture_reference(x, weights):
+    """Offload-free gradient of ``sum(gelu(linear(...)))`` chained over ``weights``."""
+    x = x.detach().clone().requires_grad_()
+    y = x
+    for weight in weights:
+        y = torch.nn.functional.gelu(torch.nn.functional.linear(y, weight.detach()))
+    y.sum().backward()
+    return x.grad
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 def test_block_capture_mode_serves_one_handler_per_capture_forward():
     """Chunk-wise CUDA graphs drive the offload manager in block-capture mode.
@@ -3065,23 +3105,12 @@ def test_block_capture_mode_serves_one_handler_per_capture_forward():
     reference. Once the capture is over, an eager caller (the post-process of fixed-length chunk
     graphs) gets no handler and runs offload-free.
     """
-    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-        PipelineOffloadManager,
-        fine_grained_offloading_group_offload,
-        fine_grained_offloading_group_start,
-    )
-
     Utils.initialize_model_parallel(1, 1)
     off_interface.reset_instance()
     torch.manual_seed(0)
     device = torch.device("cuda")
     weights = [torch.randn(64, 64, device=device, requires_grad=True) for _ in range(3)]
-
-    def group(x, name, weight):
-        x = fine_grained_offloading_group_start(x, name)
-        with PipelineOffloadManager.get_instance():
-            y = torch.nn.functional.gelu(torch.nn.functional.linear(x, weight))
-        return fine_grained_offloading_group_offload(y, name)
+    group = _block_capture_group_fn()
 
     def decoder(x):
         return group(group(x, "mlp", weights[0]), "mlp", weights[1])
@@ -3090,17 +3119,6 @@ def test_block_capture_mode_serves_one_handler_per_capture_forward():
         # Two groups of one name: the warm-up policy keeps only the last one resident, so the
         # post-process handler has a group of its own to offload and reload.
         return group(group(x, "post", weights[2]), "post", weights[2])
-
-    def reference(x, with_post):
-        x = x.detach().clone().requires_grad_()
-        w = [weight.detach() for weight in weights]
-        y = torch.nn.functional.gelu(torch.nn.functional.linear(x, w[0]))
-        y = torch.nn.functional.gelu(torch.nn.functional.linear(y, w[1]))
-        if with_post:
-            y = torch.nn.functional.gelu(torch.nn.functional.linear(y, w[2]))
-            y = torch.nn.functional.gelu(torch.nn.functional.linear(y, w[2]))
-        y.sum().backward()
-        return x.grad
 
     try:
         manager = PipelineOffloadManager.get_instance()
@@ -3187,15 +3205,12 @@ def test_block_capture_mode_serves_one_handler_per_capture_forward():
         for chunk_handler in (handler, post, fresh):
             assert not chunk_handler._groups_to_reload and not chunk_handler._reloading_group
         torch.cuda.synchronize()
-        assert torch.equal(x.grad, reference(x, with_post=True))
-        ref_hidden = hidden.detach().clone().requires_grad_()
-        ref_out = torch.nn.functional.gelu(
-            torch.nn.functional.linear(ref_hidden, weights[2].detach())
+        assert torch.equal(
+            x.grad, _block_capture_reference(x, [weights[0], weights[1], weights[2], weights[2]])
         )
-        torch.nn.functional.gelu(
-            torch.nn.functional.linear(ref_out, weights[2].detach())
-        ).sum().backward()
-        assert torch.equal(grad_hidden_again, ref_hidden.grad)
+        assert torch.equal(
+            grad_hidden_again, _block_capture_reference(hidden, [weights[2], weights[2]])
+        )
         off_interface.exit_block_capture()
         assert manager.cur_forward_chunk() is None
         # After the capture the replayed graphs own every offload; an eager caller (the
@@ -3207,11 +3222,887 @@ def test_block_capture_mode_serves_one_handler_per_capture_forward():
         eager_out = group(eager_in, "post", weights[2])
         assert manager.cur_forward_chunk() is None
         eager_out.sum().backward()
-        ref_in = eager_in.detach().clone().requires_grad_()
-        torch.nn.functional.gelu(
-            torch.nn.functional.linear(ref_in, weights[2].detach())
-        ).sum().backward()
-        assert torch.equal(eager_in.grad, ref_in.grad)
+        assert torch.equal(eager_in.grad, _block_capture_reference(eager_in, [weights[2]]))
     finally:
         off_interface.reset_instance()
         Utils.destroy_model_parallel()
+
+
+def _block_capture_warmup(forward, inputs, after_forward=None):
+    """One eager warm-up iteration (single stage) recording the template; returns its handler.
+
+    ``after_forward(output)`` runs between the forward and the backward, like the backward-time
+    recompute that appends its groups to the template after the model-chunk forward returned."""
+    off_interface.reset()
+    off_interface.init_chunk_handler(
+        pp_rank=0,
+        vp_size=1,
+        vp_stage=None,
+        min_offloaded_tensor_size=1,
+        delta_offload_bytes_across_pp_ranks=0,
+        activation_offload_fraction=1.0,
+    )
+    output = forward(inputs)
+    if after_forward is not None:
+        after_forward(output)
+    output.sum().backward()
+    off_interface.reset()  # closes the warm-up and fixes the policy
+    manager = PipelineOffloadManager.get_instance()
+    assert not manager._is_warmup
+    return manager._cached_chunks_forward[0]
+
+
+def _block_capture_offload_everything(template):
+    """Replace the post-warm-up policy (the schedule's last group of every name stays resident
+    as a margin group) by "offload every group", so that the capture's own keep-last policy is
+    the only thing that keeps a group of these templates resident."""
+    for group in template.offload_groups:
+        group.offload = True
+        group.is_offload_margin = False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_block_capture_hooks_are_noops_outside_a_capture_time_forward():
+    """Full activation recompute inside a chunk graph re-runs the layer forward from the backward
+    capture (Transformer Engine's checkpoint), after ``end_block_capture_chunk`` closed the
+    capture-time forward. The group hooks then serve no handler: the start / commit markers return
+    their input, the saved-tensor hooks are not installed, and the capture handler's groups are
+    neither advanced nor reloaded by the recompute's backward."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        fine_grained_offloading_group_offload,
+        fine_grained_offloading_group_start,
+    )
+
+    Utils.initialize_model_parallel(1, 1)
+    off_interface.reset_instance()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weights = [torch.randn(64, 64, device=device, requires_grad=True) for _ in range(2)]
+    group = _block_capture_group_fn()
+
+    def decoder(x):
+        return group(group(x, "mlp", weights[0]), "mlp", weights[1])
+
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        _block_capture_warmup(decoder, torch.randn(8, 64, device=device, requires_grad=True))
+
+        off_interface.enter_block_capture()
+        # Capture-time forward: the handler serves the hooks.
+        off_interface.begin_block_capture_chunk(None)
+        handler = manager.cur_forward_chunk()
+        assert handler is not None and manager.pop_forward_chunk("mlp") is handler
+        x = torch.randn(8, 64, device=device, requires_grad=True)
+        out = decoder(x)
+        assert handler._offloaded_group_index == 2
+        off_interface.end_block_capture_chunk()
+        pending_reloads = list(handler._groups_to_reload)
+        assert pending_reloads, "the warm-up policy should offload at least one group"
+
+        # Backward-time recompute: no handler, every hook is an identity.
+        assert manager.cur_forward_chunk() is None
+        assert manager.pop_forward_chunk("mlp") is None
+        probe = torch.randn(8, 64, device=device)
+        assert fine_grained_offloading_group_start(probe, "mlp") is probe
+        with manager:
+            assert not getattr(manager, "inside_context", False)
+        assert fine_grained_offloading_group_offload(probe, "mlp") is probe
+        recompute_in = x.detach().clone().requires_grad_()
+        recompute_out = decoder(recompute_in)
+        assert handler._offloaded_group_index == 2
+        recompute_out.sum().backward()
+        torch.cuda.synchronize()
+        assert torch.equal(recompute_in.grad, _block_capture_reference(x, weights))
+        # The recompute's backward touched none of the capture handler's groups.
+        assert list(handler._groups_to_reload) == pending_reloads
+        assert not handler._reloading_group
+
+        # The next capture-time forward (next slot) is served again, by a handler of its own.
+        off_interface.begin_block_capture_chunk(None)
+        other = manager.cur_forward_chunk()
+        assert other is not None and other is not handler
+        assert manager.pop_forward_chunk("mlp") is other
+        off_interface.end_block_capture_chunk()
+
+        # The captured forward's own backward reloads its groups as before.
+        out.sum().backward()
+        torch.cuda.synchronize()
+        assert torch.equal(x.grad, _block_capture_reference(x, weights))
+        assert not handler._groups_to_reload and not handler._reloading_group
+        off_interface.exit_block_capture()
+    finally:
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_block_capture_keeps_static_input_storage_out_of_the_release():
+    """The captured callable's static input (Transformer Engine's hidden_states sample arg) is the
+    first layer's input and residual, which the attn_norm commit force-releases. Registered as a
+    block static input, any view sharing its storage is neither offloaded nor resized to zero
+    (TE keeps the storage alive for the slot and refreshes it at replay); the registration lives
+    for the capture only."""
+    Utils.initialize_model_parallel(1, 1)
+    off_interface.reset_instance()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weight = torch.randn(64, 64, device=device, requires_grad=True)
+    group = _block_capture_group_fn()
+
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        _block_capture_warmup(
+            lambda x: group(x, "attn_norm", weight),
+            torch.randn(8, 64, device=device, requires_grad=True),
+        )
+        # Outside a capture the registration is ignored.
+        off_interface.register_block_static_input(torch.randn(8, 64, device=device))
+        assert not manager.block_static_storages
+
+        off_interface.enter_block_capture()
+        off_interface.begin_block_capture_chunk(None)
+        handler = manager.cur_forward_chunk()
+        static_input = torch.randn(8, 64, device=device)  # TE's sample arg
+        layer_input = static_input[:4]  # a view: the first layer's input / residual
+        other = torch.randn(8, 64, device=device)
+        assert handler.tensor_need_offloading_checker(layer_input)
+        off_interface.register_block_static_input(static_input)
+        assert manager.is_block_static_storage(layer_input)
+        assert not handler.tensor_need_offloading_checker(layer_input)
+        assert handler.tensor_need_offloading_checker(other)
+        off_interface.register_block_static_input(None)  # tolerated
+
+        # The forced release of a committed group frees the other tensor only.
+        group_obj = OffloadTensorGroup("attn_norm")
+        group_obj.record_offload_event(torch.cuda.current_stream())
+        handler._block_capture_pending_release.append((group_obj, [layer_input, other]))
+        handler._block_capture_release(keep=0)
+        # As plain numbers: a failed assert must not print a released tensor.
+        storage_bytes = [t.untyped_storage().size() for t in (static_input, other)]
+        assert storage_bytes == [8 * 64 * 4, 0]
+        off_interface.end_block_capture_chunk()
+        off_interface.exit_block_capture()
+        assert not manager.block_static_storages
+        assert not manager.is_block_static_storage(layer_input)
+    finally:
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_block_capture_no_grad_commit_keeps_its_forced_release_tensors():
+    """A group commit force-releases the tensors its caller names (attn_norm: the layer input)
+    once the group's saved tensors are copied out. The no-grad forward of an activation
+    checkpoint (full recompute inside a chunk graph runs every layer that way) saves nothing,
+    so nothing is copied out, and the tensor it names is the input the checkpoint holds for its
+    backward-time recompute: that commit releases nothing. A commit that runs with autograd
+    enabled still releases its tensor, and its backward reloads the copy."""
+    Utils.initialize_model_parallel(1, 1)
+    off_interface.reset_instance()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weights = [torch.randn(64, 64, device=device, requires_grad=True) for _ in range(2)]
+    group = _block_capture_group_fn()
+    num_bytes = 8 * 64 * 4
+
+    def layers(x):
+        # Like the attn_norm group of two layers: each commit names its layer input.
+        hidden = group(x, "attn_norm", weights[0], forced_released_tensors=[x])
+        return hidden, group(hidden, "attn_norm", weights[1], forced_released_tensors=[hidden])
+
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        template = _block_capture_warmup(
+            lambda x: group(group(x, "attn_norm", weights[0]), "attn_norm", weights[1]),
+            torch.randn(8, 64, device=device, requires_grad=True),
+        )
+        # Offload both groups, so that the policy never keeps a commit from releasing.
+        _block_capture_offload_everything(template)
+
+        off_interface.enter_block_capture()
+        # Capture-time forward under a checkpoint: autograd is off, as in its first pass.
+        off_interface.begin_block_capture_chunk(None)
+        handler = manager.cur_forward_chunk()
+        checkpoint_input = torch.randn(8, 64, device=device)
+        expected_input = checkpoint_input.clone()
+        with torch.no_grad():
+            hidden, _ = layers(checkpoint_input)
+        expected_hidden = hidden.clone()
+        assert handler._offloaded_group_index == 2
+        off_interface.end_block_capture_chunk()
+        assert not handler._block_capture_pending_release
+        # Sizes first, as plain numbers: a failed assert must not print a released tensor.
+        kept_bytes = [t.untyped_storage().size() for t in (checkpoint_input, hidden)]
+        assert kept_bytes == [num_bytes, num_bytes]
+        assert torch.equal(checkpoint_input, expected_input)
+        assert torch.equal(hidden, expected_hidden)
+        assert not handler._block_capture_host_buffers, "a no-grad group has nothing to copy"
+
+        # Capture-time forward with autograd on: both layer inputs are copied out and released.
+        off_interface.begin_block_capture_chunk(None)
+        handler = manager.cur_forward_chunk()
+        x = torch.randn(8, 64, device=device, requires_grad=True)
+        layer_input = x.clone()
+        hidden, out = layers(layer_input)
+        off_interface.end_block_capture_chunk()
+        assert handler._block_capture_host_buffers
+        released_bytes = [t.untyped_storage().size() for t in (layer_input, hidden)]
+        assert released_bytes == [0, 0]
+        out.sum().backward()
+        torch.cuda.synchronize()
+        assert torch.equal(x.grad, _block_capture_reference(x, weights))
+        off_interface.exit_block_capture()
+    finally:
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_eager_no_grad_commit_keeps_its_forced_release_tensors():
+    """Outside a capture the group commit follows the same rule: without autograd (the first
+    pass of an activation checkpoint, an evaluation forward) it releases nothing; with autograd
+    on it releases the tensor it names as soon as its group is copied out, and the backward
+    reloads the copy. The schedule's last group of a name stays resident, so only the first of
+    the two commits offloads."""
+    Utils.initialize_model_parallel(1, 1)
+    off_interface.reset_instance()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weights = [torch.randn(64, 64, device=device, requires_grad=True) for _ in range(2)]
+    group = _block_capture_group_fn()
+    num_bytes = 8 * 64 * 4
+
+    def layers(x):
+        hidden = group(x, "attn_norm", weights[0], forced_released_tensors=[x])
+        return group(hidden, "attn_norm", weights[1], forced_released_tensors=[hidden])
+
+    try:
+        template = _block_capture_warmup(
+            lambda x: group(group(x, "attn_norm", weights[0]), "attn_norm", weights[1]),
+            torch.randn(8, 64, device=device, requires_grad=True),
+        )
+        assert [g.offload for g in template.offload_groups] == [True, False]
+
+        off_interface.reset()
+        checkpoint_input = torch.randn(8, 64, device=device)
+        expected_input = checkpoint_input.clone()
+        with torch.no_grad():
+            layers(checkpoint_input)
+        # As a plain number: a failed assert must not print a released tensor.
+        kept_bytes = checkpoint_input.untyped_storage().size()
+        assert kept_bytes == num_bytes
+        assert torch.equal(checkpoint_input, expected_input)
+
+        off_interface.reset()
+        x = torch.randn(8, 64, device=device, requires_grad=True)
+        layer_input = x.clone()
+        out = layers(layer_input)
+        released_bytes = layer_input.untyped_storage().size()
+        assert released_bytes == 0
+        out.sum().backward()
+        torch.cuda.synchronize()
+        assert torch.equal(x.grad, _block_capture_reference(x, weights))
+    finally:
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.parametrize(
+    "ending", ["capture_raised", "capture_raised_in_te_warmup", "graphs_deleted"]
+)
+def test_block_capture_hands_the_offloads_back_to_the_eager_policy(ending):
+    """Captured block graphs own every offload of the step, so while they live an eager caller
+    gets no handler and the template marks are inert. That ownership ends with the graphs: a
+    capture that raised (``exit_block_capture(captured=False)``) never had them, and
+    ``release_block_capture`` follows their deletion. Either way the handlers the graphs kept
+    alive are dropped, and the next eager step is served by the warm-up handler again, offloads
+    and reloads as before the capture. Transformer Engine switches the offload off around its
+    warm-up pass and skips the hook that switches it back on when that pass raises."""
+    Utils.initialize_model_parallel(1, 1)
+    off_interface.reset_instance()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weights = [torch.randn(64, 64, device=device, requires_grad=True) for _ in range(2)]
+    group = _block_capture_group_fn()
+
+    def decoder(x):
+        return group(group(x, "mlp", weights[0]), "mlp", weights[1])
+
+    def marks_are_live():
+        # The marks act on the warm-up handler of the running eager forward.
+        probe = ChunkOffloadHandler(1, manager.cpu_tensor_pool)
+        probe._offloaded_group_index = 2
+        manager._cur_forward_chunk = probe
+        off_interface.mark_decoder_groups_end()
+        off_interface.mark_forward_groups_end()
+        manager._cur_forward_chunk = None
+        return (probe._decoder_group_end, probe._forward_group_end) == (2, 2)
+
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        template = _block_capture_warmup(
+            decoder, torch.randn(8, 64, device=device, requires_grad=True)
+        )
+
+        off_interface.enter_block_capture()
+        off_interface.begin_block_capture_chunk(None)
+        handler = manager.cur_forward_chunk()
+        decoder(torch.randn(8, 64, device=device, requires_grad=True))
+        off_interface.end_block_capture_chunk()
+        # Kept alive for the graphs when the stream is capturing (not in this test).
+        manager._block_capture_live_chunks.append(handler)
+
+        if ending.startswith("capture_raised"):
+            if ending == "capture_raised_in_te_warmup":
+                off_interface.disable_offload()
+                assert not manager.do_offload and not template.do_offload
+            off_interface.exit_block_capture(captured=False)
+            assert manager.do_offload and template.do_offload
+        else:
+            off_interface.exit_block_capture()
+            assert manager._block_graphs_captured
+            assert manager._block_capture_live_chunks == [handler]
+            off_interface.reset()
+            assert manager.pop_forward_chunk("mlp") is None
+            assert not marks_are_live()
+            off_interface.release_block_capture()
+        assert not manager._block_graphs_captured
+        assert not manager._block_capture_live_chunks
+        assert marks_are_live()
+
+        # The next eager step: the warm-up handler serves it and offloads its first group (the
+        # last one of a name stays resident), and the backward reloads it.
+        off_interface.reset()
+        x = torch.randn(8, 64, device=device, requires_grad=True)
+        out = decoder(x)
+        assert manager.cur_forward_chunk() is template
+        assert template._group_has_offloaded_tensor(template.offload_groups[0])
+        out.sum().backward()
+        torch.cuda.synchronize()
+        assert torch.equal(x.grad, _block_capture_reference(x, weights))
+        assert not template._groups_to_reload and not template._reloading_group
+    finally:
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_block_capture_clones_margin_flags_and_marks_kept_groups_as_margin():
+    """A slot's handler clones the warm-up policy including ``is_offload_margin`` (a margin group
+    takes no reload slot), and ``keep_last_group`` marks the groups it keeps resident as margin
+    groups too, so the backward's prefetch steps are spent on offloaded groups only."""
+    Utils.initialize_model_parallel(1, 1)
+    off_interface.reset_instance()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weights = [torch.randn(64, 64, device=device, requires_grad=True) for _ in range(2)]
+    group = _block_capture_group_fn()
+
+    def decoder(x):
+        return group(group(x, "mlp", weights[0]), "mlp", weights[1])
+
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        template = _block_capture_warmup(
+            decoder, torch.randn(8, 64, device=device, requires_grad=True)
+        )
+        assert [g._name for g in template.offload_groups] == ["mlp", "mlp"]
+        # The post-warm-up policy keeps the schedule's last mlp group resident as a margin
+        # group; make the first group the margin one instead, so the clone is told apart from
+        # the keep-last policy below (which marks the last group).
+        assert [g.is_offload_margin for g in template.offload_groups] == [False, True]
+        _block_capture_offload_everything(template)
+        template.offload_groups[0].is_offload_margin = True
+
+        off_interface.enter_block_capture(keep_last_group=False)
+        off_interface.begin_block_capture_chunk(None)
+        plain = manager.cur_forward_chunk()
+        assert [g.is_offload_margin for g in plain.offload_groups] == [True, False]
+        assert [g.offload for g in plain.offload_groups] == [True, True]
+        x = torch.randn(8, 64, device=device, requires_grad=True)
+        out = decoder(x)
+        off_interface.end_block_capture_chunk()  # records the decoder's end (2)
+        assert manager._block_capture_decoder_end == {0: 2}
+
+        manager._block_capture_keep_last_group = True
+        off_interface.begin_block_capture_chunk(None)
+        kept = manager.cur_forward_chunk()
+        assert [g.is_offload_margin for g in kept.offload_groups] == [True, True]
+        assert [g.offload for g in kept.offload_groups] == [True, False]
+        off_interface.end_block_capture_chunk()
+        # The template itself is never rewritten by a slot's policy.
+        assert [g.is_offload_margin for g in template.offload_groups] == [True, False]
+        assert [g.offload for g in template.offload_groups] == [True, True]
+        out.sum().backward()
+        torch.cuda.synchronize()
+        assert torch.equal(x.grad, _block_capture_reference(x, weights))
+        off_interface.exit_block_capture()
+    finally:
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_block_capture_keep_last_covers_the_decoder_groups_marked_by_the_eager_warm_up():
+    """The eager warm-up appends the post-process groups (an MTP layer reuses the decoder's group
+    names) and then the backward-time recompute groups to the same template, after the
+    decoder's. ``mark_decoder_groups_end`` / ``mark_forward_groups_end`` (called by the model
+    forward when the decoder chunk returns / when the forward returns) record where those ranges
+    end, so the first capture slot's ``keep_last_group`` keeps the decoder's own last group of
+    every name resident, and the post-process handler the last groups of its own range: never a
+    later group that the callable does not visit (which would leave its real last group offloaded
+    and reloaded synchronously at the start of its backward)."""
+    Utils.initialize_model_parallel(1, 1)
+    off_interface.reset_instance()
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    weights = [torch.randn(64, 64, device=device, requires_grad=True) for _ in range(4)]
+    group = _block_capture_group_fn()
+
+    def decoder(x):
+        return group(group(x, "mlp", weights[0]), "mlp", weights[1])
+
+    def post_process(x):
+        return group(group(x, "mlp", weights[2]), "post", weights[3])
+
+    def model(x):
+        hidden = decoder(x)
+        off_interface.mark_decoder_groups_end()  # GPTModel.forward, after the decoder
+        off_interface.mark_decoder_groups_end()  # idempotent
+        out = post_process(hidden)
+        off_interface.mark_forward_groups_end()  # GPTModel.forward, after the post-process
+        off_interface.mark_forward_groups_end()  # idempotent
+        return out
+
+    def backward_time_recompute(out):
+        # A checkpointed layer re-running its forward from the warm-up backward: the group
+        # hooks still find the warm-up handler and append a group of the decoder's name.
+        with torch.no_grad():
+            group(out.detach(), "mlp", weights[1])
+
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        template = _block_capture_warmup(
+            model,
+            torch.randn(8, 64, device=device, requires_grad=True),
+            after_forward=backward_time_recompute,
+        )
+        names = ["mlp", "mlp", "mlp", "post", "mlp"]
+        assert [g._name for g in template.offload_groups] == names
+        assert template._decoder_group_end == 2
+        assert template._forward_group_end == 4
+        # The post-warm-up policy keeps the schedule's last group of every name resident (the
+        # recompute's mlp and the post-process's post); offload everything so that only the
+        # capture's keep-last policy decides below.
+        assert [g.offload for g in template.offload_groups] == [True, True, True, False, False]
+        _block_capture_offload_everything(template)
+
+        off_interface.enter_block_capture(keep_last_group=True)
+        assert manager._block_capture_decoder_end == {0: 2}
+        assert manager._block_capture_forward_end == {0: 4}
+        off_interface.mark_decoder_groups_end()  # eager only: no-ops inside the capture
+        off_interface.mark_forward_groups_end()
+        assert (template._decoder_group_end, template._forward_group_end) == (2, 4)
+
+        # First capture slot, decoder callable: keep-last over the decoder's range [0, 2).
+        # Without the decoder-end mark the range would be the whole template, keeping the
+        # recompute's mlp (index 4) and the post (index 3): [True, True, True, False, False].
+        off_interface.begin_block_capture_chunk(None)
+        handler = manager.cur_forward_chunk()
+        assert handler._decoder_group_end is None and handler._forward_group_end is None
+        assert [g.offload for g in handler.offload_groups] == [True, False, True, True, True]
+        x = torch.randn(8, 64, device=device, requires_grad=True)
+        hidden = decoder(x)
+        assert handler._offloaded_group_index == 2
+        off_interface.end_block_capture_chunk()
+        assert manager._block_capture_decoder_end == {0: 2}
+        # Post-process callable of the slot: a clone of the warm-up template (not of the decoder
+        # handler) that resumes at the decoder's end, keep-last over its own range [2, 4). The
+        # decoder-range entries keep the template's flags, which is inert: this handler never
+        # starts or commits those groups. Without the forward-end mark the range would run to
+        # the template's end and keep the recompute's mlp instead of its own:
+        # [True, True, True, False, False].
+        off_interface.begin_block_capture_chunk(None, continue_current=True)
+        post = manager.cur_forward_chunk()
+        assert post is not handler and post._offloaded_group_index == 2
+        assert [g.offload for g in post.offload_groups] == [True, True, False, False, True]
+        out = post_process(hidden)
+        assert post._offloaded_group_index == 4
+        off_interface.end_block_capture_chunk(record_decoder_end=False)
+        assert manager._block_capture_decoder_end == {0: 2}
+        assert manager._block_capture_forward_end == {0: 4}
+
+        out.sum().backward()
+        torch.cuda.synchronize()
+        assert torch.equal(x.grad, _block_capture_reference(x, weights))
+        for chunk_handler in (handler, post):
+            assert not chunk_handler._groups_to_reload and not chunk_handler._reloading_group
+        off_interface.exit_block_capture()
+    finally:
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+def _run_eager_iters(
+    model: GPTModel,
+    *,
+    input_ids: torch.Tensor,
+    position_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    num_iters: int,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Eager forward+backward iterations; logits and grads of the last one (CPU float32)."""
+    for i in range(num_iters):
+        logits = model(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+        logits.float().sum().backward()
+        if i < num_iters - 1:
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.zero_()
+    torch.cuda.synchronize()
+    grads = {
+        name: (p.grad.detach().float().cpu() if p.grad is not None else None)
+        for name, p in model.named_parameters()
+    }
+    return logits.detach().float().cpu(), grads
+
+
+def _assert_chunk_graph_matches_eager(graph_logits, graph_grads, base_logits, base_grads):
+    assert torch.isfinite(graph_logits).all()
+    assert torch.allclose(
+        graph_logits, base_logits, rtol=1e-2, atol=1e-2
+    ), f"Logits mismatch: max_diff={torch.max(torch.abs(graph_logits - base_logits))}"
+    assert set(graph_grads.keys()) == set(base_grads.keys())
+    for name, gb in base_grads.items():
+        go = graph_grads[name]
+        if gb is None or go is None:
+            assert gb is None and go is None, f"Grad None mismatch for {name}"
+            continue
+        assert torch.isfinite(go).all(), f"non-finite grad for {name}"
+        assert torch.allclose(
+            go, gb, rtol=1e-2, atol=1e-2
+        ), f"Grad mismatch for {name}: max_diff={torch.max(torch.abs(go - gb))}"
+
+
+@pytest.fixture
+def chunk_graph_process_state(monkeypatch):
+    """Model-parallel state for a chunk-graph GPU test, plus the teardown of everything such a
+    test changes process-wide, also when it fails.
+
+    ``_run_iters_with_cuda_graph`` moves the thread to a side stream, initializes the
+    num-microbatches calculator and captures graphs into the shared graph pool; it destroys the
+    calculator and the graphs only when it returns normally. The graphs go first: their
+    deletion still reads the process groups.
+    """
+    from megatron.core.full_cuda_graph import release_shared_graph_pool
+    from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+    from megatron.core.tensor_parallel.random import initialize_rng_tracker
+    from megatron.core.transformer import cuda_graphs
+
+    helpers = []
+    create_cudagraphs = cuda_graphs.TECudaGraphHelper.create_cudagraphs
+
+    def tracked_create_cudagraphs(helper):
+        helpers.append(helper)
+        return create_cudagraphs(helper)
+
+    monkeypatch.setattr(
+        cuda_graphs.TECudaGraphHelper, "create_cudagraphs", tracked_create_cudagraphs
+    )
+    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    # Read after the rank selected its device: setting a stream makes its device the current
+    # one, so a stream saved before that would move the rank back to device 0.
+    original_stream = torch.cuda.current_stream()
+    off_interface.reset_instance()
+    yield
+    try:
+        torch.cuda.synchronize()
+        torch.cuda.set_stream(original_stream)
+        for helper in helpers:
+            if helper.graphs_created():
+                helper.delete_cuda_graphs()
+    finally:
+        cuda_graphs._set_capture_end()
+        release_shared_graph_pool()
+        destroy_num_microbatches_calculator()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(
+    not is_te_min_version("2.14.0"), reason="CUDA Graph with TE RNG tracker requires TE >= 2.14.0"
+)
+@pytest.mark.parametrize(
+    "case",
+    [
+        "attn_norm_standalone_input_norm",
+        "attn_norm_keep_last_group",
+        "attn_norm_capture_raises",
+        "full_recompute",
+        "attn_norm_full_recompute",
+    ],
+)
+def test_chunk_wise_cuda_graph_with_fine_grained_activation_offloading(
+    case: str, chunk_graph_process_state, monkeypatch
+):
+    """Chunk-wise TE CUDA graphs with fine-grained activation offloading, against eager:
+
+    - ``attn_norm_standalone_input_norm``: MLA layers (a standalone TENorm input layernorm, not
+      fused into the first linear) offload ``attn_norm``, whose commit force-releases the layer
+      input. For the block's first layer that input is the captured graph's static hidden_states,
+      which the capture keeps intact (``register_block_static_input``); the last layer's group
+      stays resident; the middle layer's input, a full hidden state, is copied out, released and
+      reloaded inside the graphs.
+    - ``attn_norm_keep_last_group``: the same with
+      ``fine_grained_offloading_graph_keep_last_group``, which the capture hands to the manager.
+    - ``attn_norm_capture_raises``: the graph creation fails. The helper ends the capture on its
+      way out: the capture flag is clear (a decoder block that still saw it would take the
+      capture path in its next forward) and no graphs own the offloads, so the eager step that
+      follows is served by the warm-up handler, offloads, and matches the reference.
+    - ``full_recompute``: full activation recompute captured into the backward graph together
+      with ``core_attn`` offloading; the recompute re-runs the layer forward with the group hooks
+      as no-ops (no handler outside a capture-time forward).
+    - ``attn_norm_full_recompute``: full activation recompute with ``attn_norm`` offloading. The
+      capture-time forward runs every layer under the checkpoint without autograd, where the
+      attn_norm commit must leave the layer input alone: it is the tensor the checkpoint
+      recomputes the layer from inside the backward graph.
+    """
+    seq_length, micro_batch_size, hidden_size = 128, 2, 256
+    device = torch.device("cuda")
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
+    )
+    common = dict(
+        seed=123,
+        num_layers=3,
+        hidden_size=hidden_size,
+        num_attention_heads=4,
+        vocab_size=128,
+        seq_length=seq_length,
+        num_experts=None,
+        cuda_graph_modules=[],
+        cuda_graph_warmup_steps=1,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+    )
+    full_recompute = dict(
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
+        recompute_modules=[],
+    )
+    keep_last_group = case == "attn_norm_keep_last_group"
+    capture_raises = case == "attn_norm_capture_raises"
+    if case in (
+        "attn_norm_standalone_input_norm",
+        "attn_norm_keep_last_group",
+        "attn_norm_capture_raises",
+    ):
+        common.update(is_mla=True, recompute_granularity=None)
+        offload_modules = ["attn_norm"]
+    elif case == "attn_norm_full_recompute":
+        common.update(is_mla=True, **full_recompute)
+        offload_modules = ["attn_norm"]
+    else:
+        common.update(is_mla=False, num_layers=2, **full_recompute)
+        offload_modules = ["core_attn"]
+
+    # What the capture leaves behind when it ends: the keep-last policy it ran with and the sizes
+    # of the host buffers its graphs address (the handlers the manager keeps alive for them).
+    captures = []
+    exit_block_capture = PipelineOffloadManager.exit_block_capture
+
+    def recording_exit_block_capture(manager, *args, **kwargs):
+        host_buffer_sizes = [
+            host_buffer.numel()
+            for handler in manager._block_capture_live_chunks
+            for host_buffer in handler._block_capture_host_buffers
+        ]
+        captures.append((manager._block_capture_keep_last_group, host_buffer_sizes))
+        return exit_block_capture(manager, *args, **kwargs)
+
+    monkeypatch.setattr(PipelineOffloadManager, "exit_block_capture", recording_exit_block_capture)
+
+    # Eager reference: no graphs, no offloading.
+    _reset_cuda_memory()
+    base_model = _build_gpt_model_with_cuda_graph(
+        fine_grained_activation_offloading=False,
+        offload_modules=None,
+        min_offloaded_tensor_size=1,
+        cuda_graph_impl="none",
+        **common,
+    ).cuda()
+    base_model.train()
+    base_logits, base_grads = _run_eager_iters(
+        base_model,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        num_iters=3,
+    )
+    del base_model
+    _reset_cuda_memory()
+
+    off_interface.reset_instance()
+    graph_model = _build_gpt_model_with_cuda_graph(
+        fine_grained_activation_offloading=True,
+        offload_modules=offload_modules,
+        min_offloaded_tensor_size=1,
+        cuda_graph_impl="chunk_wise",
+        fine_grained_offloading_graph_keep_last_group=keep_last_group,
+        **common,
+    ).cuda()
+    graph_model.train()
+    if offload_modules == ["attn_norm"]:
+        assert all(layer.offload_attn_norm for layer in graph_model.decoder.layers)
+    graph_run = dict(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        num_warmup_iters=1,
+        num_measure_iters=2,
+        enable_offload_reset=True,
+    )
+    if capture_raises:
+        from megatron.core.transformer import cuda_graphs
+
+        def failing_make_graphed_callables(*args, **kwargs):
+            raise RuntimeError("injected graph creation failure")
+
+        monkeypatch.setattr(cuda_graphs, "make_graphed_callables", failing_make_graphed_callables)
+        with pytest.raises(RuntimeError, match="injected graph creation failure"):
+            _run_iters_with_cuda_graph(graph_model, **graph_run)
+        assert not cuda_graphs.is_graph_capturing()
+        # No capture-time forward ran: the manager holds no host buffer for a graph.
+        assert captures == [(False, [])]
+    else:
+        graph_logits, graph_grads, _ = _run_iters_with_cuda_graph(graph_model, **graph_run)
+        _assert_chunk_graph_matches_eager(graph_logits, graph_grads, base_logits, base_grads)
+        assert len(captures) == 1
+        captured_keep_last_group, host_buffer_sizes = captures[0]
+        assert captured_keep_last_group == keep_last_group
+        if common["recompute_granularity"] is None:
+            # A full hidden state went through a captured offload and reload.
+            hidden_state_size = seq_length * micro_batch_size * hidden_size
+            assert max(host_buffer_sizes, default=0) >= hidden_state_size, host_buffer_sizes
+        else:
+            # A fully recomputed block saves no group tensor in its capture-time forward.
+            assert not host_buffer_sizes
+    if common["recompute_granularity"] is None:
+        # No graphs own the offloads any more (the helper deleted them when it returned) or ever
+        # did (the capture raised), which leaves them to the eager policy: an eager step is
+        # served by the warm-up handler, offloads, and matches the reference.
+        manager = PipelineOffloadManager.get_instance()
+        assert not manager._block_graphs_captured
+        assert not manager._block_capture_live_chunks
+        off_interface.reset()
+        graph_model.zero_grad()
+        eager_logits = graph_model(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+        handler = manager.cur_forward_chunk()
+        assert handler is not None and handler in manager._cached_chunks_forward
+        assert any(handler._group_has_offloaded_tensor(group) for group in handler.offload_groups)
+        eager_logits.float().sum().backward()
+        torch.cuda.synchronize()
+        eager_grads = {
+            name: (p.grad.detach().float().cpu() if p.grad is not None else None)
+            for name, p in graph_model.named_parameters()
+        }
+        _assert_chunk_graph_matches_eager(
+            eager_logits.detach().float().cpu(), eager_grads, base_logits, base_grads
+        )
+    del graph_model
+    _reset_cuda_memory()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.skipif(
+    not is_te_min_version("2.14.0"), reason="CUDA Graph with TE RNG tracker requires TE >= 2.14.0"
+)
+@pytest.mark.parametrize("position_embedding_type", ["yarn", "mrope"])
+def test_chunk_wise_cuda_graph_replays_yarn_and_mrope_rotary_tables(
+    position_embedding_type, chunk_graph_process_state
+):
+    """Chunk-wise TE CUDA graphs with yarn / fixed-length mRoPE, against eager.
+
+    The block's sample inputs carry a rotary table of the runtime shape (``get_rotary_pos_emb``
+    materializes it for block callables), which the runtime table overwrites at every replay;
+    a capture without the table would replay attention without RoPE and diverge from eager."""
+    seq_length, micro_batch_size = 128, 2
+    device = torch.device("cuda")
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
+    )
+    common = dict(
+        seed=123,
+        num_layers=2,
+        hidden_size=256,
+        num_attention_heads=4,
+        vocab_size=128,
+        seq_length=seq_length,
+        num_experts=None,
+        is_mla=False,
+        fine_grained_activation_offloading=False,
+        offload_modules=None,
+        min_offloaded_tensor_size=1,
+        cuda_graph_modules=[],
+        cuda_graph_warmup_steps=1,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        recompute_granularity=None,
+        position_embedding_type=position_embedding_type,
+    )
+    if position_embedding_type == "yarn":
+        common.update(
+            config_attrs=dict(
+                yarn_rotary_scaling_factor=2.0,
+                yarn_original_max_position_embeddings=seq_length // 2,
+                yarn_beta_fast=32.0,
+                yarn_beta_slow=1.0,
+                yarn_mscale=1.0,
+                yarn_mscale_all_dim=0.0,
+                yarn_correction_range_round_to_int=True,
+            )
+        )
+    else:
+        # kv_channels = 64 -> rotary dim 64 -> the T/H/W sections span dim/2 = 32 frequencies.
+        common.update(mrope_section=[16, 8, 8])
+        # Runtime mRoPE position ids are [3, batch, seq]; give the three axes distinct values.
+        position_ids = torch.stack(
+            [position_ids, position_ids // 4, position_ids // 8]
+        ).contiguous()
+
+    _reset_cuda_memory()
+    base_model = _build_gpt_model_with_cuda_graph(cuda_graph_impl="none", **common).cuda()
+    base_model.train()
+    base_logits, base_grads = _run_eager_iters(
+        base_model,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        num_iters=3,
+    )
+    del base_model
+    _reset_cuda_memory()
+
+    graph_model = _build_gpt_model_with_cuda_graph(cuda_graph_impl="chunk_wise", **common).cuda()
+    graph_model.train()
+    graph_logits, graph_grads, _ = _run_iters_with_cuda_graph(
+        graph_model,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        attention_mask=attention_mask,
+        num_warmup_iters=1,
+        num_measure_iters=2,
+        enable_offload_reset=False,
+    )
+    del graph_model
+    _reset_cuda_memory()
+
+    _assert_chunk_graph_matches_eager(graph_logits, graph_grads, base_logits, base_grads)

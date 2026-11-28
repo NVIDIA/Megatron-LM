@@ -61,6 +61,12 @@ logger = logging.getLogger(__name__)
 class GPTPostProcessBlock(ChunkCudaGraphPostProcessBlock):
     """``GPTModel._postprocess`` (MTP block, LM head, loss) as a chunk CUDA graph callable."""
 
+    def eager_only_reason(self):
+        """Also stay eager for the config logger, which dumps the logits of every forward."""
+        if has_config_logger_enabled(self.config):
+            return "config_logger_dir dumps the inputs and logits of every forward"
+        return super().eager_only_reason()
+
     def forward(
         self,
         hidden_states,
@@ -400,7 +406,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
-        # Chunk CUDA graphs also capture the post-process of the last pipeline stage.
+        # Chunk CUDA graphs of packed-sequence (THD) runs also capture the post-process of the
+        # last pipeline stage.
         self.postprocess_block = build_postprocess_block(self, GPTPostProcessBlock)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
@@ -783,6 +790,18 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 **decoder_extra_block_kwargs,
             )
 
+        # Chunk-wise CUDA graphs with fine-grained offloading: the eager warm-up marks on the
+        # microbatch's offload template where the decoder's groups end and where the forward's
+        # groups end (a backward-time recompute appends its groups after that), so each captured
+        # callable's keep-last policy covers its own range only. No-ops once the capture starts.
+        mark_offload_group_ends = (
+            getattr(self.config, "cuda_graph_impl", "none") == "chunk_wise"
+            and getattr(self.config, "fine_grained_activation_offloading", False)
+            and self.training
+        )
+        if mark_offload_group_ends:
+            off_interface.mark_decoder_groups_end()
+
         # When mHC + MTP, the decoder returns (contracted, multi-stream); when
         # AttnRes + MTP, it returns (aggregated, depth-source tuple). MTP needs
         # the extra stream; lm_head needs the first element. mHC and AttnRes are
@@ -806,9 +825,17 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             and labels is not None
             and output_processor is None
             and not InferenceMode.is_active()
+            # The captured post-process takes the tensors below only; a call that conditions
+            # the MTP, the MTP layers or the LM head on anything else runs the eager one.
+            and mtp_input_mask is None
+            and runtime_gather_output is None
+            and not extra_block_kwargs
+            and sequence_len_offset is None
+            # The config logger dumps decoder_input, which the block does not take.
+            and not has_config_logger_enabled(self.config)
         ):
             # Captured into / replayed from the chunk CUDA graphs.
-            return postprocess_block(
+            output = postprocess_block(
                 hidden_states,
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -822,8 +849,11 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_sin=rotary_pos_sin,
                 mhc_multistream=mhc_multistream,
             )
+            if mark_offload_group_ends:
+                off_interface.mark_forward_groups_end()
+            return output
 
-        return self._postprocess(
+        output = self._postprocess(
             hidden_states=hidden_states,
             input_ids=input_ids,
             position_ids=position_ids,
@@ -848,6 +878,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             output_processor=output_processor,
             output_processor_context=output_processor_context,
         )
+        if mark_offload_group_ends:
+            off_interface.mark_forward_groups_end()
+        return output
 
     def _postprocess(
         self,

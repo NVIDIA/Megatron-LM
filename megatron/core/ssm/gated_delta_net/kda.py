@@ -36,7 +36,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.utils import precision_aware_checkpoint
+from megatron.core.transformer.utils import use_te_checkpoint
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
 try:
@@ -626,9 +626,23 @@ class KimiDeltaAttention(_GDNBase):
                     chunkwise_cp_context,
                 )
 
-            out, out_bias = precision_aware_checkpoint(
-                _checkpointed_compute, self.config, active_pg_collection.tp, hidden_states
-            )
+            # Quantized recompute must restore TE's FP8/FP4 state, matching the
+            # selective MLP and MoE recompute paths.
+            if use_te_checkpoint(self.config):
+                # Import here to avoid a circular dependency.
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                out, out_bias = te_checkpoint(
+                    _checkpointed_compute,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    active_pg_collection.tp,
+                    hidden_states,
+                )
+            else:
+                out, out_bias = tensor_parallel.checkpoint(
+                    _checkpointed_compute, False, hidden_states
+                )
         else:
             out, out_bias = self._forward_compute(
                 hidden_states,

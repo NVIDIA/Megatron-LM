@@ -3,8 +3,9 @@
 """Chunk-wise Transformer Engine CUDA graphs.
 
 With ``cuda_graph_impl="chunk_wise"`` the decoder block of every PP/VPP model chunk (and, on the
-last stage, the post-process block: MTP, LM head and loss) is the callable handed to Transformer
-Engine's ``make_graphed_callables`` instead of the individual layers. One forward graph and one
+last stage of packed-sequence (THD) runs, the post-process block: MTP, LM head and loss) is the
+callable handed to Transformer Engine's ``make_graphed_callables`` instead of the individual
+layers. One forward graph and one
 backward graph are captured per callable and microbatch slot, so activation recompute, MoE
 dispatch/combine and the hyper-connection residual streams are all recorded inside one graph and
 replayed with a single launch per pass.
@@ -15,6 +16,7 @@ from contextlib import nullcontext
 
 import torch
 
+from megatron.core import tensor_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import GraphableMegatronModule
 
@@ -33,16 +35,12 @@ class ChunkCudaGraphBlockMixin:
 
     is_cuda_graph_chunk_callable = True
 
-    def _should_call_local_cudagraph(self, *args, **kwargs):
-        """A chunk callable is graphed through Transformer Engine only."""
-        return False
-
     def _chunk_cp_group(self):
         """Explicit CP group of the captured block (the post-process block uses its owner's)."""
-        pg_collection = getattr(self, 'pg_collection', None)
-        if pg_collection is None and getattr(self, '_owner', None) is not None:
-            pg_collection = getattr(self._owner, 'pg_collection', None)
-        return getattr(pg_collection, 'cp', None)
+        pg_collection = getattr(self, "pg_collection", None)
+        if pg_collection is None and getattr(self, "_owner", None) is not None:
+            pg_collection = getattr(self._owner, "pg_collection", None)
+        return getattr(pg_collection, "cp", None)
 
     def _block_uses_graph_dynamic_dsa_route(self):
         """Whether a DSA layer of this block consumes the balanced-CP per-pack route inputs.
@@ -53,11 +51,11 @@ class ChunkCudaGraphBlockMixin:
         like ``cu_seqlens``, and the ``PackedSeqParams`` rebuilt inside the graph hands them to
         every DSA layer of the block.
         """
-        if not getattr(self.config, 'dsa_cp_balance_indexer_graph_dynamic_packs', False):
+        if not getattr(self.config, "dsa_cp_balance_indexer_graph_dynamic_packs", False):
             return False
         return any(
             module is not self
-            and getattr(module, '_uses_graph_dynamic_dsa_route', None) is not None
+            and getattr(module, "_uses_graph_dynamic_dsa_route", None) is not None
             and module._uses_graph_dynamic_dsa_route()
             for module in self.modules()
         )
@@ -83,23 +81,57 @@ class ChunkCudaGraphBlockMixin:
         capture-time value), and that same first callable forwards ``is_first_microbatch`` to the
         FP8 weight-cache update (every recipe). The graphs themselves are fixed, so the context
         only drives this bookkeeping; a BF16 boundary layer stays BF16 as it was recorded.
-        """
-        if not getattr(self.config, 'fp8', None) or not self._chunk_graph_has_quantized_modules():
-            return nullcontext()
-        from megatron.core.fp8_utils import get_fp8_context
 
-        return get_fp8_context(self.config)
+        NVFP4 goes through the same TE autocast (``get_fp4_context``): without it the replay
+        would never hand ``is_first_microbatch`` to the weight cache and would re-quantize the
+        BF16 weights on every microbatch.
+        """
+        if not self._chunk_graph_has_quantized_modules():
+            return nullcontext()
+        if getattr(self.config, "fp8", None):
+            from megatron.core.fp8_utils import get_fp8_context
+
+            return get_fp8_context(self.config)
+        if getattr(self.config, "fp4", None):
+            from megatron.core.fp4_utils import get_fp4_context
+
+            return get_fp4_context(self.config)
+        return nullcontext()
+
+    def __call__(self, *args, **kwargs):
+        # Note a padding mask where the model hands it to the block: the hyper-connection
+        # layers consume it without going through TransformerLayer._forward_attention, the
+        # only place that records it per layer.
+        if (
+            kwargs.get("padding_mask") is not None
+            and getattr(self, "_padding_mask_shape_seen", None) is None
+            and getattr(self.config, "cuda_graph_impl", "none") == "chunk_wise"
+        ):
+            self._padding_mask_shape_seen = tuple(kwargs["padding_mask"].shape)
+        return super().__call__(*args, **kwargs)
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Build the static inputs of a complete decoder-block graph."""
-        layout_manager = getattr(self, '_cp_layout_manager', None)
+        layout_manager = getattr(self, "_cp_layout_manager", None)
         if layout_manager is not None and layout_manager.requires_conversion:
             raise ValueError(
-                "cuda_graph_impl='chunk_wise' cannot capture a hybrid stack whose layers use "
-                "different context-parallel layouts "
-                f"(layer layouts {sorted(set(layout_manager.layer_layouts))}): the per-layer "
-                "layout conversion exchanges tokens with data-dependent split sizes. Use one "
-                "cp_partition_mode for every layer or run without chunk graphs."
+                "cuda_graph_impl='chunk_wise' cannot capture a hybrid stack that converts "
+                "between context-parallel layouts (boundary layout "
+                f"{layout_manager.boundary_layout}, layer layouts "
+                f"{sorted(set(layout_manager.layer_layouts))}): the conversion exchanges tokens "
+                "with data-dependent split sizes. Give every layer the boundary layout "
+                "(attention_cp_layout / linear_cp_layout) or run without chunk graphs."
+            )
+        if (
+            getattr(self, "_has_linear_layer_with_chunkwise_cp", False)
+            and self._is_thd_cuda_graph()
+        ):
+            raise ValueError(
+                "cuda_graph_impl='chunk_wise' cannot capture packed (THD) sequences through "
+                "Mamba layers with chunkwise context parallelism (linear_cp_mode='chunkwise'): "
+                "their CP metadata is built on the host from the sequence boundaries of each "
+                "pack, so a captured graph would replay the layout of the capture sample. Use "
+                "fixed-length batches or run without chunk graphs."
             )
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
         config = self.config
@@ -117,10 +149,8 @@ class ChunkCudaGraphBlockMixin:
             )
 
         if self._is_thd_cuda_graph():
-            max_num_seqs = config.thd_max_packed_sequences
-            assert (
-                max_num_seqs is not None
-            ), "thd_max_packed_sequences must be set for THD chunk CUDA graphs."
+            self._check_packed_layers_are_capturable()
+            max_num_seqs = _thd_max_packed_sequences(config)
             max_tokens = config.max_seqlen_per_dp_cp_rank * config.context_parallel_size
             cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
             cu_seqlens[1:] = max_tokens
@@ -131,34 +161,113 @@ class ChunkCudaGraphBlockMixin:
                 cu_seqlens_kv_padded=cu_seqlens.clone(),
             )
             self._add_graph_dynamic_dsa_route_static_inputs(static_inputs, cu_seqlens, max_tokens)
-            local_tokens = config.max_seqlen_per_dp_cp_rank
-            if config.sequence_parallel and self.pre_process:
-                local_tokens //= config.tensor_model_parallel_size
-            static_inputs["padding_mask"] = torch.zeros(
-                1, local_tokens, dtype=torch.bool, device=device
-            )
-        elif config.create_attention_mask_in_dataloader:
-            local_seq_length = seq_length // config.context_parallel_size
-            static_inputs["attention_mask"] = (
-                ~(torch.tril(torch.ones((local_seq_length, seq_length))).bool())
-                .to(device)
-                .reshape(1, 1, local_seq_length, seq_length)
-                .tile(micro_batch_size, 1, 1, 1)
+            captures_padding_mask = True
+        else:
+            if config.create_attention_mask_in_dataloader:
+                local_seq_length = seq_length // config.context_parallel_size
+                static_inputs["attention_mask"] = (
+                    ~(torch.tril(torch.ones((local_seq_length, seq_length))).bool())
+                    .to(device)
+                    .reshape(1, 1, local_seq_length, seq_length)
+                    .tile(micro_batch_size, 1, 1, 1)
+                )
+            # Fixed-length batches carry a padding mask only for some datasets. Like the
+            # per-layer capture, reserve the input when this block (__call__) or one of its
+            # layers (TransformerLayer._padding_mask_shape_seen) received a mask during the
+            # eager warm-up steps.
+            captures_padding_mask = any(
+                getattr(module, "_padding_mask_shape_seen", None) is not None
+                for module in self.modules()
             )
 
-        has_hash_router = config.moe_n_hash_layers > 0 and any(
-            getattr(module, 'is_hash_layer', False) for module in self.modules()
-        )
-        if has_hash_router:
-            input_ids_shape = (
-                (1, config.max_seqlen_per_dp_cp_rank)
-                if self._is_thd_cuda_graph()
-                else (micro_batch_size, seq_length)
+        # padding_mask and the hash router's input_ids are batch-first token metadata. They are
+        # captured in the block's own token frame, that of its hidden_states ([tokens, batch,
+        # hidden]: CP-local and, with sequence parallelism, TP-local), on every stage; replay
+        # brings what the model passes to that frame (_align_token_metadata_to_block).
+        tokens, batch = static_inputs["hidden_states"].shape[:2]
+        if captures_padding_mask:
+            static_inputs["padding_mask"] = torch.zeros(
+                (batch, tokens), dtype=torch.bool, device=device
             )
+        self._chunk_graph_captures_padding_mask = captures_padding_mask
+        if config.moe_n_hash_layers > 0 and any(
+            getattr(module, "is_hash_layer", False) for module in self.modules()
+        ):
             static_inputs["input_ids"] = torch.zeros(
-                input_ids_shape, dtype=torch.long, device=device
+                (batch, tokens), dtype=torch.long, device=device
             )
         return static_inputs
+
+    def _check_packed_layers_are_capturable(self):
+        """Refuse layers that derive host-side state from the values of a pack's ``cu_seqlens``.
+
+        The config rejects GDN / KDA with packed sequences by ``experimental_attention_variant``
+        and by hybrid pattern symbol ('G', 'K'). Which mixer a layer runs is the layer spec's
+        choice (a Mamba-symbol layer can hold a gated delta product mixer, which runs the same
+        FLA chunk kernels), so the layers themselves are checked here.
+        """
+        from megatron.core.ssm.gated_delta_net.common import _GDNBase
+
+        def derives_chunk_indices_on_the_host(module):
+            # The gated delta product mixer is matched by name, so the check does not depend
+            # on the module that defines it.
+            return isinstance(module, _GDNBase) or any(
+                cls.__name__ == "GatedDeltaProductMixer" for cls in type(module).__mro__
+            )
+
+        if any(derives_chunk_indices_on_the_host(module) for module in self.modules()):
+            raise ValueError(
+                "cuda_graph_impl='chunk_wise' does not support packed-sequence (THD) training "
+                "with GDN / KDA / GDP layers: the FLA kernels derive their chunk indices on the "
+                "host from the cu_seqlens values and cache them per tensor, so a captured graph "
+                "replays the pack layout of the capture sample. Use fixed-length sequences (no "
+                "sequence_packing_scheduler) with chunk-wise graphs, or run the model without "
+                "CUDA graphs."
+            )
+
+    def _align_token_metadata_to_block(self, hidden_states, kwargs):
+        """Bring a replay's ``padding_mask`` / ``input_ids`` to the captured token frame.
+
+        The models differ in what they hand the block under sequence parallelism: ``GPTModel``
+        scatters the padding mask on the first stage only and never the ids, ``HybridModel``
+        scatters both. In eager mode every consumer shards full-length metadata itself
+        (``MoELayer._align_batch_first_to_sequence_parallel``); a graph input has one fixed
+        shape, so the same shard is taken here, before the replay copies it into the static
+        buffer.
+
+        The graph's keyword set is fixed at capture as well: a graph that reserved a mask gets
+        an all-False one when a batch has none, and a mask arriving at a graph captured without
+        one would be dropped silently by the graphed callable, so it raises when the block
+        routes tokens (the routers would diverge from eager) and is dropped when nothing in the
+        block reads it.
+        """
+        if self.config.sequence_parallel:
+            for key in ("padding_mask", "input_ids"):
+                value = kwargs.get(key)
+                if value is not None and value.shape[1] != hidden_states.shape[0]:
+                    kwargs[key] = (
+                        tensor_parallel.scatter_to_sequence_parallel_region(
+                            value.transpose(0, 1).contiguous(), group=self.tp_group
+                        )
+                        .transpose(0, 1)
+                        .contiguous()
+                    )
+        if getattr(self, "_chunk_graph_captures_padding_mask", False):
+            if kwargs.get("padding_mask") is None:
+                tokens, batch = hidden_states.shape[:2]
+                kwargs["padding_mask"] = torch.zeros(
+                    (batch, tokens), dtype=torch.bool, device=hidden_states.device
+                )
+        elif kwargs.pop("padding_mask", None) is not None:
+            from megatron.core.transformer.moe.moe_layer import MoELayer
+
+            if any(isinstance(module, MoELayer) for module in self.modules()):
+                raise RuntimeError(
+                    "padding_mask was passed to a chunk CUDA graph that was captured without a "
+                    "padding_mask input: no mask reached this block during "
+                    "cuda_graph_warmup_steps (is it 0?). The graphed MoE routers would silently "
+                    "ignore the mask. Run at least one eager warm-up step with masked batches."
+                )
 
     def _add_graph_dynamic_dsa_route_static_inputs(self, static_inputs, cu_seqlens, max_tokens):
         """Add the balanced-CP route pair (full-capacity sample) to the block's static inputs."""
@@ -171,18 +280,20 @@ class ChunkCudaGraphBlockMixin:
         )
 
     def _drop_cp_layout_kwargs(self, kwargs):
-        """Drop the per-layout packed metadata (``packed_seq_params_by_layout``, ``cp_layout_plan``)
-        that a hybrid stack receives alongside ``packed_seq_params``.
+        """Drop the per-layout metadata (``packed_seq_params_by_layout``,
+        ``padding_mask_by_layout``, ``cp_layout_plan``) that a hybrid stack receives alongside
+        ``packed_seq_params`` and ``padding_mask``.
 
-        ``packed_seq_params_by_layout`` and ``cp_layout_plan`` only carry information when the
-        stack converts between CP layouts across its layers (``ContextParallelLayoutManager.
-        requires_conversion``); that conversion routes tokens with data-dependent split sizes and
-        cannot be captured, so ``get_layer_static_inputs`` rejects such stacks. For a single layout
-        the dict holds the one ``packed_seq_params`` already passed and the plan is ``None``, and
-        the block rebuilds nothing from them.
+        They only carry information when the stack converts between CP layouts across its
+        layers (``ContextParallelLayoutManager.requires_conversion``); that conversion routes
+        tokens with data-dependent split sizes and cannot be captured, so
+        ``get_layer_static_inputs`` rejects such stacks. For a single layout the dicts hold the
+        one ``packed_seq_params`` / ``padding_mask`` already passed and the plan is ``None``;
+        the stack reads none of them.
         """
-        kwargs.pop('packed_seq_params_by_layout', None)
-        plan = kwargs.pop('cp_layout_plan', None)
+        kwargs.pop("packed_seq_params_by_layout", None)
+        kwargs.pop("padding_mask_by_layout", None)
+        plan = kwargs.pop("cp_layout_plan", None)
         assert plan is None, (
             "Chunk CUDA graphs received a THD CP layout plan: per-layer CP layout conversion is "
             "not supported inside a captured block."
@@ -192,13 +303,33 @@ class ChunkCudaGraphBlockMixin:
         """Replace ``packed_seq_params`` by its graph-copyable tensors (``cu_seqlens`` and, with
         the graph-dynamic balanced CP indexer, the per-pack route pair)."""
         self._drop_cp_layout_kwargs(kwargs)
-        packed_seq_params = kwargs.pop('packed_seq_params', None)
+        packed_seq_params = kwargs.pop("packed_seq_params", None)
         if packed_seq_params is None:
             return
-        kwargs['cu_seqlens_q'] = packed_seq_params.cu_seqlens_q
-        kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
-        kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
-        kwargs['cu_seqlens_kv_padded'] = packed_seq_params.cu_seqlens_kv_padded
+        if (
+            packed_seq_params.local_cp_size is not None
+            and packed_seq_params.local_cp_size != self.config.context_parallel_size
+        ):
+            # dynamic_context_parallel: the captured collectives use the capture's CP group.
+            raise RuntimeError(
+                "A chunk CUDA graph cannot replay a microbatch scheduled on a context-parallel "
+                f"group of size {packed_seq_params.local_cp_size}: its collectives were "
+                f"captured for context_parallel_size={self.config.context_parallel_size}."
+            )
+        if not self._is_thd_cuda_graph():
+            # Captured from fixed-length samples, the graph has no cu_seqlens inputs: the
+            # graphed callable would drop them and replay plain causal attention across the
+            # sequence boundaries.
+            raise RuntimeError(
+                "A chunk CUDA graph captured for fixed-length batches received packed_seq_params. "
+                "Packed sequences are captured only with sequence_packing_scheduler (which "
+                "bounds the packed layout through max_seqlen_per_dp_cp_rank and "
+                "thd_max_packed_sequences); run this data path without chunk-wise CUDA graphs."
+            )
+        kwargs["cu_seqlens_q"] = packed_seq_params.cu_seqlens_q
+        kwargs["cu_seqlens_kv"] = packed_seq_params.cu_seqlens_kv
+        kwargs["cu_seqlens_q_padded"] = packed_seq_params.cu_seqlens_q_padded
+        kwargs["cu_seqlens_kv_padded"] = packed_seq_params.cu_seqlens_kv_padded
         if self._block_uses_graph_dynamic_dsa_route():
             from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
@@ -215,7 +346,7 @@ class ChunkCudaGraphBlockMixin:
 
     def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
         """Rebuild the graph-static ``PackedSeqParams`` inside the captured block."""
-        if 'cu_seqlens_q' not in kwargs:
+        if "cu_seqlens_q" not in kwargs:
             return
         from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
@@ -224,12 +355,12 @@ class ChunkCudaGraphBlockMixin:
         )
         max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
         packed_seq_params = PackedSeqParams(
-            qkv_format='thd',
+            qkv_format="thd",
             cp_partition_mode=self.config.cp_partition_mode,
-            cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
-            cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
-            cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
-            cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
+            cu_seqlens_q=kwargs.pop("cu_seqlens_q"),
+            cu_seqlens_kv=kwargs.pop("cu_seqlens_kv"),
+            cu_seqlens_q_padded=kwargs.pop("cu_seqlens_q_padded"),
+            cu_seqlens_kv_padded=kwargs.pop("cu_seqlens_kv_padded"),
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
             pad_between_seqs=True,
@@ -240,7 +371,7 @@ class ChunkCudaGraphBlockMixin:
             raise RuntimeError(
                 "Chunk CUDA graph input is missing the graph-dynamic balanced CP route metadata."
             )
-        kwargs['packed_seq_params'] = packed_seq_params
+        kwargs["packed_seq_params"] = packed_seq_params
 
     def _prepare_pipeline_input_for_chunk_cuda_graph(self, args, kwargs):
         """Expose the pipeline input tensor as the positional graph input."""
@@ -249,7 +380,7 @@ class ChunkCudaGraphBlockMixin:
         if self.pre_process:
             return args, kwargs
 
-        hidden_states = args[0] if args else kwargs.get('hidden_states')
+        hidden_states = args[0] if args else kwargs.get("hidden_states")
         if hidden_states is None:
             hidden_states = self.input_tensor
         assert torch.is_tensor(
@@ -259,7 +390,7 @@ class ChunkCudaGraphBlockMixin:
         if args:
             args = (hidden_states,) + args[1:]
         else:
-            kwargs['hidden_states'] = hidden_states
+            kwargs["hidden_states"] = hidden_states
         self.input_tensor = hidden_states
         return args, kwargs
 
@@ -270,7 +401,7 @@ class ChunkCudaGraphBlockMixin:
 
         args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
-        kwargs.setdefault('attention_mask', None)
+        kwargs.setdefault("attention_mask", None)
 
         if self.config.moe_paged_stash:
             from megatron.core.transformer.moe.paged_stash import (
@@ -282,11 +413,11 @@ class ChunkCudaGraphBlockMixin:
             # a new (microbatch, layer=1) key range for this capture-time forward. The
             # post-process block continues the decoder's layer numbering, like eager MTP.
             if PagedStashManager.get_instance().enabled and not getattr(
-                self, 'is_cuda_graph_postprocess_callable', False
+                self, "is_cuda_graph_postprocess_callable", False
             ):
                 paged_stash_init_chunk_handler(
                     self.config.virtual_pipeline_model_parallel_size,
-                    getattr(self, 'vp_stage', None),
+                    getattr(self, "vp_stage", None),
                 )
 
         if self.config.fine_grained_activation_offloading:
@@ -296,22 +427,30 @@ class ChunkCudaGraphBlockMixin:
 
             # One offload handler per capture-time callable forward; the post-process block's
             # handler resumes where the decoder's groups end, like eager MTP, but is its own
-            # (the two callables are separate graphs). backward_record/forward_record are dev's
-            # per-callable capture boundary: the backward graph's tail joins the H2D stream and
+            # (the two callables are separate graphs). backward_record/forward_record mark the
+            # capture boundary of a callable: the backward graph's tail joins the H2D stream and
             # the forward graph's tail joins the D2H stream.
-            is_postprocess = getattr(self, 'is_cuda_graph_postprocess_callable', False)
+            is_postprocess = getattr(self, "is_cuda_graph_postprocess_callable", False)
             off_interface.begin_block_capture_chunk(
-                getattr(self, 'vp_stage', None), continue_current=is_postprocess
+                getattr(self, "vp_stage", None), continue_current=is_postprocess
             )
             off_interface.block_capture_forward_start()
             if args:
                 hidden_states = off_interface.backward_record(args[0])
                 args = (hidden_states,) + args[1:]
             else:
-                hidden_states = off_interface.backward_record(kwargs['hidden_states'])
-                kwargs['hidden_states'] = hidden_states
+                hidden_states = off_interface.backward_record(kwargs["hidden_states"])
+                kwargs["hidden_states"] = hidden_states
             if not self.pre_process:
                 self.input_tensor = hidden_states
+            # The callable's static inputs (hidden_states, and for the post-process block
+            # mhc_multistream, labels, ...) are Transformer Engine's sample args: it keeps them
+            # alive for the slot and refreshes them at replay. The first layer's input / residual
+            # (attn_norm's forced release) and the loss inputs alias them, so the offload release
+            # must not resize_(0) their storage.
+            for value in (*args, *kwargs.values()):
+                if torch.is_tensor(value):
+                    off_interface.register_block_static_input(value)
 
         output = self.forward(*args, **kwargs)
 
@@ -337,10 +476,11 @@ class ChunkCudaGraphBlockMixin:
 
         args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
         self._decompose_packed_seq_params_to_kwargs(kwargs)
+        self._align_token_metadata_to_block(args[0] if args else kwargs["hidden_states"], kwargs)
         # Only tensors are graph inputs; a keyword that is None at runtime was not captured.
         kwargs = {key: value for key, value in kwargs.items() if value is not None}
 
-        microbatch_id = getattr(self, 'current_microbatch', 0)
+        microbatch_id = getattr(self, "current_microbatch", 0)
         # Without pipeline parallelism one slot serves every microbatch (a microbatch's backward
         # completes before the next forward). With PP the capture holds one slot per microbatch,
         # so the base replay's ``current_microbatch % len(cuda_graphs)`` must not wrap: reusing a
@@ -370,48 +510,64 @@ class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatron
     """
 
     is_cuda_graph_postprocess_callable = True
-    ATTRIBUTE_NAME = 'postprocess_block'
 
-    def __init__(self, model):
+    def __init__(self, model: torch.nn.Module) -> None:
         super().__init__(config=model.config)
-        object.__setattr__(self, '_owner', model)  # plain reference, not a registered child
-        if getattr(model, 'mtp', None) is not None:
+        object.__setattr__(self, "_owner", model)  # plain reference, not a registered child
+        if getattr(model, "mtp", None) is not None:
             self.mtp = model.mtp
         self.output_layer = model.output_layer
-        if getattr(model, 'embedding', None) is not None:
+        if getattr(model, "embedding", None) is not None:
             self.embedding = model.embedding
         self.pre_process = False
         self.post_process = True
         self.input_tensor = None
-        self.vp_stage = getattr(model, 'vp_stage', None)
+        self.vp_stage = getattr(model, "vp_stage", None)
         self.register_load_state_dict_post_hook(self._drop_shared_missing_keys)
 
     @staticmethod
     def _drop_shared_missing_keys(module, incompatible_keys):
         """The shared parameters are loaded through the owner's own attributes."""
-        marker = f"{ChunkCudaGraphPostProcessBlock.ATTRIBUTE_NAME}."
+        marker = "postprocess_block."
         incompatible_keys.missing_keys[:] = [
             key for key in incompatible_keys.missing_keys if marker not in key
         ]
 
-    def state_dict(self, *args, destination=None, prefix='', keep_vars=False):
+    def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
         """Shared parameters are serialized by their owning module."""
         if destination is None:
             destination = OrderedDict()
         return destination
 
-    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Shared parameters are serialized by their owning module."""
         return {}
 
+    def eager_only_reason(self):
+        """Why this post-process has to stay eager, or ``None`` when it can be captured.
+
+        A replay runs no Python, so code that has to see the logits of every microbatch keeps
+        the eager post-process (after the decoder replay): forward hooks on the LM head (logits
+        savers, distillation captures) here, and what a model's own post-process adds.
+        """
+        if self.output_layer._forward_hooks:
+            return "forward hooks are registered on the output layer"
+        return None
+
     def _chunk_graph_has_quantized_modules(self):
-        """The MTP layers run under FP8 like eager (``get_layer_fp8_context``) and the LM head
-        is a Transformer Engine module only with the MXFP8 output projection; a post-process
-        block with neither opens no autocast, exactly as the eager post-process does not."""
+        """The MTP layers run under FP8 like eager (``get_layer_fp8_context``) unless
+        ``keep_mtp_in_bf16`` holds them out, and the LM head is a Transformer Engine module
+        only with the MXFP8 output projection; a post-process block with neither is captured
+        and replayed without an autocast, exactly as the eager post-process opens none."""
         from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 
         mtp_on_this_stage = (self.config.mtp_num_layers or 0) > 0 and self._owner.mtp_process
-        return mtp_on_this_stage or is_mxfp8_output_proj_active(self.config)
+        quantized_mtp = mtp_on_this_stage and not getattr(self.config, "keep_mtp_in_bf16", False)
+        return quantized_mtp or is_mxfp8_output_proj_active(self.config)
+
+    def _align_token_metadata_to_block(self, hidden_states, kwargs):
+        """The post-process consumes the caller's full-length ``input_ids`` / ``padding_mask``
+        (the MTP rolls them together and gathers its own hidden states), captured as such."""
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Static inputs of the post-process graph (packed sequences only)."""
@@ -419,6 +575,7 @@ class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatron
         assert (
             self._is_thd_cuda_graph()
         ), "Post-process chunk CUDA graphs are supported for packed (THD) sequences only."
+        self._check_packed_layers_are_capturable()
         device = torch.cuda.current_device()
         if config.bf16:
             dtype = torch.bfloat16
@@ -453,16 +610,13 @@ class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatron
             # (data_schedule.py), the replay drops None keywords, and a keyword that was captured
             # but never arrives at replay makes the graphed callable raise, so they are captured
             # only where the stage actually consumes them.
+            # Zeros: valid indices for any vocabulary and any learned position table (which can
+            # be shorter than a pack); the runtime tensors overwrite them at every replay.
             inputs["input_ids"] = torch.zeros((1, tokens), dtype=torch.long, device=device)
-            inputs["position_ids"] = torch.arange(
-                tokens, dtype=torch.long, device=device
-            ).unsqueeze(0)
+            inputs["position_ids"] = torch.zeros((1, tokens), dtype=torch.long, device=device)
         inputs["labels"] = torch.zeros((1, tokens), dtype=torch.long, device=device)
         inputs["loss_mask"] = torch.ones((1, tokens), dtype=torch.float32, device=device)
-        max_num_seqs = config.thd_max_packed_sequences
-        assert (
-            max_num_seqs is not None
-        ), "thd_max_packed_sequences must be set for THD chunk CUDA graphs."
+        max_num_seqs = _thd_max_packed_sequences(config)
         max_tokens = tokens * config.context_parallel_size
         cu_seqlens = torch.zeros(max_num_seqs + 1, dtype=torch.int32, device=device)
         cu_seqlens[1:] = max_tokens
@@ -479,6 +633,18 @@ class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatron
             # copy.
             inputs["padding_mask"] = torch.zeros(1, tokens, dtype=torch.bool, device=device)
         return inputs
+
+
+def _thd_max_packed_sequences(config) -> int:
+    """Upper bound on packed sequences per microbatch, from either config spelling."""
+    max_num_seqs = config.thd_max_packed_sequences
+    if max_num_seqs is None:
+        max_num_seqs = getattr(config, "cuda_graph_thd_max_packed_sequences", None)
+    assert max_num_seqs is not None, (
+        "thd_max_packed_sequences (or cuda_graph_thd_max_packed_sequences) must be set for "
+        "THD chunk CUDA graphs."
+    )
+    return max_num_seqs
 
 
 def build_postprocess_block(model, block_cls):

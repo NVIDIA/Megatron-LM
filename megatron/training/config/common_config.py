@@ -32,9 +32,9 @@ class RNGConfig:
         transformer = getattr(model_config, "transformer", model_config)
         if not isinstance(transformer, TransformerConfig):
             return
-        if transformer.cuda_graph_impl != "none" and "transformer_engine" in (
-            transformer.transformer_impl,
-            transformer.cuda_graph_impl,
+        if transformer.cuda_graph_impl != "none" and (
+            "transformer_engine" in (transformer.transformer_impl, transformer.cuda_graph_impl)
+            or transformer.cuda_graph_impl == "chunk_wise"
         ):
             self.te_rng_tracker = True
         # Core retains these fields for standalone use; within a run they are derived.

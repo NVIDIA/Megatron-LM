@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import warnings
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ from megatron.core.transformer.moe.megakernel import (
     prepare_megakernel_shared_expert_config,
 )
 from megatron.core.transformer.moe.megakernel.mok import weights
+from megatron.core.transformer.moe.megakernel.mok.backend import MoKMegakernel
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
@@ -86,10 +88,128 @@ def test_mxfp8_shared_expert_config_expresses_bf16_module(monkeypatch, recwarn):
             "cuda_graph_modules": [],
             "moe_layer_recompute": True,
         },
+        # MXFP8 MoK under chunk-wise block capture: the scale re-swizzle is recorded
+        # into the captured block, so no host-side refresh is needed between replays.
+        {
+            "fp8": "e4m3",
+            "fp8_recipe": "mxfp8",
+            "fp8_param": True,
+            "cuda_graph_impl": "chunk_wise",
+            "cuda_graph_modules": [],
+        },
     ],
 )
 def test_mok_accepts_key_supported_configurations(overrides):
     assert _mok_transformer_config(**overrides).moe_megakernel_backend == "mok"
+
+
+@pytest.mark.parametrize("routing_map_mode", ["indices", "bool"])
+def test_mok_keeps_the_configured_hybridep_routing_map_mode(routing_map_mode):
+    """The router hands a megakernel backend the boolean token-to-expert map whatever the
+    HybridEP routing-map option says, so a MOK config neither overrides it nor warns."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        config = _mok_transformer_config(
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_hybridep_routing_map_mode=routing_map_mode,
+        )
+    assert config.moe_hybridep_routing_map_mode == routing_map_mode
+    assert not [w for w in caught if "moe_hybridep_routing_map_mode" in str(w.message)]
+
+
+def _detached_mok_backend(*, use_mxfp8_weights: bool, cuda_graph_impl: str = "chunk_wise"):
+    """Build a MoKMegakernel with only the state quantized_routed_weights() reads.
+
+    Bypasses __init__ (which needs the mok package, TE grouped parameters, and an EP
+    group) so the view-refresh decision can be tested on any device.
+    """
+    backend = MoKMegakernel.__new__(MoKMegakernel)
+    torch.nn.Module.__init__(backend)
+    backend.use_mxfp8_weights = use_mxfp8_weights
+    backend.native_single_grouped_weights = True
+    backend.num_local_experts = 2
+    backend.hidden_size = 128
+    backend.intermediate_size = 256
+    backend.register_parameter("routed_fc1_weight", None)
+    backend.register_parameter("routed_fc2_weight", None)
+    backend.is_first_microbatch = False
+    backend._refresh_scales_in_every_capture = cuda_graph_impl == "chunk_wise"
+    backend._routed_weight_view_cache = (object(), object())
+    backend._split_main_grad_descriptor_cache = None
+    return backend
+
+
+@pytest.mark.parametrize(
+    ("use_mxfp8_weights", "is_first_microbatch", "capturing", "cuda_graph_impl", "expect_rebuild"),
+    [
+        # Eager MXFP8: refresh exactly when the host flag says a new iteration began.
+        (True, True, False, "chunk_wise", True),
+        (True, False, False, "chunk_wise", False),
+        # Captured chunk-wise MXFP8 block: the refresh is recorded into the graph regardless
+        # of the flag, so replays re-swizzle TE's live scale_inv instead of keeping a stale
+        # copy.
+        (True, False, True, "chunk_wise", True),
+        (True, True, True, "chunk_wise", True),
+        # A full-iteration graph records the whole iteration and keeps the host schedule:
+        # one refresh, at the first microbatch.
+        (True, True, True, "full_iteration", True),
+        (True, False, True, "full_iteration", False),
+        # BF16 payloads alias TE storage directly; nothing to refresh in either mode.
+        (False, True, False, "chunk_wise", False),
+        (False, False, True, "chunk_wise", False),
+    ],
+)
+def test_quantized_routed_weights_refreshes_scales_under_capture(
+    monkeypatch, use_mxfp8_weights, is_first_microbatch, capturing, cuda_graph_impl, expect_rebuild
+):
+    backend = _detached_mok_backend(
+        use_mxfp8_weights=use_mxfp8_weights, cuda_graph_impl=cuda_graph_impl
+    )
+    backend.is_first_microbatch = is_first_microbatch
+    cached_fc1, cached_fc2 = backend._routed_weight_view_cache
+    calls = []
+
+    def fake_view(parameters, *, rows, columns, cached_view):
+        # The refresh must write into the cached view (stable descriptor addresses).
+        calls.append(cached_view)
+        return cached_view
+
+    monkeypatch.setattr(backend, "_routed_weight_view", fake_view)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+
+    views = backend.quantized_routed_weights()
+
+    assert views == (cached_fc1, cached_fc2)
+    assert calls == ([cached_fc1, cached_fc2] if expect_rebuild else [])
+    # Eager semantics are unchanged: the host flag is consumed by the call.
+    assert backend.is_first_microbatch is False
+
+
+@pytest.mark.parametrize("use_mxfp8_weights", [True, False])
+@pytest.mark.parametrize("capturing", [False, True])
+def test_quantized_routed_weights_first_call_builds_the_views(
+    monkeypatch, use_mxfp8_weights, capturing
+):
+    """The first call builds the views wherever it runs: a full-iteration graph captured
+    without an eager warm-up step records the build, like the native MoE's first forward."""
+    backend = _detached_mok_backend(use_mxfp8_weights=use_mxfp8_weights)
+    backend._routed_weight_view_cache = None
+    built = []
+
+    def fake_view(parameters, *, rows, columns, cached_view):
+        assert cached_view is None
+        built.append(object())
+        return built[-1]
+
+    monkeypatch.setattr(backend, "_routed_weight_view", fake_view)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+
+    views = backend.quantized_routed_weights()
+
+    assert len(built) == 2
+    assert views == tuple(built)
+    assert backend._routed_weight_view_cache == tuple(built)
 
 
 def test_native_moe_still_accepts_fp64_router():
@@ -183,16 +303,6 @@ def test_shared_execution_is_independent_of_activation_and_preserves_native_prec
         ),
         ({"gradient_accumulation_fusion": False}, "gradient_accumulation_fusion=True"),
         ({"fp8": "hybrid", "fp8_recipe": "mxfp8", "fp8_param": False}, "fp8_param=True"),
-        (
-            {
-                "fp8": "e4m3",
-                "fp8_recipe": "mxfp8",
-                "fp8_param": True,
-                "cuda_graph_impl": "chunk_wise",
-                "cuda_graph_modules": [],
-            },
-            "MXFP8 .* does not support cuda_graph_impl='chunk_wise'",
-        ),
         ({"moe_shortcut_connection": True}, "does not support moe_shortcut_connection"),
         ({"add_bias_linear": True}, "add_bias_linear"),
         ({"moe_apply_probs_on_input": True}, "moe_apply_probs_on_input"),

@@ -1968,7 +1968,7 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
         If so, raise a MoECudaGraphPartialCaptureSignal.
         """
         if (
-            moe_layer.config.cuda_graph_impl in ("transformer_engine", "chunk_wise")
+            moe_layer.config.cuda_graph_impl == "transformer_engine"
             and moe_layer.training
             and is_graph_capturing()
         ):
@@ -1996,7 +1996,7 @@ def maybe_skip_or_early_return_by_cudagraph(step_condition):
             early return in CUDA graph capture.
             """
 
-            if moe_layer.config.cuda_graph_impl not in ("transformer_engine", "chunk_wise"):
+            if moe_layer.config.cuda_graph_impl != "transformer_engine":
                 return func(moe_layer, *args, **kwargs)
 
             # The non-cudagraph codepath just calls the original function.

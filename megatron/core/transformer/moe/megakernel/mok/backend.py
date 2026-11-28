@@ -38,6 +38,9 @@ if TYPE_CHECKING:
 class MoKMegakernel(MegakernelBackend):
     """Execute MOK using trainable parameters owned by native MCore modules."""
 
+    # Set per instance for chunk-wise CUDA graphs (see quantized_routed_weights).
+    _refresh_scales_in_every_capture = False
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -153,7 +156,11 @@ class MoKMegakernel(MegakernelBackend):
         self.is_first_microbatch = True
         # Cached MOK-consumable views, not weight copies: payloads alias MCore/TE
         # storage. BF16 weights update in place; MXFP8 converted scales refresh
-        # once per optimizer iteration while retaining graph-captured addresses.
+        # once per optimizer iteration (and inside every captured chunk-wise block, see
+        # quantized_routed_weights) while retaining graph-captured addresses.
+        self._refresh_scales_in_every_capture = (
+            getattr(config, "cuda_graph_impl", "none") == "chunk_wise"
+        )
         self._routed_weight_view_cache = None
         self._split_main_grad_descriptor_cache = None
 
@@ -271,9 +278,26 @@ class MoKMegakernel(MegakernelBackend):
         the MOK payload views reference TE storage, not that temporary buffer.
         Scale conversion still needs to run after each optimizer update, in place
         so descriptors keep their addresses. It does not requantize the weights.
+
+        A ``cuda_graph_impl='chunk_wise'`` block graph is captured per microbatch slot,
+        after eager warm-up calls consumed the host flag, and a replay never re-enters
+        this Python code, so the flag cannot drive the refresh there. Instead the scale
+        re-swizzle is recorded into every captured block. It is a device-side ``copy_``
+        from TE's live ``scale_inv`` storage into the cached MOK scale buffers (same
+        addresses the megakernel descriptors reference), so each replay re-reads the
+        scales the last optimizer update produced. Eager execution and full-iteration
+        graphs (which record the whole iteration, first microbatch included) keep the
+        once-per-iteration ``is_first_microbatch`` schedule.
         """
         needs_weight_view_update = self._routed_weight_view_cache is None or (
-            self.use_mxfp8_weights and self.is_first_microbatch
+            self.use_mxfp8_weights
+            and (
+                self.is_first_microbatch
+                or (
+                    self._refresh_scales_in_every_capture
+                    and torch.cuda.is_current_stream_capturing()
+                )
+            )
         )
         if needs_weight_view_update:
             cached_fc1, cached_fc2 = (

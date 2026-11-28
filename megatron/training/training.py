@@ -132,7 +132,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa_logging import
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
-from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
@@ -6669,10 +6668,7 @@ def train(
         optimizer.step = OptimizerCudaGraphWrapper(
             optimizer.step,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            # Chunk-wise CUDA graphs capture into the shared pool; the optimizer step joins it.
-            use_single_mempool=(
-                config.cuda_graph_use_single_mempool or config.cuda_graph_impl == "chunk_wise"
-            ),
+            use_single_mempool=config.cuda_graph_use_single_mempool,
         )
 
     def get_e2e_base_metrics():
@@ -6915,12 +6911,6 @@ def train(
                 ):
                     disable_forward_pre_hook(model, param_sync=False)
                 cuda_graph_helper.create_cudagraphs()
-                # TE's warm-up passes ran the training forward on the static inputs and
-                # accumulated into the per-step loss trackers; drop that so this step logs only
-                # its real forward.
-                clear_aux_losses_tracker()
-                DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
-                MTPLossLoggingHelper.clean_loss_in_tracker()
                 if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(
                     args, optimizer
                 ):

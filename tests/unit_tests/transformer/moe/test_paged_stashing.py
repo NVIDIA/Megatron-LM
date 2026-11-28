@@ -2,6 +2,7 @@
 
 import gc
 import inspect
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -12,9 +13,14 @@ from megatron.core import config
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    init_num_microbatches_calculator,
+)
 from megatron.core.tensor_parallel.random import (
     _mark_checkpoint_without_output_tensor,
     is_checkpoint_without_output_tensor,
+    model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import is_nccl_ep_bootstrapped, reset_hybrid_ep_buffer
@@ -27,9 +33,11 @@ from megatron.core.transformer.moe.paged_stash import (
     PagedStashRunner,
     PagedTensor,
     _stash_buffer_dtype,
+    check_paged_stash_host_spill,
     check_paged_stash_overflow,
     configure_runtime_schedule,
     paged_stash_init_chunk_handler,
+    paged_stash_prepare_for_cuda_graph_capture,
     paged_stash_reset,
     paged_stash_te_graph_capture,
 )
@@ -173,11 +181,11 @@ def test_te_graph_capture_reallocates_buffers_released_by_warmup_fallback(monkey
 
 
 @pytest.mark.parametrize("pipeline_model_parallel_size", [1, 2])
-def test_runtime_schedule_stashes_at_every_pipeline_size(pipeline_model_parallel_size):
-    """Chunk-wise graphs key the stash by the live (vp, layer, microbatch) coordinates: every
-    captured MoE layer stashes its own activations and reloads them before its own backward,
-    at PP=1 as on the last pipeline stage. Without stashing the page buffers would be allocated
-    for nothing."""
+def test_runtime_schedule_is_selected_at_every_pipeline_size(pipeline_model_parallel_size):
+    """Chunk-wise graphs key the stash by the live (vp, layer, microbatch) coordinates, at PP=1
+    as on any pipeline stage; forward-only passes and the other graph implementations keep the
+    recorded pipeline order. (That a runtime-keyed layer really stashes at PP=1 is checked on the
+    device by ``TestChunkWiseGraphPagedStash``.)"""
     manager = SimpleNamespace()
     config = SimpleNamespace(
         cuda_graph_impl="chunk_wise",
@@ -185,13 +193,51 @@ def test_runtime_schedule_stashes_at_every_pipeline_size(pipeline_model_parallel
         pipeline_model_parallel_size=pipeline_model_parallel_size,
     )
     configure_runtime_schedule(manager, True, config)
-    assert manager.runtime_schedule and manager.runtime_schedule_stash_activations
+    assert manager.runtime_schedule
     configure_runtime_schedule(manager, False, config)
-    assert not manager.runtime_schedule and not manager.runtime_schedule_stash_activations
+    assert not manager.runtime_schedule
     configure_runtime_schedule(
         manager, True, SimpleNamespace(cuda_graph_impl="transformer_engine", moe_paged_stash=True)
     )
-    assert not manager.runtime_schedule and not manager.runtime_schedule_stash_activations
+    assert not manager.runtime_schedule
+
+
+def test_chunk_capture_after_evaluation_restarts_the_runtime_coordinates(monkeypatch):
+    """A forward-only evaluation right before the chunk capture leaves the manager disabled and
+    its microbatch counter advanced by every evaluation forward (a disabled reset returns before
+    it restarts the coordinates). The capture runs before the next training reset: it re-enables
+    the manager in runtime-keyed mode and restarts the coordinates, whose key encoding holds
+    three digits per field. An unfinished discovery is rejected; a manager that no training
+    schedule drove is left alone."""
+    config = SimpleNamespace(cuda_graph_impl="chunk_wise", moe_paged_stash=True)
+
+    manager = _make_schedule_manager([1_001_000, -1_001_000])
+    monkeypatch.setattr(PagedStashManager, "STASH_MGR", manager)
+    manager.enabled = False
+    manager.runtime_schedule = False
+    manager.current_layer = [3]
+    manager.current_microbatch = [1500]
+    paged_stash_prepare_for_cuda_graph_capture(config)
+    assert manager.enabled and manager.runtime_schedule
+    # The first capture-time forward opens microbatch 1, layer 1.
+    paged_stash_init_chunk_handler(1, 0)
+    assert (manager.current_layer, manager.current_microbatch) == ([1], [1])
+    assert manager.get_schedule_layer(1, 1, manager.current_microbatch[0]) == 1_001_001
+
+    manager = _make_schedule_manager([1_001_000])
+    monkeypatch.setattr(PagedStashManager, "STASH_MGR", manager)
+    manager.status = 'capture'
+    with pytest.raises(AssertionError, match="finish schedule and capacity discovery"):
+        paged_stash_prepare_for_cuda_graph_capture(config)
+
+    manager = _make_schedule_manager([])
+    monkeypatch.setattr(PagedStashManager, "STASH_MGR", manager)
+    manager.status = 'begin'
+    manager.enabled = False
+    manager.runtime_schedule = False
+    paged_stash_prepare_for_cuda_graph_capture(config)
+    assert not manager.enabled and not manager.runtime_schedule
+    assert (manager.current_layer, manager.current_microbatch) == ([99], [99])
 
 
 def test_paged_stash_schedule_supports_distinct_vp_layer_templates():
@@ -553,6 +599,57 @@ class TestPagedTensorRoundTrip:
         assert torch.count_nonzero(round_trip(zero_padded_tokens=True)) == 0
         assert torch.equal(round_trip(), garbage[num_tokens:])
 
+    def test_reload_kernel_constants_ignore_the_token_budget_without_zero_fill(self, monkeypatch):
+        """The pop kernel's compile-time constants select its specialization. The row count is
+        one of them and only the zero-fill reads it: without ``zero_padded_tokens`` a reload
+        passes the same constants for every token budget (one compiled kernel for variable
+        budgets), with it the row count of the buffer it fills."""
+        from megatron.core.transformer.moe import paged_stash as paged_stash_module
+
+        device = torch.device("cuda")
+        page_size, hidden_size = 64, 64
+        pop_kernel = paged_stash_module.paged_stash_pop_kernel
+        launches = []
+
+        class RecordingKernel:
+            def __getitem__(self, grid):
+                launch = pop_kernel[grid]
+
+                def record(*args, **kwargs):
+                    launches.append({key: kwargs[key] for key in kwargs if key.isupper()})
+                    return launch(*args, **kwargs)
+
+                return record
+
+        monkeypatch.setattr(paged_stash_module, "paged_stash_pop_kernel", RecordingKernel())
+
+        def reload_constants(max_num_tokens, **reload_kwargs):
+            src = torch.randn(max_num_tokens, hidden_size, device=device).to(torch.bfloat16)
+            overflow = torch.zeros(1, dtype=torch.int64, device=device)
+            host_spill = torch.zeros(1, dtype=torch.int64, device=device)
+            stash = PagedStashBuffer(
+                max_num_tokens, hidden_size, page_size, device, overflow, host_spill, src.dtype
+            )
+            paged = PagedTensor(
+                src.clone(),
+                num_tokens_tensor=torch.tensor([200], dtype=torch.int64, device=device),
+                max_num_tokens=max_num_tokens,
+                hidden_size=hidden_size,
+                page_size=page_size,
+            )
+            paged.offload_to_stash(stash)
+            paged._tensor = torch.zeros_like(src)
+            paged.reload_from_stash(stash, **reload_kwargs)
+            torch.cuda.synchronize()
+            assert torch.equal(paged._tensor[:200], src[:200])
+            return launches.pop()
+
+        constants = reload_constants(600)
+        assert constants["ZERO_PADDED_TOKENS"] is False
+        assert reload_constants(1200) == constants
+        assert reload_constants(600, zero_padded_tokens=True)["MAX_NUM_TOKENS"] == 600
+        assert reload_constants(1200, zero_padded_tokens=True)["MAX_NUM_TOKENS"] == 1200
+
 
 class MoEModelTestContainer:
     def __init__(
@@ -834,6 +931,457 @@ class TestPagedStashingGroupedTensor:
         assert overflow.any().item() == 0
         torch.testing.assert_close(output, output_ref, atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(hidden_states_grad, hidden_states_grad_ref, atol=1e-4, rtol=1e-4)
+
+
+# Stash-free step vs. step with stash (eager or replayed), on float32 copies of the BF16 loss and
+# gradients. The stash only copies bytes, and on GB200 the three steps agree bit for bit; the
+# tolerance leaves room for kernels that do not reproduce bitwise and stays two orders below the
+# gradient error of a reload from the wrong pages (about 2e-2).
+_STASH_RTOL = 1e-4
+_STASH_ATOL = 1e-4
+
+
+def _cuda_page_use(stash_manager):
+    """(pages allocated since the last reset, pages currently held) over the CUDA page buffers.
+
+    Each buffer's free list is a ring with monotonic head (allocation) and tail (release)
+    counters that ``paged_stash_reset`` sets back to (0, num_cuda_pages); the modulo is applied
+    only when indexing the ring. The stash kernels advance them on the device, so they also
+    account for stash / reload work that a replayed CUDA graph issues without any Python call.
+    """
+    allocated = 0
+    held = 0
+    for dtype_buffers in stash_manager.stash_buffers.values():
+        for stash_buffer in dtype_buffers.values():
+            head = stash_buffer.free_list_head[0].item()
+            tail = stash_buffer.free_list_tail[0].item()
+            allocated += head
+            held += stash_buffer.num_cuda_pages - (tail - head)
+    return allocated, held
+
+
+@pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)
+@pytest.mark.skipif(
+    not _te_grouped_tensor_environment_supported(),
+    reason="TE GroupedLinear does not expose the grouped-tensor API",
+)
+@pytest.mark.skipif(not is_hybrid_ep_available(), reason="Hybrid EP are not available")
+@pytest.mark.skipif(
+    not is_te_min_version("2.19.0"), reason="chunk-wise paged stash requires TE >= 2.19"
+)
+class TestChunkWiseGraphPagedStash:
+    """Chunk-wise TE CUDA graphs must stash MoE activations through the page buffers.
+
+    ``configure_runtime_schedule`` keys the stash by the live (vp, layer, microbatch) coordinates
+    at every pipeline size. The tests drive the real path: two eager warm-up steps (schedule and
+    capacity discovery, cuda_graph_warmup_steps=2), chunk-graph capture, then one replayed step
+    whose page traffic is read back from the device free lists -- a replayed graph leaves no
+    Python trace, so the buffers themselves are the evidence that pages were used.
+    """
+
+    seq_length = 512
+    vocab_size = 128
+
+    def teardown_method(self, method):
+        destroy_num_microbatches_calculator()
+        reset_hybrid_ep_buffer()
+        Utils.destroy_model_parallel()
+
+    def _build_model(self, **config_overrides):
+        from megatron.core.models.gpt.gpt_model import GPTModel
+
+        # The paged-stash MoE recipe of TestPagedStashingGroupedTensor (GroupedTensor path, no
+        # op fuser) under chunk-wise graphs: the HybridEP flex dispatcher with a rank capacity
+        # gives the MoE its static shapes. CPU factor 0: no host spill, every page is a CUDA page.
+        config_kwargs = dict(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=4,
+            ffn_hidden_size=512,
+            moe_ffn_hidden_size=512,
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="none",
+            moe_aux_loss_coeff=0.0,
+            moe_router_dtype="fp32",
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+            moe_permute_fusion=True,
+            moe_grouped_gemm=True,
+            moe_use_grouped_tensor=True,
+            use_transformer_engine_op_fuser=False,
+            moe_expert_rank_capacity_factor=2.0,
+            moe_paged_stash=True,
+            moe_paged_stash_buffer_size_factor_cuda=2.0,
+            moe_paged_stash_buffer_size_factor_cpu=0.0,
+            moe_router_padding_for_quantization=True,
+            gated_linear_unit=True,
+            activation_func=F.silu,
+            bias_activation_fusion=True,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp8='e4m3',
+            fp8_recipe='mxfp8',
+            fp8_wgrad=True,
+            fp8_amax_compute_algo='most_recent',
+            fp8_amax_history_len=1,
+            fp8_interval=1,
+            fp8_margin=0,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            cuda_graph_impl="chunk_wise",
+            # The batch carries no attention mask (causal, like --no-create-attention-mask-in-
+            # dataloader); the chunk capture must not sample one the replay cannot refresh.
+            create_attention_mask_in_dataloader=False,
+            cuda_graph_modules=[],
+            cuda_graph_warmup_steps=2,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            use_cpu_initialization=True,
+        )
+        config_kwargs.update(config_overrides)
+        transformer_config = TransformerConfig(**config_kwargs)
+        assert transformer_config.pipeline_model_parallel_size == 1
+        layer_spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=transformer_config.num_moe_experts, moe_grouped_gemm=True
+        )
+        model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=layer_spec,
+            vocab_size=self.vocab_size,
+            max_sequence_length=self.seq_length,
+            position_embedding_type="rope",
+        ).cuda()
+        model.train()
+        # The helper's post-capture reset calls the DDP wrapper's zero_grad_buffer(); this test
+        # drives the bare model and zeroes gradients itself.
+        model.zero_grad_buffer = lambda: None
+        return model
+
+    def _get_batch(self):
+        data = torch.arange(self.seq_length, dtype=torch.int64, device="cuda")
+        return {
+            "input_ids": (data * 7 % self.vocab_size).unsqueeze(0),
+            "labels": ((data + 1) * 7 % self.vocab_size).unsqueeze(0),
+            "position_ids": data.unsqueeze(0),
+            "loss_mask": torch.ones((1, self.seq_length), dtype=torch.float32, device="cuda"),
+        }
+
+    @staticmethod
+    def _forward(model, batch):
+        """One training forward, prepared the way the pipeline schedules prepare it."""
+        # schedules.py resets the stash at the start of every training iteration.
+        paged_stash_reset(enabled=True, config=model.config)
+        for param in model.parameters():
+            # Caller-owned leaf-grad buffers: with a leaf grad of None, AccumulateGrad may adopt
+            # TE's recyclable static grad buffer instead of copying out of it.
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+            else:
+                param.grad.zero_()
+        per_token_loss = model(
+            input_ids=batch["input_ids"],
+            position_ids=batch["position_ids"],
+            attention_mask=None,
+            labels=batch["labels"],
+            loss_mask=batch["loss_mask"],
+        )
+        loss = (per_token_loss.float() * batch["loss_mask"]).sum() / batch["loss_mask"].sum()
+        assert torch.isfinite(loss), "non-finite loss"
+        return loss
+
+    @staticmethod
+    def _evaluate(model, batch):
+        """One forward-only pass, prepared the way the pipeline schedules prepare evaluation."""
+        paged_stash_reset(enabled=False, config=model.config)
+        model.eval()
+        with torch.no_grad():
+            model(
+                input_ids=batch["input_ids"],
+                position_ids=batch["position_ids"],
+                attention_mask=None,
+                labels=batch["labels"],
+                loss_mask=batch["loss_mask"],
+            )
+        model.train()
+
+    @classmethod
+    def _split_tokens_between_two_expert_ranks(cls, model, batch):
+        """Top-1 router weights for a one-layer model whose experts live on two ranks: the logits
+        of the first rank's experts are a projection of the router input that is orthogonal to
+        the batch mean (scaled by 1, 1/2, 1/4, ...), those of the second rank's experts its
+        negative. The projection has zero mean over the batch, so about half of its tokens go to
+        each rank (to its first expert), whereas a constant input (all tokens alike) takes a
+        single route. Returns the fraction of the batch's tokens that the first rank receives."""
+        (layer,) = model.decoder.layers
+        router_inputs = []
+        hook = layer.mlp.router.register_forward_hook(
+            lambda module, args, output: router_inputs.append(args[0].detach().float())
+        )
+        try:
+            cls._evaluate(model, batch)
+        finally:
+            hook.remove()
+        # The untrained router may have sent that pass down one route.
+        layer.mlp.token_dispatcher.reset_over_budget()
+        tokens = router_inputs[0].reshape(-1, router_inputs[0].shape[-1])
+        mean = tokens.mean(dim=0)
+        direction = torch.randn(mean.shape, generator=torch.Generator().manual_seed(0)).to(mean)
+        direction -= (direction @ mean) / (mean @ mean) * mean
+        weight = layer.mlp.router.weight
+        scales = 0.5 ** torch.arange(weight.shape[0] // 2).to(mean)
+        with torch.no_grad():
+            weight.copy_((torch.cat([scales, -scales])[:, None] * direction).to(weight))
+        return ((tokens @ direction) > 0).float().mean().item()
+
+    @staticmethod
+    def _step_result(model, loss):
+        """Loss and every parameter gradient of the step that just ran its backward."""
+        torch.cuda.synchronize()
+        grads = {
+            name: param.grad.detach().float().clone() for name, param in model.named_parameters()
+        }
+        return loss.detach().float().clone(), grads
+
+    @staticmethod
+    def _assert_same_step(result, reference, what):
+        """The stash moves bytes: a step that stashes, eagerly or from a replayed graph, computes
+        the loss and the gradients of the step that kept its activations in place."""
+        loss, grads = result
+        reference_loss, reference_grads = reference
+        torch.testing.assert_close(
+            loss,
+            reference_loss,
+            rtol=_STASH_RTOL,
+            atol=_STASH_ATOL,
+            msg=lambda msg: f"{what}: loss\n{msg}",
+        )
+        assert grads.keys() == reference_grads.keys()
+        for name, reference_grad in reference_grads.items():
+            torch.testing.assert_close(
+                grads[name],
+                reference_grad,
+                rtol=_STASH_RTOL,
+                atol=_STASH_ATOL,
+                msg=lambda msg, name=name: f"{what}: gradient of {name}\n{msg}",
+            )
+
+    @contextmanager
+    def _chunk_graph_run(self, **model_parallel_sizes):
+        """Model-parallel state, the calculator and the capture stream of one chunk-graph run;
+        yields the list the test adds its graph helper to, for the teardown."""
+        # A MoEModelTestContainer that still awaits collection destroys the model-parallel state
+        # from its finalizer: collect it before this run initializes its own.
+        gc.collect()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, **model_parallel_sizes
+        )
+        # The capture sizes its TE warm-up from the run's micro-batch count.
+        init_num_microbatches_calculator(
+            rank=0,
+            rampup_batch_size=None,
+            global_batch_size=Utils.world_size,
+            micro_batch_size=1,
+            data_parallel_size=Utils.world_size,
+        )
+        # Graph-safe RNG tracker, as the training loop enables for CUDA graphs; the CPU generator
+        # initializes the weights (use_cpu_initialization).
+        model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
+        torch.manual_seed(123)
+
+        helpers = []
+        # Warm up on the stream the capture uses: AccumulateGrad nodes created by the warm-up
+        # backwards keep a reference to their stream, and a default-stream reference would pull
+        # a non-capturing stream into the graph (see _run_iters_with_cuda_graph in the offload
+        # tests and the training loop's side stream).
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        prev_stream = torch.cuda.current_stream()
+        torch.cuda.set_stream(side_stream)
+        try:
+            yield helpers
+        finally:
+            torch.cuda.synchronize()
+            torch.cuda.set_stream(prev_stream)
+            torch.cuda.synchronize()
+            for helper in helpers:
+                if helper.graphs_created():
+                    helper.delete_cuda_graphs()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_pp1_replay_uses_stash_pages(self, monkeypatch):
+        """PP=1, one rank's own experts, three layers.
+
+        The first layer is checkpointed (full recompute, method "block"): its forward saves
+        nothing, and its recompute runs inside the backward, which consumes the recomputed
+        activations on the spot, so that layer moves no page; the other two stash in the forward
+        and reload in the backward. A forward-only evaluation runs between the warm-up and the
+        capture (the training loop evaluates at the end of an iteration and captures at the
+        start of the next): it leaves the manager disabled, and the capture must still record
+        the stash. The eager step with stash and the replayed step reproduce the loss and every
+        gradient of the step that stashed nothing."""
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        config.ENABLE_EXPERIMENTAL = True
+        with self._chunk_graph_run(expert_model_parallel_size=1) as helpers:
+            model = self._build_model(
+                num_layers=3,
+                recompute_granularity="full",
+                recompute_method="block",
+                recompute_num_layers=1,
+            )
+            batch = self._get_batch()
+            stash_manager = PagedStashManager.get_instance()
+
+            def assert_page_use(step, after_forward):
+                torch.cuda.synchronize()
+                allocated, held = _cuda_page_use(stash_manager)
+                if after_forward:
+                    assert allocated > 0, f"{step}: the PP=1 chunk_wise forward stashed nothing"
+                    assert held > 0, f"{step}: the forward holds no stash pages before backward"
+                else:
+                    assert held == 0, f"{step}: the backward left {held} stash pages unreleased"
+                return allocated
+
+            # Warm-up step 1: records the stash schedule and the token maxima; nothing is
+            # stashed yet, which makes it the reference for the steps that do.
+            loss = self._forward(model, batch)
+            loss.backward()
+            assert stash_manager.status == 'capture'
+            assert (
+                stash_manager.max_tokens_across_vp_stages
+            ), "no GroupedLinear activations were captured for paged stashing"
+            reference = self._step_result(model, loss)
+
+            # Warm-up step 2: the page buffers exist and the eager run already stashes at PP=1.
+            loss = self._forward(model, batch)
+            assert stash_manager.status == 'captured'
+            assert stash_manager.runtime_schedule
+            assert stash_manager.stash_buffers
+            allocated = assert_page_use("eager", after_forward=True)
+            loss.backward()
+            assert (
+                assert_page_use("eager", after_forward=False) == allocated
+            ), "the eager backward (the first layer's recompute) must not stash"
+            self._assert_same_step(
+                self._step_result(model, loss), reference, "eager step with stash"
+            )
+
+            # Evaluation, then the capture after cuda_graph_warmup_steps=2, like the training loop.
+            self._evaluate(model, batch)
+            assert not stash_manager.enabled
+            helper = TECudaGraphHelper(
+                model=[model], config=model.config, seq_length=self.seq_length, micro_batch_size=1
+            )
+            helpers.append(helper)
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            assert len(model.decoder.cuda_graphs) > 0
+
+            replays = []
+            original_replay = torch.cuda.CUDAGraph.replay
+
+            def counting_replay(graph, *args, **kwargs):
+                replays.append(graph)
+                return original_replay(graph, *args, **kwargs)
+
+            monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", counting_replay)
+
+            # Replayed step: the forward graph must stash into the pages, the backward graph must
+            # reload and release them.
+            loss = self._forward(model, batch)
+            torch.cuda.synchronize()
+            forward_replays = len(replays)
+            assert forward_replays > 0, "the decoder forward did not replay a CUDA graph"
+            allocated = assert_page_use("replay", after_forward=True)
+            loss.backward()
+            torch.cuda.synchronize()
+            assert len(replays) > forward_replays, "the decoder backward did not replay a graph"
+            assert (
+                assert_page_use("replay", after_forward=False) == allocated
+            ), "the backward graph (the first layer's recompute) must not stash"
+            assert check_paged_stash_overflow().any().item() == 0
+            assert check_paged_stash_host_spill().any().item() == 0
+            self._assert_same_step(self._step_result(model, loss), reference, "replayed step")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_capture_on_constant_samples_leaves_no_over_budget_flag(self):
+        """Transformer Engine warms every block up on constant sample inputs before it records
+        the graphs. All tokens then take one route, so the rank that hosts the chosen expert
+        receives the tokens of both ranks of its expert-parallel group: twice the tokens of a
+        rank, against a capacity of 1.5 times that the batch itself respects (two expert ranks,
+        top-1). The dispatcher's over-budget flag accumulates until it is reset;
+        the capture must leave it clear, or the first replayed step fails as if its own, fitting
+        batch had overflowed the static buffers."""
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        if Utils.world_size % 2 != 0:
+            pytest.skip("expert_model_parallel_size=2 needs an even number of ranks")
+        config.ENABLE_EXPERIMENTAL = True
+        with self._chunk_graph_run(expert_model_parallel_size=2) as helpers:
+            model = self._build_model(
+                num_layers=1,
+                expert_model_parallel_size=2,
+                num_moe_experts=8,
+                moe_router_topk=1,
+                moe_router_pre_softmax=True,
+                moe_expert_rank_capacity_factor=1.5,
+            )
+            batch = self._get_batch()
+            # Every rank holds the same batch and weights, so the two expert ranks receive this
+            # fraction of the group's tokens and the rest: within the capacity up to 3/4.
+            first_rank_share = self._split_tokens_between_two_expert_ranks(model, batch)
+            assert 0.3 < first_rank_share < 0.7, first_rank_share
+
+            schedule_runs = []
+
+            def forward_backward_func(*, model, data_iterator, **schedule_kwargs):
+                schedule_runs.append(schedule_kwargs)
+                loss = self._forward(model[0], next(data_iterator[0]))
+                loss.backward()
+                return loss
+
+            # The training loop's overflow handling around the schedule.
+            runner = PagedStashRunner(model.config, False, [model], None, forward_backward_func)
+            assert len(runner.moe_layers) == model.config.num_layers
+
+            def run_step():
+                return runner(
+                    model=[model],
+                    data_iterator=iter([batch]),
+                    num_microbatches=1,
+                    seq_length=self.seq_length,
+                    forward_only=False,
+                )
+
+            # Two eager warm-up steps: the real batch fits the rank capacity on every rank, so
+            # the runner never repeats a step without the capacity.
+            for step in (1, 2):
+                run_step()
+                assert len(schedule_runs) == step, "the test batch must fit the rank capacity"
+            assert PagedStashManager.get_instance().status == 'captured'
+
+            helper = TECudaGraphHelper(
+                model=[model], config=model.config, seq_length=self.seq_length, micro_batch_size=1
+            )
+            helpers.append(helper)
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            runner.mark_te_graph_captured(num_microbatches=1)
+            _, over_budget_ranks, _ = runner.check_moe_overflow()
+            assert over_budget_ranks == 0, (
+                f"{over_budget_ranks} rank(s) still flag the over-budget dispatch of the capture "
+                "warm-ups"
+            )
+
+            # The replayed step, whose batch fits: no static-buffer overflow error.
+            loss = run_step()
+            assert len(schedule_runs) == 3 and torch.isfinite(loss)
+            assert runner.check_moe_overflow()[:2] == (0, 0)
 
 
 @pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)

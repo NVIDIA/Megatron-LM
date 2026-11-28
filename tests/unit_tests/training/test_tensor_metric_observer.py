@@ -869,3 +869,32 @@ def test_forward_metrics_reject_full_iteration_cuda_graphs():
             model=[model], iteration=0, pg_collection=_pg_collection()
         ):
             pass
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "sequence_packing_scheduler", "rejected"),
+    [
+        # Residual and router observations sit inside the captured decoder block.
+        ("residual_accumulator", None, True),
+        ("router_logits", None, True),
+        # The post-process is captured with packed sequences and eager without them.
+        ("output_logits", "dp_balanced", True),
+        ("mtp_logits", "dp_balanced", True),
+        ("output_logits", None, False),
+        ("mtp_logits", None, False),
+    ],
+)
+def test_forward_metrics_reject_blocks_captured_by_chunk_wise_cuda_graphs(
+    source_kind, sequence_packing_scheduler, rejected
+):
+    """A chunk-wise replay runs no Python inside the captured blocks, so their observation
+    sites would never notify the observer."""
+    model = _forward_model(cuda_graph_impl="chunk_wise")
+    model.config.sequence_packing_scheduler = sequence_packing_scheduler
+    source_kinds = frozenset({source_kind})
+
+    if rejected:
+        with pytest.raises(NotImplementedError, match="chunk-wise CUDA graphs"):
+            observer_mod._validate_forward_observation_model([model], source_kinds)
+    else:
+        observer_mod._validate_forward_observation_model([model], source_kinds)

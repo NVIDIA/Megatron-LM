@@ -343,7 +343,9 @@ class PagedTensor:
             PAGE_SIZE=self.page_size,
             HIDDEN_SIZE=self.hidden_size,
             BLOCK_SIZE=block_size,
-            MAX_NUM_TOKENS=max_num_tokens,
+            # Compile-time constants: only the zero-fill reads the row count, so every other
+            # caller keeps one kernel specialization whatever its token budget.
+            MAX_NUM_TOKENS=max_num_tokens if zero_padded_tokens else 0,
             ZERO_PADDED_TOKENS=zero_padded_tokens,
         )
 
@@ -395,6 +397,7 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
         if ctx.vp_stage is None:
             ctx.vp_stage = 0
         ctx.layer_no, ctx.microbatch_no = stash_manager.update_pp_schedule(ctx.vp_stage + 1)
+        ctx.runtime_stash = False
 
         # Initiate stash for current layer and reload for next layer
         if stash_manager.status == 'captured':
@@ -405,7 +408,10 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
                 # Runtime-keyed mode (chunk CUDA graphs): every layer stashes its own
                 # activations and reloads them right before its own backward, so the captured
                 # graphs do not depend on the recorded pipeline order, at any pipeline size.
-                if stash_manager.runtime_schedule_stash_activations:
+                # A forward that runs inside a backward pass is an activation checkpoint's
+                # recompute, which that backward consumes at once: its activations stay put.
+                ctx.runtime_stash = torch._C._current_graph_task_id() == -1
+                if ctx.runtime_stash:
                     ctx.stash_manager.stash_paged_tensors(current_schedule_layer)
                 else:
                     ctx.stash_manager.remove_paged_tensor_from_stash()
@@ -431,11 +437,7 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
     def backward(ctx, *grad_output):  # before backward
         # pylint: disable=missing-function-docstring
         if ctx.vp_stage is not None:
-            if (
-                ctx.stash_manager.status == 'captured'
-                and ctx.stash_manager.runtime_schedule
-                and ctx.stash_manager.runtime_schedule_stash_activations
-            ):
+            if ctx.runtime_stash:
                 # Runtime-keyed mode: reload this layer's own activations now.
                 ctx.stash_manager.reload_paged_tensors(
                     ctx.stash_manager.get_schedule_layer(
@@ -501,7 +503,6 @@ class PagedStashManager:
         # Runtime-keyed mode: stash/reload keys come from the live (vp, layer, microbatch)
         # counters instead of the recorded pipeline order (chunk CUDA graphs).
         self.runtime_schedule = False
-        self.runtime_schedule_stash_activations = False
 
         # Track max tokens needed across all vp_stages grouped by dtype and hidden_size
         self.max_tokens_across_vp_stages = None
@@ -1086,27 +1087,18 @@ class PagedStashManager:
             tensor = tensor_truncated
 
         tensor.grouped_tensor_scale_inv = columnwise_scale_inv
-        if self.runtime_schedule:
-            vp_stage_index = self.current_vp_stage if self.current_vp_stage is not None else 0
-            schedule_layer_no = self.get_schedule_layer(
-                vp_stage_index + 1,
-                self.current_layer[vp_stage_index],
-                self.current_microbatch[vp_stage_index],
-            )
-        else:
-            schedule_layer_no = (
-                self._pp_schedule[self.current_schedule_index]
-                if self._pp_schedule is not None
-                and self.current_schedule_index < len(self._pp_schedule)
-                else None
-            )
         paged_tensor = PagedTensor(
             tensor,
             num_tokens_tensor=self.num_tokens_tensor,
             avg_num_tokens=avg_num_tokens,
             vp_stage=self.current_vp_stage,
             original_shape=original_shape,
-            schedule_layer_no=schedule_layer_no,
+            schedule_layer_no=(
+                self._pp_schedule[self.current_schedule_index]
+                if self._pp_schedule is not None
+                and self.current_schedule_index < len(self._pp_schedule)
+                else None
+            ),
             is_columnwise_scale_inv=columnwise_scale_inv,
             max_num_tokens=self.max_num_tokens,
             hidden_size=hidden_size,
@@ -1260,20 +1252,16 @@ def configure_runtime_schedule(stash_manager, enabled, config):
     Chunk-wise TE CUDA graphs capture whole decoder blocks, so a captured backward holds each
     layer's reload (and, with full recompute, its recompute forward) itself. The stash keys are
     then the live (vp, layer, microbatch) coordinates and no cross-layer prefetch is derived from
-    the recorded pipeline order. Sets ``runtime_schedule`` and
-    ``runtime_schedule_stash_activations`` on ``stash_manager``.
+    the recorded pipeline order: every layer stashes its own activations in the forward and
+    reloads them before its own backward, so PP=1 and the last pipeline stage take the same path
+    as any other stage. Sets ``runtime_schedule`` on ``stash_manager``.
     """
-    runtime_schedule = bool(
+    stash_manager.runtime_schedule = bool(
         enabled
         and config is not None
         and getattr(config, 'cuda_graph_impl', 'none') == 'chunk_wise'
         and getattr(config, 'moe_paged_stash', False)
     )
-    stash_manager.runtime_schedule = runtime_schedule
-    # Every captured layer stashes its own activations and reloads them before its own
-    # backward, at any pipeline size: the keys are the live (vp, layer, microbatch)
-    # coordinates, so PP=1 and the last pipeline stage take the same path.
-    stash_manager.runtime_schedule_stash_activations = runtime_schedule
 
 
 def paged_stash_prepare_for_cuda_graph_capture(config):
@@ -1283,13 +1271,24 @@ def paged_stash_prepare_for_cuda_graph_capture(config):
     next pipeline schedule (and therefore before its ``paged_stash_reset``) would re-create them.
     """
     stash_manager = PagedStashManager.get_instance()
-    if not stash_manager.enabled:
+    if stash_manager.status != 'captured':
+        # No training schedule drove the manager at all, or its discovery is incomplete.
+        assert not stash_manager.enabled, (
+            "Paged stash must finish schedule and capacity discovery before chunk CUDA graph "
+            "capture (cuda_graph_warmup_steps >= 2)."
+        )
         return
-    assert stash_manager.status == 'captured', (
-        "Paged stash must finish schedule and capacity discovery before chunk CUDA graph "
-        "capture (cuda_graph_warmup_steps >= 2)."
-    )
+    # Forward-only evaluation disables the singleton manager and can run immediately before
+    # the capture, which precedes the paged_stash_reset of its training iteration. Capture
+    # readiness is tracked by ``status``; re-enable the manager so the captured blocks execute
+    # their stash hooks (that iteration's reset sets ``enabled`` for its own pass anyway).
+    stash_manager.enabled = True
     configure_runtime_schedule(stash_manager, True, config)
+    # Restart the runtime coordinates as well: every evaluation forward advances the microbatch
+    # counter, a disabled reset returns before it restarts them, and a stash key holds three
+    # digits per field. The first capture-time forward opens them again (update_model_chunk).
+    stash_manager.current_layer = None
+    stash_manager.current_microbatch = None
     if stash_manager.stash_buffers is None:
         stash_manager.prepare_stash_buffers(config)
     assert stash_manager.stash_buffers is not None

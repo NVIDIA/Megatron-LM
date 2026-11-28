@@ -1531,10 +1531,11 @@ class TransformerConfig(ModelParallelConfig):
     determines the scope of graph capture."""
 
     cuda_graph_use_single_mempool: bool = True
-    """For cuda_graph_impl "full_iteration" only.
+    """For cuda_graph_impl "full_iteration" and "chunk_wise".
 
     When True, full-iteration graph replay (training and evaluation) and optimizer graph
-    capture/replay share the same CUDA graph memory pool."""
+    capture/replay share the same CUDA graph memory pool. With cuda_graph_impl "chunk_wise" it
+    lets the block graphs and the optimizer graph share one pool."""
 
     cuda_graph_retain_backward_graph: bool = False
     """When set to true, cudagraph backward passes will be graph captured with 'retain_grad=True'
@@ -1569,8 +1570,10 @@ class TransformerConfig(ModelParallelConfig):
     per microbatch and, on the last pipeline stage of packed-sequence (THD) runs, also the
     post-process (MTP block, LM head and loss). Activation recompute, MoE dispatch and the
     hyper-connection residual streams are recorded inside the graph. With optimizer_cuda_graph the
-    optimizer step graph is captured into the same memory pool. Inference CUDA graphs are not
-    supported; inference_cuda_graph_scope must be "none".
+    optimizer step graph is captured into the same memory pool when
+    cuda_graph_use_single_mempool is on (the default) and Transformer Engine's
+    make_graphed_callables() takes a pool. Inference CUDA graphs are not supported;
+    inference_cuda_graph_scope must be "none".
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration" or "chunk_wise"."""
 
@@ -1595,7 +1598,8 @@ class TransformerConfig(ModelParallelConfig):
     "moe_router".
     "mamba": captures the mamba layer.
     An empty list means capturing the whole Transformer layer.
-    This field is meaningless when cuda_graph_impl="full_iteration" and must be empty.
+    This field is meaningless when cuda_graph_impl="full_iteration" or "chunk_wise" and must
+    be empty.
     Backward compatibility: "full" is deprecated but kept for backward compatibility; it is
     transformed to an empty list in __post_init__. The deprecated values "full_iteration" and
     "full_iteration_inference" are also accepted and migrated to the new API in __post_init__."""
@@ -1655,7 +1659,8 @@ class TransformerConfig(ModelParallelConfig):
 
     cuda_graph_dynamic_microbatches: bool = False
     """Allow CUDA graph replay when runtime microbatch count varies across iterations.
-    This option is only meaningful for cuda_graph_impl=transformer_engine. For THD sequence
+    This option is only meaningful for cuda_graph_impl=transformer_engine and chunk_wise (which
+    requires it with THD sequence packing). For THD sequence
     packing, capture uses a conservative upper bound on the packed microbatch count so graph
     replay can cover iterations whose real packed microbatch count changes at a fixed source
     global batch size. Increasing the source global batch size with step_batch_size_schedule
@@ -2114,9 +2119,8 @@ class TransformerConfig(ModelParallelConfig):
     """Chunk-wise CUDA graphs only. Keep the last offload group of every module resident in
     each captured slot instead of offloading it. A slot's backward graph cannot be prefetched by the
     previous slot (its graphs are self-contained), so the first group it consumes is otherwise
-    reloaded synchronously; keeping it resident trades memory for step time (DSv4 proxy: about
-    -15% step time and one third to two thirds less offload memory saving, depending on the
-    modules)."""
+    reloaded synchronously; keeping it resident trades part of the offload memory saving for
+    step time (measurements in docs/user-guide/features/cuda_graph.md)."""
 
     moe_paged_stash: bool = False
     """If True, enable paged stash for all routed-expert activations needed for backward"""
@@ -3939,18 +3943,6 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if not self.gated_linear_unit or self.activation_func not in (F.silu, situlu):
                 raise ValueError("MOK requires SwiGLU or SiTU-GLU")
-            if self.moe_hybridep_routing_map_mode != "bool":
-                # The megakernel replaces the dispatcher, and its route adapter compacts the
-                # dense [tokens, experts] boolean map; the HybridEP top-k index format would
-                # fail its shape check in the first forward.
-                warnings.warn(
-                    "MOK consumes the boolean token-to-expert routing map; overriding "
-                    f"moe_hybridep_routing_map_mode={self.moe_hybridep_routing_map_mode!r} "
-                    "with 'bool'.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                self.moe_hybridep_routing_map_mode = "bool"
 
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(
@@ -5357,15 +5349,6 @@ class TransformerConfig(ModelParallelConfig):
         is_te_chunk_graph = self.cuda_graph_impl == "chunk_wise"
 
         if self.moe_megakernel_backend == "mok":
-            if self.cuda_graph_impl == "chunk_wise" and self.fp8 is not None:
-                # MoK's MXFP8 mode keeps swizzled E8M0 scale copies that are refreshed on the
-                # host-side is_first_microbatch flag; a replayed block never runs that refresh,
-                # so the scales would go stale after every parameter update.
-                raise ValueError(
-                    "MOK with MXFP8 (fp8_param) does not support cuda_graph_impl='chunk_wise': "
-                    "the expert scale refresh runs on the host between microbatches and is not "
-                    "part of the captured block. Use BF16 MOK or cuda_graph_impl='full_iteration'."
-                )
             if self.cuda_graph_impl in ("local", "transformer_engine"):
                 # Empty modules mean whole-layer capture here, not full_iteration.
                 # Per-layer replay needs per-microbatch ownership or recomputation
@@ -5388,7 +5371,8 @@ class TransformerConfig(ModelParallelConfig):
                     )
             elif self.cuda_graph_impl not in ("none", "full_iteration", "chunk_wise"):
                 # Whole-iteration and whole-block captures record the megakernel inside the
-                # graph (BF16 only for whole-block captures, see above).
+                # graph; MoK's MXFP8 scale refresh is recorded into the captured block
+                # (MoKMegakernel.quantized_routed_weights), so both precisions are supported.
                 raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")
         if (
             self.fine_grained_activation_offloading
@@ -5649,7 +5633,7 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "dsa_cp_balance_indexer with attention-capturing CUDA graphs currently "
                 "supports PP/VPP only when dynamic-pack routing is inferred from "
-                "cuda_graph_impl='transformer_engine' and "
+                "cuda_graph_impl='transformer_engine' or 'chunk_wise' and "
                 "sequence_packing_scheduler='dp_balanced'. Use those settings, disable "
                 "attention capture, or disable pipeline parallelism."
             )
@@ -5663,27 +5647,38 @@ class TransformerConfig(ModelParallelConfig):
         ):
             warnings.warn(PACKED_DSA_CP_CUDA_GRAPH_WARNING, stacklevel=2)
 
-        has_gated_delta_net_layers = is_gated_delta_net_variant(self.experimental_attention_variant)
-        if (
-            is_te_chunk_graph
-            and self.sequence_packing_scheduler is not None
-            and has_gated_delta_net_layers
-        ):
-            # The FLA kernels behind GDN / KDA build their chunk index tensors (and the CP
-            # context) on the host from the *values* of cu_seqlens and cache them by tensor
-            # identity. A captured block graph refreshes the static cu_seqlens buffer in place,
-            # so every replay keeps the chunk layout of the capture sample and silently computes
-            # wrong results as soon as the pack layout changes between microbatches.
-            raise ValueError(
-                "cuda_graph_impl='chunk_wise' does not support packed-sequence (THD) training "
-                "with GDN / KDA layers (experimental_attention_variant="
-                f"{self.experimental_attention_variant!r}): the FLA kernels derive their chunk "
-                "indices on the host from the cu_seqlens values and cache them per tensor, so a "
-                "captured graph replays the pack layout of the capture sample. Use fixed-length "
-                "sequences (no sequence_packing_scheduler) with chunk-wise graphs, or run the "
-                "model without CUDA graphs."
+        if is_te_chunk_graph and self.sequence_packing_scheduler is not None:
+            packed_gated_delta_net_layers = is_gated_delta_net_variant(
+                self.experimental_attention_variant
             )
-        cp_layout_conversion_required = has_gated_delta_net_layers
+            if self.hybrid_layer_pattern:
+                # A hybrid stack selects GDN / KDA layers per pattern symbol, whatever the
+                # variant says (the captured block re-checks its actual layers).
+                from megatron.core.models.hybrid.layers.utils import Symbols
+
+                packed_gated_delta_net_layers = packed_gated_delta_net_layers or any(
+                    symbol in self.hybrid_layer_pattern for symbol in (Symbols.GDN, Symbols.KDA)
+                )
+            if packed_gated_delta_net_layers:
+                # The FLA kernels behind GDN / KDA build their chunk index tensors (and the CP
+                # context) on the host from the *values* of cu_seqlens and cache them by
+                # tensor identity. A captured block graph refreshes the static cu_seqlens
+                # buffer in place, so every replay keeps the chunk layout of the capture sample
+                # and silently computes wrong results as soon as the pack layout changes
+                # between microbatches.
+                raise ValueError(
+                    "cuda_graph_impl='chunk_wise' does not support packed-sequence (THD) "
+                    "training with GDN / KDA layers (experimental_attention_variant="
+                    f"{self.experimental_attention_variant!r}, hybrid_layer_pattern="
+                    f"{self.hybrid_layer_pattern!r}): the FLA kernels derive their chunk "
+                    "indices on the host from the cu_seqlens values and cache them per tensor, "
+                    "so a captured graph replays the pack layout of the capture sample. Use "
+                    "fixed-length sequences (no sequence_packing_scheduler) with chunk-wise "
+                    "graphs, or run the model without CUDA graphs."
+                )
+        cp_layout_conversion_required = is_gated_delta_net_variant(
+            self.experimental_attention_variant
+        )
         # (dsa_cp_balance_indexer does NOT belong in this predicate: the balanced DSA
         # indexer operates natively on the contiguous layout and performs no
         # module-local THD CP layout conversion.)
@@ -5725,39 +5720,49 @@ class TransformerConfig(ModelParallelConfig):
                         "cuda_graph_impl='chunk_wise' captures the whole decoder chunk; "
                         "cuda_graph_modules must be empty."
                     )
+                # The captured block includes the MoE dispatch, which needs static shapes.
+                validate_moe_cuda_graph_support(self)
+                if self.moe_hybridep_pad_variable_tokens:
+                    # Every dispatcher rank holds the same static token count under chunk
+                    # graphs (fixed-length batches, or packed ones padded to
+                    # max_seqlen_per_dp_cp_rank), so HybridEP's runtime padding is redundant,
+                    # and its per-layer all-reduce plus host read cannot be captured.
+                    warnings.warn(
+                        "cuda_graph_impl='chunk_wise' captures the MoE dispatch with the same "
+                        "static token count on every rank; moe_hybridep_pad_variable_tokens "
+                        "is redundant there and cannot be captured (an all-reduce and a host "
+                        "read per MoE layer), so it is disabled."
+                    )
+                    self.moe_hybridep_pad_variable_tokens = False
+                    self.moe_hybridep_pad_uneven_dispatch_inputs = False
                 if self.overlap_moe_expert_parallel_comm or self.delay_wgrad_compute:
                     raise ValueError(
                         "cuda_graph_impl='chunk_wise' is incompatible with "
                         "overlap_moe_expert_parallel_comm and delay_wgrad_compute: those "
                         "schedules invoke the layers individually."
                     )
-                if self.mhc_recompute_attn_cuda_graph_split:
-                    raise ValueError(
-                        "mhc_recompute_attn_cuda_graph_split is a per-layer capture option and "
-                        "does not apply to cuda_graph_impl='chunk_wise'."
-                    )
-                if self.fp4:
-                    # The whole block is captured under one quantization autocast; the FP4
-                    # branches of the layer contexts do not opt first_last_layers_bf16 layers out
-                    # of it the way get_layer_fp8_context does for FP8.
-                    raise ValueError(
-                        "cuda_graph_impl='chunk_wise' does not support FP4 (fp4_format) yet: the "
-                        "block-wide NVFP4 capture autocast would also quantize "
-                        "first_last_layers_bf16 layers. Use cuda_graph_impl='transformer_engine' "
-                        "or disable FP4."
-                    )
                 if (
-                    self.fine_grained_activation_offloading
-                    and "attn_norm" in (self.offload_modules or [])
-                    and not self.enable_hyper_connections
+                    self.sequence_packing_scheduler is not None
+                    and self.defer_embedding_wgrad_compute
                 ):
-                    # The attn_norm commit frees the layer input; in the block's first layer
-                    # that input is the captured graph's static hidden_states buffer.
+                    # With packed sequences the LM head is part of the captured post-process:
+                    # its weight gradient has to be computed inside the backward graph, while
+                    # the deferral hands the inputs of that GEMM to the schedule through
+                    # Python lists that a replay never refills.
+                    warnings.warn(
+                        "cuda_graph_impl='chunk_wise' with packed sequences captures the LM head "
+                        "with the post-process, so its weight gradient is computed inside the "
+                        "graph; defer_embedding_wgrad_compute is disabled."
+                    )
+                    self.defer_embedding_wgrad_compute = False
+                if self.dynamic_context_parallel:
+                    # The context-parallel collectives of a captured block are recorded with
+                    # the communicator of the capture sample.
                     raise ValueError(
-                        "cuda_graph_impl='chunk_wise' cannot offload 'attn_norm' on layers "
-                        "without hyper connections: the attn_norm commit frees the layer input, "
-                        "which for the block's first layer is the static graph input. Drop "
-                        "'attn_norm' from offload_modules."
+                        "cuda_graph_impl='chunk_wise' does not support dynamic_context_parallel: "
+                        "the captured block records the context-parallel communicator of the "
+                        "capture sample, so a microbatch scheduled on a different CP group "
+                        "cannot be replayed."
                     )
                 if (
                     self.sequence_packing_scheduler is not None
@@ -5796,20 +5801,22 @@ class TransformerConfig(ModelParallelConfig):
                         "hidden_dropout=0, attention_dropout=0 and no moe_input_jitter_eps: a "
                         "captured recompute cannot reproduce those random draws."
                     )
-                if self.recompute_granularity == "full" and self.fine_grained_activation_offloading:
-                    # The captured recompute re-runs the offload hooks inside the backward graph.
-                    raise ValueError(
-                        "cuda_graph_impl='chunk_wise' does not support full activation recompute "
-                        "together with fine_grained_activation_offloading: the recompute captured "
-                        "into the backward graph would re-run the offload hooks there."
+                if (
+                    self.moe_router_force_load_balancing or self.moe_router_force_biased is not None
+                ) and (
+                    self.recompute_granularity == "full"
+                    or (
+                        self.recompute_granularity == "selective"
+                        and "moe" in (self.recompute_modules or [])
                     )
-                if self.recompute_granularity == "full" and self.moe_router_force_load_balancing:
+                ):
                     warnings.warn(
-                        "cuda_graph_impl='chunk_wise' with full activation recompute and "
-                        "moe_router_force_load_balancing: the benchmark's random router logits "
-                        "are drawn again in the captured recompute, so the recomputed routing can "
-                        "differ from the forward's. Throughput numbers are unaffected; do not use "
-                        "this combination for numerical comparisons."
+                        "cuda_graph_impl='chunk_wise' with activation recompute of the MoE "
+                        "router (full recompute, or selective recompute of 'moe') and "
+                        "moe_router_force_load_balancing / moe_router_force_biased: the "
+                        "benchmark's random router logits are drawn again in the recompute, so "
+                        "the recomputed routing can differ from the forward's. Throughput numbers "
+                        "are unaffected; do not use this combination for numerical comparisons."
                     )
 
             # Check cuda graph scopes for per-layer implementations.
@@ -6652,21 +6659,16 @@ class TransformerConfig(ModelParallelConfig):
                     "('alltoall', 'flex'), "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
-                # Static THD padding (every rank's microbatch is padded to
-                # max_seqlen_per_dp_cp_rank, as CUDA graphs require) already equalizes the
-                # token counts across the dispatcher ranks; the runtime padding would add an
-                # all-reduce plus a host read per MoE layer, which a graph capture forbids.
-                statically_padded_graph_inputs = (
-                    self.cuda_graph_impl != "none"
-                    and self.max_seqlen_per_dp_cp_rank is not None
-                    and self.pad_packed_seq_alignment in ("max", self.max_seqlen_per_dp_cp_rank)
-                )
+                # Chunk-wise CUDA graphs pad every rank's microbatch to
+                # max_seqlen_per_dp_cp_rank (checked below), which already equalizes the token
+                # counts across the dispatcher ranks, and turn the runtime padding off (its
+                # all-reduce plus host read per MoE layer cannot be captured).
                 if (
                     self.moe_megakernel_backend is None
                     and self.moe_token_dispatcher_type == "flex"
                     and self.moe_flex_dispatcher_backend == "hybridep"
                     and not self.moe_hybridep_pad_variable_tokens
-                    and not statically_padded_graph_inputs
+                    and self.cuda_graph_impl != "chunk_wise"
                 ):
                     raise ValueError(
                         "sequence_packing with HybridEP requires "

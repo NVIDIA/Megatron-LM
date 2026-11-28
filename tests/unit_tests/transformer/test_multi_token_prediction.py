@@ -2,6 +2,7 @@
 
 import itertools
 import os
+import random
 import sys
 import types
 
@@ -108,6 +109,60 @@ def _randint_stub(expected_size, make_result):
         return make_result(high, size, device)
 
     return fake_randint
+
+
+def _capture_in_cuda_graph(function, *static_inputs):
+    """Record ``function(*static_inputs)`` in a CUDA graph after eager warm-up passes.
+
+    Returns the graph and the outputs it rewrites on every ``replay()``. The inputs are the
+    graph's static buffers: a replay reads whatever they hold at that time.
+    """
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            function(*static_inputs)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_outputs = function(*static_inputs)
+    return graph, static_outputs
+
+
+def _static_thd_boundaries(documents, capacity, slots, logical_tail=True):
+    """Logical and physical ``cu_seqlens`` of one pack in the static THD layout, as lists.
+
+    ``documents`` holds one ``(valid_length, physical_length)`` pair per packed document. The
+    logical boundaries are the compact cumulative valid lengths and the physical ones include
+    each document's padding. A dummy sequence pads the tokens to ``capacity`` (its logical
+    length is the tail with ``thd_max_packed_sequences`` and zero with
+    ``cuda_graph_thd_max_packed_sequences``), and the final boundary repeats until both lists
+    have ``slots + 1`` entries.
+    """
+    logical, physical = [0], [0]
+    for valid_length, physical_length in documents:
+        assert valid_length <= physical_length
+        logical.append(logical[-1] + valid_length)
+        physical.append(physical[-1] + physical_length)
+    tail = capacity - physical[-1]
+    assert tail >= 0 and len(physical) + (tail > 0) <= slots + 1
+    if tail:
+        logical.append(logical[-1] + (tail if logical_tail else 0))
+        physical.append(capacity)
+    logical += [logical[-1]] * (slots + 1 - len(logical))
+    physical += [physical[-1]] * (slots + 1 - len(physical))
+    return logical, physical
+
+
+def _expected_roll_within_physical_documents(full, physical, rolls, fill):
+    """``full`` after ``rolls`` one-token left rolls along its last dimension that never cross
+    a physical document boundary; slots without a successor, and those past the last
+    boundary, take ``fill``."""
+    expected = torch.full_like(full, fill)
+    for start, end in zip(physical[:-1], physical[1:]):
+        if end - start > rolls:
+            expected[..., start : end - rolls] = full[..., start + rolls : end]
+    return expected
 
 
 @pytest.mark.parametrize("precision", ["bf16", "fp4"])
@@ -2359,6 +2414,149 @@ class TestMTPHiddenStateRollUnderParallelism:
 
         Utils.destroy_model_parallel()
 
+    @staticmethod
+    def _contiguous_local_hsm_roll(values, cu_seqlens, cu_seqlens_padded, cp_layout, tp_group):
+        """The roll ``MultiTokenPredictionBlock.forward`` applies to the older HSM entries when
+        it withholds the CP group under ``cp_partition_mode="contiguous"``: the boundaries are
+        translated into this shard's frame and the roll stays local."""
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            qkv_format="thd",
+            cp_partition_mode="contiguous",
+        )
+        shard_params = _packed_seq_params_for_local_hsm_roll(
+            packed_seq_params, local_seq_length=values.size(-1), cp_group=None, tp_group=tp_group
+        )
+        rolled, _ = roll_tensor(
+            values,
+            shifts=-1,
+            dims=-1,
+            cp_group=None,
+            packed_seq_params=shard_params,
+            return_sum=False,
+            cp_layout=cp_layout,
+        )
+        return rolled
+
+    @staticmethod
+    def _expected_contiguous_local_hsm_roll(values, logical, physical, cp_layout, window_start):
+        """Host-side reference: a slot takes its right neighbour unless a physical boundary or
+        the end of a document's valid tokens lies between the two. The contiguous layout also
+        zeroes the slots past the last boundary; the zigzag one rolls them as a trailing
+        segment."""
+        length = values.size(-1)
+        valid_ends = [
+            start + logical[index + 1] - logical[index] for index, start in enumerate(physical[:-1])
+        ]
+        boundaries = {
+            min(max(boundary, window_start), window_start + length) - window_start
+            for boundary in (*physical, *valid_ends)
+        }
+        expected = torch.zeros_like(values)
+        for slot in range(length - 1):
+            past_last_boundary = cp_layout == "contiguous" and slot >= max(boundaries)
+            if slot + 1 not in boundaries and not past_last_boundary:
+                expected[..., slot] = values[..., slot + 1]
+        return expected
+
+    def _contiguous_local_hsm_roll_setup(self, tp, capacity):
+        """Sequence-parallel shard of ``capacity`` tokens: its TP group, window start and
+        distinct values per (row, slot)."""
+        if int(os.environ.get("WORLD_SIZE", "1")) < tp:
+            pytest.skip(f"TP={tp} requires at least {tp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+        tp_group = get_tensor_model_parallel_group()
+        length = capacity // tp
+        window_start = get_pg_rank(tp_group) * length
+        values = torch.arange(1, 2 * length + 1, device="cuda", dtype=torch.float32)
+        return tp_group, window_start, values.view(2, length)
+
+    @pytest.mark.parametrize("cp_layout", ["zigzag", "contiguous"])
+    @pytest.mark.parametrize("tp", [1, 2])
+    def test_contiguous_local_hsm_roll_stops_at_every_boundary(self, tp, cp_layout):
+        """Random packs in the static THD layout, whose metadata repeats boundaries (empty
+        documents, documents without padding, the repeated final boundary): the translated
+        boundaries keep those repeats, and the local roll gives the same result as for the
+        distinct boundaries alone."""
+        capacity, slots = 32, 6
+        tp_group, window_start, values = self._contiguous_local_hsm_roll_setup(tp, capacity)
+        generator = random.Random(_SEED)
+        for _ in range(100):
+            documents, used = [], 0
+            for _ in range(generator.randint(0, slots - 1)):
+                physical_length = generator.randint(0, (capacity - used) // 2)
+                documents.append((generator.randint(0, physical_length), physical_length))
+                used += physical_length
+            if documents and generator.random() < 0.25:
+                # The last document takes the rest of the capacity: no dummy tail.
+                valid_length, physical_length = documents[-1]
+                documents[-1] = (valid_length, physical_length + capacity - used)
+            for logical_tail in (True, False):
+                logical, physical = _static_thd_boundaries(documents, capacity, slots, logical_tail)
+                rolled = self._contiguous_local_hsm_roll(
+                    values,
+                    torch.tensor(logical, dtype=torch.int32, device="cuda"),
+                    torch.tensor(physical, dtype=torch.int32, device="cuda"),
+                    cp_layout,
+                    tp_group,
+                )
+                expected = self._expected_contiguous_local_hsm_roll(
+                    values, logical, physical, cp_layout, window_start
+                )
+                assert torch.equal(rolled, expected), (logical, physical)
+
+    @pytest.mark.parametrize("cp_layout", ["zigzag", "contiguous"])
+    @pytest.mark.parametrize("tp", [1, 2])
+    def test_contiguous_local_hsm_roll_replays_in_a_cuda_graph_across_packings(self, tp, cp_layout):
+        """A chunk CUDA graph captures the post-process with static ``cu_seqlens`` buffers,
+        separate ones for the logical and the physical boundaries, and refreshes their values
+        for every replay. The boundary translation therefore has to keep one entry count for
+        every pack: the recorded roll must reproduce each pack's eager result."""
+        capacity, slots = 32, 4
+        tp_group, window_start, values = self._contiguous_local_hsm_roll_setup(tp, capacity)
+        packings = (
+            [(13, 16), (16, 16)],  # two documents fill the capacity, the first one padded
+            [(32, 32)],
+            [(5, 6), (9, 10), (7, 8), (8, 8)],  # every slot holds a document
+            [(10, 12), (6, 6)],  # dummy tail and one repeated boundary
+            [],  # only the dummy tail
+            [(3, 4), (0, 0), (20, 24)],  # an empty document between two others
+        )
+
+        def boundaries(documents, logical_tail):
+            logical, physical = _static_thd_boundaries(documents, capacity, slots, logical_tail)
+            return (
+                logical,
+                physical,
+                torch.tensor(logical, dtype=torch.int32, device="cuda"),
+                torch.tensor(physical, dtype=torch.int32, device="cuda"),
+            )
+
+        def roll(values, cu_seqlens, cu_seqlens_padded):
+            return self._contiguous_local_hsm_roll(
+                values, cu_seqlens, cu_seqlens_padded, cp_layout, tp_group
+            )
+
+        _, _, static_logical, static_physical = boundaries(packings[0], True)
+        graph, static_rolled = _capture_in_cuda_graph(roll, values, static_logical, static_physical)
+        for documents in packings:
+            for logical_tail in (True, False):
+                logical, physical, cu_seqlens, cu_seqlens_padded = boundaries(
+                    documents, logical_tail
+                )
+                expected = self._expected_contiguous_local_hsm_roll(
+                    values, logical, physical, cp_layout, window_start
+                )
+                assert torch.equal(roll(values, cu_seqlens, cu_seqlens_padded), expected), documents
+                static_logical.copy_(cu_seqlens)
+                static_physical.copy_(cu_seqlens_padded)
+                graph.replay()
+                torch.cuda.synchronize()
+                assert torch.equal(static_rolled, expected), (logical, physical)
+
     @pytest.mark.parametrize("force_oldest_selection", [False, True])
     @pytest.mark.parametrize(
         ("tp", "cp", "sequence_parallel"),
@@ -4016,6 +4214,174 @@ class TestMultiTokenPrediction:
         )
 
         Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _contiguous_cp_packed_seq_params(cu_seqlens, cu_seqlens_padded):
+        return PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            qkv_format='thd',
+            cp_partition_mode='contiguous',
+        )
+
+    def test_contiguous_cp_roll_plan_skips_repeated_boundaries(self):
+        """Static packed metadata repeats boundaries: empty documents and the final boundary,
+        which pads the entry count. The roll plan keeps those entries, so its shapes follow from
+        the metadata shape alone, and describes the same boundaries as the compact metadata."""
+        cp = 2
+        if Utils.world_size % cp != 0:
+            pytest.skip(f"world size {Utils.world_size} is not a multiple of cp={cp}")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+        rows = 10  # contiguous CP rank r owns global rows [10 r, 10 r + 10)
+        full = torch.arange(1, cp * rows + 1, dtype=torch.float32, device="cuda").view(1, -1)
+        tokens = full[..., cp_rank * rows : (cp_rank + 1) * rows].contiguous()
+
+        def plan_and_roll(logical, physical):
+            packed_seq_params = self._contiguous_cp_packed_seq_params(
+                torch.tensor(logical, dtype=torch.int32, device="cuda"),
+                torch.tensor(physical, dtype=torch.int32, device="cuda"),
+            )
+            context = prepare_mtp_sequence_roll_context(
+                tensor=tokens, cp_group=cp_group, packed_seq_params=packed_seq_params
+            )
+            assert isinstance(context, ContiguousPackedCPRollContext)
+            rolled = roll_tensor(
+                [tokens],
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                roll_context=context,
+            )[0]
+            return context.plan, rolled
+
+        repeated_boundaries = (
+            ([0, 7, 18, 18, 18], [0, 8, 20, 20, 20]),  # repeated final boundary
+            ([0, 7, 7, 18], [0, 8, 8, 20]),  # empty document between two others
+            ([0, 0, 7, 18, 18], [0, 0, 8, 20, 20]),  # empty first document
+        )
+        # Every exchange runs before the first assertion: a rank that stopped early would
+        # leave its neighbour waiting for it.
+        reference_plan, reference_rolled = plan_and_roll([0, 7, 18], [0, 8, 20])
+        results = [plan_and_roll(logical, physical) for logical, physical in repeated_boundaries]
+        empty_plan, empty_rolled = plan_and_roll([0, 0, 0], [0, 0, 0])
+
+        expected = _expected_roll_within_physical_documents(full, [0, 8, 20], rolls=1, fill=0)
+        expected = expected[..., cp_rank * rows : (cp_rank + 1) * rows]
+        assert torch.equal(reference_rolled, expected)
+        assert not reference_plan.invalid_next.all()
+        for (_, physical), (plan, rolled) in zip(repeated_boundaries, results):
+            assert plan.has_sequences
+            assert torch.equal(plan.invalid_next, reference_plan.invalid_next), physical
+            assert torch.equal(
+                plan.right_halo_valid_count, reference_plan.right_halo_valid_count
+            ), physical
+            assert torch.equal(rolled, expected), physical
+
+        # Only empty documents: no slot has a successor.
+        assert empty_plan.has_sequences and empty_plan.invalid_next.all()
+        assert empty_plan.right_halo_valid_count.item() == 0
+        assert torch.equal(empty_rolled, torch.zeros_like(tokens))
+
+    def test_contiguous_cp_roll_replays_in_a_cuda_graph_across_packings(self):
+        """A chunk CUDA graph captures the post-process with static ``cu_seqlens`` buffers,
+        separate ones for the logical and the physical boundaries, whose values change per
+        replay while repeated final boundaries keep the entry count. The roll plan, the halo
+        prefetch and the rolls are recorded once and must reproduce every pack's rolls: the
+        grouped exchange, then one roll per MTP depth from the prefetched halos."""
+        cp = 2
+        if Utils.world_size % cp != 0:
+            pytest.skip(f"world size {Utils.world_size} is not a multiple of cp={cp}")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = torch.distributed.get_rank(group=cp_group)
+        rows, slots, depths = 16, 4, 2
+        capacity = cp * rows
+        owned = slice(cp_rank * rows, (cp_rank + 1) * rows)
+        full_tokens = torch.arange(1, capacity + 1, dtype=torch.long, device="cuda").view(1, -1)
+        full_padding = (full_tokens % 5 == 0).contiguous()
+        tokens = full_tokens[..., owned].contiguous()
+        padding_mask = full_padding[..., owned].contiguous()
+        fields = dict(fill_values=[0, True], sequence_fields=["input_ids", "padding_mask"])
+
+        def roll(tokens, padding_mask, cu_seqlens, cu_seqlens_padded):
+            packed_seq_params = self._contiguous_cp_packed_seq_params(cu_seqlens, cu_seqlens_padded)
+            context = prepare_mtp_sequence_roll_context(
+                tensor=tokens, cp_group=cp_group, packed_seq_params=packed_seq_params
+            )
+            # Without halos the roll exchanges its boundary rows in one grouped P2P.
+            outputs = roll_tensor(
+                [tokens, padding_mask],
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+                roll_context=context,
+                **fields,
+            )
+            context = context.prefetch_halos(
+                width=depths, input_ids=tokens, padding_mask=padding_mask
+            )
+            rolled = [tokens, padding_mask]
+            for depth in range(depths):
+                rolled = roll_tensor(
+                    rolled,
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                    roll_context=context,
+                    roll_depth=depth,
+                    **fields,
+                )
+                outputs += rolled
+            return outputs
+
+        def expected(physical):
+            outputs = []
+            for rolls in (1, *range(1, depths + 1)):
+                for full, fill in ((full_tokens, 0), (full_padding, True)):
+                    rolled = _expected_roll_within_physical_documents(full, physical, rolls, fill)
+                    outputs.append(rolled[..., owned])
+            return outputs
+
+        def boundaries(documents):
+            logical, physical = _static_thd_boundaries(documents, capacity, slots)
+            return (
+                physical,
+                torch.tensor(logical, dtype=torch.int32, device="cuda"),
+                torch.tensor(physical, dtype=torch.int32, device="cuda"),
+            )
+
+        packings = (
+            [(14, 16), (10, 16)],  # the first document ends on the CP boundary
+            [(32, 32)],  # one document across both ranks
+            [(5, 6), (9, 10), (7, 8), (8, 8)],  # every slot holds a document
+            [(10, 12), (6, 6)],  # dummy tail and one repeated boundary
+            [(3, 4), (0, 0), (20, 24)],  # an empty document between two others
+            [],  # only the dummy tail
+        )
+        _, static_logical, static_physical = boundaries(packings[0])
+        graph, static_outputs = _capture_in_cuda_graph(
+            roll, tokens, padding_mask, static_logical, static_physical
+        )
+        results = []
+        for documents in packings:
+            physical, cu_seqlens, cu_seqlens_padded = boundaries(documents)
+            static_logical.copy_(cu_seqlens)
+            static_physical.copy_(cu_seqlens_padded)
+            graph.replay()
+            torch.cuda.synchronize()
+            replayed = [output.clone() for output in static_outputs]
+            eager = roll(tokens, padding_mask, cu_seqlens, cu_seqlens_padded)
+            results.append((physical, replayed, eager))
+        # Asserted after the last exchange and with the graph released. A rank that stopped
+        # early would leave its neighbour waiting for it, and a failed assertion keeps this
+        # frame alive: tearing down the process groups hangs while a graph that recorded an
+        # exchange on them still exists.
+        del graph, static_outputs
+        for physical, replayed, eager in results:
+            for index, reference in enumerate(expected(physical)):
+                assert torch.equal(eager[index], reference), (physical, index)
+                assert torch.equal(replayed[index], reference), (physical, index)
 
     def test_contiguous_packed_cp_prefetches_halos_once_before_mtp(self, monkeypatch):
         """One pre-MTP P2P supplies all depths and masks remote packed boundaries."""
@@ -6106,6 +6472,81 @@ class TestMHCMTPIntegration:
                 assert not torch.all(param.main_grad == 0), f"Zero gradient for {name}"
 
 
+class TestMTPLossScaleInCudaGraph:
+    """``MTPLossAutoScaler`` when a CUDA graph records the backward of the MTP loss.
+
+    The graph reads the scale from the address the scale tensor had during the capture, so
+    every scale ``set_loss_scale`` publishes afterwards has to be written into that tensor.
+    """
+
+    @pytest.fixture(autouse=True)
+    def class_default_scale(self, monkeypatch):
+        """Start from the class default, a CPU scalar no training step has replaced, and put
+        the process-wide scale back afterwards."""
+        monkeypatch.setattr(MTPLossAutoScaler, "main_loss_backward_scale", torch.tensor(1.0))
+
+    @pytest.mark.parametrize(
+        "later_shape, later_dtype",
+        [((), torch.float32), ((1,), torch.float32), ((), torch.float64)],
+        ids=["then-0-dim", "then-one-element", "then-0-dim-float64"],
+    )
+    @pytest.mark.parametrize(
+        "first_shape", [None, (), (1,)], ids=["capture-first", "0-dim", "one-element"]
+    )
+    def test_replayed_backward_reads_the_scale_set_after_the_capture(
+        self, first_shape, later_shape, later_dtype
+    ):
+        """``first_shape`` is the scale published before the capture; None captures before the
+        first ``set_loss_scale``, as a run without eager warm-up steps does. The scales
+        published after the capture differ from it in value and, per case, in shape or dtype."""
+        if not torch.cuda.is_available():
+            pytest.skip("needs a GPU")
+        weight = torch.tensor([1.0, 2.0, 3.0], device="cuda", requires_grad=True)
+
+        def backward(weight):
+            mtp_loss = (weight * weight).sum()
+            output = MTPLossAutoScaler.apply(2.0 * weight, mtp_loss)
+            return torch.autograd.grad(output.sum(), weight)[0]
+
+        def expected(scale):
+            return 2.0 + scale * 2.0 * weight.detach()
+
+        if first_shape is not None:
+            MTPLossAutoScaler.set_loss_scale(torch.full(first_shape, 0.5, device="cuda"))
+        graph, static_grad = _capture_in_cuda_graph(backward, weight)
+        captured_scale = MTPLossAutoScaler.main_loss_backward_scale
+        for scale in (0.25, 3.0):
+            MTPLossAutoScaler.set_loss_scale(
+                torch.full(later_shape, scale, dtype=later_dtype, device="cuda")
+            )
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(static_grad, expected(scale)), (static_grad, scale)
+            assert torch.equal(backward(weight), expected(scale)), scale
+            assert MTPLossAutoScaler.main_loss_backward_scale is captured_scale
+
+    def test_set_loss_scale_updates_one_tensor_and_never_binds_the_callers(self):
+        persistent = MTPLossAutoScaler.main_loss_backward_scale
+        first = torch.tensor([0.5])
+        MTPLossAutoScaler.set_loss_scale(first)
+        assert MTPLossAutoScaler.main_loss_backward_scale is persistent
+        assert persistent.shape == () and persistent.item() == 0.5
+        MTPLossAutoScaler.set_loss_scale(torch.tensor(0.25, dtype=torch.float64))
+        assert MTPLossAutoScaler.main_loss_backward_scale is persistent
+        assert persistent.dtype == torch.float32 and persistent.item() == 0.25
+        assert first.item() == 0.5
+
+        # Not a one-element tensor: nothing to update in place, so a private copy is bound.
+        MTPLossAutoScaler.main_loss_backward_scale = 1.0
+        scale = torch.tensor(0.125)
+        MTPLossAutoScaler.set_loss_scale(scale)
+        bound = MTPLossAutoScaler.main_loss_backward_scale
+        assert bound is not scale and bound.item() == 0.125
+        MTPLossAutoScaler.set_loss_scale(torch.tensor(2.0))
+        assert MTPLossAutoScaler.main_loss_backward_scale is bound
+        assert bound.item() == 2.0 and scale.item() == 0.125
+
+
 class TestZigzagPackedRoll:
     """The zigzag-CP packed roll against a roll of the full packed sequence."""
 
@@ -6121,8 +6562,9 @@ class TestZigzagPackedRoll:
             parts += [chunks[rank], chunks[2 * cp - 1 - rank]]
         return torch.cat(parts, dim=-1)
 
+    @pytest.mark.parametrize("trailing_rows", [0, 3])
     @pytest.mark.parametrize("cp", [2, 4])
-    def test_matches_the_roll_of_the_full_packed_sequence(self, cp):
+    def test_matches_the_roll_of_the_full_packed_sequence(self, cp, trailing_rows):
         if Utils.world_size % cp != 0:
             pytest.skip(f"world size {Utils.world_size} is not a multiple of cp={cp}")
         from megatron.core.transformer.multi_token_prediction import (
@@ -6133,9 +6575,9 @@ class TestZigzagPackedRoll:
         try:
             cp_group = get_context_parallel_group()
             rank = torch.distributed.get_rank(group=cp_group)
-            # Global packed lengths (multiples of 2 * cp); the empty slot mimics static packed
-            # metadata that repeats a boundary.
-            lengths = [8 * cp, 2 * cp, 0, 6 * cp]
+            # Global packed lengths (multiples of 2 * cp); the empty slots mimic static packed
+            # metadata that repeats a boundary, between documents and after the last one.
+            lengths = [8 * cp, 2 * cp, 0, 6 * cp, 0, 0]
             cu = [0]
             for length in lengths:
                 cu.append(cu[-1] + length)
@@ -6149,20 +6591,48 @@ class TestZigzagPackedRoll:
                     expected_full[..., end - 1] = fill
             local = self._zigzag_shard(full, cu, cp, rank)
             expected = self._zigzag_shard(expected_full, cu, cp, rank)
-            # Rows beyond the packed data roll as a trailing segment whose last slot takes the
-            # fill value, like the CP1 path.
-            pad = torch.full((2, 3), 99, device="cuda", dtype=torch.int64)
-            local = torch.cat([local, pad], dim=-1)
-            expected_pad = pad.clone()
-            expected_pad[..., -1] = fill
-            expected = torch.cat([expected, expected_pad], dim=-1)
+            if trailing_rows:
+                # Rows beyond the packed data roll as a trailing segment whose last slot takes
+                # the fill value, like the CP1 path. Without them the last local slot is the
+                # end of the last document's tail chunk.
+                pad = torch.full((2, trailing_rows), 99, device="cuda", dtype=torch.int64)
+                local = torch.cat([local, pad], dim=-1)
+                expected_pad = pad.clone()
+                expected_pad[..., -1] = fill
+                expected = torch.cat([expected, expected_pad], dim=-1)
             cu_seqlens = torch.tensor(cu, device="cuda", dtype=torch.int32)
 
             rolled = _roll_tensor_packed_seq_zigzag_cp(
                 local, -1, -1, cu_seqlens, cp_group, fill_value=fill
             )
 
+            # A slot's gradient reaches its right neighbour when that neighbour is its
+            # successor on this rank: not across the end of a tail chunk, and across the end
+            # of a front chunk only on the last rank, whose two chunks are adjacent globally.
+            num_rows = local.size(-1)
+            no_local_successor = {num_rows - 1}
+            for start, length in zip(cu[:-1], lengths):
+                if length:
+                    local_start, half = start // cp, length // (2 * cp)
+                    no_local_successor.add(local_start + 2 * half - 1)
+                    if rank != cp - 1:
+                        no_local_successor.add(local_start + half - 1)
+            weights = torch.arange(1.0, num_rows + 1, device="cuda", dtype=torch.float64)
+            expected_grad = torch.zeros(num_rows, device="cuda", dtype=torch.float64)
+            for row in range(num_rows - 1):
+                if row not in no_local_successor:
+                    expected_grad[row + 1] = weights[row]
+            source = local.double().requires_grad_()
+            differentiable = _roll_tensor_packed_seq_zigzag_cp(
+                source, -1, -1, cu_seqlens, cp_group, fill_value=fill
+            )
+            (differentiable * weights).sum().backward()
+
+            # Asserted after the last exchange: a rank that stopped early would leave its
+            # neighbours waiting for it.
             assert torch.equal(rolled, expected)
+            assert rolled.is_contiguous()
+            assert torch.equal(source.grad, expected_grad.expand_as(source))
         finally:
             Utils.destroy_model_parallel()
 
@@ -6199,6 +6669,7 @@ class TestZigzagPackedRoll:
                 [8 * cp, 8 * cp],
                 [16 * cp],
                 [2 * cp, 6 * cp, 4 * cp, 4 * cp],
+                [0, 8 * cp, 0, 8 * cp],
                 [6 * cp, 4 * cp],
             )
             local = torch.arange(rows, device="cuda", dtype=torch.float32) + 100.0 * rank
@@ -6220,11 +6691,19 @@ class TestZigzagPackedRoll:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 static_out = roll(static_x, static_cu)
-            for packing, reference in zip(packings, references):
+            replayed = []
+            for packing in packings:
                 static_cu.copy_(cu_seqlens(packing))
                 graph.replay()
                 torch.cuda.synchronize()
-                assert torch.equal(static_out, reference), packing
+                replayed.append(static_out.clone())
+            # Asserted after the last exchange and with the graph released. A rank that
+            # stopped early would leave its neighbours waiting for it, and a failed assertion
+            # keeps this frame alive: tearing down the process groups hangs while a graph
+            # that recorded an exchange on them still exists.
+            del graph, static_out
+            for packing, reference, output in zip(packings, references, replayed):
+                assert torch.equal(output, reference), packing
         finally:
             Utils.destroy_model_parallel()
 

@@ -342,8 +342,8 @@ def test_checkpointed_absorbed_attention_keeps_metadata_out_of_tensor_args(monke
         attn_mask_type=AttnMaskType.causal,
         core_attention=CoreAttention(),
         pg_collection=SimpleNamespace(cp=None, tp=None),
-        # precision_aware_checkpoint() picks the backend from the config: BF16, no graphs.
-        config=SimpleNamespace(fp8=None, fp4=None, cuda_graph_impl="none"),
+        # core_attention_checkpoint(): tensor_parallel.checkpoint outside chunk-wise graphs.
+        config=SimpleNamespace(cuda_graph_impl="none"),
     )
     monkeypatch.setattr(absorbed_mla_module.tensor_parallel, "checkpoint", fake_checkpoint)
 
@@ -422,9 +422,6 @@ def test_absorbed_mla_forward_uses_and_restores_dynamic_cp_group(monkeypatch):
             tensor_model_parallel_size=1,
             context_parallel_size=1,
             dynamic_context_parallel=True,
-            fp8=None,
-            fp4=None,
-            cuda_graph_impl="none",
         ),
         recompute_up_proj=False,
         linear_gate=None,

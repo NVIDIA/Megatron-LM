@@ -2303,16 +2303,6 @@ class CudaGraphManager(torch.nn.Module):
 
 
 # The following functions are for capturing CUDA Graphs using TE make_graphed_callables().
-TE_CUDA_GRAPH_IMPLS = ("transformer_engine", "chunk_wise")
-
-
-def uses_te_cuda_graphs(config) -> bool:
-    """Whether ``config`` captures its training CUDA graphs with Transformer Engine's
-    ``make_graphed_callables`` (per layer with ``transformer_engine``, whole decoder blocks with
-    ``chunk_wise``)."""
-    return getattr(config, 'cuda_graph_impl', 'none') in TE_CUDA_GRAPH_IMPLS
-
-
 def is_chunk_wise_cuda_graph(config) -> bool:
     """Whether ``config`` selects chunk-wise (whole decoder block) TE CUDA graphs."""
     return getattr(config, 'cuda_graph_impl', 'none') == "chunk_wise"
@@ -2466,8 +2456,9 @@ class TECudaGraphHelper:
         thd_sequence_length_upper_bound=None,
     ):
         assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
-        assert uses_te_cuda_graphs(
-            config
+        assert config.cuda_graph_impl in (
+            "transformer_engine",
+            "chunk_wise",
         ), "Option cuda_graph_impl=transformer_engine or chunk_wise not enabled."
         assert (
             "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
@@ -2848,6 +2839,36 @@ class TECudaGraphHelper:
             if hasattr(block, "clear_te_cuda_graph_route_metadata_arenas"):
                 block.clear_te_cuda_graph_route_metadata_arenas()
 
+    @contextmanager
+    def _te_capture_scope(self):
+        """Bracket the Transformer Engine capture with the state that has to outlive a failure.
+
+        A whole-block capture records the fine-grained activation offloads into the graphs,
+        so the offload manager is told when the capture starts and whether it produced graphs.
+        A capture that raises is over all the same: later eager forwards must not take the
+        capture path (``GraphableMegatronModule._should_call_te_cudagraph``).
+        """
+        block_offload_capture = (
+            self.config.fine_grained_activation_offloading and is_chunk_wise_cuda_graph(self.config)
+        )
+        if block_offload_capture:
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+
+            off_interface.enter_block_capture(
+                keep_last_group=self.config.fine_grained_offloading_graph_keep_last_group
+            )
+        captured = False
+        try:
+            yield
+            captured = True
+        finally:
+            if block_offload_capture:
+                off_interface.exit_block_capture(captured=captured)
+            if not captured:
+                _set_capture_end()
+
     def _validate_mhc_static_hidden_inputs(self, sample_args):
         """Ensure aliased static inputs have disjoint [fwd, bwd] liveness windows.
 
@@ -2931,18 +2952,28 @@ class TECudaGraphHelper:
                     if num_decoder_layers > 0 and _layer_is_graphable(
                         chunk_with_decoder.decoder, self.config
                     ):
-                        # HybridBlock does not record its virtual pipeline stage; the chunk
-                        # capture keys paged-stash and offload state by it.
-                        if getattr(chunk_with_decoder.decoder, 'vp_stage', None) is None:
-                            chunk_with_decoder.decoder.vp_stage = getattr(
-                                chunk_with_decoder, 'vp_stage', None
-                            )
                         callables.append(chunk_with_decoder.decoder)
                         callables_is_mtp.append(False)
                     postprocess_block = getattr(chunk_with_decoder, 'postprocess_block', None)
-                    if callables and postprocess_block is not None:
-                        callables.append(postprocess_block)
-                        callables_is_mtp.append(False)
+                    if postprocess_block is not None:
+                        if not callables:
+                            eager_reason = "its pipeline stage owns no decoder layer"
+                        else:
+                            eager_reason = postprocess_block.eager_only_reason()
+                        if eager_reason is None:
+                            callables.append(postprocess_block)
+                            callables_is_mtp.append(False)
+                        else:
+                            # The post-process lives on the last pipeline stage.
+                            log_on_each_pipeline_stage(
+                                logger=logger,
+                                tp_group=self.tp_group,
+                                dp_cp_group=self.dp_cp_group,
+                                level=logging.WARNING,
+                                msg=f'Rank {torch.distributed.get_rank()}: chunk-wise CUDA '
+                                'graphs: the post-process (MTP block, LM head, loss) runs '
+                                f'eagerly because {eager_reason}.',
+                            )
                 else:
                     callables = _get_graphable_te_callables(
                         chunk_with_decoder.decoder.layers, self.config
@@ -3093,7 +3124,102 @@ class TECudaGraphHelper:
                 or _is_mtp_te_callable(layer, chunk_of_the_layer)
             ), "Layer is not in the chunk"
 
+            is_block_callable = is_chunk_callable or is_postprocess_callable
+
+            def get_block_rotary_pos_emb(transformer_module, transformer_input):
+                # A block callable is the whole training forward, and TE flattens only the
+                # keyword tensors that were captured, so its sample must carry a table of the
+                # runtime shape for every rotary type the runtime hands the block: 'rope' and
+                # 'yarn' tables depend only on the sequence length; mRoPE is built from
+                # position_ids, so it gets a sample built from a fixed-shape arange that the
+                # runtime table overwrites at replay.
+                uses_mla = self.config.multi_latent_attention
+                if getattr(transformer_module, "hybrid_layer_config_list", None) is not None:
+                    # A block callable carries the model's root config; the runtime hands the
+                    # decoder / MTP a RoPE table iff its own section is not MLA
+                    # (HybridModel.forward: decoder_rotary_pos_emb, _postprocess_after_decoder).
+                    uses_mla = (
+                        transformer_module._decoder_uses_mla
+                        if is_chunk_callable
+                        else transformer_module._mtp_uses_mla
+                    )
+                position_embedding_type = transformer_module.position_embedding_type
+                rotary_module = getattr(transformer_module, 'rotary_pos_emb', None)
+                if (
+                    uses_mla
+                    or rotary_module is None
+                    or position_embedding_type not in ('rope', 'yarn', 'mrope')
+                ):
+                    return None
+
+                # The packing scheduler builds the full packed table (indexed by global packed
+                # position) rather than the per-CP-rank slice.
+                packed_seq = getattr(self.config, "sequence_packing_scheduler", None) is not None
+                if position_embedding_type == 'mrope':
+                    if packed_seq:
+                        # The packing scheduler (data_schedule.py) carries position_ids as a
+                        # single [1, tokens] row, while MultimodalRotaryEmbedding needs the
+                        # [3, batch, seq] (T/H/W) layout, so no runtime table exists to copy
+                        # into the sample and the replayed attention would run without RoPE.
+                        raise ValueError(
+                            "cuda_graph_impl='chunk_wise' cannot capture position_embedding_type="
+                            "'mrope' together with packed (THD) sequences: the sequence packing "
+                            "scheduler provides position_ids as one [1, tokens] row, but mRoPE "
+                            "needs [3, batch, seq] position ids. Use fixed-length (non-packed) "
+                            "batches with mRoPE, or disable chunk-wise CUDA graphs."
+                        )
+                    # MultimodalRotaryEmbedding has no get_rotary_seq_len; mirror
+                    # RotaryEmbedding.get_rotary_seq_len for a static (non-inference) sample.
+                    rotary_seq_len = transformer_input.size(0)
+                    if self.config.sequence_parallel:
+                        rotary_seq_len *= self.config.tensor_model_parallel_size
+                    rotary_seq_len *= self.config.context_parallel_size
+                    # Runtime position_ids are [3, batch, seq] int64 (GPTModel.forward); the
+                    # values only matter for the shape here, the runtime table replaces them at
+                    # replay. Mirror the runtime's raw-vs-materialized choice, which decides
+                    # the table layout ([3, batch, seq, dim/2] raw frequencies for the fused
+                    # mRoPE kernel, else [seq, batch, 1, dim]).
+                    position_ids = torch.arange(
+                        rotary_seq_len, dtype=torch.long, device=transformer_input.device
+                    )
+                    position_ids = position_ids[None, None, :].expand(
+                        3, transformer_input.size(1), -1
+                    )
+                    use_raw_mrope_freqs = (
+                        self.config.apply_rope_fusion
+                        and not self.config.rotary_interleaved
+                        and not self.config.fused_single_qkv_rope
+                    )
+                    use_fused_mrope = use_raw_mrope_freqs and bool(
+                        getattr(transformer_module, '_fused_mrope_available', False)
+                    )
+                    # Not cached: the table follows each microbatch's position_ids and the
+                    # rotation's backward reads it again, so every slot needs its own buffer (a
+                    # later microbatch's forward replay would overwrite a shared one before this
+                    # slot's backward ran). The rope / yarn tables below are constants.
+                    return rotary_module(
+                        position_ids,
+                        transformer_module.mrope_section,
+                        return_raw_freqs=use_fused_mrope,
+                        packed_seq=packed_seq,
+                    )
+
+                rotary_seq_len = rotary_module.get_rotary_seq_len(
+                    None, transformer_module.decoder, transformer_input, self.config, None
+                )
+                if rotary_seq_len not in rotary_pos_emb_cache:
+                    # [seq, 1, 1, dim] (CP-sliced unless packed_seq), float32.
+                    table = rotary_module(rotary_seq_len, packed_seq=packed_seq)
+                    if position_embedding_type == 'yarn':
+                        # YarnRotaryEmbedding.forward returns (emb, mscale); the runtime
+                        # (GPTModel._preprocess / HybridModel.forward) hands the block emb only.
+                        table, _ = table
+                    rotary_pos_emb_cache[rotary_seq_len] = table
+                return rotary_pos_emb_cache[rotary_seq_len]
+
             def get_rotary_pos_emb(transformer_module, transformer_input):
+                if is_block_callable:
+                    return get_block_rotary_pos_emb(transformer_module, transformer_input)
                 # The TE sample builder currently materializes only the regular RoPE
                 # contract. Yarn and mRoPE need different runtime inputs, while packed
                 # THD with CP>1 needs a full (not CP-sliced) RoPE table. Keep the legacy
@@ -3101,50 +3227,33 @@ class TECudaGraphHelper:
                 # unsupported contracts is actually captured.
                 uses_mla = self.config.multi_latent_attention
                 if getattr(transformer_module, "hybrid_layer_config_list", None) is not None:
-                    if is_chunk_callable or is_postprocess_callable:
-                        # A block callable carries the model's root config; the runtime hands
-                        # the decoder / MTP a RoPE table iff its own section is not MLA
-                        # (HybridModel.forward: decoder_rotary_pos_emb, _postprocess_after_decoder).
-                        uses_mla = (
-                            transformer_module._decoder_uses_mla
-                            if is_chunk_callable
-                            else transformer_module._mtp_uses_mla
-                        )
-                    else:
-                        # Config types select the layer implementation; copied flags may differ.
-                        config_type = type(layer.config)
-                        if config_type is AttentionLayerConfig:
-                            uses_mla = False
-                        elif config_type in (MLALayerConfig, DSALayerConfig, CSALayerConfig):
-                            uses_mla = True
-                if (
-                    transformer_module.position_embedding_type == 'rope'
-                    and not uses_mla
-                    and getattr(transformer_module, 'rotary_pos_emb', None) is not None
-                ):
+                    # Config types select the layer implementation; copied flags may differ.
+                    config_type = type(layer.config)
+                    if config_type is AttentionLayerConfig:
+                        uses_mla = False
+                    elif config_type in (MLALayerConfig, DSALayerConfig, CSALayerConfig):
+                        uses_mla = True
+                if transformer_module.position_embedding_type == 'rope' and not uses_mla:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None
                     )
-                    # A captured block applies RoPE with the fused THD kernel, which indexes the
-                    # table by global packed position (as GPTModel._preprocess builds it), so it
-                    # needs the full packed table rather than the per-CP-rank slice. The packing
-                    # scheduler builds the packed table for every callable.
-                    packed_seq = (
-                        (is_chunk_callable or is_postprocess_callable)
-                        and bool(layer._is_thd_cuda_graph())
-                    ) or getattr(self.config, "sequence_packing_scheduler", None) is not None
-                    cache_key = (rotary_seq_len, packed_seq)
-                    if cache_key not in rotary_pos_emb_cache:
-                        rotary_pos_emb_cache[cache_key] = transformer_module.rotary_pos_emb(
-                            rotary_seq_len, packed_seq=packed_seq
+                    if rotary_seq_len not in rotary_pos_emb_cache:
+                        rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
+                            rotary_seq_len,
+                            packed_seq=getattr(self.config, "sequence_packing_scheduler", None)
+                            is not None,
                         )
-                    return rotary_pos_emb_cache[cache_key]
+                    return rotary_pos_emb_cache[rotary_seq_len]
                 else:
                     return None
 
             static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
 
-            if self._needs_full_local_padding_mask(layer, chunk_of_the_layer, static_inputs):
+            # (A block callable captures the mask in its own token frame on every stage and
+            # shards the runtime mask to it at replay.)
+            if not is_block_callable and self._needs_full_local_padding_mask(
+                layer, chunk_of_the_layer, static_inputs
+            ):
                 local_slen = self.config.max_seqlen_per_dp_cp_rank
                 static_inputs["padding_mask"] = torch.zeros(
                     1, local_slen, dtype=torch.bool, device=torch.cuda.current_device()
@@ -3156,24 +3265,19 @@ class TECudaGraphHelper:
             attention_layer = (
                 layer.inner_layer if isinstance(layer, HyperConnectionHybridLayer) else layer
             )
-            if is_chunk_callable:
-                contains_self_attn = any(
-                    isinstance(module, TransformerLayer)
-                    and not isinstance(module.self_attention, IdentityOp)
-                    for module in layer.modules()
+            contains_self_attn = (
+                isinstance(attention_layer, TransformerLayer)
+                and not isinstance(attention_layer.self_attention, IdentityOp)
+                and (
+                    not self.config.cuda_graph_modules
+                    or CudaGraphModule.attn in self.config.cuda_graph_modules
                 )
-            elif is_postprocess_callable:
-                # The post-process runs the MTP transformer layer(s).
-                contains_self_attn = bool(getattr(chunk_of_the_layer, 'mtp_process', False))
-            else:
-                contains_self_attn = (
-                    isinstance(attention_layer, TransformerLayer)
-                    and not isinstance(attention_layer.self_attention, IdentityOp)
-                    and (
-                        not self.config.cuda_graph_modules
-                        or CudaGraphModule.attn in self.config.cuda_graph_modules
-                    )
-                )
+            )
+            if is_block_callable:
+                # Not a layer: the per-layer sample-contract warning below does not apply (a
+                # block's sample carries the rope / yarn / mRoPE table of the runtime shape,
+                # get_block_rotary_pos_emb). Set for the block after the warning.
+                contains_self_attn = False
 
             if contains_self_attn and not self.config.multi_latent_attention:
                 position_embedding_type = getattr(
@@ -3181,7 +3285,6 @@ class TECudaGraphHelper:
                 )
                 is_thd = 'cu_seqlens_q' in static_inputs
                 context_parallel_size = self.config.context_parallel_size
-                is_block_callable = is_chunk_callable or is_postprocess_callable
                 unsupported_reasons = []
                 if position_embedding_type == 'yarn':
                     unsupported_reasons.append(
@@ -3191,26 +3294,10 @@ class TECudaGraphHelper:
                     unsupported_reasons.append(
                         'mRoPE rotary embeddings are not represented in the capture sample inputs'
                     )
-                if (
-                    position_embedding_type == 'rope'
-                    and is_thd
-                    and context_parallel_size > 1
-                    and not is_block_callable
-                ):
-                    # Chunk callables capture the full packed RoPE table (get_rotary_pos_emb).
+                if position_embedding_type == 'rope' and is_thd and context_parallel_size > 1:
                     unsupported_reasons.append(
                         'THD with context parallelism captures a CP-sliced RoPE table, while '
                         'runtime packed sequences use the full table'
-                    )
-                if is_block_callable and unsupported_reasons:
-                    # A chunk graph is the whole training forward: replaying it without the
-                    # rotary table would silently train without RoPE. Refuse instead of warning.
-                    raise ValueError(
-                        "cuda_graph_impl='chunk_wise' does not capture "
-                        f"position_embedding_type={position_embedding_type!r} rotary embeddings "
-                        f"({'; '.join(unsupported_reasons)}): the replayed attention would run "
-                        "without RoPE. Use position_embedding_type='rope' or disable chunk-wise "
-                        "CUDA graphs."
                     )
 
                 warning_key = (position_embedding_type, is_thd, context_parallel_size)
@@ -3237,6 +3324,16 @@ class TECudaGraphHelper:
                         'RoPE with SBHD (any supported CP) or THD with CP=1, until the shared '
                         'sample-input path is fixed.',
                     )
+
+            if is_chunk_callable:
+                contains_self_attn = any(
+                    isinstance(module, TransformerLayer)
+                    and not isinstance(module.self_attention, IdentityOp)
+                    for module in layer.modules()
+                )
+            elif is_postprocess_callable:
+                # The post-process runs the MTP transformer layer(s).
+                contains_self_attn = bool(getattr(chunk_of_the_layer, 'mtp_process', False))
 
             _sample_kwargs = {}
             if is_te_min_version("1.10.0"):
@@ -3560,6 +3657,13 @@ class TECudaGraphHelper:
                 and resolve_thd_tail_padding_policy(self.config) == 'append_dummy_seq'
             ):
                 max_num_seqs -= 1
+        elif getattr(self.config, 'cuda_graph_thd_max_packed_sequences', None) is not None:
+            # This capacity includes the dummy padding document, which the packing scheduler
+            # reserves whenever padding is enabled (data_schedule.wrap_data_iterator).
+            from megatron.core.datasets.data_schedule_utils import get_packed_sequence_alignment
+
+            _, pad_enabled = get_packed_sequence_alignment(self.config, 1)
+            max_num_seqs = int(self.config.cuda_graph_thd_max_packed_sequences) - int(pad_enabled)
 
         return (
             self._get_dp_balanced_thd_max_num_microbatches(
@@ -3803,23 +3907,22 @@ class TECudaGraphHelper:
                 te_parameters = inspect.signature(make_graphed_callables).parameters
                 # One process-wide pool: the optimizer step graph (optimizer_cuda_graph) is
                 # captured into the same pool and reuses the blocks the chunk graphs leave idle.
-                # Pool blocks are keyed by the allocating stream, so TE has to capture on the
-                # same stream as that graph.
-                if 'pool' in te_parameters:
+                # Pool blocks are keyed by the allocating stream, so create_cudagraphs runs
+                # TE's capture on the same stream as that graph. Only the optimizer graph's
+                # transient tensors live in the pool: the optimizer's first step, which
+                # allocates its state, always runs eagerly (OptimizerCudaGraphWrapper).
+                if 'pool' in te_parameters and getattr(
+                    self.config, "cuda_graph_use_single_mempool", True
+                ):
                     from megatron.core.full_cuda_graph import (
-                        capture_te_graphs_on_shared_stream,
                         get_shared_graph_pool,
+                        release_shared_graph_pool,
                     )
 
-                    capture_te_graphs_on_shared_stream()
+                    # A capture round is the first user of its pool: never capture into the
+                    # handle of an earlier round, whose graphs may be gone.
+                    release_shared_graph_pool()
                     kwargs['pool'] = get_shared_graph_pool()
-                # With gradient accumulation fusion the parameter grads a graph returns are
-                # placeholders (the real wgrad goes to main_grad), so there is nothing to clone.
-                if (
-                    self.config.gradient_accumulation_fusion
-                    and 'clone_param_grads_on_return' in te_parameters
-                ):
-                    kwargs['clone_param_grads_on_return'] = False
 
             if sample_kwargs:
                 kwargs['sample_kwargs'] = sample_kwargs
@@ -3834,8 +3937,12 @@ class TECudaGraphHelper:
                 def _get_fp8_enabled():
                     if is_chunk_wise_cuda_graph(self.config):
                         # Per-layer FP8/BF16 selection happens inside the block forward; the
-                        # outer TE context only enables the quantization bookkeeping.
-                        return tuple(True for _ in self.flattened_callables)
+                        # outer TE context only enables the quantization bookkeeping. A
+                        # post-process block without quantized modules gets none, as in eager.
+                        return tuple(
+                            callable._chunk_graph_has_quantized_modules()
+                            for callable in self.flattened_callables
+                        )
                     if is_te_min_version("2.8.0"):
                         from megatron.core.fp8_utils import is_first_last_bf16_layer
 
@@ -3914,6 +4021,19 @@ class TECudaGraphHelper:
         # TE executes real eager warmups before recording its graphs. Discard any metric writes
         # while retaining the fixed storage and process-group metadata used by graph replay.
         dsa_logging.DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
+        if is_chunk_wise_cuda_graph(self.config):
+            # A captured post-process block accumulated the MTP loss of those warmups as well.
+            from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+
+            MTPLossLoggingHelper.clean_loss_in_tracker()
+            # The warmups also ran the MoE dispatch on the constant sample inputs, where every
+            # token takes the same route: a rank capacity that real batches respect can
+            # overflow there, and the dispatcher's over-budget flag accumulates until reset.
+            for model_chunk in self.model:
+                for module in model_chunk.modules():
+                    token_dispatcher = getattr(module, "token_dispatcher", None)
+                    if hasattr(token_dispatcher, "reset_over_budget"):
+                        token_dispatcher.reset_over_budget()
         reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):
@@ -3989,7 +4109,12 @@ class TECudaGraphHelper:
             )
         else:
             # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
-            sample_args, kwargs = self._get_cuda_graph_input_data()
+            try:
+                sample_args, kwargs = self._get_cuda_graph_input_data()
+            except BaseException:
+                # A callable that cannot be captured is refused while its sample is built.
+                _set_capture_end()
+                raise
             sample_kwargs = kwargs.get('sample_kwargs', [])
             route_arenas = self._canonicalize_graph_dynamic_route_inputs(sample_kwargs)
             if self.config.sequence_parallel:
@@ -3998,34 +4123,36 @@ class TECudaGraphHelper:
                 rng_context = nullcontext()
             from megatron.core.transformer.moe.paged_stash import paged_stash_te_graph_capture
 
-            block_offload_capture = (
-                self.config.fine_grained_activation_offloading
-                and is_chunk_wise_cuda_graph(self.config)
-            )
-            if block_offload_capture:
-                from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                    FineGrainedActivationOffloadingInterface as off_interface,
-                )
+            if 'pool' in kwargs:
+                from megatron.core.full_cuda_graph import capture_te_graphs_on_shared_stream
 
-                off_interface.enter_block_capture(
-                    keep_last_group=self.config.fine_grained_offloading_graph_keep_last_group
+                shared_stream_context = capture_te_graphs_on_shared_stream()
+            else:
+                shared_stream_context = nullcontext()
+            if is_chunk_wise_cuda_graph(self.config) and hasattr(
+                torch.autograd.graph, 'set_override_stale_capture_stream'
+            ):
+                # The eager warm-up steps can keep AccumulateGrad nodes alive on their stream
+                # (any tensor of an earlier forward that a module still references keeps that
+                # forward's autograd graph), and a whole-block capture runs the backward of
+                # every parameter of the block. As in the local and full-iteration captures,
+                # let autograd redirect those stale references to the capturing stream; the
+                # process-global setting stays enabled for the same reason as there.
+                torch.autograd.graph.set_override_stale_capture_stream(True)
+            with (
+                self._te_capture_scope(),
+                rng_context,
+                shared_stream_context,
+                capture_constants(self),
+                paged_stash_te_graph_capture(
+                    self._should_enable_paged_stash_capture(),
+                    order=kwargs['_order'],
+                    config=self.config,
+                ),
+            ):
+                graphs = make_graphed_callables(
+                    tuple(self.flattened_callables), sample_args, **kwargs
                 )
-            try:
-                with (
-                    rng_context,
-                    capture_constants(self),
-                    paged_stash_te_graph_capture(
-                        self._should_enable_paged_stash_capture(),
-                        order=kwargs['_order'],
-                        config=self.config,
-                    ),
-                ):
-                    graphs = make_graphed_callables(
-                        tuple(self.flattened_callables), sample_args, **kwargs
-                    )
-            finally:
-                if block_offload_capture:
-                    off_interface.exit_block_capture()
             self._validate_mhc_static_hidden_inputs(sample_args)
 
             # The returned callables can outlive this helper. Share the capture's
@@ -4111,6 +4238,19 @@ class TECudaGraphHelper:
                 layer.cuda_graph_manual_hooks = []
                 layer.clear_te_cuda_graph_static_hidden_inputs()
         self._clear_graph_dynamic_route_arenas()
+        if is_chunk_wise_cuda_graph(self.config):
+            # The chunk graphs were captured into the process-wide shared pool; a later capture
+            # round must not reuse that pool id (see release_shared_graph_pool).
+            from megatron.core.full_cuda_graph import release_shared_graph_pool
+
+            release_shared_graph_pool()
+            if self.config.fine_grained_activation_offloading:
+                from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                    FineGrainedActivationOffloadingInterface as off_interface,
+                )
+
+                # The deleted graphs carried the offloads; eager forwards drive them again.
+                off_interface.release_block_capture()
 
         log_on_each_pipeline_stage(
             logger=logger,

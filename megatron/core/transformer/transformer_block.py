@@ -14,8 +14,8 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context, get_layer_fp8_context
+from megatron.core.fp4_utils import get_fp4_context, get_layer_quantization_context
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -354,14 +354,11 @@ class TransformerBlock(ChunkCudaGraphBlockMixin, GraphableMegatronModule, Megatr
         self.num_layers_per_pipeline_rank = len(self.layers)
 
     def _get_inner_quantization_context(self, layer):
-        """Return the per-layer quantization context used inside this block."""
-        if self.config.fp8:
-            # Under a chunk capture the block runs inside one FP8 context, so BF16 boundary
-            # layers opt out explicitly instead of inheriting it (get_layer_fp8_context).
-            return get_layer_fp8_context(self.config, layer.layer_number - 1)
-        if self.config.fp4:
-            return get_fp4_context(self.config, layer.layer_number - 1)
-        return nullcontext()
+        """Return the per-layer quantization context of a chunk-wise CUDA graph block."""
+        # A chunk capture runs the block inside one FP8 / NVFP4 context, so BF16 boundary
+        # layers opt out explicitly instead of inheriting it (get_layer_fp8_context,
+        # get_layer_fp4_context).
+        return get_layer_quantization_context(self.config, layer.layer_number - 1)
 
     def _build_layers(self):
         # Transformer layers.
@@ -967,7 +964,18 @@ class TransformerBlock(ChunkCudaGraphBlockMixin, GraphableMegatronModule, Megatr
                     residual_accumulator = hidden_states
                     # Get appropriate inner quantization context
                     if use_inner_quantization_context:
-                        inner_quantization_context = self._get_inner_quantization_context(layer)
+                        if self.config.fp8:
+                            inner_quantization_context = get_fp8_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        elif self.config.fp4:
+                            inner_quantization_context = get_fp4_context(
+                                self.config, layer.layer_number - 1
+                            )
+                        else:
+                            inner_quantization_context = nullcontext()
+                        if self.config.cuda_graph_impl == "chunk_wise":
+                            inner_quantization_context = self._get_inner_quantization_context(layer)
                     else:
                         inner_quantization_context = nullcontext()
 
