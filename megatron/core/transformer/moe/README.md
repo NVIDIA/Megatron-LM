@@ -34,6 +34,51 @@ For the latest features and architectures, please refer to the [MCore dev roadma
 - Support Multi-Token Prediction (MTP) (--mtp-num-layers 1)
 - CUDA Graph support for dropless MoE models with attention only capture (--te-rng-track --external-cuda-graph --cuda-graph-scope attn)
 
+## BF16 squared-ReLU expert fusion
+
+TE's operation fuser supports BF16 `GroupedLinear -> ScaledSReLU -> GroupedLinear`
+and `ScaledTanhSReLU` on SM100/SM103. Select `activation_func=squared_relu`,
+`use_fused_weighted_squared_relu=True`, `gated_linear_unit=False`,
+`moe_grouped_gemm=True`, `use_transformer_engine_op_fuser=True`, BF16 parameters,
+`add_bias_linear=False`, and expert tensor parallel size 1. Set
+`activation_func_tanh_clamp_scale` to a positive value for tanh-clamped sReLU;
+leave it unset for plain sReLU. The op fuser enables grouped tensors and reuses
+the existing 256-token expert padding and unpadding paths.
+
+This requires a TE build with BF16 unary grouped-MLP fusion, CuTe DSL >=4.8.0,
+and cuDNN Frontend's BF16 sReLU forward/backward APIs
+([#2885](https://github.com/NVIDIA/cudnn-frontend/pull/2885),
+[#2886](https://github.com/NVIDIA/cudnn-frontend/pull/2886)), alongside the
+canonical BF16 grouped GEMM/wgrad APIs from Frontend >=1.32.0. TE chooses the
+backend according to the active precision context and hardware capabilities.
+These options do not select BF16 or change an FP8/FP4 override.
+
+| MCore option | TE activation option | Default and behavior |
+| --- | --- | --- |
+| `moe_bf16_srelu_act_input` | `bf16_act_input` | `acc`: activate the FP32 FC1 accumulator; `saved`: activate the saved BF16 pre-activation |
+| `moe_bf16_srelu_tanh_mode` | `bf16_tanh_mode` | `approx`: hardware approximate tanh; `accurate`: accurate FP32 tanh; ignored for plain sReLU |
+| Selective recomputation of `moe_act` | `activation_recompute_in_mlp` | `False` unless `recompute_granularity="selective"` and `"moe_act"` is in `recompute_modules` |
+| TE/PyTorch determinism policy | cuDNN `deterministic` | Deterministic dProb if `NVTE_ALLOW_NONDETERMINISTIC_ALGO=0` **or** PyTorch deterministic algorithms are enabled; atomic otherwise |
+
+The first two fields are also available as `--moe-bf16-srelu-act-input` and
+`--moe-bf16-srelu-tanh-mode` in the training CLI. MCore forwards them to either
+scaled activation. Older TE versions can retain the default behavior; requesting
+a nondefault option that their activation constructor cannot accept raises an
+upgrade error. Unsupported fusion configurations retain TE's existing fallback;
+the `bf16_*` numerical options apply only to the BF16 fused backend.
+
+By default, `acc` with saving retains the **actual forward FC2 input** for FC2
+wgrad. With `saved` and recomputation, the reconstructed FC2 input is bitwise
+identical to forward under the same tanh configuration. `acc` with recomputation
+is also supported: backward reconstructs from the saved **BF16** pre-activation,
+which can differ from the FP32 accumulator used in forward and change FC2 wgrad.
+MCore and TE never silently replace `acc` with `saved`. Backward activation
+derivatives always use the saved BF16 pre-activation. The bitwise statement is
+limited to FC2's input; it does not guarantee full training or MLP equivalence to
+unfused BF16. BF16 sReLU supports deterministic dProb and does not inherit the
+BF16 GLU rejection in deterministic mode. Set the determinism policy before
+capturing CUDA graphs, since replay retains the captured reduction choice.
+
 ## Overview of MCore MoE Supported Features and Architectures
 
 ### Model Support

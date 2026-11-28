@@ -557,6 +557,14 @@ def test_gdp_num_householder_rejects_non_positive_values(num_householder: int):
         )
 
 
+@pytest.mark.parametrize("name", ["moe_bf16_srelu_act_input", "moe_bf16_srelu_tanh_mode"])
+@pytest.mark.parametrize("value", [None, "invalid"])
+def test_bf16_srelu_rejects_invalid_numerical_options(name, value):
+    """The dataclass's explicit validation rejects unsupported kernel modes."""
+    with pytest.raises(ValueError, match=name):
+        TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4, **{name: value})
+
+
 def test_squared_relu_tanh_clamp_allows_te_op_fuser():
     """Whether the fused path can clamp depends on the installed TE; TEGroupedMLP decides."""
     config = TransformerConfig(

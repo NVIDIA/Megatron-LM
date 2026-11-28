@@ -42,12 +42,18 @@ def test_op_fuser_transformer_config_args_are_exposed():
             "--moe-mlp-glu-interleave-size",
             "16",
             "--moe-use-grouped-tensor",
+            "--moe-bf16-srelu-act-input",
+            "saved",
+            "--moe-bf16-srelu-tanh-mode",
+            "accurate",
         ]
     )
 
     assert args.use_transformer_engine_op_fuser is True
     assert args.moe_mlp_glu_interleave_size == 16
     assert args.moe_use_grouped_tensor is True
+    assert args.moe_bf16_srelu_act_input == "saved"
+    assert args.moe_bf16_srelu_tanh_mode == "accurate"
 
 
 def test_op_fuser_enables_grouped_tensor():
@@ -999,15 +1005,33 @@ def _make_fake_te_namespace():
             self.glu_linear_offset = glu_linear_offset
 
     class FakeScaledSReLU(torch.nn.Module):
-        def __init__(self, *, activation_recompute_in_mlp=False):
+        def __init__(
+            self,
+            *,
+            activation_recompute_in_mlp=False,
+            bf16_act_input="acc",
+            bf16_tanh_mode="approx",
+        ):
             super().__init__()
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
+            self.bf16_act_input = bf16_act_input
+            self.bf16_tanh_mode = bf16_tanh_mode
 
-    class FakeScaledTanhSReLU(torch.nn.Module):
-        def __init__(self, *, tanh_clamp_scale, activation_recompute_in_mlp=False):
-            super().__init__()
+    class FakeScaledTanhSReLU(FakeScaledSReLU):
+        def __init__(
+            self,
+            *,
+            tanh_clamp_scale,
+            activation_recompute_in_mlp=False,
+            bf16_act_input="acc",
+            bf16_tanh_mode="approx",
+        ):
+            super().__init__(
+                activation_recompute_in_mlp=activation_recompute_in_mlp,
+                bf16_act_input=bf16_act_input,
+                bf16_tanh_mode=bf16_tanh_mode,
+            )
             self.tanh_clamp_scale = tanh_clamp_scale
-            self.activation_recompute_in_mlp = activation_recompute_in_mlp
 
     class FakeSequential(list):
         def register_forward_pre_hook(self, hook):
@@ -1079,9 +1103,23 @@ def test_make_fused_ops_uses_clamped_qgeglu(
     assert activation.glu_linear_offset == expected_offset
 
 
-def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch):
+@pytest.mark.parametrize("act_input", ["acc", "saved"])
+@pytest.mark.parametrize("tanh_mode", ["approx", "accurate"])
+@pytest.mark.parametrize("recompute", [False, True])
+@pytest.mark.parametrize("legacy_te", [False, True])
+def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(
+    monkeypatch, act_input, tanh_mode, recompute, legacy_te
+):
     """squared_relu + weighted squared-ReLU fusion -> ScaledSReLU."""
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    if legacy_te:
+
+        class FakeScaledSReLU(torch.nn.Module):
+            def __init__(self, *, activation_recompute_in_mlp=False):
+                super().__init__()
+                self.activation_recompute_in_mlp = activation_recompute_in_mlp
+
+        fake_te.pytorch.ops.ScaledSReLU = FakeScaledSReLU
     monkeypatch.setattr(experts_module, "te", fake_te)
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
@@ -1095,9 +1133,11 @@ def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch)
         activation_func=squared_relu,
         gated_linear_unit=False,
         use_fused_weighted_squared_relu=True,
+        moe_bf16_srelu_act_input=act_input,
+        moe_bf16_srelu_tanh_mode=tanh_mode,
     )
     module.activation_func = squared_relu
-    module.activation_recompute = True
+    module.activation_recompute = recompute
     common = dict(
         device="cuda",
         dtype=torch.bfloat16,
@@ -1111,13 +1151,24 @@ def test_make_fused_ops_uses_scaled_srelu_for_weighted_squared_relu(monkeypatch)
     module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
     module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8))
 
-    ops = module._make_fused_ops()
+    if legacy_te and (act_input != "acc" or tanh_mode != "approx"):
+        with pytest.raises(RuntimeError, match="Upgrade Transformer Engine"):
+            module._make_fused_ops()
+    else:
+        ops = module._make_fused_ops()
+        assert type(ops[1]).__name__ == "FakeScaledSReLU"
+        assert ops[1].activation_recompute_in_mlp is recompute
+        if not legacy_te:
+            assert ops[1].bf16_act_input == act_input
+            assert ops[1].bf16_tanh_mode == tanh_mode
 
-    assert type(ops[1]).__name__ == "FakeScaledSReLU"
-    assert ops[1].activation_recompute_in_mlp is True
 
-
-def test_make_fused_ops_uses_scaled_tanh_srelu_when_clamp_is_set(monkeypatch):
+@pytest.mark.parametrize("act_input", ["acc", "saved"])
+@pytest.mark.parametrize("tanh_mode", ["approx", "accurate"])
+@pytest.mark.parametrize("recompute", [False, True])
+def test_make_fused_ops_uses_scaled_tanh_srelu_when_clamp_is_set(
+    monkeypatch, act_input, tanh_mode, recompute
+):
     """A clamp scale selects ScaledTanhSReLU and is passed through to it."""
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
@@ -1133,9 +1184,11 @@ def test_make_fused_ops_uses_scaled_tanh_srelu_when_clamp_is_set(monkeypatch):
         activation_func=squared_relu,
         gated_linear_unit=False,
         use_fused_weighted_squared_relu=True,
+        moe_bf16_srelu_act_input=act_input,
+        moe_bf16_srelu_tanh_mode=tanh_mode,
     )
     module.activation_func = squared_relu
-    module.activation_recompute = True
+    module.activation_recompute = recompute
     common = dict(
         device="cuda",
         dtype=torch.bfloat16,
@@ -1153,7 +1206,9 @@ def test_make_fused_ops_uses_scaled_tanh_srelu_when_clamp_is_set(monkeypatch):
 
     assert type(ops[1]).__name__ == "FakeScaledTanhSReLU"
     assert ops[1].tanh_clamp_scale == 16.0
-    assert ops[1].activation_recompute_in_mlp is True
+    assert ops[1].activation_recompute_in_mlp is recompute
+    assert ops[1].bf16_act_input == act_input
+    assert ops[1].bf16_tanh_mode == tanh_mode
 
 
 def test_make_fused_ops_rejects_scaled_srelu_with_gated_linear_unit(monkeypatch):
@@ -2627,8 +2682,8 @@ class TestTEGroupedMLP:
         # A successful capability probe does not restore an import-time fusion registration.
         request.getfixturevalue("require_te_fused_srelu_mlp")
 
-    def _build_clamp_experts(self, tanh_clamp_scale, use_op_fuser):
-        tf_config = TransformerConfig(
+    def _build_clamp_experts(self, tanh_clamp_scale, use_op_fuser, **overrides):
+        config_kwargs = dict(
             num_layers=1,
             hidden_size=self.CLAMP_HIDDEN,
             ffn_hidden_size=self.CLAMP_FFN,
@@ -2650,6 +2705,8 @@ class TestTEGroupedMLP:
             fp8="e4m3",
             fp8_recipe="mxfp8",
         )
+        config_kwargs.update(overrides)
+        tf_config = TransformerConfig(**config_kwargs)
         submodules = get_submodules(
             get_gpt_layer_with_transformer_engine_submodules(
                 self.CLAMP_EXPERTS, moe_grouped_gemm=True
@@ -2688,7 +2745,7 @@ class TestTEGroupedMLP:
         return hidden, probs, tokens_per_expert
 
     @staticmethod
-    def _assert_fused_op_selected(experts):
+    def _assert_fused_op_selected(experts, expected="GroupedMLP_CuTeGEMMUnary"):
         """When the cuDSL kernel is unavailable TE computes the same numbers on its basic-op
         path, so the op type has to be checked directly (after the lazy first forward)."""
         (sequential,) = experts._fused_ops
@@ -2697,7 +2754,71 @@ class TestTEGroupedMLP:
             for group in sequential._module_groups
             for entry in group._forward_ops
         ]
-        assert "GroupedMLP_CuTeGEMMUnary" in selected, selected
+        assert expected in selected, selected
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.parametrize("tanh_clamp_scale", [None, 2.0])
+    @pytest.mark.parametrize("act_input", ["acc", "saved"])
+    @pytest.mark.parametrize("tanh_mode", ["approx", "accurate"])
+    @pytest.mark.parametrize("recompute", [False, True])
+    @pytest.mark.parametrize("deterministic", [False, True])
+    def test_bf16_srelu_modes(
+        self, monkeypatch, tanh_clamp_scale, act_input, tanh_mode, recompute, deterministic
+    ):
+        """All BF16 modes reach TE through a real MCore expert layer, including padding."""
+        from transformer_engine.pytorch.ops.fused import grouped_mlp as te_mlp
+
+        fused_cls = getattr(te_mlp, "GroupedMLP_CuTeGEMMUnaryBf16", None)
+        if fused_cls is None or not fused_cls.is_supported():
+            pytest.skip("BF16 sReLU requires SM100/103 and TE/cuDNN BF16 sReLU support")
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0" if deterministic else "1")
+        torch_deterministic = torch.are_deterministic_algorithms_enabled()
+        warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        torch.use_deterministic_algorithms(False)
+        try:
+            fused = self._build_clamp_experts(
+                tanh_clamp_scale,
+                use_op_fuser=True,
+                fp8=None,
+                moe_bf16_srelu_act_input=act_input,
+                moe_bf16_srelu_tanh_mode=tanh_mode,
+                recompute_granularity="selective" if recompute else None,
+                recompute_modules=["moe_act"] if recompute else None,
+            )
+            reference = self._build_clamp_experts(tanh_clamp_scale, use_op_fuser=False, fp8=None)
+            self._copy_params(dst=reference, src=fused)
+            torch.manual_seed(123)
+            # Deliberately unaligned counts exercise MCore's existing pad/unpad path.
+            sizes = torch.tensor([17, 257], dtype=torch.long)
+            hidden = 4 * torch.randn(274, self.CLAMP_HIDDEN, device="cuda", dtype=torch.bfloat16)
+            prob = torch.rand(274, device="cuda", dtype=torch.float32)
+            dy = torch.randn_like(hidden)
+
+            def run(experts):
+                x, p = hidden.clone().requires_grad_(), prob.clone().requires_grad_()
+                out, _ = experts(x, sizes, p)
+                out.backward(dy)
+                return (out, x.grad, p.grad, *[w.grad for w in experts.parameters()])
+
+            actual, expected = run(fused), run(reference)
+            self._assert_fused_op_selected(fused, "GroupedMLP_CuTeGEMMUnaryBf16")
+            (sequential,) = fused._fused_ops
+            activation = sequential[1]
+            assert activation.bf16_act_input == act_input
+            assert activation.bf16_tanh_mode == tanh_mode
+            assert activation.activation_recompute_in_mlp is recompute
+            # This compares distinct BF16 rounding boundaries, not bitwise training
+            # equivalence. TE's mode-specific tests check the exact FC2 wgrad source.
+            assert len(actual) == len(expected)
+            for got, want in zip(actual, expected):
+                assert got is not None and want is not None
+                error = (got.float() - want.float()).square().mean().sqrt()
+                scale = want.float().square().mean().sqrt()
+                assert error <= 0.02 * scale + 1e-6
+        finally:
+            torch.use_deterministic_algorithms(torch_deterministic, warn_only=warn_only)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
