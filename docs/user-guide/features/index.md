@@ -17,6 +17,7 @@ Guides for Megatron Core training and inference features.
 - [Mixture of Experts](moe.md)
 - [Megatron-FSDP](megatron_fsdp.md)
 - [Distributed Optimizer](dist_optimizer.md)
+- [Muon Optimizer](muon.md)
 - [Weighted Checkpoint Merge](checkpoint-merge.md)
 - [Optimizer CPU Offload](optimizer_cpu_offload.md)
 - [MoE Paged Stash](paged_stash.md)
