@@ -1,7 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Unit tests for megatron.training.utils.checkpoint_utils."""
 
+import subprocess
+import sys
 from dataclasses import dataclass, field
+from textwrap import dedent
 from unittest import mock
 
 import pytest
@@ -273,6 +276,8 @@ class TestReadRunConfigTargetValidation:
             "transformers.models.auto.tokenization_auto.AutoTokenizer.from_pretrained",
             "transformers.pipelines.pipeline",
             "torch.serialization.load",
+            "torch.package.PackageImporter",
+            "torch.package.PackageImporter.load_pickle",
         ],
     )
     def test_rejects_unsafe_targets_before_compat_import(self, tmp_path, target):
@@ -354,3 +359,51 @@ class TestApplyRunConfigBackwardCompat:
 
         mock_sanitize.assert_called_once_with(config_dict)
         assert result == {"sanitized": True}
+
+
+def test_optional_package_metadata_in_fresh_process(tmp_path):
+    path = tmp_path / "run_config.yaml"
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "_target_": "megatron.bridge.models.hybrid.model_config.BridgeHybridModelConfig",
+                    "seq_length": 16,
+                }
+            }
+        )
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            dedent("""
+            import sys
+            from unittest.mock import patch
+            from megatron.training.config.instantiate_utils import (
+                InstantiationException, instantiate, target_allowlist,
+            )
+            from megatron.training.utils.checkpoint_utils import read_run_config
+
+            target_allowlist.enable()
+            with patch("importlib.import_module", side_effect=AssertionError("unexpected import")) as importer:
+                data = read_run_config(sys.argv[1])
+                assert data["model"]["seq_length"] == 16
+                assert data["model"]["_target_"] == (
+                    "megatron.bridge.models.hybrid.model_config.BridgeHybridModelConfig"
+                )
+                try:
+                    instantiate(data["model"])
+                except InstantiationException:
+                    pass
+                else:
+                    raise AssertionError("unregistered construction must fail")
+                importer.assert_not_called()
+            assert not any(name.startswith("megatron.bridge") for name in sys.modules)
+        """),
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )

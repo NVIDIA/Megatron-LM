@@ -17,11 +17,7 @@ except ImportError:
 
 from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.msc_utils import MultiStorageClientFeature
-from megatron.training.config.instantiate_utils import (
-    _DISALLOWED_CANONICAL_TARGETS,
-    InstantiationException,
-    _reject_unsafe_target_name,
-)
+from megatron.training.config.instantiate_utils import _reject_unsafe_target_name
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.state import TrainState
 from megatron.training.utils.common_utils import print_rank_0
@@ -156,12 +152,10 @@ def _validate_run_config_targets(value: Any, path: str = "") -> None:
     if isinstance(value, dict):
         target = value.get("_target_")
         if isinstance(target, str):
-            full_key = f"{path}._target_" if path else "_target_"
+            # Metadata-only reads may contain optional packages that are not
+            # registered in this process. Enforce construction policy when
+            # instantiating; reject known unsafe names here without importing.
             _reject_unsafe_target_name(target=target, full_key=path)
-            if target in _DISALLOWED_CANONICAL_TARGETS:
-                raise InstantiationException(
-                    f"Instantiation of '{target}' is not allowed.\nfull_key: {full_key}"
-                )
         for key, child in value.items():
             if key != "_target_":
                 child_path = f"{path}.{key}" if path else str(key)

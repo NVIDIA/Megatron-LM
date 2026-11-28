@@ -202,11 +202,12 @@ class TestResolveTargetClassAllowlistEnforcement:
         assert result is None
 
     def test_allowed_target_resolves(self):
+        # This should resolve to the actual class
+        from megatron.training.config.training_config import TrainingConfig
         from megatron.training.config.utils import _resolve_target_class
 
-        # This should resolve to the actual class
-        result = _resolve_target_class("megatron.training.config.instantiate_utils.TargetAllowlist")
-        assert result is TargetAllowlist
+        result = _resolve_target_class("megatron.training.config.training_config.TrainingConfig")
+        assert result is TrainingConfig
 
 
 class TestModuleLevelSingleton:

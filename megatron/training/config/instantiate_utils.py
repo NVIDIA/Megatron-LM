@@ -4,6 +4,7 @@ import functools
 import inspect
 import logging
 from enum import Enum
+from functools import partial as _Partial
 from textwrap import dedent
 from typing import Any, Callable, Sequence
 
@@ -23,8 +24,18 @@ _TARGET_ALLOWLIST_MUTATORS: tuple[str, ...] = (
     "disable",
     "enable",
 )
-_DISALLOWED_CANONICAL_TARGETS: set[str] = {"numpy.load", "torch.serialization.load"}
+_DISALLOWED_CANONICAL_TARGETS: set[str] = {
+    "megatron.core.transformer.spec_utils.import_module",
+    "megatron.core.transformer.spec_utils.get_module",
+    "megatron.core.transformer.spec_utils.build_module",
+    "numpy.load",
+    "torch.serialization.load",
+    "torch.hub.load_state_dict_from_url",
+    "torch.package.package_importer.PackageImporter",
+    "torch.package.package_importer.PackageImporter.load_pickle",
+}
 _DISALLOWED_TARGETS: set[str] = {
+    *_DISALLOWED_CANONICAL_TARGETS,
     "numpy.ctypeslib.load_library",
     "numpy.load",
     "torch.classes.load_library",
@@ -37,6 +48,10 @@ _DISALLOWED_TARGETS: set[str] = {
     "torch.ctypes.pydll.LoadLibrary",
     "torch.ctypes.windll.LoadLibrary",
     "torch.hub.load",
+    "torch.hub.load_state_dict_from_url",
+    "torch.utils.model_zoo.load_url",
+    "torch.package.PackageImporter",
+    "torch.package.PackageImporter.load_pickle",
     "torch.load",
     "torch.ops.load_library",
     "torch.utils.cpp_extension.load",
@@ -59,6 +74,90 @@ _DISALLOWED_CALLABLE_FIELD_NAMES: set[str] = {
     "preprocess_fn",
     "process_example_fn",
 }
+
+
+# Configuration values and numerical functions, not the entire torch API.
+# Additional application-specific targets require an exact trusted registration.
+_TORCH_CONFIG_TARGETS = frozenset(
+    {
+        "torch.device",
+        "torch.Size",
+        "torch.dtype",
+        "torch.nn.init.normal_",
+        "torch.nn.init.xavier_uniform_",
+        *{
+            f"torch.nn.functional.{name}"
+            for name in (
+                "gelu",
+                "relu",
+                "relu6",
+                "silu",
+                "mish",
+                "sigmoid",
+                "tanh",
+                "leaky_relu",
+                "elu",
+                "selu",
+                "celu",
+                "glu",
+                "softplus",
+                "softsign",
+                "softmax",
+                "log_softmax",
+                "hardsigmoid",
+                "hardswish",
+                "hardtanh",
+                "tanhshrink",
+            )
+        },
+        "torch._C._nn.gelu",
+        "torch._C._nn.softplus",
+        "torch.sigmoid",
+        "torch.tanh",
+        "torch.relu",
+        "torch._VariableFunctionsClass.sigmoid",
+        "torch._VariableFunctionsClass.tanh",
+        "torch._VariableFunctionsClass.relu",
+    }
+)
+
+
+# Historical serialized model specs and the native GELU symbol remain readable.
+_ALLOWED_PRIVATE_TARGETS = frozenset(
+    {
+        "megatron.core.extensions.te_batched_linear._TEBatchedLinear",
+        "megatron.core.models.gpt.moe_module_specs._build_shared_experts",
+        "torch._C._nn.gelu",
+        "torch._C._nn.softplus",
+        "torch._VariableFunctionsClass.sigmoid",
+        "torch._VariableFunctionsClass.tanh",
+        "torch._VariableFunctionsClass.relu",
+        "megatron.bridge.models.gemma.modeling_gemma4._gemma4_block_spec",
+        "megatron.bridge.models.ernie.ernie_45_bridge._ernie45_decoder_block_spec",
+        "megatron.bridge.models.ernie.modeling_ernie55.norm._build_downcasting_norm",
+        "megatron.bridge.models.ernie.modeling_ernie55.norm._build_fixed_downcasting_norm",
+        "megatron.bridge.diffusion.models.llada15.llada15_provider._llada15_layer_spec",
+    }
+)
+
+
+def _is_torch_dtype_name(target: str) -> bool:
+    """Recognize dtype exports from the installed PyTorch version without importing a target."""
+    if not target.startswith("torch.") or target.count(".") != 1:
+        return False
+    import torch
+
+    return isinstance(vars(torch).get(target.split(".")[1]), torch.dtype)
+
+
+def _is_torch_module_constructor_name(target: str) -> bool:
+    parts = target.split(".")
+    return (
+        target.startswith("torch.nn.")
+        and len(parts) >= 3
+        and parts[-1][0:1].isupper()
+        and all(part and not part.startswith("_") for part in parts)
+    )
 
 
 class InstantiationException(Exception):
@@ -92,14 +191,25 @@ _DEFAULT_ALLOWED_PREFIXES: tuple[str, ...] = (
     "signal.",
 )
 
-_DEFAULT_ALLOWED_EXACT: frozenset[str] = frozenset({"functools.partial"})
+_DEFAULT_ALLOWED_EXACT: frozenset[str] = frozenset(
+    {"functools.partial", "examples.mimo.training.builder.MimoModelBuilder"}
+)
 
 
 class TargetAllowlist:
     """Controls which ``_target_`` strings are permitted for instantiation.
 
-    Security: prevents arbitrary code execution from untrusted YAML configs
-    by gating which module paths can be imported and called.
+    Restricts the import paths used by configuration deserialization. Registered
+    packages and their constructors must be trusted: this is not a sandbox for
+    arbitrary untrusted configurations. Known unsafe targets remain prohibited.
+
+    PyTorch targets are limited to dtype/device values, activation functions,
+    native initializers and public ``torch.nn.Module`` constructors. Private targets
+    and other PyTorch APIs require trusted registration of their exact names with
+    ``add_exact`` (including the canonical name for an alias). ``add_prefix``
+    alone does not expand these categories. Function references and partials
+    follow the same policy as immediately called targets. Historical model-spec
+    names emitted by supported checkpoints are retained explicitly.
     """
 
     def __init__(self) -> None:
@@ -451,6 +561,7 @@ def _call_target(
 ) -> Any:
     """Call target (type) with args and kwargs."""
     args, kwargs = _extract_pos_args(args, kwargs)
+    validate_target_arguments(_target_, args, kwargs, full_key=full_key)
     if _partial_:
         try:
             return functools.partial(_target_, *args, **kwargs)
@@ -470,6 +581,42 @@ def _call_target(
             if full_key:
                 msg += f"\nfull_key: {full_key}"
             raise InstantiationException(msg) from e
+
+
+def validate_target_arguments(
+    target: Any, args: Sequence[Any], kwargs: dict[str, Any], *, full_key: str
+) -> None:
+    """Validate deferred imports before constructing a configuration object.
+
+    Deserializers that call dataclass constructors directly must call this after
+    restoring their arguments. ModuleSpec carries an import path outside the
+    usual ``_target_`` field; apply the same policy before retaining that path.
+    This does not make arbitrary constructors in trusted packages a sandbox.
+    """
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    if isinstance(target, _Partial):
+        validate_target_arguments(
+            target.func, (*target.args, *args), {**target.keywords, **kwargs}, full_key=full_key
+        )
+    if target is _Partial and args:
+        validate_target_arguments(args[0], args[1:], kwargs, full_key=full_key)
+    if isinstance(target, type) and issubclass(target, ModuleSpec):
+        if "module" not in kwargs and not args:
+            return  # A partial may receive its module later from trusted application code.
+        module = kwargs.get("module", args[0] if args else None)
+        if isinstance(module, (tuple, list)):
+            if len(module) != 2 or not all(isinstance(part, str) for part in module):
+                raise InstantiationException(f"Invalid ModuleSpec.module at {full_key}.module")
+            module = _resolve_target(".".join(module), full_key=f"{full_key}.module")
+        elif not callable(module):
+            raise InstantiationException(f"Invalid ModuleSpec.module at {full_key}.module")
+        # A spec can itself construct another spec or partial. Its params are
+        # deferred constructor arguments and must follow the same validation.
+        params = kwargs.get("params", args[1] if len(args) > 1 else {})
+        if not isinstance(params, dict):
+            raise InstantiationException(f"Invalid ModuleSpec.params at {full_key}.params")
+        validate_target_arguments(module, (), params, full_key=f"{full_key}.params")
 
 
 def _convert_target_to_string(t: Any) -> Any:
@@ -560,20 +707,8 @@ def _resolve_target(
 ) -> type | Callable[..., Any] | object:
     """Resolve target string, type or callable into type or callable."""
     if isinstance(target, str):
-        # Security: check allowlist BEFORE importing to prevent
-        # arbitrary code execution from untrusted _target_ strings.
-        if not target_allowlist.is_allowed(target):
-            msg = (
-                f"Target '{target}' is not in the allowlist for _target_ instantiation.\n"
-                f"Allowed module prefixes: {', '.join(target_allowlist.allowed_prefixes)}\n"
-                f"Allowed exact targets: {', '.join(sorted(target_allowlist.allowed_exact))}\n"
-                f"To allow this target, call:\n"
-                f"  target_allowlist.add_prefix('{target.rsplit('.', 1)[0] + '.'}')\n"
-                f"  or: target_allowlist.add_exact('{target}')"
-            )
-            if full_key:
-                msg += f"\nfull_key: {full_key}"
-            raise InstantiationException(msg)
+        _validate_target_name(target=target, full_key=full_key)
+        target_name = target
         try:
             target = _locate(target)
         except Exception as e:
@@ -581,6 +716,26 @@ def _resolve_target(
             if full_key:
                 msg += f"\nfull_key: {full_key}"
             raise InstantiationException(msg) from e
+        module = getattr(target, "__module__", None)
+        qualname = getattr(target, "__qualname__", None)
+        if isinstance(target, TargetAllowlist):
+            raise InstantiationException("Target allowlist objects cannot be deserialized.")
+        if isinstance(module, str) and isinstance(qualname, str):
+            canonical = f"{module}.{qualname}"
+            _validate_target_name(target=canonical, full_key=full_key)
+        if (
+            target_allowlist.enabled
+            and target_name.startswith("torch.nn.")
+            and target_name not in _TORCH_CONFIG_TARGETS
+            and target_name not in target_allowlist.allowed_exact
+        ):
+            import torch
+
+            if not isinstance(target, type) or not issubclass(target, torch.nn.Module):
+                raise InstantiationException(
+                    f"Target '{target_name}' is not a torch.nn.Module constructor."
+                    + (f"\nfull_key: {full_key}" if full_key else "")
+                )
     if check_callable and not callable(target):
         msg = f"Expected a callable target, got '{target}' of type '{type(target).__name__}'"
         if full_key:
@@ -613,7 +768,9 @@ def _convert_node(node: Any) -> Any:
 
 def _reject_unsafe_target_name(*, target: str, full_key: str | int) -> None:
     """Reject known unsafe target names without importing their modules."""
-    field_name = full_key.rsplit(".", 1)[-1] if isinstance(full_key, str) else ""
+    field_name = ""
+    if isinstance(full_key, str):
+        field_name = full_key.rsplit(".", 1)[-1].split("[", 1)[0]
     if field_name in _DISALLOWED_CALLABLE_FIELD_NAMES:
         raise InstantiationException(
             f"Instantiation of '{target}' is not allowed for callable config field '{full_key}'. "
@@ -621,6 +778,8 @@ def _reject_unsafe_target_name(*, target: str, full_key: str | int) -> None:
         )
     if (
         target in _DISALLOWED_TARGETS
+        or (target.startswith(__name__ + ".") and target != __name__ + ".InstantiationMode")
+        or target in _DISALLOWED_CANONICAL_TARGETS
         or target.startswith(_DISALLOWED_TRANSFORMERS_PREFIXES)
         or (
             target.startswith("transformers.")
@@ -629,5 +788,40 @@ def _reject_unsafe_target_name(*, target: str, full_key: str | int) -> None:
     ):
         raise InstantiationException(
             f"Instantiation of '{target}' is not allowed because it can bypass target validation."
+            + (f"\nfull_key: {full_key}" if full_key else "")
+        )
+
+
+def _validate_target_name(*, target: str, full_key: str | int) -> None:
+    """Apply the shared name policy before importing a serialized target."""
+    _reject_unsafe_target_name(target=target, full_key=full_key)
+    if (
+        target_allowlist.enabled
+        and any(part.startswith("_") for part in target.split("."))
+        and target not in _ALLOWED_PRIVATE_TARGETS
+        and target not in target_allowlist.allowed_exact
+    ):
+        raise InstantiationException(
+            f"Instantiation of private target '{target}' is not allowed."
+            + (f"\nfull_key: {full_key}" if full_key else "")
+        )
+    if not target_allowlist.is_allowed(target):
+        raise InstantiationException(
+            f"Target '{target}' is not in the allowlist for _target_ instantiation.\n"
+            f"Allowed module prefixes: {', '.join(target_allowlist.allowed_prefixes)}\n"
+            "Register trusted application targets with target_allowlist.add_exact() "
+            "or target_allowlist.add_prefix()." + (f"\nfull_key: {full_key}" if full_key else "")
+        )
+    if (
+        target_allowlist.enabled
+        and target.startswith("torch.")
+        and target not in _TORCH_CONFIG_TARGETS
+        and target not in target_allowlist.allowed_exact
+        and not _is_torch_module_constructor_name(target)
+        and not _is_torch_dtype_name(target)
+    ):
+        raise InstantiationException(
+            f"Target '{target}' is not a supported torch configuration target. "
+            "Register additional trusted targets with target_allowlist.add_exact()."
             + (f"\nfull_key: {full_key}" if full_key else "")
         )

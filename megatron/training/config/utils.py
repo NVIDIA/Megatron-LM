@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
-import importlib
 import inspect
 import logging
 from dataclasses import fields as dataclass_fields
@@ -190,19 +189,27 @@ def _resolve_target_class(target: str) -> type | None:
     Returns:
         The resolved class, or None if resolution fails.
     """
-    from megatron.training.config.instantiate_utils import target_allowlist
+    from megatron.training.config.instantiate_utils import (
+        InstantiationException,
+        _resolve_target,
+        _validate_target_name,
+        target_allowlist,
+    )
 
+    # Keep legacy handling for absent optional packages, but never suppress a
+    # policy rejection or import a target outside the shared resolver.
     if not target_allowlist.is_allowed(target):
         logger.warning(f"Target '{target}' is not in the allowlist. Skipping resolution.")
         return None
-
+    _validate_target_name(target=target, full_key="")
     try:
-        module_path, class_name = target.rsplit(".", 1)
-        module = importlib.import_module(module_path)
-        return getattr(module, class_name, None)
-    except (ValueError, ImportError, AttributeError) as e:
-        logger.warning(f"Could not resolve target '{target}': {e}")
-        return None
+        resolved = _resolve_target(target, full_key="", check_callable=False)
+    except InstantiationException as exc:
+        if isinstance(exc.__cause__, (ImportError, ValueError)):
+            logger.warning(f"Could not resolve target '{target}': {exc}")
+            return None
+        raise
+    return resolved if isinstance(resolved, type) else None
 
 
 @lru_cache(maxsize=128)

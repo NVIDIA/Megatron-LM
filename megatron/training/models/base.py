@@ -1,7 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import abc
-import importlib
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
@@ -86,9 +85,13 @@ class ModelConfig:
         """Get the appropriate builder type for this config.
         Dynamically imports the builder from the string path.
         """
-        module_path, class_name = self.builder.rsplit(".", 1)
-        module = importlib.import_module(module_path)
-        builder_cls = getattr(module, class_name)
+        from megatron.training.config.instantiate_utils import _resolve_target
+
+        builder_cls = _resolve_target(self.builder, full_key="_builder_")
+        if not isinstance(builder_cls, type) or not issubclass(builder_cls, ModelBuilder):
+            raise TypeError(
+                f"Builder target must resolve to a ModelBuilder class, got {self.builder!r}"
+            )
         return builder_cls
 
     def as_dict(self) -> dict[str, Any]:
@@ -124,25 +127,34 @@ class ModelConfig:
             Instance of the appropriate ModelConfig subclass
         """
 
-        def _from_dict(subdata):
+        def _from_dict(subdata, path):
             target = subdata.get("_target_")
             if target is None:
                 raise ValueError("Cannot deserialize: missing '_target_' field")
 
-            # Import the class from the target path
-            module_path, class_name = target.rsplit(".", 1)
-            module = importlib.import_module(module_path)
-            config_cls = getattr(module, class_name)
+            from megatron.training.config.instantiate_utils import (
+                _resolve_target,
+                validate_target_arguments,
+            )
+
+            config_cls = _resolve_target(target, full_key=path)
 
             # Filter to valid fields for this class
             valid_fields = {f.name for f in dataclass_fields(config_cls)}
             filtered_data = {k: v for k, v in subdata.items() if k in valid_fields and not k.startswith("_")}
 
-            return config_cls(**{key: _from_value(value) for key, value in filtered_data.items()})
+            kwargs = {
+                key: _from_value(value, f"{path}.{key}") for key, value in filtered_data.items()
+            }
+            validate_target_arguments(config_cls, (), kwargs, full_key=path)
+            return config_cls(**kwargs)
 
-        def _from_value(value):
+        def _from_value(value, path):
             if isinstance(value, dict):
                 if "_target_" in value:
+                    from megatron.training.config.instantiate_utils import _resolve_target
+
+                    _resolve_target(value["_target_"], full_key=path, check_callable=False)
                     if (
                         value.get("_call_", True) is False
                         or value.get("_partial_", False)
@@ -151,13 +163,15 @@ class ModelConfig:
                         from megatron.training.config.instantiate_utils import instantiate
 
                         return instantiate(value)
-                    return _from_dict(value)
-                return {key: _from_value(item) for key, item in value.items()}
+                    return _from_dict(value, path)
+                return {key: _from_value(item, f"{path}.{key}") for key, item in value.items()}
             if isinstance(value, (list, tuple)):
-                return type(value)(_from_value(item) for item in value)
+                return type(value)(
+                    _from_value(item, f"{path}[{index}]") for index, item in enumerate(value)
+                )
             return value
 
-        result = _from_dict(data)
+        result = _from_dict(data, "model")
         result.builder = data["_builder_"]
 
         return result

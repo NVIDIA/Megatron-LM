@@ -394,9 +394,11 @@ def test_hybrid_model_spec_round_trip(spec_name, yaml_roundtrip, customized):
     from megatron.core.models.hybrid import hybrid_layer_specs
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear
     from megatron.core.transformer.spec_utils import ModuleSpec
+    from megatron.training.config.instantiate_utils import target_allowlist
     from megatron.training.config.yaml_utils import safe_yaml_representers
     from megatron.training.models import HybridModelConfig, ModelConfig
 
+    target_allowlist.enable()
     spec = deepcopy(getattr(hybrid_layer_specs, spec_name))
     if customized:
         # Old YAML conversion dropped these fields and could select the default spec.
@@ -422,3 +424,58 @@ def test_hybrid_model_spec_round_trip(spec_name, yaml_roundtrip, customized):
         restored.hybrid_stack_spec.submodules.mlp_layer.submodules.mlp.keywords['submodules']
         == spec.submodules.mlp_layer.submodules.mlp.keywords['submodules']
     )
+
+    original_experts = spec.submodules.moe_layer.submodules.mlp.keywords[
+        "submodules"
+    ].shared_experts
+    restored_experts = restored.hybrid_stack_spec.submodules.moe_layer.submodules.mlp.keywords[
+        "submodules"
+    ].shared_experts
+    assert restored_experts.func is original_experts.func
+    assert restored_experts.keywords == original_experts.keywords
+    if spec.submodules.csa_layer is not None:
+        assert (
+            restored.hybrid_stack_spec.submodules.csa_layer.submodules.self_attention.submodules.linear_o_group_proj
+            is spec.submodules.csa_layer.submodules.self_attention.submodules.linear_o_group_proj
+        )
+
+
+@pytest.mark.parametrize("initializer", [None, torch.nn.init.xavier_uniform_])
+def test_gpt_initializer_round_trip(tmp_path, initializer):
+    import yaml
+
+    from megatron.training.config.instantiate_utils import instantiate, target_allowlist
+    from megatron.training.config.yaml_utils import safe_yaml_representers
+    from megatron.training.models import GPTModelConfig
+    from megatron.training.utils.checkpoint_utils import read_run_config
+
+    target_allowlist.enable()
+    config = GPTModelConfig(
+        transformer=TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            init_method=initializer,
+            output_layer_init_method=initializer,
+        ),
+        seq_length=16,
+        vocab_size=128,
+    )
+    serialized = config.as_dict()
+    path = tmp_path / "run_config.yaml"
+    with safe_yaml_representers():
+        path.write_text(yaml.safe_dump({"model": serialized}))
+    for restored in (
+        ModelConfig.from_dict(serialized),
+        instantiate(serialized),
+        ModelConfig.from_dict(read_run_config(str(path))["model"]),
+    ):
+        for field_name in ("init_method", "output_layer_init_method", "embedding_init_method"):
+            original = getattr(config.transformer, field_name)
+            actual = getattr(restored.transformer, field_name)
+            if initializer is None:
+                assert actual.func is original.func is torch.nn.init.normal_
+                assert actual.args == original.args
+                assert actual.keywords == original.keywords
+            else:
+                assert actual is original is initializer
