@@ -25,6 +25,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.training.training import wrap_model_chunks_with_ddp
+from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -53,56 +54,50 @@ def _compute_config() -> TransformerConfig:
     return TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1)
 
 
-class TestMfsdpV2PipelineSharedContext:
-    """MFSDP v2 virtual-pipeline chunks share a single FSDP context."""
+@pytest.fixture
+def process_group_collection(distributed_setup):
+    """Reset model-parallel state before distributed_setup tears down the groups."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    yield ProcessGroupCollection.use_mpu_process_groups()
+    destroy_model_parallel()
 
-    def setup_method(self):
-        """Initialize the single-stage process groups the wrapping call needs."""
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
-        )
-        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
-    def teardown_method(self):
-        """Destroy the process groups initialized in ``setup_method``."""
-        Utils.destroy_model_parallel()
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices.")
+def test_shared_context_across_virtual_pipeline_chunks(distributed_setup, process_group_collection):
+    """Multiple virtual-pipeline chunks wrapped in one call share one FsdpContext."""
+    device = distributed_setup.device
 
-    @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices.")
-    def test_shared_context_across_virtual_pipeline_chunks(self, distributed_setup):
-        """Multiple virtual-pipeline chunks wrapped in one call share one FsdpContext."""
-        device = distributed_setup.device
+    # virtual_pipeline_model_parallel_size > 1 yields multiple chunks on this
+    # rank; model two virtual-pipeline sub-stages here. The ambient
+    # fully_shard_context is opened for every MFSDP v2 wrap, regardless of the
+    # chunk count.
+    chunks = [_VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)]
 
-        # virtual_pipeline_model_parallel_size > 1 yields multiple chunks on this
-        # rank; model two virtual-pipeline sub-stages here. The ambient
-        # fully_shard_context is opened for every MFSDP v2 wrap, regardless of the
-        # chunk count.
-        chunks = [_VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)]
+    wrapped_chunks = wrap_model_chunks_with_ddp(
+        chunks,
+        _compute_config(),
+        _mfsdp_v2_ddp_config(),
+        DP=FullyShardedDataParallel,
+        pg_collection=process_group_collection,
+        disable_bucketing_per_chunk=[False] * len(chunks),
+    )
 
-        wrapped_chunks = wrap_model_chunks_with_ddp(
-            chunks,
-            _compute_config(),
-            _mfsdp_v2_ddp_config(),
-            DP=FullyShardedDataParallel,
-            pg_collection=self.pg_collection,
-            disable_bucketing_per_chunk=[False] * len(chunks),
-        )
+    # Every chunk is an MFSDP v2 wrapper whose root is an FsdpModule.
+    assert len(wrapped_chunks) == len(chunks)
+    for wrapped_chunk in wrapped_chunks:
+        assert isinstance(wrapped_chunk, FullyShardedDataParallelV2)
+        assert isinstance(wrapped_chunk.module, FsdpModule)
 
-        # Every chunk is an MFSDP v2 wrapper whose root is an FsdpModule.
-        assert len(wrapped_chunks) == len(chunks)
-        for wrapped_chunk in wrapped_chunks:
-            assert isinstance(wrapped_chunk, FullyShardedDataParallelV2)
-            assert isinstance(wrapped_chunk.module, FsdpModule)
+    # The whole point of the feature: all chunks share ONE context, so each chunk
+    # must report the same context object as the first one.
+    first_context = wrapped_chunks[0].module.context
+    for wrapped_chunk in wrapped_chunks:
+        assert wrapped_chunk.module.context is first_context
 
-        # The whole point of the feature: all chunks share ONE context, so each chunk
-        # must report the same context object as the first one.
-        first_context = wrapped_chunks[0].module.context
-        for wrapped_chunk in wrapped_chunks:
-            assert wrapped_chunk.module.context is first_context
+    # The shared context was finalized exactly once after the loop, so it is
+    # ready to drive forward/backward without an extra finalize.
+    first_context.ensure_finalized()
 
-        # The shared context was finalized exactly once after the loop, so it is
-        # ready to drive forward/backward without an extra finalize.
-        first_context.ensure_finalized()
-
-        # The helper left no ambient context behind: the chunks joined its scope and
-        # that scope, which owned the only finalize call, has since exited.
-        assert current_fully_shard_context() is None
+    # The helper left no ambient context behind: the chunks joined its scope and
+    # that scope, which owned the only finalize call, has since exited.
+    assert current_fully_shard_context() is None
