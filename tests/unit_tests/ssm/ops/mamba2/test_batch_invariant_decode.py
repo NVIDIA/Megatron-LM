@@ -20,6 +20,17 @@ try:
 except ImportError:
     HAVE_BATCH_INVARIANT_DECODE = False
 
+try:
+    # The prep kernel test needs Triton, not mamba_ssm.
+    from megatron.core.ssm.ops.mamba2.batch_invariant_decode import (
+        BatchInvariantDecodeBuffers,
+        _decode_step_prep_kernel,
+    )
+
+    HAVE_DECODE_STEP_PREP = True
+except ImportError:
+    HAVE_DECODE_STEP_PREP = False
+
 
 def _full_scan(x, dt, A, B, C, D, dt_bias, chunk_size, initial_states=None):
     """Reference: a single `mamba_chunk_scan_combined` over the whole sequence."""
@@ -1169,6 +1180,107 @@ class TestBatchInvariantDecodeRowKernels(unittest.TestCase):
                 self.assertTrue(
                     torch.equal(_bits(out_tile[:, i, 0]), _bits(y_full[0, plen:])),
                     f"slot {slots[i]}: decode differs from the training scan",
+                )
+
+
+@unittest.skipIf(not HAVE_DECODE_STEP_PREP, "batch_invariant_decode unavailable")
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+class TestDecodeStepPrepKernel(unittest.TestCase):
+    """The decode-step prep kernel alone, launched many times (CUDA and Triton only)."""
+
+    ENTRIES = 65536
+    CHUNK_SIZE = 4
+
+    def _wrong_rows(self, nheads, dstate, chunks):
+        """Buffer ``chunks`` whole chunks for every entry; count wrong (slot, row) pairs per buffer.
+
+        Launch i buffers the constant i % 251 + 1, so after each whole chunk every row of every
+        slot must hold its own launch's constant in every element; a row with stale elements
+        holds the constant of one chunk earlier.
+        """
+        device, dtype = torch.device("cuda"), torch.bfloat16
+        entries, chunk_size, headdim, ngroups = self.ENTRIES, self.CHUNK_SIZE, 64, 1
+        x_size, bc_size = nheads * headdim, ngroups * dstate
+        buffers = BatchInvariantDecodeBuffers.allocate(
+            entries, chunk_size, nheads, headdim, ngroups, dstate, device, dtype
+        )
+        generator = torch.Generator().manual_seed(11)
+        slots = torch.randperm(entries, generator=generator).to(torch.int32).to(device)
+        # One constant row per entry; dt, B and C read prefixes of it through their row strides.
+        token = torch.empty((entries, x_size), dtype=dtype, device=device)
+        x_rows, dt_rows, bc_rows = token, token[:, :nheads], token[:, :bc_size]
+        replay = (("x", buffers.x), ("dt", buffers.dt), ("B", buffers.B), ("C", buffers.C))
+        wrong = {name: torch.zeros((), dtype=torch.int64, device=device) for name, _ in replay}
+        wrong["bookkeeping"] = torch.zeros((), dtype=torch.int64, device=device)
+        rows = torch.arange(chunk_size, device=device)
+        buffers.out.fill_(1.0)  # every launch zeroes it
+
+        for launch in range(chunks * chunk_size):
+            row = launch % chunk_size
+            token.fill_(launch % 251 + 1)
+            _decode_step_prep_kernel[(entries,)](
+                slots,
+                buffers.num_buffered,
+                x_rows,
+                dt_rows,
+                bc_rows,
+                bc_rows,
+                buffers.x,
+                buffers.dt,
+                buffers.B,
+                buffers.C,
+                buffers.out,
+                buffers.target_rows,
+                buffers.chunk_flags,
+                buffers.chunk_starts,
+                x_rows.stride(0),
+                dt_rows.stride(0),
+                bc_rows.stride(0),
+                bc_rows.stride(0),
+                X_SIZE=x_size,
+                DT_SIZE=nheads,
+                BC_SIZE=bc_size,
+                OUT_SIZE=x_size,
+                CHUNK_SIZE=chunk_size,
+                BLOCK_SIZE=1024,
+            )
+            wrong["bookkeeping"] += (
+                (buffers.target_rows != row).sum()
+                + (buffers.chunk_flags != int(row == chunk_size - 1)).sum()
+                + (buffers.chunk_starts != slots * chunk_size).sum()
+                + (buffers.num_buffered != (row + 1) % chunk_size).sum()
+            )
+            if row == chunk_size - 1:
+                first = launch - row
+                expected = ((first + rows) % 251 + 1).to(dtype).view(1, chunk_size, 1)
+                for name, buffer in replay:
+                    wrong[name] += (buffer.flatten(2) != expected).any(dim=2).sum()
+
+        wrong["bookkeeping"] += (buffers.out != 0).sum()
+        return {name: int(count) for name, count in wrong.items()}
+
+    def test_every_token_row_lands_in_the_row_num_buffered_named(self):
+        """Each launch must buffer the whole token in the row its slot's cursor named.
+
+        The kernel reads num_buffered[slot] in every thread of a program and one thread stores
+        the advanced value at the end. The threads of a Triton program are not synchronized, so
+        without the barrier before that store a thread that got to the read late saw the
+        advanced cursor and copied its elements into the next buffer row (row 0 after a
+        crossing), leaving its part of the right row stale. It needs a row wider than the 256
+        BF16 elements one warp owns, and how often it happens depends on the GPU and the row
+        width. With 65536 entries per launch, GB300 misplaced a warp's 256 elements of a
+        512-element x row about once in 2.2 million programs (22,668 rows in 50 billion); H100
+        did so in a 1024-element row about once in 27 million (139 in 3.8 billion) and never
+        in a 512-element row (none in 5.3 billion). Both widths run here.
+        """
+        for nheads, dstate, chunks in ((8, 64, 512), (16, 128, 1152)):
+            with self.subTest(x_size=nheads * 64):
+                counts = self._wrong_rows(nheads, dstate, chunks)
+                programs = chunks * self.CHUNK_SIZE * self.ENTRIES
+                self.assertEqual(
+                    sum(counts.values()),
+                    0,
+                    f"wrong (slot, row) pairs per buffer in {programs} programs: {counts}",
                 )
 
 
