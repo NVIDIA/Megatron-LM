@@ -35,6 +35,7 @@ from megatron.core.tensor_parallel.layers import (
     VocabParallelEmbedding,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
@@ -44,6 +45,9 @@ from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     deterministic_algorithms,
     seeded,
+)
+from tests.unit_tests.determinism.kernels.softmax_offset import (
+    assert_softmax_offset_clipping_replays,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -67,6 +71,11 @@ def _config(**overrides):
     )
     kwargs.update(overrides)
     return TransformerConfig(**kwargs)
+
+
+def test_learnable_softmax_offset_clipping_replays():
+    """Every local-attention head shard contributes to repeatable TP norm/clipping."""
+    assert_softmax_offset_clipping_replays(DotProductAttention)
 
 
 class TestTensorParallelLayers:
@@ -303,7 +312,8 @@ class TestTensorParallelLayers:
     @pytest.mark.skipif(
         te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
     )
-    def test_column_parallel_linear_fp32_output_replays(self):
+    @pytest.mark.parametrize("bias", [False, True])
+    def test_column_parallel_linear_fp32_output_replays(self, bias):
         """Replay the mixed-output GEMM used by FP32 language-model logits."""
         seeded()
         config = _config(hidden_size=512, num_attention_heads=8)
@@ -312,13 +322,20 @@ class TestTensorParallelLayers:
             1024,
             config=config,
             init_method=init_method_normal(0.02),
-            bias=False,
+            bias=bias,
             output_dtype=torch.float32,
         ).cuda()
+        if bias:
+            # The bias is zero-initialized; give the GEMM epilogue values to add.
+            torch.nn.init.normal_(module.bias, std=0.02)
         x = torch.randn(2048, 2, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
         outputs, _ = assert_module_replays_bit_exact(
-            module, (x,), replays=3, contention=True, what="column linear[bf16 input, fp32 output]"
+            module,
+            (x,),
+            replays=3,
+            contention=True,
+            what=f"column linear[bf16 input, fp32 output, bias={bias}]",
         )
         assert outputs["out[0]"].dtype is torch.float32
 
