@@ -20,6 +20,44 @@ def _make_context(temperature, top_k, top_p, *, paused_request_count=0):
     )
 
 
+class TestFilterLogitsPrecision:
+    """Regression tests for issue #7857: temperature scaling must run in fp32.
+
+    Scaling in the logits dtype rounds every scaled logit before the fp32
+    softmax, which can change top-p membership; fp16 division by the
+    temperature floor can also overflow to inf.
+    """
+
+    def test_bf16_scaling_keeps_top_p_membership(self):
+        logits = torch.tensor([[26.625, 26.375]], dtype=torch.bfloat16)
+        filtered = TorchSampling.filter_logits(logits, temperature=0.1, top_k=0, top_p=0.9)
+        expected = TorchSampling.filter_logits(logits.float(), temperature=0.1, top_k=0, top_p=0.9)
+        assert filtered.dtype == torch.float32
+        torch.testing.assert_close(filtered, expected)
+        # In bf16 the scaled logits round to [266, 264], whose fp32 softmax leaves
+        # the runner-up inside the 0.9 nucleus. In fp32 it falls outside.
+        assert filtered[0, 1] == float("-inf")
+
+    @pytest.mark.parametrize("top_k,top_p", [(0, 0.9), (1, 0.0)])
+    def test_fp16_greedy_temperature_stays_finite(self, top_k, top_p):
+        logits = torch.tensor([[26.625, 26.375]], dtype=torch.float16)
+        filtered = TorchSampling.filter_logits(logits, temperature=0.0, top_k=top_k, top_p=top_p)
+        kept = filtered[filtered != float("-inf")]
+        assert torch.isfinite(kept).all()
+        assert filtered.argmax(dim=-1).item() == 0
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("temperature", [1.0, 0.7, 0.1, 0.0])
+    def test_matches_float32_reference(self, dtype, temperature):
+        torch.manual_seed(0)
+        logits = torch.randn(3, 64, dtype=dtype)
+        for top_k, top_p in ((0, 0.9), (8, 0.0)):
+            actual = TorchSampling.filter_logits(logits, temperature, top_k, top_p)
+            expected = TorchSampling.filter_logits(logits.float(), temperature, top_k, top_p)
+            assert actual.dtype == torch.float32
+            torch.testing.assert_close(actual, expected)
+
+
 class TestLogProbsKernelDtype:
     """Regression test for the fp32 log-probs precision fix.
 
