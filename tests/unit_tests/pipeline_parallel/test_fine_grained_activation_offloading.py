@@ -42,6 +42,537 @@ EPSILON_A2A = 0.35
 DELTA = 20  # MiB
 
 
+@pytest.mark.parametrize("aux_requires_grad", [False, True])
+def test_checkpoint_hooks_capture_only_hidden_states(monkeypatch, aux_requires_grad):
+    """Auxiliary layer inputs bypass the group and retain their gradients."""
+    from megatron.core.extensions import transformer_engine as te_ext
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as offload
+
+    monkeypatch.setattr(te_ext, "cpu_offload", None)
+    hidden = torch.randn(4, requires_grad=True)
+    auxiliary = torch.randn(4, requires_grad=aux_requires_grad)
+    captured = []
+
+    class Handler:
+        do_offload = True
+
+        def tensor_push(self, tensor):
+            captured.append(tensor)
+            return (1, 0)
+
+        def tensor_pop(self, tag):
+            assert tag == (1, 0)
+            return hidden.detach().clone()
+
+    handler = Handler()
+    manager = offload.PipelineOffloadManager.__new__(offload.PipelineOffloadManager)
+    manager._cur_forward_chunk = handler
+    manager._cur_backward_chunk = handler
+    manager.inside_context = False
+    manager._offload_context = None
+
+    class CheckpointInputs(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, hidden, auxiliary):
+            ctx.save_for_backward(hidden, auxiliary)
+            return hidden * auxiliary
+
+        @staticmethod
+        def backward(ctx, grad):
+            hidden, auxiliary = ctx.saved_tensors
+            return grad * auxiliary, grad * hidden
+
+    manager.__enter__("layer_input", layer_input=hidden)
+    try:
+        result = CheckpointInputs.apply(hidden, auxiliary)
+    finally:
+        manager.__exit__(None, None, None)
+    result.sum().backward()
+    assert len(captured) == 1 and captured[0] is hidden
+    torch.testing.assert_close(hidden.grad, auxiliary)
+    if aux_requires_grad:
+        torch.testing.assert_close(auxiliary.grad, hidden)
+    assert not manager.inside_context
+    assert manager._offload_context is None
+
+
+@pytest.mark.parametrize("previous_enabled", [False, True])
+def test_offload_context_restores_te_flag_on_exception(monkeypatch, previous_enabled):
+    """Checkpoint scopes leave TE state untouched; module scopes restore it on exit."""
+    from megatron.core.extensions import transformer_engine as te_ext
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as offload
+
+    class TEOffload:
+        CPUOffloadEnabled = previous_enabled
+
+    class Handler:
+        do_offload = True
+
+    monkeypatch.setattr(te_ext, "cpu_offload", TEOffload)
+    manager = offload.PipelineOffloadManager.__new__(offload.PipelineOffloadManager)
+    manager._cur_forward_chunk = Handler()
+    manager.inside_context = False
+    manager._offload_context = None
+    manager._saved_tensors_hooks = torch.autograd.graph.saved_tensors_hooks(
+        lambda x: x, lambda x: x
+    )
+
+    # Checkpoint-input scope must not touch TE's operator-level CPU-offload flag.
+    manager.__enter__("layer_input", layer_input=torch.ones(4))
+    assert TEOffload.CPUOffloadEnabled == previous_enabled
+    manager.__exit__(RuntimeError, RuntimeError("scope failed"), None)
+    assert TEOffload.CPUOffloadEnabled == previous_enabled
+
+    manager.__enter__("core_attn")
+    assert TEOffload.CPUOffloadEnabled
+    manager.__exit__(RuntimeError, RuntimeError("scope failed"), None)
+    assert TEOffload.CPUOffloadEnabled == previous_enabled
+    assert not manager.inside_context
+    assert manager._offload_context is None
+
+
+def test_offload_scopes_reject_nesting_before_group_start(monkeypatch):
+    """Nested interface entry fails before group mutation and preserves the outer scope."""
+    from megatron.core.extensions import transformer_engine as te_ext
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as offload
+
+    class TEOffload:
+        CPUOffloadEnabled = False
+
+    class Handler:
+        do_offload = True
+
+    monkeypatch.setattr(te_ext, "cpu_offload", TEOffload)
+    manager = offload.PipelineOffloadManager.__new__(offload.PipelineOffloadManager)
+    manager._cur_forward_chunk = Handler()
+    manager.inside_context = False
+    manager._offload_context = None
+    manager._saved_tensors_hooks = torch.autograd.graph.saved_tensors_hooks(
+        lambda x: x, lambda x: x
+    )
+    monkeypatch.setattr(offload.PipelineOffloadManager, "get_instance", lambda: manager)
+    group_starts = []
+    monkeypatch.setattr(
+        offload,
+        "fine_grained_offloading_group_start",
+        lambda tensor, name: (group_starts.append(name), tensor)[1],
+    )
+
+    hidden = torch.ones(4)
+    with offload.FineGrainedActivationOffloadingInterface(True, hidden, "core_attn"):
+        outer_context = manager._offload_context
+        with pytest.raises(RuntimeError, match="Nested activation offload scopes"):
+            offload.FineGrainedActivationOffloadingInterface(
+                True, hidden, "layer_input"
+            ).__enter__()
+        with pytest.raises(RuntimeError, match="Nested activation offload scopes"):
+            manager.__enter__("layer_input", layer_input=hidden)
+        assert manager._offload_context is outer_context
+        assert manager.inside_context
+        assert TEOffload.CPUOffloadEnabled
+        assert group_starts == ["core_attn"]
+
+    assert manager._offload_context is None
+    assert not manager.inside_context
+    assert not TEOffload.CPUOffloadEnabled
+
+
+def test_layer_input_offload_rejects_module_offload():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            fine_grained_activation_offloading=True,
+            offload_modules=["layer_input", "qkv_linear"],
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+        )
+
+
+def test_layer_input_offload_requires_full_recompute():
+    with pytest.raises(ValueError, match="requires full"):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            fine_grained_activation_offloading=True,
+            offload_modules=["layer_input"],
+        )
+
+
+def test_backward_waits_only_for_exact_reloading_group(monkeypatch):
+    """Resident layer2 must not consume the event for the same-named layer1."""
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as offload
+
+    waits = []
+
+    class Group:
+        def __init__(self, layer):
+            self._name = "layer_input"
+            self.layer = layer
+
+        def wait_reload_event(self, stream):
+            waits.append((self.layer, stream))
+
+    layer1, layer2, layer3 = (Group(i) for i in (1, 2, 3))
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler.do_offload = True
+    handler._reloading_group = []
+    manager = offload.PipelineOffloadManager.__new__(offload.PipelineOffloadManager)
+    manager._cur_backward_chunk = handler
+    monkeypatch.setattr(offload.PipelineOffloadManager, "get_instance", lambda: manager)
+    monkeypatch.setattr(offload, "is_graph_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: "compute-stream")
+
+    handler.on_group_commit_backward("layer_input", layer3)
+    handler._reloading_group.append(layer1)  # H2D queued after layer3 backward.
+    handler.on_group_commit_backward("layer_input", layer2)
+    assert waits == []
+    assert handler._reloading_group == [layer1]
+    handler.on_group_commit_backward("layer_input", layer1)
+    assert waits == [(1, "compute-stream")]
+    assert handler._reloading_group == []
+    handler.on_group_commit_backward("layer_input", layer1)
+    assert len(waits) == 1
+
+
+@pytest.mark.parametrize("delayed", [False, True])
+def test_commit_records_consumed_group_for_backward(monkeypatch, delayed):
+    """Commit contexts retain identity even if another same-named commit runs."""
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as offload
+
+    class Handler:
+        def __init__(self):
+            self.pending = [object(), object()]
+            self.seen = []
+
+        def on_group_commit_forward(self, name, tensors):
+            return self.pending.pop(0)
+
+        def on_group_commit_backward(self, name, group):
+            self.seen.append(group)
+
+    class Context:
+        pass
+
+    handler = Handler()
+    expected = list(handler.pending)
+    manager = offload.PipelineOffloadManager.__new__(offload.PipelineOffloadManager)
+    manager.defer_group_commits = delayed
+    manager._delayed_offload_groups = []
+    monkeypatch.setattr(offload.PipelineOffloadManager, "get_instance", lambda: manager)
+    contexts = [Context(), Context()]
+    for ctx in contexts:
+        result = offload.FineGrainedOffloadingGroupCommitFunction.forward(
+            ctx, "tensor", handler, "layer_input", [], delayed
+        )
+        assert result == "tensor"
+    if delayed:
+        assert all(ctx.group is None for ctx in contexts)
+        manager.flush_delayed_groups()
+    assert all(ctx.group is group for ctx, group in zip(contexts, expected))
+    for ctx in reversed(contexts):
+        grads = offload.FineGrainedOffloadingGroupCommitFunction.backward(ctx, "gradient")
+        assert grads == ("gradient", None, None, None, None)
+    assert handler.seen == list(reversed(expected))
+
+
+def test_resident_checkpoint_segment_does_not_finish_chunk_early():
+    """Empty transfer queues do not imply the last cached segment was reached."""
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler.offload_groups = [SimpleNamespace(_name="layer_input") for _ in range(2)]
+    handler._groups_to_offload = []
+    handler._groups_to_reload = []
+    handler._max_group_size = 2
+    handler._offloaded_group_index = 1
+    assert not handler.finish_all_groups("layer_input")
+    handler._offloaded_group_index = 2
+    assert handler.finish_all_groups("layer_input")
+
+
+@pytest.mark.parametrize("non_blocking", [False, True])
+def test_reload_cpu_buffer_reuse_waits_for_copy(monkeypatch, non_blocking):
+    """Pending H2D sources stay checked out; completed sources become reusable."""
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as offload
+
+    class CopyEvent:
+        def __init__(self):
+            self.complete = False
+            self.stream = None
+
+        def record(self, stream):
+            self.stream = stream
+
+        def query(self):
+            return self.complete
+
+    manager = offload.PipelineOffloadManager.__new__(offload.PipelineOffloadManager)
+    manager._pending_cpu_pool_frees = []
+    manager._pending_pipeline_storage_releases = []
+    monkeypatch.setattr(offload.PipelineOffloadManager, "get_instance", lambda: manager)
+    monkeypatch.setattr(torch.cuda, "Event", CopyEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: "copy-stream")
+    # Exercise the real reload and pool code on CPU, with deterministic completion
+    # events standing in for the asynchronously executing CUDA transfer.
+    monkeypatch.setattr(torch.Tensor, "is_pinned", lambda self: True)
+    pool = offload.OffloadTensorPool(device="cpu")
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler.cpu_tensor_pool = pool
+    source = pool.allocate((16,), dtype=torch.float32)
+    source.fill_(3)
+    state = (torch.device("cpu"), source, True, None)
+
+    recovered = handler.reload(state, non_blocking=non_blocking)
+    torch.testing.assert_close(recovered, torch.full_like(source, 3))
+    deferred = non_blocking
+    assert len(manager._pending_cpu_pool_frees) == int(deferred)
+    if deferred:
+        event, pending_pool, pending_source = manager._pending_cpu_pool_frees[0]
+        assert event.stream == "copy-stream"
+        assert pending_pool is pool and pending_source is source
+        manager.release_completed_pipeline_storages()
+        assert len(manager._pending_cpu_pool_frees) == 1
+        other = pool.allocate(source.shape, source.dtype)
+        assert other is not source
+        event.complete = True
+        manager.release_completed_pipeline_storages()
+        assert not manager._pending_cpu_pool_frees
+        assert pool.allocate(source.shape, source.dtype) is source
+        manager.release_completed_pipeline_storages()
+    else:
+        assert pool.allocate(source.shape, source.dtype) is source
+
+
+def test_reset_preserves_pending_h2d_sources(monkeypatch):
+    """An iteration reset cannot return an in-flight H2D source to the pool."""
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as offload
+
+    class CopyEvent:
+        complete = False
+
+        def query(self):
+            return self.complete
+
+    manager = offload.PipelineOffloadManager.__new__(offload.PipelineOffloadManager)
+    pool = offload.OffloadTensorPool(device="cpu")
+    manager._cpu_tensor_pool = pool
+    manager._pending_cpu_pool_frees = []
+    manager._pending_pipeline_storage_releases = []
+    manager._cached_chunks_forward = []
+    manager._is_warmup = False
+    source = pool.allocate((16,))
+    event = CopyEvent()
+    manager.defer_cpu_pool_free(event, pool, source)
+    manager.reset()
+    assert len(manager._pending_cpu_pool_frees) == 1
+    assert pool.allocate((16,)) is not source
+    event.complete = True
+    manager.release_completed_pipeline_storages()
+    assert pool.allocate((16,)) is source
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.parametrize(
+    "recompute_method, recompute_num_layers, precision",
+    [("uniform", 2, "bf16"), ("block", 2, "bf16"), ("uniform", 2, "fp8"), ("uniform", 2, "fp4")],
+)
+def test_gpt_layer_input_offloading_correctness(
+    monkeypatch, recompute_method, recompute_num_layers, precision
+):
+    """Compare real pipeline forward/backward with and without layer-input offload."""
+    from megatron.core import parallel_state
+    from megatron.core.pipeline_parallel import fine_grained_activation_offload as offload
+    from megatron.core.pipeline_parallel import get_forward_backward_func
+
+    pipeline_size = 4
+    if Utils.world_size < pipeline_size or Utils.world_size % pipeline_size:
+        pytest.skip("Requires a distributed world size divisible by four (PP=4, TP=1).")
+    if precision != "bf16":
+        te_fp8 = pytest.importorskip("transformer_engine.pytorch.fp8")
+        check_support = getattr(
+            te_fp8, "check_fp8_support" if precision == "fp8" else "check_nvfp4_support", None
+        )
+        if check_support is None:
+            pytest.skip(f"Installed Transformer Engine does not expose {precision} support checks.")
+        supported, reason = check_support()
+        if not supported:
+            pytest.skip(reason)
+
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=pipeline_size
+    )
+    seed, seq_length, micro_batch_size, num_microbatches = 123, 64, 2, 8
+    model = None
+    off_interface.reset_instance()
+    offloaded_bytes = []
+    released_storages = []
+    original_offload = offload.ChunkOffloadHandler.bulk_offload_group
+    original_release = offload.PipelineOffloadManager.defer_pipeline_storage_release
+
+    def record_offload(handler, group, *args, **kwargs):
+        original_offload(handler, group, *args, **kwargs)
+        if group._name == "layer_input":
+            # Inspect the actual post-D2H state, not just configured group names.
+            for state in group._tensors.values():
+                if isinstance(state, tuple):
+                    cpu_backup = state[1]
+                else:
+                    continue
+                assert cpu_backup.device.type == "cpu" and cpu_backup.is_pinned()
+                offloaded_bytes.append(cpu_backup.numel() * cpu_backup.element_size())
+
+    def record_release(manager, event, tensor):
+        # Keep the storage handle so its size can be checked after deferred release.
+        released_storages.append(tensor.untyped_storage())
+        original_release(manager, event, tensor)
+
+    monkeypatch.setattr(offload.ChunkOffloadHandler, "bulk_offload_group", record_offload)
+    monkeypatch.setattr(
+        offload.PipelineOffloadManager, "defer_pipeline_storage_release", record_release
+    )
+
+    def build_model(enable_offload):
+        model_parallel_cuda_manual_seed(seed)
+        torch.manual_seed(seed)
+        config = TransformerConfig(
+            num_layers=16,
+            hidden_size=128,
+            num_attention_heads=4,
+            pipeline_model_parallel_size=pipeline_size,
+            pipeline_dtype=torch.bfloat16,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            use_cpu_initialization=True,
+            attention_backend=AttnBackend.unfused,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            recompute_granularity="full",
+            recompute_method=recompute_method,
+            recompute_num_layers=recompute_num_layers,
+            recompute_modules=[],
+            fp8="e4m3" if precision == "fp8" else None,
+            fp4="e2m1" if precision == "fp4" else None,
+            fine_grained_activation_offloading=enable_offload,
+            offload_modules=["layer_input"] if enable_offload else [],
+            min_offloaded_tensor_size=0,
+        )
+        return (
+            GPTModel(
+                config=config,
+                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+                vocab_size=128,
+                max_sequence_length=seq_length,
+                pre_process=parallel_state.is_pipeline_first_stage(),
+                post_process=parallel_state.is_pipeline_last_stage(),
+                position_embedding_type="rope",
+                share_embeddings_and_output_weights=False,
+            )
+            .bfloat16()
+            .cuda()
+            .train()
+        )
+
+    def run_iteration(model, iteration):
+        model.zero_grad(set_to_none=True)
+        model_parallel_cuda_manual_seed(seed + iteration)
+        torch.manual_seed(seed + iteration)
+        outputs = []
+
+        def forward_step(data_iterator, stage_model):
+            microbatch = next(data_iterator)
+            positions = torch.arange(seq_length, device="cuda").expand(micro_batch_size, -1)
+            tokens = (positions + microbatch + iteration) % 128
+            mask = torch.ones((1, 1, seq_length, seq_length), device="cuda", dtype=torch.bool).triu(
+                1
+            )
+            output = stage_model(tokens, positions, mask)
+
+            def loss_func(logits):
+                outputs.append(logits.detach().float().cpu().clone())
+                loss = logits.float().square().mean()
+                return loss, {"loss": loss.detach()}
+
+            return output, loss_func
+
+        get_forward_backward_func()(
+            forward_step_func=forward_step,
+            data_iterator=iter(range(num_microbatches)),
+            model=[model],
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            forward_only=False,
+        )
+        torch.cuda.synchronize()
+        grads = {
+            name: param.grad.detach().float().cpu().clone() if param.grad is not None else None
+            for name, param in model.named_parameters()
+        }
+        assert any(grad is not None and torch.count_nonzero(grad) > 0 for grad in grads.values())
+        return outputs, grads
+
+    try:
+        model = build_model(False)
+        initial_params = _capture_params(model)
+        # Two iterations cover both initial warmup and cached offload scheduling.
+        baseline = [run_iteration(model, iteration) for iteration in range(2)]
+        del model
+        model = None
+        _reset_cuda_memory()
+        model = build_model(True)
+        _restore_params(model, initial_params)
+        pp_rank = model.pg_collection.pp.rank()
+        for iteration, (base_outputs, base_grads) in enumerate(baseline):
+            offloaded_bytes.clear()
+            released_storages.clear()
+            outputs, grads = run_iteration(model, iteration)
+            manager = offload.PipelineOffloadManager.get_instance()
+            manager.release_completed_pipeline_storages()
+            assert not manager._pending_cpu_pool_frees
+            assert not manager._pending_pipeline_storage_releases
+            assert (
+                len(outputs)
+                == len(base_outputs)
+                == (num_microbatches if pp_rank == pipeline_size - 1 else 0)
+            )
+            for actual, expected in zip(outputs, base_outputs):
+                torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-3)
+            assert grads.keys() == base_grads.keys()
+            for name, expected in base_grads.items():
+                actual = grads[name]
+                if actual is None or expected is None:
+                    assert actual is None and expected is None, f"Missing gradient: {name}"
+                else:
+                    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-6, msg=name)
+            if pp_rank == pipeline_size - 1:
+                assert not offloaded_bytes  # This stage deliberately skips layer_input.
+            else:
+                assert sum(offloaded_bytes) > 0, "Test did not actually offload layer inputs"
+                groups = manager._cached_chunks_forward[0].offload_groups
+                expected_groups = (
+                    4 // recompute_num_layers
+                    if recompute_method == "uniform"
+                    else recompute_num_layers
+                )
+                assert len(groups) == expected_groups
+                assert all(
+                    group._name == "layer_input" and group.total_tensor_count == 1
+                    for group in groups
+                )
+                if pp_rank > 0:
+                    assert (
+                        released_storages
+                    ), "Shared pipeline-input storage release was not exercised"
+                    assert all(storage.nbytes() == 0 for storage in released_storages)
+    finally:
+        del model
+        torch.cuda.synchronize()
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize("fraction", [0.0, 0.5, 0.7, 0.8, 1.0])
 def test_partial_offload_backward_does_not_accumulate_reloaded_groups(monkeypatch, fraction):
@@ -446,6 +977,7 @@ def test_chunk_offload_handler_offloads_base_storage_for_covering_views(capacity
     assert reloaded.shape == view.shape
     assert reloaded.stride() == view.stride()
     assert torch.equal(reloaded, view)
+    PipelineOffloadManager.get_instance().release_completed_pipeline_storages()
     # The pool backup was returned after the reload.
     assert handler.cpu_tensor_pool._stats["current_in_use"] == 0
 
@@ -458,6 +990,7 @@ def test_chunk_offload_handler_offloads_base_storage_for_covering_views(capacity
     reloaded_d = handler.reload(state_d)
     torch.cuda.synchronize()
     assert torch.equal(reloaded_d, detached)
+    PipelineOffloadManager.get_instance().release_completed_pipeline_storages()
     assert handler.cpu_tensor_pool._stats["current_in_use"] == 0
 
 
@@ -482,6 +1015,7 @@ def test_chunk_offload_handler_gathers_low_coverage_views(capacity_bytes, use_cp
     torch.cuda.synchronize()
     assert reloaded.is_contiguous()
     assert torch.equal(reloaded, view)
+    PipelineOffloadManager.get_instance().release_completed_pipeline_storages()
     status = handler.cpu_tensor_pool.get_pool_status()
     assert status["global_stats"]["current_in_use"] == 0
     if capacity_bytes:
