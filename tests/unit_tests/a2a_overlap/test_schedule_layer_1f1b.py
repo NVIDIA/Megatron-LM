@@ -13,10 +13,15 @@ from megatron.core.models.gpt import fine_grained_callables
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
     DummyState,
@@ -37,7 +42,16 @@ from tests.unit_tests.test_utilities import (
 )
 
 
-def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):
+class _NoAttention(IdentityOp):
+    """Self-attention for an MoE-only layer. The overlap path still calls its backward_dw."""
+
+    def backward_dw(self):
+        """No attention weights, so there is no delayed weight gradient to compute."""
+
+
+def run_transformer_layer_ref_with_capture(
+    model, input_tensors, iterations, packed_seq_params=None, padding_mask=None
+):
     """
     Runs the model in reference mode and captures outputs and gradients.
 
@@ -45,6 +59,8 @@ def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):
         model: The transformer model to run.
         input_tensors: List of input tensors for each iteration.
         iterations: Number of iterations to run the model.
+        packed_seq_params: Packed sequence parameters passed to every iteration.
+        padding_mask: Padding mask passed to every iteration.
 
     Returns:
         dict: A dictionary containing model outputs and parameter gradients.
@@ -52,7 +68,9 @@ def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):
     transformer_layer = model.decoder.layers[0]
     output_tensors = []
     for i in range(iterations):
-        output = transformer_layer(input_tensors[i].clone())[0]
+        output = transformer_layer(
+            input_tensors[i].clone(), packed_seq_params=packed_seq_params, padding_mask=padding_mask
+        )[0]
         output_tensors.append(output)
         output.backward(torch.ones_like(output))
 
@@ -63,7 +81,9 @@ def run_transformer_layer_ref_with_capture(model, input_tensors, iterations):
     return capture
 
 
-def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microbatches):
+def run_transformer_layer_a2a_overlap_with_capture(
+    model, input_tensors, microbatches, packed_seq_params=None, padding_mask=None
+):
     """
     Runs the model with all-to-all overlap optimization and captures outputs and gradients.
 
@@ -71,6 +91,8 @@ def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microba
         model: The transformer model to run.
         input_tensors: List of input tensors for each microbatch.
         microbatches: Number of microbatches to process.
+        packed_seq_params: Packed sequence parameters shared by every microbatch.
+        padding_mask: Padding mask shared by every microbatch.
 
     Returns:
         dict: A dictionary containing model outputs and parameter gradients.
@@ -84,6 +106,8 @@ def run_transformer_layer_a2a_overlap_with_capture(model, input_tensors, microba
     state = DummyState()
     state.is_mtp = False
     state.model = model
+    state.packed_seq_params = packed_seq_params
+    state.padding_mask = padding_mask
     layers = [
         TransformerLayerSchedulePlan(
             transformer_layer,
@@ -452,6 +476,75 @@ class TestA2AOverlap:
             reset_model(gpt_model, params)
             capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
                 gpt_model, input_tensors, microbatches
+            )
+            comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
+            assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("use_padding_mask", [False, True])
+    def test_transformer_layer_overlap_packed_moe_routes_per_sample(self, use_padding_mask):
+        """
+        Verifies that a packed micro-batch flattened to [mbs*s, 1, h] reaches the router per
+        sample in the overlap path, as in the eager path. The sequence-level aux loss reaches
+        the router weight gradient, so routing the flattened batch as one sequence changes it.
+        The shared expert sees the per-sample layout too, and its output joins the routed
+        output before both are flattened back for the residual add.
+        """
+        micro_batch_size, seq_length = 2, 512
+        extra_kwargs = {
+            "moe_token_dispatcher_type": "alltoall",
+            "moe_router_load_balancing_type": "seq_aux_loss",
+            "moe_aux_loss_coeff": 1.0,
+            "moe_shared_expert_intermediate_size": 512,
+        }
+        config = get_test_config(extra_kwargs=extra_kwargs)
+        microbatches = 2
+        packed_seq_params = PackedSeqParams(tokens_per_sample=seq_length)
+        padding_mask = None
+        if use_padding_mask:
+            # Batch-first, as GPTModel passes it for a packed batch: [1, mbs * s].
+            padding_mask = torch.zeros(micro_batch_size, seq_length, dtype=torch.bool)
+            padding_mask[:, -64:] = True
+            padding_mask = padding_mask.view(1, micro_batch_size * seq_length).cuda()
+        with deterministic_mode():
+            # An MoE-only GPT layer: the unfused test attention rejects packed_seq_params, and
+            # the per-sample routing under test lives entirely in the MoE slots.
+            submodules = get_gpt_layer_with_transformer_engine_submodules(
+                num_experts=config.num_moe_experts, moe_grouped_gemm=config.moe_grouped_gemm
+            )
+            transformer_layer_spec = ModuleSpec(
+                module=TransformerLayer,
+                submodules=TransformerLayerSubmodules(
+                    self_attention=_NoAttention,
+                    pre_mlp_layernorm=submodules.pre_mlp_layernorm,
+                    mlp=submodules.mlp,
+                    mlp_bda=submodules.mlp_bda,
+                ),
+            )
+            gpt_model = GPTModel(
+                config=config,
+                transformer_layer_spec=transformer_layer_spec,
+                vocab_size=100,
+                pre_process=True,
+                post_process=True,
+                max_sequence_length=300,
+            )
+
+            params = reset_model(gpt_model)
+            input_tensors = [
+                build_data(seq_len=micro_batch_size * seq_length) for _ in range(microbatches)
+            ]
+
+            capture_ref = run_transformer_layer_ref_with_capture(
+                gpt_model, input_tensors, microbatches, packed_seq_params, padding_mask
+            )
+            assert any(
+                name.endswith("router.weight") and grad is not None
+                for name, grad in capture_ref.items()
+            )
+            reset_model(gpt_model, params)
+            capture_a2a_overlap = run_transformer_layer_a2a_overlap_with_capture(
+                gpt_model, input_tensors, microbatches, packed_seq_params, padding_mask
             )
             comp_res = compare_captures(capture_ref, capture_a2a_overlap, True)
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
