@@ -15,7 +15,8 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm import causal_conv1d as causal_conv1d_module
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
-from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.ssm.mamba_mixer import CudnnMambaSplitConv1dScan, MambaMixer
+from megatron.core.ssm.ops.mamba2.cudnn_ssd import cudnn_mamba2_unsupported_reason
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.determinism.configs import hybrid_base
@@ -77,12 +78,16 @@ def _conv_backward(x, weight, bias, grad):
     return torch.autograd.grad(out, (x, weight, bias), grad_outputs=grad)
 
 
-def _build_mixer(deterministic_mode=True):
+def _build_mixer(deterministic_mode=True, **config_overrides):
     """A bare MambaMixer on the suite's shared hybrid config."""
     Utils.initialize_model_parallel()
     model_parallel_cuda_manual_seed(123)
     config = TransformerConfig(
-        **(hybrid_base() | {"num_layers": 1, "deterministic_mode": deterministic_mode})
+        **(
+            hybrid_base()
+            | {"num_layers": 1, "deterministic_mode": deterministic_mode}
+            | config_overrides
+        )
     )
     mixer = MambaMixer(
         config,
@@ -171,16 +176,28 @@ class TestMambaMixerDeterminism:
     @requires_deterministic_conv1d
     @pytest.mark.parametrize("batch_first", [True, False], ids=["batch_first", "sequence_first"])
     @pytest.mark.parametrize("packed_layout", ["none", "unpadded", "padded"])
-    def test_mixer_replays_bit_exactly(self, monkeypatch, packed_layout, batch_first):
+    @pytest.mark.parametrize(
+        "backend", ["triton", pytest.param("cudnn", marks=pytest.mark.launch_on_gb200)]
+    )
+    def test_mixer_replays_bit_exactly(self, monkeypatch, backend, packed_layout, batch_first):
         """Two runs of one mixer agree bitwise under the deterministic conv reduction.
 
-        ``MAMBA_DETERMINISTIC`` pins the SSD scan, whose nondeterminism would otherwise reach
-        the conv weight gradient, so a failure points at the convolution. Both training
-        layouts are replayed; sequence-first still runs under sequence or context parallelism.
+        ``MAMBA_DETERMINISTIC`` pins the Triton SSD scan, whose nondeterminism would otherwise
+        reach the conv weight gradient, so a failure points at the convolution. The cuDNN
+        backend (``mamba_kernel_backend='cudnn'``) replaces that scan and has no such switch.
+        Both training layouts are replayed; sequence-first still runs under sequence or context
+        parallelism.
         """
+        if backend == "cudnn":
+            reason = cudnn_mamba2_unsupported_reason(64, 128)
+            if reason is not None:
+                pytest.skip(reason)
         monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
-        mixer = _build_mixer()
+        mixer = _build_mixer(mamba_kernel_backend=backend)
+        assert isinstance(mixer.split_conv1d_scan, CudnnMambaSplitConv1dScan) == (
+            backend == "cudnn"
+        )
         # This config passes the batch-first gate, so only sequence-first needs pinning.
         assert mixer._use_batch_first_ssm(inference_mode=False)
         if not batch_first:

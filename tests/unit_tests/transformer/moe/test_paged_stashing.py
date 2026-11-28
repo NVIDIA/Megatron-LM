@@ -727,9 +727,9 @@ class TestNcclEpPagedStashing:
 
     ncclep's CUDA-graph / paged-stash path requires moe_expert_rank_capacity_factor, which feeds
     the experts the full fixed-size recv buffer and is only valid with fp8/fp4 + the CuTe DSL
-    grouped GEMM (the container always configures mxfp8; NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 must be
-    set in the environment). This mirrors TestPagedStashing: run the paged-stash path twice and
-    assert the two
+    grouped GEMM (the container always configures mxfp8; TE before 2.21 also needs
+    NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 in the environment). This mirrors TestPagedStashing: run
+    the paged-stash path twice and assert the two
     passes agree (a determinism guard for the static ncclep path), plus no paged-stash overflow.
     """
 
