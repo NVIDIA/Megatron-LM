@@ -626,25 +626,27 @@ class FsdpParameterGroup:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
 
-        grads: list[torch.Tensor] = []
-        for fsdp_parameter in self.fsdp_parameters:
-            if fsdp_parameter.unsharded.grad is None:
-                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            grads.append(fsdp_parameter.unsharded.grad)
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 layout=self.main_weight.layout,
                 dtype=self.grad_comm_dtype,
-                device=grads[0].device,
+                device=self.main_grad.device,
             )
+
+    def copy_gradient_to_partial_buffer(self, index: int, partial_grad: DBuffer) -> None:
+        """Pack and release one complete parameter gradient on the caller's stream."""
+        parameter = self.fsdp_parameters[index]
+        if parameter.unsharded.grad is None:
+            raise RuntimeError(f"Missing gradient for FSDP parameter {parameter.fqns!r}.")
+        partial_grad.get_tensor_view(index).copy_(parameter.unsharded.grad)
+        parameter.unsharded.grad = None
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients on compute into the reduce-scatter input buffer."""
-        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
-            fsdp_parameter.unsharded.grad = None
+        for index in range(len(self.fsdp_parameters)):
+            self.copy_gradient_to_partial_buffer(index, partial_grad)
 
     def accumulate_local_gradients(self) -> None:
         """Accumulate on compute, retaining source gradients for caller cleanup.
