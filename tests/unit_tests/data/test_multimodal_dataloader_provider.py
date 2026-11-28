@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -55,8 +55,6 @@ def test_new_dataloader_prefetch_factor(
     loader_kwargs = {}
 
     monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
-    # The provider reads the checkpoint policy from the run config's checkpoint section.
-    monkeypatch.setattr(dataloader_provider, "get_run_config", lambda: _run_config(load=None))
     monkeypatch.setattr(dataloader_provider, "is_dataloader_rank", lambda _, **kwargs: True)
     monkeypatch.setattr(dataloader_provider.parallel_state, "get_data_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -126,104 +124,9 @@ def test_length_inputs_are_checked_before_the_loader_rank_early_return(
     ) == (None, None, None)
 
 
-def _run_config(load, pretrained_checkpoint=None):
-    """The run config the provider reads its checkpoint policy from."""
-    return SimpleNamespace(
-        checkpoint=SimpleNamespace(load=load, pretrained_checkpoint=pretrained_checkpoint)
-    )
-
-
-@pytest.fixture
-def strict_resume_provider(monkeypatch):
-    args = SimpleNamespace(
-        dataloader_save="/checkpoints/dataloader",
-        strict_dataloader_state_load=True,
-        num_workers=0,
-        dataloader_seed=0,
-        packing_buffer_size=10000,
-    )
-    # The resume facts come from the train state (the primary load's classification included)
-    # and the checkpoint section, not from args.
-    train_state = SimpleNamespace(iteration=100, effective_finetune=False)
+def test_energon_dataloader_restore_state_delegates_to_rank_state():
+    """The training loop restores state through EnergonDataloader.restore_state."""
     loader = MagicMock()
-    loader.__len__.return_value = 42
-    checkpoint_name = Mock(return_value="/checkpoints/dataloader/iter_0000100/state.pt")
-    load_state = Mock(return_value={"dataloader_state_dict": "saved-state"})
-    monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
-    monkeypatch.setattr(
-        dataloader_provider, "get_run_config", lambda: _run_config(load="/checkpoints/model")
-    )
-    monkeypatch.setattr(dataloader_provider, "get_train_state", lambda: train_state)
-    monkeypatch.setattr(dataloader_provider, "is_dataloader_rank", lambda *a, **kw: True)
-    for name, value in (
-        ("get_data_parallel_rank", 0),
-        ("get_data_parallel_world_size", 1),
-        ("get_data_parallel_group", None),
-    ):
-        monkeypatch.setattr(dataloader_provider.parallel_state, name, Mock(return_value=value))
-    monkeypatch.setattr(dataloader_provider, "WorkerConfig", lambda **kw: kw)
-    monkeypatch.setattr(
-        dataloader_provider, "datasets_provider", lambda *a, **kw: (object(), None, None)
-    )
-    monkeypatch.setattr(dataloader_provider, "use_new_dataloader_path", lambda: True)
-    monkeypatch.setattr(dataloader_provider, "FileStoreCachePool", lambda **kw: None)
-    monkeypatch.setattr(dataloader_provider, "get_savable_loader", lambda *a, **kw: loader)
-    monkeypatch.setattr(dataloader_provider, "get_checkpoint_name", checkpoint_name)
-    monkeypatch.setattr(dataloader_provider.torch, "load", load_state)
-    return args, loader, checkpoint_name, load_state, train_state
-
-
-@pytest.mark.parametrize("iteration", [0, 100])
-@pytest.mark.parametrize("state_exists", [False, True])
-def test_length_probe_never_restores_state(
-    monkeypatch, strict_resume_provider, iteration, state_exists
-):
-    args, loader, checkpoint_name, load_state, train_state = strict_resume_provider
-    train_state.iteration = iteration
-    monkeypatch.setattr(dataloader_provider.os.path, "exists", lambda _: state_exists)
-
-    train, _, _ = dataloader_provider.train_valid_test_dataloaders_provider(
-        None, task_encoder=object(), restore_dataloader_state=False
-    )
-
-    assert len(train._dataloader) == 42
-    assert train_state.iteration == iteration
-    checkpoint_name.assert_not_called()
-    load_state.assert_not_called()
-    loader.restore_state_rank.assert_not_called()
-
-
-def test_default_restore_uses_resolved_iteration(monkeypatch, strict_resume_provider):
-    args, loader, checkpoint_name, load_state, _ = strict_resume_provider
-    monkeypatch.setattr(dataloader_provider.os.path, "exists", lambda _: True)
-    dataloader_provider.train_valid_test_dataloaders_provider(None, task_encoder=object())
-    assert checkpoint_name.call_args.args[:2] == (args.dataloader_save, 100)
-    load_state.assert_called_once()
+    loader.__iter__.return_value = iter([])
+    dataloader_provider.EnergonDataloader(loader).restore_state("saved-state")
     loader.restore_state_rank.assert_called_once_with("saved-state")
-
-
-def test_probe_does_not_disable_strict_restore(monkeypatch, strict_resume_provider):
-    args, loader, _, load_state, _ = strict_resume_provider
-    monkeypatch.setattr(dataloader_provider.os.path, "exists", lambda _: False)
-    dataloader_provider.train_valid_test_dataloaders_provider(
-        None, task_encoder=object(), restore_dataloader_state=False
-    )
-    with pytest.raises(FileNotFoundError, match="refusing to resume"):
-        dataloader_provider.train_valid_test_dataloaders_provider(None, task_encoder=object())
-    assert args.strict_dataloader_state_load
-    load_state.assert_not_called()
-    loader.restore_state_rank.assert_not_called()
-
-
-def test_initial_finetune_load_tolerates_missing_state(monkeypatch, strict_resume_provider):
-    """A primary load that applied finetune semantics starts the dataloader from the beginning
-    when its state is missing, strict restore or not; the provider learns it from the train
-    state, not from the namespace."""
-    args, loader, _, load_state, train_state = strict_resume_provider
-    train_state.iteration = 0
-    train_state.effective_finetune = True
-    monkeypatch.setattr(dataloader_provider.os.path, "exists", lambda _: False)
-    dataloader_provider.train_valid_test_dataloaders_provider(None, task_encoder=object())
-    assert args.strict_dataloader_state_load
-    load_state.assert_not_called()
-    loader.restore_state_rank.assert_not_called()
