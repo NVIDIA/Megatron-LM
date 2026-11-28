@@ -2032,7 +2032,10 @@ class TestCheckpointParameterIdentity:
             buffers=[buffer],
             distributed_optimizer_instance_id=0,
             get_parameter_state_dp_zero=lambda **kwargs: {0: {torch.float32: {"exp_avg": moment}}},
-            _get_main_param_and_optimizer_states=lambda _: {"param": master, "exp_avg": moment},
+            _get_main_param_and_optimizer_states=lambda *_, **__: {
+                "param": master,
+                "exp_avg": moment,
+            },
         )
         method = getattr(DistributedOptimizer, f"sharded_param_state_{layout}")
         state = method(optimizer, {"w": entry}, metadata={})

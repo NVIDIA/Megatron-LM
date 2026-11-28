@@ -265,6 +265,15 @@ def test_an_async_save_needs_the_worker_before_the_format_capability(monkeypatch
             config.validate()
 
 
+def test_cpu_staging_of_precision_aware_optimizer_state_requires_torch_dist():
+    CheckpointConfig(stage_precision_aware_optimizer_state_on_cpu=True).validate()
+    config = CheckpointConfig(
+        stage_precision_aware_optimizer_state_on_cpu=True, ckpt_format="torch"
+    )
+    with pytest.raises(AssertionError, match="requires --ckpt-format torch_dist"):
+        config.validate()
+
+
 def test_construction_runs_no_checks():
     """A section constructs with any values; the checks run in validate()."""
     config = CheckpointConfig(save="/ckpt", save_interval=-1)

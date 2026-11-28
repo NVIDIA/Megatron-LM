@@ -1152,7 +1152,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
         checkpoint file by calling 'save_parameter_state()'.
         """
-        inner_state_dict = self.optimizer.state_dict()
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 and not isinstance(
+            self.optimizer, HybridDeviceOptimizer
+        ):
+            # TE FusedAdam.state_dict() expands every state to FP32 on the GPU at once, but only
+            # the groups are kept below.
+            inner_state_dict = torch.optim.Optimizer.state_dict(self.optimizer)
+        else:
+            inner_state_dict = self.optimizer.state_dict()
         state_dict = {}
 
         # Extract 'step', for non-Apex/TE support.
@@ -1268,7 +1275,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for param_group in state_dict["optimizer"]["param_groups"]:
             needed_groups = make_needed_groups(param_group)
             param_groups_map[needed_groups] = param_group
-        inner_state_dict = self.optimizer.state_dict()
+        precision_aware_te_state = self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 and (
+            not isinstance(self.optimizer, HybridDeviceOptimizer)
+        )
+        if precision_aware_te_state:
+            # Unlike TE FusedAdam.state_dict(), this does not expand every state to FP32 on the
+            # GPU; the existing state is kept as is below.
+            inner_state_dict = torch.optim.Optimizer.state_dict(self.optimizer)
+        else:
+            inner_state_dict = self.optimizer.state_dict()
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
@@ -1354,9 +1369,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         v["step"] = step.detach().clone()
 
         # Optimizer.
-        self.optimizer.load_state_dict(
-            {"state": state_dict_state, "param_groups": state_dict_param_groups}
-        )
+        if precision_aware_te_state and len(self.optimizer.state) != 0:
+            # The existing state already has its storage dtypes and scales. TE's
+            # load_state_dict() would round-trip all of it through FP32 on the GPU at once, so
+            # only the groups are loaded.
+            existing_state = self.optimizer.state
+            torch.optim.Optimizer.load_state_dict(
+                self.optimizer, {"state": {}, "param_groups": state_dict_param_groups}
+            )
+            self.optimizer.state = existing_state
+        else:
+            self.optimizer.load_state_dict(
+                {"state": state_dict_state, "param_groups": state_dict_param_groups}
+            )
 
         # Grad scaler.
         if 'grad_scaler' not in state_dict:
@@ -1402,25 +1427,38 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
 
-    def _get_main_param_and_optimizer_states(self, model_param):
+    def _get_main_param_and_optimizer_states(
+        self, model_param, stage_expanded_state_on_cpu: bool = False
+    ):
         """Return a dict containing the main param and optimizer states corresponding to the input
         model_param.
 
         The returned dict always contains "param" and one entry per optimizer state tensor
         (e.g., "exp_avg" and "exp_avg_sq" for Adam, or just "exp_avg" for Lion).
+
+        Args:
+            model_param: model parameter whose main param and optimizer states are returned.
+            stage_expanded_state_on_cpu (bool, optional): with the precision-aware optimizer,
+                move FP32 expansions of reduced-precision states to CPU. States the optimizer
+                already keeps in FP32 are returned as is. Defaults to False.
         """
         group_index, group_order = self.model_param_group_index_map[model_param]
         if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
             sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
             tensors = {}
             for k in self.optimizer.state[sharded_model_param]:
-                if not isinstance(self.optimizer.state[sharded_model_param][k], torch.Tensor):
+                state = self.optimizer.state[sharded_model_param][k]
+                if not isinstance(state, torch.Tensor):
                     continue
                 if isinstance(self.optimizer, HybridDeviceOptimizer):
-                    tensors[k] = self.optimizer.state[sharded_model_param][k]
+                    tensors[k] = state
                     continue
 
                 tensors[k] = self.optimizer.get_unscaled_state(sharded_model_param, k)
+                if stage_expanded_state_on_cpu and tensors[k] is not state:
+                    # A checkpoint keeps every expansion alive until it is written (or, when
+                    # loading, consumed), which can exceed the device memory training fits in.
+                    tensors[k] = tensors[k].cpu()
             tensors["param"] = tensors.pop("master_param")
         else:
             main_param = self.optimizer.param_groups[group_index]["params"][group_order]
@@ -1552,13 +1590,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
                 dst_tensors[key].copy_(tensors[source_key])
 
-    def get_parameter_state_dp_reshardable(self):
+    def get_parameter_state_dp_reshardable(self, stage_expanded_state_on_cpu: bool = False):
         """Get internal representation of parameter state without any copies and modifications.
 
         This is referred to as "fully sharded bucket space" because the optimizer state is
         fully sharded (e.g. no gather involved) and bucket-centric (the state
         follows the internal structure of the Distributed Optimizer buckets)
         as opposed to model-centric (typical structure of PyT optimizers)
+
+        Args:
+            stage_expanded_state_on_cpu (bool, optional): see
+                `_get_main_param_and_optimizer_states`. Defaults to False.
         """
         state = {
             "per_bucket_numel": self.per_bucket_numel,
@@ -1574,7 +1616,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
                     bucket_state = []
                     for model_param, param_range_map in gbuf_range_map["param_map"].items():
-                        tensors = self._get_main_param_and_optimizer_states(model_param)
+                        tensors = self._get_main_param_and_optimizer_states(
+                            model_param, stage_expanded_state_on_cpu=stage_expanded_state_on_cpu
+                        )
                         tensors.update(
                             {
                                 "gbuf_local_start": param_range_map["gbuf_local"].start,
@@ -1824,6 +1868,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             Results in fully parallel save and load without any inter-process communication or
             intermediate buffers/copies.
 
+        With the precision-aware optimizer, the
+        `metadata['distrib_optim_stage_precision_aware_state_on_cpu']` flag makes
+        'dp_reshardable' and 'fully_sharded_model_space' hold FP32 expansions of
+        reduced-precision states on CPU instead of GPU. The checkpoint content is unchanged.
+        The other formats already gather the state in CPU buffers.
 
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
@@ -2216,7 +2265,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_rank = self.data_parallel_group.rank()
         data_parallel_world_size = self.data_parallel_group.size()
 
-        state = self.get_parameter_state_dp_reshardable()
+        state = self.get_parameter_state_dp_reshardable(
+            stage_expanded_state_on_cpu=(metadata or {}).get(
+                'distrib_optim_stage_precision_aware_state_on_cpu', False
+            )
+        )
         # per_bucket_numel metadata is saved separately for each TPxPP domain.
         for per_bucket_key in ('per_bucket_numel', 'per_bucket_numel_unpadded'):
             key = (
@@ -2371,12 +2424,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         prefix = 'optimizer.state'
         state = {}
+        stage_expanded_state_on_cpu = (metadata or {}).get(
+            'distrib_optim_stage_precision_aware_state_on_cpu', False
+        )
 
         # Not stored in the checkpoint, used only to identify params in
         # `sharded_param_state_fs_model_space`.
         def _get_param_state_sharded_tensors(model_param, item_slice):
             # Main param & optimizer states.
-            tensors = self._get_main_param_and_optimizer_states(model_param)
+            tensors = self._get_main_param_and_optimizer_states(
+                model_param, stage_expanded_state_on_cpu=stage_expanded_state_on_cpu
+            )
             tensors["fp32_param"] = tensors.pop("param")
 
             # Match optimizer parameter with model ShardedTensor (or
