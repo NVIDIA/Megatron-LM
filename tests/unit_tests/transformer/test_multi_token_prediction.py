@@ -3838,8 +3838,31 @@ class TestMultiTokenPrediction:
         torch.testing.assert_close(unpacked_rolled, expected)
         (rolled * weights).sum().backward()
 
+        # The first token of each chunk is sent to a neighbor; its gradient comes back from there.
         expected_grad = torch.tensor(
-            [0.0, 1.0, 2.0 if cp_rank == cp - 1 else 0.0, 3.0], device="cuda"
+            [0.0 if cp_rank == 0 else 2.0, 1.0, 2.0 if cp_rank == cp - 1 else 4.0, 3.0],
+            device="cuda",
+        )
+        torch.testing.assert_close(tensor.grad, expected_grad)
+        Utils.destroy_model_parallel()
+
+    def test_roll_tensor_zigzag_cp_gradients(self):
+        cp = 4
+        if int(os.environ.get("WORLD_SIZE", "1")) < cp:
+            pytest.skip(f"CP={cp} requires at least {cp} ranks")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp)
+        cp_group = get_context_parallel_group()
+        cp_rank = get_pg_rank(cp_group)
+        tensor = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda", requires_grad=True)
+        weights = torch.tensor([1.0, 2.0, 3.0, 4.0], device="cuda")
+
+        rolled, _ = roll_tensor(tensor, cp_group=cp_group, return_sum=False)
+        (rolled * weights).sum().backward()
+
+        # Same layout as the packed single-document case: chunk starts go to the neighbors.
+        expected_grad = torch.tensor(
+            [0.0 if cp_rank == 0 else 2.0, 1.0, 2.0 if cp_rank == cp - 1 else 4.0, 3.0],
+            device="cuda",
         )
         torch.testing.assert_close(tensor.grad, expected_grad)
         Utils.destroy_model_parallel()
@@ -5287,6 +5310,35 @@ class TestRollTensorWithCPSubgroup:
         assert len(seen_batches) == 1, "All packed documents must share one boundary exchange"
         assert seen_batches[0]
         assert all(group is cp_group for group in seen_batches[0])
+
+    @pytest.mark.parametrize("sequence_parallel", [False, True])
+    def test_roll_precomputed_embeddings_zigzag_cp_gradients(self, sequence_parallel):
+        """Each shard gets the gradient a dense roll gives it, including tokens sent across CP
+        and SP ranks."""
+        cp_group = get_context_parallel_group()
+        tp_group = get_tensor_model_parallel_group()
+        cp_size, cp_rank = cp_group.size(), cp_group.rank()
+        sp_group = tp_group if sequence_parallel else None
+        sp_size, sp_rank = (tp_group.size(), tp_group.rank()) if sequence_parallel else (1, 0)
+
+        def shard(tensor):
+            return self._cp_shard(tensor, cp_rank, cp_size, dim=0).chunk(sp_size)[sp_rank]
+
+        torch.manual_seed(_SEED)
+        full = torch.randn(16, 2, 3, device="cuda", requires_grad=True)
+        weight = torch.randn_like(full)
+        # Dense reference: shift left by one along the sequence, zero-fill the last row.
+        dense_rolled = torch.cat((full[1:], torch.zeros_like(full[:1])))
+        (dense_rolled * weight).sum().backward()
+
+        local = shard(full.detach()).clone().requires_grad_()
+        rolled = roll_tensor_precomputed_embeddings(
+            local, dims=0, sp_group=sp_group, cp_group=cp_group, cp_layout="zigzag"
+        )
+        (rolled * shard(weight)).sum().backward()
+
+        torch.testing.assert_close(rolled, shard(dense_rolled.detach()))
+        torch.testing.assert_close(local.grad, shard(full.grad))
 
 
 class TestLearnedOutputContract:
