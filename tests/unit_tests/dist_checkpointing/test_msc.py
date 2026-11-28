@@ -1,5 +1,8 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import importlib
+
+import pytest
 import torch
 
 try:
@@ -12,7 +15,11 @@ except ImportError:
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
-from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
+from megatron.core.dist_checkpointing.core import CheckpointingException
+from megatron.core.dist_checkpointing.strategies.torch import (
+    HAVE_NVRX,
+    TorchDistSaveShardedStrategy,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -69,3 +76,77 @@ class TestSerializationWithMultiStorageClient:
             assert loaded_state_dict['load_sd_keyA'].shape == (2, 4)
 
         Utils.destroy_model_parallel()
+
+    def test_writer_options_reach_msc_writer(self, tmp_path_dist_ckpt, monkeypatch):
+        Utils.initialize_model_parallel(2, 4)
+        msc = MultiStorageClientFeature.import_package()
+        writer_cls = msc.torch.MultiStorageFileSystemWriter
+        options = object()
+        received = []
+
+        def recording_writer(path, *args, writer_options=None, **kwargs):
+            received.append(writer_options)
+            return writer_cls(path, *args, **kwargs)
+
+        monkeypatch.setattr(msc.torch, 'MultiStorageFileSystemWriter', recording_writer)
+        sharded_state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets(
+                'keyA', torch.arange(8.0).reshape(2, 4), replica_id=Utils.rank
+            )
+        }
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_writer_options', sync=True) as ckpt_dir:
+            save(sharded_state_dict, ckpt_dir, TorchDistSaveShardedStrategy(writer_options=options))
+            torch.distributed.barrier()
+            assert received == [options]
+
+            load_ssd = {
+                'keyA': ShardedTensor.from_rank_offsets(
+                    'keyA', torch.zeros(2, 4), replica_id=Utils.rank
+                )
+            }
+            assert torch.equal(load(load_ssd, ckpt_dir)['keyA'], torch.arange(8.0).reshape(2, 4))
+
+        MultiStorageClientFeature.disable()
+        with pytest.raises(CheckpointingException, match='writer_options'):
+            TorchDistSaveShardedStrategy(writer_options=options).save(
+                sharded_state_dict, tmp_path_dist_ckpt / 'test_writer_options_without_msc'
+            )
+
+    @pytest.mark.skipif(not HAVE_NVRX, reason="requires nvidia-resiliency-ext")
+    def test_writer_options_reach_async_writer(self, tmp_path_dist_ckpt, monkeypatch):
+        Utils.initialize_model_parallel()
+        filesystem_async = importlib.import_module(
+            'nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async'
+        )
+        received = []
+
+        class WriterCreated(Exception):
+            """Stops async_save once the writer is built."""
+
+        class CompatibleWriter:
+            def __init__(self, path, *, writer_options=None, **kwargs):
+                received.append(writer_options)
+                raise WriterCreated
+
+        class OlderWriter:
+            def __init__(self, path, **kwargs):
+                received.append(kwargs)
+                raise WriterCreated
+
+        options = object()
+        checkpoint_dir = tmp_path_dist_ckpt / 'test_writer_options_async'
+
+        monkeypatch.setattr(filesystem_async, 'FileSystemWriterAsync', CompatibleWriter)
+        with pytest.raises(WriterCreated):
+            TorchDistSaveShardedStrategy(writer_options=options).async_save({}, checkpoint_dir)
+        assert len(received) == 1 and received[0] is options
+
+        received.clear()
+        monkeypatch.setattr(filesystem_async, 'FileSystemWriterAsync', OlderWriter)
+        with pytest.raises(AssertionError, match='does not support writer_options'):
+            TorchDistSaveShardedStrategy(writer_options=options).async_save({}, checkpoint_dir)
+        assert received == []
+
+        with pytest.raises(WriterCreated):
+            TorchDistSaveShardedStrategy().async_save({}, checkpoint_dir)
+        assert len(received) == 1 and 'writer_options' not in received[0]
