@@ -18,6 +18,7 @@ import torch
 
 from megatron.core.extensions.te_cuda_graphs import _TECudaGraphBackwardDWWrapperMixin
 from megatron.core.pipeline_parallel.utils import ScheduleNode, make_viewless
+from megatron.core.quantization.utils import is_custom_recipe_selected, is_quantization_enabled
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import internal_api, make_viewless_tensor, nvtx_range_pop, nvtx_range_push
@@ -83,9 +84,11 @@ def should_free_input(name, is_moe, config, num_local_experts):
     # The input and output of A2A are not needed anymore after the forward pass,
     # so we can free the input memory after the forward pass.
 
-    # When low precision fp8/4 is enabled, the casted tensors are saved and the
-    # original bf16 tensors are safe to be freed.
-    free_mlp = config.fp8 is not None or config.fp4 is not None
+    # Built-in FP8/FP4 recipes save quantized copies of the expert inputs, so the
+    # original bf16 tensors are safe to free. A custom recipe may return Identity
+    # quantizers whose "quantized" tensors alias the original storage, so custom
+    # recipes keep the high-precision rule below.
+    free_mlp = is_quantization_enabled(config) and not is_custom_recipe_selected(config)
     if not free_mlp:
         # AlltoAll dispatcher with local_num_experts=1, HybridEP, and NCCL EP all use
         # identity operation for `dispatch_postprocess`, hence the mlp inputs will be

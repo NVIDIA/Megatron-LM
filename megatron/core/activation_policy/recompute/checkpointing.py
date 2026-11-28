@@ -718,7 +718,8 @@ def precision_aware_checkpoint(
 
     Args:
         function: Callable to checkpoint.
-        config: Transformer config whose ``fp8`` and ``fp4`` fields select the implementation.
+        config: Transformer config whose quantization mode (FP8, FP4 or custom recipe) selects
+            the implementation.
         tp_group: Tensor-parallel group for Transformer Engine's checkpoint.
         *args: Positional arguments for ``function``.
         distribute_saved_activations: Passed through to the checkpoint implementation.
@@ -728,8 +729,9 @@ def precision_aware_checkpoint(
         The output of ``function``.
     """
     from megatron.core import tensor_parallel
+    from megatron.core.quantization.utils import is_quantization_enabled
 
-    if config.fp8 or config.fp4:
+    if is_quantization_enabled(config):
         # Imported lazily to avoid a circular import.
         from megatron.core.extensions.transformer_engine import te_checkpoint
 

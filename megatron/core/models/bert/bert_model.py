@@ -142,6 +142,7 @@ class BertModel(LanguageModule):
             pre_process=self.pre_process,
             post_process=self.post_process,
             vp_stage=vp_stage,
+            name="encoder",
         )
 
         # Output

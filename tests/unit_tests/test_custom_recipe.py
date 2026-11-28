@@ -1,0 +1,1371 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import operator
+import sys
+import warnings
+from contextlib import nullcontext
+from unittest.mock import Mock, patch
+
+import pytest
+import torch
+
+from megatron.core import parallel_state
+from megatron.core.enums import Fp8Recipe
+from megatron.core.extensions import transformer_engine as te_extension
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.quantization import custom_recipe, te_recipe
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_block import TransformerBlock
+from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
+
+RECORDED_ROLES = []
+
+
+def current_scaling_test_factory(role):
+    """Current scaling for linears and QKV, with TE's native S/dP attention policy."""
+    from transformer_engine.pytorch.constants import DType
+    from transformer_engine.pytorch.tensor.float8_tensor import Float8CurrentScalingQuantizer
+
+    RECORDED_ROLES.append(role)
+    if role is not None and role.module_type == "dpa" and role.tensor_type in ("s", "dp"):
+        # cuDNN's FP8 attention kernel requires shared delayed-scaling buffers for
+        # these internal slots, including when QKV uses current scaling.
+        from transformer_engine.common.recipe import Format
+        from transformer_engine.pytorch.quantization import DelayedScalingRequest
+
+        return DelayedScalingRequest(fp8_format=Format.HYBRID)
+    return Float8CurrentScalingQuantizer(DType.kFloat8E4M3, device=torch.device("cuda"))
+
+
+def delayed_scaling_test_factory(role):
+    """Stateful factory used only to test delayed-scaling limitations."""
+    from transformer_engine.common.recipe import Format
+    from transformer_engine.pytorch.quantization import DelayedScalingRequest
+
+    RECORDED_ROLES.append(role)
+    return DelayedScalingRequest(fp8_format=Format.HYBRID)
+
+
+TEST_FACTORY_PATH = f"{__name__}.current_scaling_test_factory"
+DELAYED_FACTORY_PATH = f"{__name__}.delayed_scaling_test_factory"
+
+
+def test_resolve_quantizer_factory_returns_callable():
+    assert custom_recipe.resolve_quantizer_factory("operator.neg") is operator.neg
+
+
+@pytest.mark.parametrize(
+    ("path", "error"),
+    [
+        ("", "must be a non-empty string"),
+        ("factory", "Expected 'package.module.callable'"),
+        ("missing_package.module.factory", "Failed to import module"),
+        ("operator.missing_factory", "Attribute 'missing_factory' not found"),
+        ("operator.__doc__", "is not callable"),
+    ],
+)
+def test_resolve_quantizer_factory_rejects_invalid_paths(path, error):
+    with pytest.raises(ValueError, match=error):
+        custom_recipe.resolve_quantizer_factory(path)
+
+
+@pytest.mark.skipif(custom_recipe.te_recipe is None, reason="Transformer Engine is not installed")
+def test_build_custom_recipe_forwards_attention_flags():
+    factory = Mock()
+
+    recipe = custom_recipe.build_custom_recipe(factory, fp8_dpa=True, fp8_mha=True)
+
+    assert recipe.qfactory is factory
+    assert recipe.fp8_dpa is True
+    assert recipe.fp8_mha is True
+
+
+@pytest.mark.skipif(custom_recipe.te_recipe is None, reason="Transformer Engine is not installed")
+def test_build_custom_recipe_rejects_unsupported_attention_flags():
+    class RecipeWithoutAttentionFlags:
+
+        def __init__(self, qfactory):
+            self.qfactory = qfactory
+
+    with patch.object(custom_recipe.te_recipe, "CustomRecipe", RecipeWithoutAttentionFlags):
+        with pytest.raises(ValueError, match="supports the 'fp8_dpa' constructor argument"):
+            custom_recipe.build_custom_recipe(Mock(), fp8_dpa=True)
+
+
+@pytest.mark.skipif(custom_recipe.te_recipe is None, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize(
+    ("config_kwargs", "recipe_getter"),
+    [
+        (
+            {"fp8": "hybrid", "fp8_recipe": "custom", "fp8_quantizer_factory": TEST_FACTORY_PATH},
+            "fp8",
+        ),
+        (
+            {"fp4": "e2m1", "fp4_recipe": "custom", "fp4_quantizer_factory": TEST_FACTORY_PATH},
+            "fp4",
+        ),
+    ],
+)
+def test_legacy_custom_recipe_paths_forward_attention_flags(config_kwargs, recipe_getter):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        fp8_dot_product_attention=True,
+        fp8_multi_head_attention=True,
+        **config_kwargs,
+    )
+    if recipe_getter == "fp8":
+        from megatron.core.fp8_utils import get_fp8_recipe
+
+        recipe = get_fp8_recipe(config)
+        cached_recipe = get_fp8_recipe(config)
+    else:
+        from megatron.core.fp4_utils import get_fp4_recipe
+
+        recipe = get_fp4_recipe(config)
+        cached_recipe = get_fp4_recipe(config)
+
+    assert cached_recipe is recipe
+    assert recipe.qfactory is current_scaling_test_factory
+    assert recipe.fp8_dpa is True
+    assert recipe.fp8_mha is True
+
+
+@pytest.mark.parametrize(
+    "config_kwargs",
+    [
+        {"fp8": "hybrid", "fp8_recipe": "custom", "fp8_quantizer_factory": TEST_FACTORY_PATH},
+        {"fp4": "e2m1", "fp4_recipe": "custom", "fp4_quantizer_factory": TEST_FACTORY_PATH},
+    ],
+)
+def test_legacy_custom_recipe_warns_once(config_kwargs):
+    mode = "fp8" if "fp8" in config_kwargs else "fp4"
+    custom_recipe._WARNED_LEGACY_CUSTOM_RECIPE_MODES.discard(mode)
+    try:
+        with pytest.warns(
+            FutureWarning, match="Pass the factory path to --custom-recipe"
+        ) as warnings:
+            for _ in range(2):
+                TransformerConfig(
+                    num_layers=1, hidden_size=128, num_attention_heads=4, **config_kwargs
+                )
+        custom_recipe_warnings = [
+            warning
+            for warning in warnings
+            if issubclass(warning.category, FutureWarning)
+            and f"--{mode}-recipe custom" in str(warning.message)
+        ]
+        assert len(custom_recipe_warnings) == 1
+    finally:
+        custom_recipe._WARNED_LEGACY_CUSTOM_RECIPE_MODES.discard(mode)
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_per_module_custom_recipe_uses_format_neutral_autocast():
+    config = te_extension.TEQuantizationRecipe(
+        fp8_quantization_recipe=Fp8Recipe.custom,
+        fp8_format="hybrid",
+        custom_recipe_factory=TEST_FACTORY_PATH,
+        override_nonquantized_autocast=True,
+    )
+    expected_context = nullcontext()
+
+    with (
+        patch.object(te_extension.FP8GlobalStateManager, "is_fp8_enabled", return_value=False),
+        patch.object(
+            te_extension.te.pytorch, "autocast", return_value=expected_context
+        ) as autocast,
+    ):
+        context = te_extension._get_fp8_autocast_for_quant_recipe(config)
+
+    assert context is expected_context
+    assert autocast.call_args.kwargs["recipe"].qfactory is current_scaling_test_factory
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_per_module_custom_recipe_rejects_quantized_parameter_storage():
+    with pytest.raises(ValueError, match="do not yet support quantized parameter storage"):
+        te_extension.TEQuantizationRecipe.parse_from_config(
+            {
+                "fp8_quantization_recipe": Fp8Recipe.custom,
+                "custom_recipe_factory": TEST_FACTORY_PATH,
+                "fp8_param": True,
+            }
+        )
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_per_module_custom_recipe_cannot_inherit_quantized_parameter_storage():
+    """Inheriting the model-init context must not smuggle in quantized storage.
+
+    fp8_param/fp4_param are rejected for per-module custom recipes, but inheriting under a
+    quantized-storage model would allocate the weight in that format anyway. Only the storage
+    actually inherited matters, so BF16 regions inside such a model keep working.
+    """
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+
+    inherit_custom = te_extension.TEQuantizationRecipe.parse_from_config(
+        {
+            "fp8_quantization_recipe": Fp8Recipe.custom,
+            "custom_recipe_factory": TEST_FACTORY_PATH,
+            "inherit_model_init_context": True,
+        }
+    )
+    inherit_builtin = te_extension.TEQuantizationRecipe.parse_from_config(
+        {"fp8_quantization_recipe": Fp8Recipe.mxfp8, "inherit_model_init_context": True}
+    )
+    resolve = te_extension._get_fp8_model_init_for_quant_recipe
+
+    # BF16 storage inherited: nothing to reject.
+    assert isinstance(resolve(inherit_custom), nullcontext)
+    with te_extension.te.pytorch.quantized_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+        with pytest.raises(ValueError, match="inherit_model_init_context"):
+            resolve(inherit_custom)
+        # Built-in per-module recipes may still inherit quantized storage.
+        assert isinstance(resolve(inherit_builtin), nullcontext)
+        # A BF16 region nested in a quantized-storage model (e.g. first/last BF16 layers).
+        with te_extension.te.pytorch.quantized_model_init(enabled=False):
+            assert isinstance(resolve(inherit_custom), nullcontext)
+
+
+def _inherit_custom_fc2_recipe():
+    from megatron.core.quantization.quant_config import RecipeConfig
+
+    return RecipeConfig.from_config_dict(
+        {
+            "configs": {
+                "custom_inherit": {
+                    "transformer_engine_config_type": "TEQuantizationParams",
+                    "training_recipe": {
+                        "fp8_quantization_recipe": "custom",
+                        "custom_recipe_factory": TEST_FACTORY_PATH,
+                        "inherit_model_init_context": True,
+                    },
+                }
+            },
+            "matchers": {
+                "custom_inherit": {
+                    "type": "glob",
+                    "enabled": True,
+                    "pattern": "*linear_fc2",
+                    "config": "custom_inherit",
+                }
+            },
+        }
+    )
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("storage_kwargs", "rejected"),
+    [
+        pytest.param({"fp8_param": True}, True, id="mxfp8-param-storage"),
+        pytest.param({}, False, id="bf16-storage"),
+        pytest.param(
+            {"fp8_param": True, "first_last_layers_bf16": True, "num_layers_at_start_in_bf16": 1},
+            False,
+            id="mxfp8-param-storage-in-bf16-first-layer",
+        ),
+    ],
+)
+def test_global_mxfp8_storage_rejects_inheriting_per_module_custom_recipe(storage_kwargs, rejected):
+    """The per-module custom-recipe storage check covers inherited global MXFP8 storage."""
+    _skip_unless_fp8_available()
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            params_dtype=torch.bfloat16,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            quant_recipe=_inherit_custom_fc2_recipe(),
+            **storage_kwargs,
+        )
+        build = lambda: TransformerBlock(
+            config, get_gpt_layer_with_transformer_engine_spec(), name="decoder"
+        )
+        if rejected:
+            with pytest.raises(ValueError, match="inherit_model_init_context"):
+                build()
+        else:
+            build()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_recipe.HAVE_TE, reason="Transformer Engine is not installed")
+def test_get_quantization_context_uses_format_neutral_te_api():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        custom_recipe=TEST_FACTORY_PATH,
+        fp8_dot_product_attention=True,
+        fp8_multi_head_attention=True,
+    )
+    expected_context = nullcontext()
+
+    with patch.object(te_recipe.te, "autocast", return_value=expected_context) as autocast:
+        context = te_recipe.get_quantization_context(config)
+
+    assert context is expected_context
+    call_kwargs = autocast.call_args.kwargs
+    assert call_kwargs["enabled"] is True
+    assert call_kwargs["amax_reduction_group"] is None
+    assert call_kwargs["recipe"].qfactory is current_scaling_test_factory
+    assert call_kwargs["recipe"].fp8_dpa is True
+    assert call_kwargs["recipe"].fp8_mha is True
+
+
+@pytest.mark.skipif(not te_recipe.HAVE_TE, reason="Transformer Engine is not installed")
+def test_custom_recipe_init_context_is_noop_without_parameter_storage():
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
+    )
+
+    with te_recipe.get_quantization_context(config, is_init=True):
+        pass
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_custom_recipe_is_materialized_once_per_config():
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
+    )
+
+    first = te_recipe.get_te_quantization_recipe(config)
+    second = te_recipe.get_te_quantization_recipe(config)
+
+    assert first is second
+
+
+CUSTOM_RECIPE_SPELLINGS = [
+    pytest.param({"custom_recipe": TEST_FACTORY_PATH}, id="canonical"),
+    pytest.param(
+        {"fp8": "hybrid", "fp8_recipe": "custom", "fp8_quantizer_factory": TEST_FACTORY_PATH},
+        id="legacy-fp8",
+    ),
+    pytest.param(
+        {"fp4": "e2m1", "fp4_recipe": "custom", "fp4_quantizer_factory": TEST_FACTORY_PATH},
+        id="legacy-fp4",
+    ),
+]
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize("config_kwargs", CUSTOM_RECIPE_SPELLINGS)
+def test_custom_recipe_alignment_uses_declared_value_or_conservative_fallback(config_kwargs):
+    from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
+
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, **config_kwargs
+    )
+    recipe = te_recipe.get_te_quantization_recipe(config)
+
+    # Every custom spelling must use the recipe's declared alignment rather than the
+    # 16-byte default of the legacy FP8 enum.
+    expected = getattr(recipe, "quantization_alignment", 128)
+    assert expected != 16
+    assert te_recipe.get_quantization_alignment(config) == expected
+    assert get_align_size_for_quantization(config) == expected
+    with patch.object(te_recipe, "get_te_quantization_recipe", return_value=object()):
+        assert te_recipe.get_quantization_alignment(config) == 128
+
+
+@pytest.mark.parametrize(
+    ("quant_kwargs", "num_local_experts", "expected"),
+    [
+        pytest.param({}, 1, False, id="bf16-single-local-expert"),
+        pytest.param({}, 2, True, id="bf16-multi-local-expert"),
+        pytest.param({"fp8": "hybrid", "fp8_recipe": "mxfp8"}, 1, True, id="builtin-fp8"),
+        pytest.param({"custom_recipe": TEST_FACTORY_PATH}, 1, False, id="custom-single"),
+        pytest.param({"custom_recipe": TEST_FACTORY_PATH}, 2, True, id="custom-multi"),
+        pytest.param(
+            {"fp8": "hybrid", "fp8_recipe": "custom", "fp8_quantizer_factory": TEST_FACTORY_PATH},
+            1,
+            False,
+            id="legacy-custom-single",
+        ),
+    ],
+)
+def test_should_free_input_keeps_high_precision_rule_for_custom_recipes(
+    quant_kwargs, num_local_experts, expected
+):
+    """Custom factories may return Identity quantizers that alias the MLP input.
+
+    Only built-in FP8/FP4 recipes guarantee that TE saved a separate quantized copy, so
+    only they may free the expert input when the dispatcher hands it over unchanged.
+    """
+    from megatron.core.models.common.utils import should_free_input
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=128,
+        moe_token_dispatcher_type="alltoall",
+        **quant_kwargs,
+    )
+
+    assert should_free_input("mlp", True, config, num_local_experts) is expected
+
+
+@pytest.mark.skipif(not te_recipe.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize(
+    ("quant_kwargs", "expected"),
+    [
+        pytest.param({}, False, id="bf16"),
+        pytest.param({"fp8": "hybrid", "fp8_recipe": "delayed"}, False, id="fp8-delayed"),
+        pytest.param({"fp8": "hybrid", "fp8_recipe": "mxfp8"}, True, id="fp8-mxfp8"),
+        pytest.param({"fp4": "e2m1", "fp4_recipe": "nvfp4"}, True, id="fp4-nvfp4"),
+        pytest.param({"custom_recipe": TEST_FACTORY_PATH}, "te-validates", id="custom"),
+        pytest.param(
+            {"fp8": "hybrid", "fp8_recipe": "custom", "fp8_quantizer_factory": TEST_FACTORY_PATH},
+            "te-validates",
+            id="legacy-custom",
+        ),
+    ],
+)
+def test_supports_save_original_input_matches_recipe_family(quant_kwargs, expected):
+    """Custom recipes rely on TE's per-quantizer validation of save_original_input."""
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4, **quant_kwargs)
+    if expected == "te-validates":
+        expected = te_recipe._te_validates_save_original_input()
+        # Without TE's validation helper, custom recipes must stay conservative.
+        with patch.dict(sys.modules, {"transformer_engine.pytorch.module._common": None}):
+            assert te_recipe.supports_save_original_input(config) is False
+
+    assert te_recipe.supports_save_original_input(config) is expected
+
+
+def test_mfsdp_v2_rejects_custom_recipe_at_startup():
+    from types import SimpleNamespace
+
+    from megatron.core.distributed.distributed_data_parallel_config import (
+        DistributedDataParallelConfig,
+    )
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
+    )
+    ddp_config = DistributedDataParallelConfig(
+        data_parallel_sharding_strategy="optim_grads_params",
+        expert_outer_dp_sharding_strategy="no_shard",
+    )
+    pg_collection = SimpleNamespace(
+        dp_cp=object(), tp=None, pp=None, cp=None, ep=None, expt_dp=None
+    )
+
+    with pytest.raises(ValueError, match="custom quantization recipes"):
+        FullyShardedDataParallelV2._validate_config(
+            config, ddp_config, torch.nn.Linear(2, 2), pg_collection, disable_bucketing=False
+        )
+
+
+def _skip_unless_fp8_available():
+    availability = te_extension.te.pytorch.is_fp8_available()
+    if isinstance(availability, tuple):
+        fp8_available, reason = availability
+    else:
+        fp8_available, reason = availability, "FP8 execution is unavailable"
+    if not fp8_available:
+        pytest.skip(reason)
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "factory_path", [TEST_FACTORY_PATH, DELAYED_FACTORY_PATH], ids=["current", "delayed-fallback"]
+)
+def test_custom_recipe_dense_forward_backward_receives_semantic_role_names(factory_path):
+    _skip_unless_fp8_available()
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        RECORDED_ROLES.clear()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            params_dtype=torch.bfloat16,
+            custom_recipe=factory_path,
+            fp8_dot_product_attention=True,
+        )
+        block = TransformerBlock(
+            config, get_gpt_layer_with_transformer_engine_spec(), name="decoder"
+        )
+        # The projection reuses the attention output saved by DPA instead of a quantized
+        # copy; TE validates the factory's quantizer at runtime.
+        linear_proj = block.layers[0].self_attention.linear_proj
+        assert linear_proj.save_original_input is te_recipe.supports_save_original_input(config)
+        hidden_states = torch.randn(
+            16, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            output = block(hidden_states=hidden_states, attention_mask=None)
+        output.float().square().mean().backward()
+        if linear_proj.save_original_input and factory_path == DELAYED_FACTORY_PATH:
+            # The delayed-scaling test factory cannot requantize deterministically, so TE must
+            # downgrade the optimization with a warning rather than fail or silently drift.
+            assert any("save_original_input" in str(w.message) for w in caught)
+
+        assert torch.isfinite(output).all()
+        assert hidden_states.grad is not None
+        assert torch.isfinite(hidden_states.grad).all()
+        role_names = {role.name for role in RECORDED_ROLES if role is not None}
+        assert {
+            "decoder.layers.0.self_attention.linear_qkv",
+            "decoder.layers.0.self_attention.linear_proj",
+            "decoder.layers.0.mlp.linear_fc1",
+            "decoder.layers.0.mlp.linear_fc2",
+            "decoder.layers.0.self_attention.core_attention",
+        } <= role_names
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def _grouped_moe_config(factory_path):
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        ffn_hidden_size=256,
+        num_attention_heads=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        params_dtype=torch.bfloat16,
+        add_bias_linear=False,
+        custom_recipe=factory_path,
+        num_moe_experts=2,
+        moe_ffn_hidden_size=256,
+        moe_grouped_gemm=True,
+        moe_router_topk=2,
+        moe_token_dispatcher_type="alltoall",
+        moe_router_padding_for_quantization=True,
+    )
+
+
+def _grouped_moe_block(config):
+    return TransformerBlock(
+        config,
+        get_gpt_layer_with_transformer_engine_spec(num_experts=2, moe_grouped_gemm=True),
+        name="decoder",
+    )
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_custom_recipe_grouped_moe_checkpoint_extra_state_is_stateless():
+    """Grouped experts must checkpoint without unpickling the CustomRecipe factory.
+
+    TE stores the CustomRecipe object, including its quantizer factory, in the TE extra
+    state, exactly as it does for the built-in recipes. MCore's own ``SafeUnpickler`` cannot
+    decode an arbitrary factory, so the per-GEMM split used by distributed checkpointing
+    stores an empty extra state, which is lossless for a stateless factory.
+    """
+    _skip_unless_fp8_available()
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = _grouped_moe_config(TEST_FACTORY_PATH)
+        block = _grouped_moe_block(config)
+        hidden_states = torch.randn(
+            16, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        output = block(hidden_states=hidden_states, attention_mask=None)
+        output.float().square().mean().backward()
+
+        sharded_state_dict = block.sharded_state_dict()
+        grouped_extra_states = {
+            key: value
+            for key, value in sharded_state_dict.items()
+            if ".experts.linear_fc" in key and "_extra_state" in key
+        }
+        assert len(grouped_extra_states) == 4, sorted(grouped_extra_states)
+        for sharded_object in grouped_extra_states.values():
+            assert sharded_object.data.numel() == 0
+
+        # Distributed-checkpoint load path: per-GEMM empty states are merged back by the
+        # grouped linear's load pre-hook without decoding any pickled recipe.
+        grouped_linear = block.layers[0].mlp.experts.linear_fc1
+        grouped_state_dict = grouped_linear.state_dict()
+        grouped_state_dict["_extra_state"] = torch.empty(0, dtype=torch.uint8)
+        for gemm_idx in range(1, grouped_linear.num_gemms):
+            grouped_state_dict[f"_extra_state{gemm_idx}"] = torch.empty(0, dtype=torch.uint8)
+        grouped_linear.load_state_dict(grouped_state_dict)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_custom_recipe_grouped_moe_rejects_delayed_scaling_state_on_first_step():
+    """Delayed-scaling state cannot be checkpointed per expert, so fail before training on.
+
+    Failing at the first checkpoint would waste the compute spent until then.
+    """
+    _skip_unless_fp8_available()
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        block = _grouped_moe_block(_grouped_moe_config(DELAYED_FACTORY_PATH))
+        hidden_states = torch.randn(
+            16, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with pytest.raises(
+            RuntimeError,
+            match=r"delayed-scaling quantizers for grouped linear "
+            r"'decoder\.layers\.0\.mlp\.experts\.linear_fc1'",
+        ):
+            block(hidden_states=hidden_states, attention_mask=None)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_custom_recipe_grouped_moe_checkpoint_save_rejects_delayed_scaling_state(monkeypatch):
+    """The per-expert checkpoint split must never drop delayed-scaling state silently.
+
+    Covers state that the forward check could not observe yet, e.g. delayed scaling returned
+    only for backward roles and saved before the next forward.
+    """
+    _skip_unless_fp8_available()
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        block = _grouped_moe_block(_grouped_moe_config(TEST_FACTORY_PATH))
+        hidden_states = torch.randn(
+            16, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        block(hidden_states=hidden_states, attention_mask=None).float().sum().backward()
+        monkeypatch.setattr(
+            te_extension, "_te_custom_recipe_has_delayed_state", lambda fp8_meta: True
+        )
+        with pytest.raises(RuntimeError, match="cannot be saved in per-expert checkpoints"):
+            block.sharded_state_dict()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+class _NameLessTELinear:
+    """Stand-in for a Transformer Engine constructor that predates the ``name`` argument."""
+
+    def __init__(self, in_features, out_features, bias=True):
+        pass
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize(
+    "config_kwargs",
+    [
+        pytest.param({}, id="bf16"),
+        pytest.param({"fp8": "hybrid", "fp8_recipe": Fp8Recipe.mxfp8}, id="builtin_fp8"),
+    ],
+)
+def test_te_name_kwarg_is_omitted_on_older_te_without_custom_recipe(config_kwargs):
+    """``name`` must not be forwarded to a TE constructor that cannot accept it.
+
+    MCore supports a wide range of TE versions and uses ``name`` for its own per-module
+    matcher regardless of TE support. Forwarding it unconditionally raises TypeError on
+    every BF16 and built-in FP8 run against a TE release without the keyword.
+    """
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, **config_kwargs
+    )
+    assert (
+        te_extension._te_name_kwarg(_NameLessTELinear, "decoder.layers.0.mlp.linear_fc1", config)
+        == {}
+    )
+    # The stand-in constructor must actually reject the keyword we just declined to pass.
+    with pytest.raises(TypeError):
+        _NameLessTELinear(128, 128, name="decoder.layers.0.mlp.linear_fc1")
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_te_name_kwarg_raises_for_custom_recipe_on_older_te():
+    """A custom recipe may select quantizers by name, so a dropped name must not be silent."""
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
+    )
+    with pytest.raises(RuntimeError, match="does not accept a 'name' argument"):
+        te_extension._te_name_kwarg(_NameLessTELinear, "decoder.layers.0.mlp.linear_fc1", config)
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize(
+    "config_kwargs",
+    [
+        pytest.param(
+            {"fp8": "hybrid", "fp8_recipe": "custom", "fp8_quantizer_factory": TEST_FACTORY_PATH},
+            id="legacy-fp8",
+        ),
+        pytest.param(
+            {"fp4": "e2m1", "fp4_recipe": "custom", "fp4_quantizer_factory": TEST_FACTORY_PATH},
+            id="legacy-fp4",
+        ),
+    ],
+)
+def test_te_name_kwarg_is_omitted_for_legacy_custom_recipe_on_older_te(config_kwargs):
+    """The deprecated custom-recipe flags never passed module names, so older TE keeps working.
+
+    Raising here would break GPT construction on TE releases whose DotProductAttention has
+    no ``name`` argument, even with FP8 attention disabled.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        warnings.simplefilter("ignore", DeprecationWarning)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, **config_kwargs
+        )
+    name = "decoder.layers.0.self_attention.core_attention"
+    assert te_extension._te_name_kwarg(_NameLessTELinear, name, config) == {}
+
+
+class _NameLessCoreAttention:
+    """Stand-in for a pluggable core attention whose constructor predates ``name``."""
+
+    def __init__(self, config, layer_number, attn_mask_type=None):
+        pass
+
+
+class _KwargsCoreAttention:
+    def __init__(self, config, **kwargs):
+        pass
+
+
+def test_name_kwarg_if_accepted_only_forwards_names_modules_can_take():
+    """Core attentions without a ``name`` parameter must still build (e.g. DSA over GQA)."""
+    from functools import partial
+
+    from megatron.core.transformer.dot_product_attention import DotProductAttention
+    from megatron.core.transformer.spec_utils import ModuleSpec, name_kwarg_if_accepted
+
+    name = "decoder.layers.0.self_attention.core_attention"
+    assert name_kwarg_if_accepted(_NameLessCoreAttention, name) == {}
+    assert name_kwarg_if_accepted(ModuleSpec(module=_NameLessCoreAttention), name) == {}
+    assert name_kwarg_if_accepted(partial(_NameLessCoreAttention, layer_number=1), name) == {}
+    assert name_kwarg_if_accepted(_KwargsCoreAttention, name) == {"name": name}
+    assert name_kwarg_if_accepted(DotProductAttention, name) == {"name": name}
+    assert name_kwarg_if_accepted(ModuleSpec(module=DotProductAttention), name) == {"name": name}
+    assert name_kwarg_if_accepted(DotProductAttention, None) == {}
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_te_name_kwarg_is_forwarded_when_supported():
+    config = TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
+    )
+    name = "decoder.layers.0.mlp.linear_fc1"
+    for te_class in (
+        te_extension.te.pytorch.Linear,
+        te_extension.te.pytorch.LayerNormLinear,
+        te_extension.te.pytorch.GroupedLinear,
+        te_extension.te.pytorch.DotProductAttention,
+    ):
+        if te_extension._te_constructor_accepts_name(te_class):
+            assert te_extension._te_name_kwarg(te_class, name, config) == {"name": name}
+    # A module with no semantic name never contributes the keyword.
+    assert te_extension._te_name_kwarg(te_extension.te.pytorch.Linear, None, config) == {}
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+def test_safe_unpickler_allowlists_builtin_recipes_but_not_custom_recipe():
+    """Pin why grouped custom-recipe extra state cannot be split per GEMM.
+
+    This is a Megatron-side constraint, not a Transformer Engine one: TE serializes a
+    ``CustomRecipe`` into the extra state exactly as it does the built-in recipes, but
+    decoding one here would also have to resolve the factory's arbitrary callable, which is
+    precisely what ``SafeUnpickler`` exists to prevent. If ``CustomRecipe`` is ever added to
+    the allowlist, ``_split_extra_state`` can preserve delayed-scaling state instead of
+    dropping it, and this test should be updated together with that change.
+    """
+    from megatron.core.safe_globals import SafeUnpickler
+
+    recipe_module = "transformer_engine.common.recipe"
+    for builtin in (
+        "DelayedScaling",
+        "Float8CurrentScaling",
+        "Float8BlockScaling",
+        "MXFP8BlockScaling",
+        "NVFP4BlockScaling",
+    ):
+        assert (recipe_module, builtin) in SafeUnpickler._SAFE_CLASSES
+    assert (recipe_module, "CustomRecipe") not in SafeUnpickler._SAFE_CLASSES
+
+
+def _te_module_names(block):
+    """Collect the semantic names Megatron actually handed to Transformer Engine."""
+    return {
+        module.name
+        for module in block.modules()
+        if isinstance(getattr(module, "name", None), str) and ".layers." in module.name
+    }
+
+
+def _layer_indices_in_names(names, suffix="self_attention.linear_qkv"):
+    return sorted(
+        int(name.split(".layers.")[1].split(".")[0]) for name in names if name.endswith(suffix)
+    )
+
+
+def _pp_naming_config(**kwargs):
+    settings = dict(
+        num_layers=4,
+        hidden_size=128,
+        ffn_hidden_size=256,
+        num_attention_heads=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+    )
+    settings.update(kwargs)
+    return TransformerConfig(**settings)
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_layer_names_are_global_across_pipeline_stages():
+    """A layer's semantic name must identify the same layer regardless of the PP split.
+
+    With stage-local indices, stage 1 of a 4-layer PP=2 model also emits ``decoder.layers.0``,
+    so a factory selecting on ``.layers.0.`` silently keeps one layer per stage in a different
+    precision instead of only the model's first layer.
+    """
+    Utils.initialize_model_parallel(1, 2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = _pp_naming_config(pipeline_model_parallel_size=2)
+        block = TransformerBlock(
+            config, get_gpt_layer_with_transformer_engine_spec(), name="decoder"
+        )
+        indices = _layer_indices_in_names(_te_module_names(block))
+        # Rank within the pipeline group: several global ranks share each stage.
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        expected = [0, 1] if pp_rank == 0 else [2, 3]
+        assert indices == expected, f"pp_rank={pp_rank} got {indices}, expected {expected}"
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_layer_names_are_global_across_virtual_pipeline_stages():
+    """Virtual pipeline stages must not restart layer numbering either."""
+    Utils.initialize_model_parallel(1, 2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = _pp_naming_config(
+            pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2
+        )
+        # Rank within the pipeline group: several global ranks share each stage.
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        seen = {}
+        for vp_stage in range(2):
+            block = TransformerBlock(
+                config,
+                get_gpt_layer_with_transformer_engine_spec(),
+                name="decoder",
+                vp_stage=vp_stage,
+            )
+            seen[vp_stage] = _layer_indices_in_names(_te_module_names(block))
+        # 4 layers over PP=2 x VPP=2 is one layer per (pp_rank, vp_stage) chunk, interleaved.
+        assert seen[0] == [pp_rank], seen
+        assert seen[1] == [2 + pp_rank], seen
+        # Every emitted index is unique model-wide, which is the property factories rely on.
+        flat = seen[0] + seen[1]
+        assert len(set(flat)) == len(flat), seen
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _record_finish_init_names(model_module, build):
+    """Build a model and return {module: name} for the names its finish_init() pass used."""
+    from megatron.core.quantization.utils import get_quant_config_or_none
+
+    seen_names = []
+
+    def record(name, recipe=None):
+        seen_names.append(name)
+        return get_quant_config_or_none(name, recipe)
+
+    with patch.object(model_module, "get_quant_config_or_none", side_effect=record):
+        model = build()
+    finish_init_modules = [
+        (path, module) for path, module in model.named_modules() if hasattr(module, "finish_init")
+    ]
+    assert len(seen_names) == len(finish_init_modules)
+    return model, [
+        (path, module, name) for (path, module), name in zip(finish_init_modules, seen_names)
+    ]
+
+
+def _layer_index(name):
+    return int(name.split(".layers.")[1].split(".")[0])
+
+
+def _build_gpt(config, mtp_num_layers=None):
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
+
+    spec = get_gpt_layer_with_transformer_engine_spec()
+    mtp_block_spec = (
+        get_gpt_mtp_block_spec(config=config, spec=spec, use_transformer_engine=True)
+        if mtp_num_layers
+        else None
+    )
+    return GPTModel(
+        config=config,
+        transformer_layer_spec=spec,
+        vocab_size=128,
+        max_sequence_length=16,
+        pre_process=parallel_state.is_pipeline_first_stage(),
+        post_process=parallel_state.is_pipeline_last_stage(),
+        mtp_block_spec=mtp_block_spec,
+    )
+
+
+def _build_hybrid(config, pattern):
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    return HybridModel(
+        config=config,
+        hybrid_stack_spec=hybrid_stack_spec,
+        vocab_size=128,
+        max_sequence_length=16,
+        hybrid_layer_pattern=pattern,
+        pre_process=parallel_state.is_pipeline_first_stage(),
+        post_process=parallel_state.is_pipeline_last_stage(),
+    )
+
+
+def _hybrid_naming_config(**kwargs):
+    # Small GDN heads keep the model cheap; GDN construction does not need FLA kernels.
+    return _pp_naming_config(
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        **kwargs,
+    )
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("model_type", ["gpt", "hybrid"])
+def test_finish_init_reuses_global_layer_names_across_pipeline_stages(model_type):
+    """GPTModel/HybridModel finish_init() must match recipes with the construction-time name.
+
+    named_modules() restarts layer numbering on each pipeline stage. Re-matching recipes with
+    that path would replace the recipe chosen when the weights were allocated, e.g. stage 1's
+    first layer would be treated as decoder.layers.0 instead of decoder.layers.2.
+    """
+    from megatron.core.models.gpt import gpt_model
+    from megatron.core.models.hybrid import hybrid_model
+
+    Utils.initialize_model_parallel(1, 2)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        if model_type == "gpt":
+            config = _pp_naming_config(pipeline_model_parallel_size=2)
+            _, records = _record_finish_init_names(gpt_model, lambda: _build_gpt(config))
+        else:
+            # Covers the custom-layer-free GDN branch, which used stage-local names, and the
+            # attention/MLP branches. One GDN, attention and MLP layer on each stage.
+            config = _hybrid_naming_config(pipeline_model_parallel_size=2, num_layers=6)
+            _, records = _record_finish_init_names(
+                hybrid_model, lambda: _build_hybrid(config, "G*-|G*-")
+            )
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        layer_records = [record for record in records if ".layers." in record[0]]
+        assert layer_records
+        for path, module, name in layer_records:
+            assert name == module.quant_module_name, (path, name)
+            # Stage-local path index plus this stage's offset gives the global index.
+            offset = pp_rank * (2 if model_type == "gpt" else 3)
+            assert _layer_index(name) == _layer_index(path) + offset, (path, name)
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("model_type", ["gpt", "gpt-mtp", "hybrid"])
+def test_finish_init_names_match_module_paths_without_pipelining(model_type):
+    """Without pipelining, construction-time names must equal named_modules() paths.
+
+    finish_init() now prefers the construction-time name; this pins that doing so cannot
+    change which recipe a module receives in single-stage models.
+    """
+    from megatron.core.models.gpt import gpt_model
+    from megatron.core.models.hybrid import hybrid_model
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        if model_type == "hybrid":
+            config = _hybrid_naming_config(num_layers=3)
+            _, records = _record_finish_init_names(
+                hybrid_model, lambda: _build_hybrid(config, "G*-")
+            )
+        else:
+            mtp_num_layers = 1 if model_type == "gpt-mtp" else None
+            config = _pp_naming_config(mtp_num_layers=mtp_num_layers)
+            _, records = _record_finish_init_names(
+                gpt_model, lambda: _build_gpt(config, mtp_num_layers)
+            )
+        named = [(path, name) for path, module, name in records if module.quant_module_name]
+        assert named
+        mismatched = [(path, name) for path, name in named if path != name]
+        assert not mismatched, mismatched
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_recipe.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize(
+    "quant_kwargs",
+    [
+        pytest.param({"fp8": "e4m3", "fp8_recipe": "mxfp8"}, id="fp8"),
+        pytest.param({"fp4": "e2m1", "fp4_recipe": "nvfp4"}, id="fp4"),
+        pytest.param({"custom_recipe": TEST_FACTORY_PATH}, id="custom"),
+    ],
+)
+@pytest.mark.parametrize("compatibility_api", [False, True], ids=["canonical", "fp8-wrapper"])
+def test_disabled_quantization_context_restores_enclosing_recipe(quant_kwargs, compatibility_api):
+    from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+    from megatron.core.fp8_utils import get_fp8_disabled_context
+
+    _skip_unless_fp8_available()
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4, **quant_kwargs)
+    recipe = te_recipe.get_te_quantization_recipe(config)
+    disable = (
+        get_fp8_disabled_context
+        if compatibility_api
+        else te_recipe.get_quantization_disabled_context
+    )
+    with te_extension.te.pytorch.autocast(enabled=True, recipe=recipe):
+        assert FP8GlobalStateManager.is_fp8_enabled()
+        with disable(config):
+            assert not FP8GlobalStateManager.is_fp8_enabled()
+        assert FP8GlobalStateManager.is_fp8_enabled()
+        assert FP8GlobalStateManager.get_fp8_recipe() is recipe
+
+
+@pytest.mark.skipif(not te_recipe.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+@pytest.mark.parametrize("compatibility_api", [False, True], ids=["canonical", "fp8-wrapper"])
+def test_disabled_quantization_init_restores_parameter_storage(precision, compatibility_api):
+    from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+    from megatron.core.fp8_utils import get_fp8_disabled_context
+
+    quant_kwargs = (
+        {"fp8": "e4m3", "fp8_recipe": "mxfp8", "fp8_param": True}
+        if precision == "fp8"
+        else {"fp4": "e2m1", "fp4_recipe": "nvfp4", "fp4_param": True}
+    )
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4, **quant_kwargs)
+    disable = (
+        get_fp8_disabled_context
+        if compatibility_api
+        else te_recipe.get_quantization_disabled_context
+    )
+    with te_recipe.get_quantization_context(config, is_init=True):
+        assert FP8GlobalStateManager.with_fp8_parameters()
+        with disable(config, is_init=True):
+            assert not FP8GlobalStateManager.with_fp8_parameters()
+        assert FP8GlobalStateManager.with_fp8_parameters()
+
+
+@pytest.mark.parametrize(
+    "config_kwargs",
+    [
+        pytest.param({"fp8": "e4m3", "fp8_recipe": "tensorwise"}, id="fp8"),
+        pytest.param({"fp4": "e2m1", "fp4_recipe": "nvfp4"}, id="fp4"),
+        *CUSTOM_RECIPE_SPELLINGS,
+    ],
+)
+def test_disable_quantization_clears_every_mode(config_kwargs):
+    from megatron.core.quantization.utils import (
+        disable_quantization,
+        is_custom_recipe_selected,
+        is_quantization_enabled,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        warnings.simplefilter("ignore", DeprecationWarning)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, **config_kwargs
+        )
+    assert is_quantization_enabled(config)
+
+    disable_quantization(config)
+
+    assert not is_quantization_enabled(config)
+    assert not is_custom_recipe_selected(config)
+    assert config.fp8_quantizer_factory is None
+    assert config.fp4_quantizer_factory is None
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("keep_mtp_in_bf16", [False, True], ids=["quantized-mtp", "bf16-mtp"])
+@pytest.mark.parametrize(
+    "quant_kwargs",
+    [
+        pytest.param({"fp8": "e4m3", "fp8_recipe": "tensorwise"}, id="fp8"),
+        pytest.param({"custom_recipe": TEST_FACTORY_PATH}, id="custom"),
+    ],
+)
+def test_mtp_block_builds_under_quantization_and_honors_keep_mtp_in_bf16(
+    quant_kwargs, keep_mtp_in_bf16
+):
+    """MTP layers build under every quantization mode, and --keep-mtp-in-bf16 clears them all."""
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.quantization.utils import is_quantization_enabled
+    from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
+
+    _skip_unless_fp8_available()
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=2,
+            mtp_num_layers=1,
+            hidden_size=128,
+            ffn_hidden_size=256,
+            num_attention_heads=4,
+            params_dtype=torch.bfloat16,
+            keep_mtp_in_bf16=keep_mtp_in_bf16,
+            **quant_kwargs,
+        )
+        spec = get_gpt_mtp_block_spec(
+            config=config,
+            spec=get_gpt_layer_with_transformer_engine_spec(),
+            use_transformer_engine=True,
+        )
+        mtp = MultiTokenPredictionBlock(
+            config=config,
+            spec=spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            name="mtp",
+        )
+
+        # The block keeps the global config; every MTP layer below it owns the effective one.
+        assert is_quantization_enabled(mtp.config)
+        layer_configs = {
+            name: module.config
+            for name, module in mtp.named_modules()
+            if module is not mtp and getattr(module, "config", None) is not None
+        }
+        assert layer_configs
+        mismatched = sorted(
+            name
+            for name, layer_config in layer_configs.items()
+            if is_quantization_enabled(layer_config) is keep_mtp_in_bf16
+        )
+        assert not mismatched, mismatched
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_multimodal_projector_runs_under_custom_recipe():
+    """Moving from --fp8 to --custom-recipe must keep the projector quantized."""
+    from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+    from megatron.core.transformer.mlp import MLPSubmodules
+
+    _skip_unless_fp8_available()
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            params_dtype=torch.bfloat16,
+            custom_recipe=TEST_FACTORY_PATH,
+        )
+        projector = MultimodalProjector(
+            config=config,
+            submodules=MLPSubmodules(
+                linear_fc1=te_extension.TEColumnParallelLinear,
+                linear_fc2=te_extension.TERowParallelLinear,
+            ),
+            projector_type="mlp",
+            input_size=64,
+        ).cuda()
+        # A token count that is not a multiple of the recipe alignment exercises padding.
+        hidden_states = torch.randn(
+            5, 3, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+
+        RECORDED_ROLES.clear()
+        output = projector(hidden_states)
+        output.float().square().mean().backward()
+
+        assert RECORDED_ROLES, "the projector linears did not run under the custom recipe"
+        assert output.shape == (5, 3, config.hidden_size)
+        assert torch.isfinite(output).all()
+        assert torch.isfinite(hidden_states.grad).all()
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    ("config_kwargs", "expected"),
+    [
+        pytest.param({}, None, id="bf16"),
+        pytest.param({"fp8": "e4m3", "fp8_recipe": "tensorwise"}, 16, id="fp8-tensorwise"),
+        pytest.param({"fp8": "e4m3", "fp8_recipe": "mxfp8"}, 32, id="mxfp8"),
+        pytest.param({"fp4": "e2m1", "fp4_recipe": "nvfp4"}, 32, id="nvfp4"),
+        *[pytest.param(p.values[0], None, id=f"custom-{p.id}") for p in CUSTOM_RECIPE_SPELLINGS],
+    ],
+)
+def test_dense_gemm_alignment_is_format_specific_and_deferred_for_custom_recipes(
+    config_kwargs, expected
+):
+    """Dense projections use their GEMM requirement, never the grouped-padding fallback.
+
+    A custom recipe picks each projection's format only when its factory runs, so there is no
+    construction-time requirement; Transformer Engine validates each GEMM at runtime.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        warnings.simplefilter("ignore", DeprecationWarning)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, **config_kwargs
+        )
+    assert te_recipe.get_dense_gemm_alignment(config) == expected
+
+
+def _first_layer_in_proj(model, pattern):
+    layer = model.decoder.layers[0]
+    return layer.mixer.in_proj if pattern == "M" else layer.self_attention.in_proj
+
+
+def _in_proj_width(model, pattern):
+    layer = model.decoder.layers[0]
+    if pattern == "M":
+        mixer = layer.mixer
+        return 2 * mixer.d_inner + 2 * mixer.ngroups * mixer.d_state + mixer.nheads
+    return layer.self_attention.in_proj_dim
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("pattern", ["M", "G"], ids=["mamba", "gdn"])
+def test_custom_recipe_does_not_apply_grouped_padding_to_dense_projections(pattern):
+    """TE's CustomRecipe.quantization_alignment (default 128) is for grouped-operation padding.
+
+    Applying it to the dense Mamba/GDN input projection rejected valid widths such as
+    Mamba's 6176 (hidden 1024 with default Mamba dims), even when the factory keeps those
+    projections in BF16 and only quantizes routed experts.
+    """
+    if pattern == "M":
+        from megatron.core.ssm.mamba_mixer import HAVE_MAMBA_SSM
+
+        if not HAVE_MAMBA_SSM:
+            pytest.skip("mamba-ssm is not installed")
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        extra = {"hidden_size": 1024} if pattern == "M" else {}
+        config = _hybrid_naming_config(num_layers=1, custom_recipe=TEST_FACTORY_PATH, **extra)
+        model = _build_hybrid(config, pattern)
+        width = _in_proj_width(model, pattern)
+        assert width % 128 != 0, "the fixture must not be aligned to the grouped fallback"
+        assert _first_layer_in_proj(model, pattern) is not None
+        if pattern == "M":
+            assert width == 6176
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fp8_still_rejects_dense_projection_widths_its_gemm_cannot_run():
+    """Built-in formats keep their dense GEMM check: FP8 needs multiples of 16."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = _hybrid_naming_config(num_layers=1, fp8="e4m3", fp8_recipe="tensorwise")
+        with pytest.raises(AssertionError, match="must be a multiple of 16"):
+            # GDN in_proj width here is 2 * 128 + 2 * 128 + 2 * 4 = 520.
+            _build_hybrid(config, "G")
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("config_kwargs", CUSTOM_RECIPE_SPELLINGS)
+def test_custom_recipe_rejects_local_transformer_impl(config_kwargs):
+    """Local layers never enter TE autocast, so the factory would be silently ignored."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        warnings.simplefilter("ignore", DeprecationWarning)
+        with pytest.raises(ValueError, match="transformer_impl='transformer_engine'"):
+            TransformerConfig(
+                num_layers=1,
+                hidden_size=128,
+                num_attention_heads=4,
+                transformer_impl="local",
+                **config_kwargs,
+            )
+    # Without a custom recipe, local layers remain a valid choice.
+    TransformerConfig(
+        num_layers=1, hidden_size=128, num_attention_heads=4, transformer_impl="local"
+    )
+
+
+def _mok_config(**kwargs):
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=8,
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        gradient_accumulation_fusion=True,
+        add_bias_linear=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        moe_shared_expert_intermediate_size=128,
+        gated_linear_unit=True,
+        activation_func=torch.nn.functional.silu,
+        moe_megakernel_backend="mok",
+        **kwargs,
+    )
+
+
+def test_custom_recipe_rejects_mok_megakernel_backend():
+    """MOK's BF16 path accepted --custom-recipe, but its experts bypass the TE linears."""
+    # The same MOK configuration is valid without a custom recipe, so the rejection below
+    # comes from the custom recipe and not from an unrelated MOK requirement.
+    _mok_config()
+    with pytest.raises(ValueError, match="MOK does not support custom recipes"):
+        _mok_config(custom_recipe=TEST_FACTORY_PATH)

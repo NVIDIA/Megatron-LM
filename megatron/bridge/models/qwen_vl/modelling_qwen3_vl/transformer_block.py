@@ -38,6 +38,8 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.te_recipe import get_quantization_context
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock, TransformerBlockSubmodules
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
@@ -120,7 +122,7 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
                 for index in range(start, end):
                     layer = self._get_layer(index)
                     inner_fp8_context = (
-                        get_fp8_context(self.config, layer.layer_number - 1)
+                        get_quantization_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
                         else nullcontext()
                     )
@@ -161,7 +163,7 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
 
         def checkpoint_handler(forward_func):
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            if self.config.fp8:
+            if is_quantization_enabled(self.config):
                 return te_checkpoint(
                     forward_func,
                     self.config.distribute_saved_activations,
@@ -211,7 +213,7 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
                 # Skip recomputation when input grad computation is not needed.
                 # Need to have at least one input tensor with gradient computation
                 # for re-enterant autograd engine.
-                if self.config.fp8 and not hidden_states.requires_grad:
+                if is_quantization_enabled(self.config) and not hidden_states.requires_grad:
                     recompute_skip_num_layers += 1
                 if (
                     layer_idx >= recompute_skip_num_layers
@@ -313,7 +315,9 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
         # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
         # control which layer will be fp8 or bf16
         use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
-        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        use_inner_fp8_context = (
+            self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        ) or self.config.custom_recipe is not None
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
         with rng_context, outer_fp8_context:
@@ -333,7 +337,7 @@ class Qwen3VLVisionTransformerBlock(TransformerBlock):
                 deepstack_feature_lists = []
                 for l_no, layer in enumerate(self.layers):
                     inner_fp8_context = (
-                        get_fp8_context(self.config, layer.layer_number - 1)
+                        get_quantization_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
                         else nullcontext()
                     )
@@ -553,7 +557,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                 for index in range(start, end):
                     layer = self._get_layer(index)
                     inner_fp8_context = (
-                        get_fp8_context(self.config, layer.layer_number - 1)
+                        get_quantization_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
                         else nullcontext()
                     )
@@ -586,7 +590,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
 
         def checkpoint_handler(forward_func):
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            if self.config.fp8:
+            if is_quantization_enabled(self.config):
                 return te_checkpoint(
                     forward_func,
                     self.config.distribute_saved_activations,
@@ -637,7 +641,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
                 # Skip recomputation when input grad computation is not needed.
                 # Need to have at least one input tensor with gradient computation
                 # for re-enterant autograd engine.
-                if self.config.fp8 and not hidden_states.requires_grad:
+                if is_quantization_enabled(self.config) and not hidden_states.requires_grad:
                     recompute_skip_num_layers += 1
                 if (
                     layer_idx >= recompute_skip_num_layers
@@ -752,7 +756,9 @@ class Qwen3VLTransformerBlock(TransformerBlock):
         # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
         # control which layer will be fp8 or bf16
         use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
-        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        use_inner_fp8_context = (
+            self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        ) or self.config.custom_recipe is not None
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
         with rng_context, outer_fp8_context:
@@ -774,7 +780,7 @@ class Qwen3VLTransformerBlock(TransformerBlock):
             else:
                 for l_no, layer in enumerate(self.layers):
                     inner_fp8_context = (
-                        get_fp8_context(self.config, layer.layer_number - 1)
+                        get_quantization_context(self.config, layer.layer_number - 1)
                         if use_inner_fp8_context
                         else nullcontext()
                     )
