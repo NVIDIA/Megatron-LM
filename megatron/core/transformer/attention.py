@@ -280,6 +280,32 @@ class CrossAttentionSubmodules:
     linear_proj: LinearProjBuilder
 
 
+def resolve_absorbed_mla_decode_kernel(config: MLATransformerConfig) -> Tuple[Optional[str], str]:
+    """Return the kernel that runs absorbed MLA decode over the cached latents on this device, and
+    why none does when it returns None.
+
+    ``"flash_mla"`` is FlashMLA's dense decode. It exists only for SM90, where it takes DeepSeek's
+    latent shape (``kv_lora_rank`` 512 plus a 64-dim RoPE part); on any other device it raises at
+    its first call, and upstream FlashMLA has removed it. With None, the layer's decode steps
+    up-project the cached latents and run unabsorbed attention, like every other step.
+    """
+    if (config.kv_lora_rank, config.qk_pos_emb_head_dim) != (512, 64):
+        return None, (
+            "FlashMLA's dense decode takes kv_lora_rank 512 with a 64-dim RoPE part, not "
+            f"{config.kv_lora_rank} with {config.qk_pos_emb_head_dim}"
+        )
+    if not torch.cuda.is_available():
+        return None, "CUDA is not available"
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) != (9, 0):
+        return None, (
+            f"FlashMLA's dense decode runs only on SM90, not on compute capability {major}.{minor}"
+        )
+    if not HAVE_FMLA:
+        return None, "flash_mla is not installed"
+    return "flash_mla", ""
+
+
 class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
     """Attention layer abstract class.
 
@@ -758,11 +784,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                 self.layer_number - pp_layer_offset, key, value
             )
 
-            if (
-                getattr(self.config, "cache_mla_latents", None)
-                and not inference_context.is_decode_only()
-            ):
-                # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
+            cache_mla_latents = getattr(self.config, "cache_mla_latents", None)
+            if cache_mla_latents and not self._absorbs_cached_latents(inference_context):
+                # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode, and
+                # every step in batch-invariant mode)
                 kv_cache, _, block_table = inference_context.key_value_cache(
                     self.layer_number - pp_layer_offset
                 )

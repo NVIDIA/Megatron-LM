@@ -95,7 +95,7 @@ the configurations they have been exercised in.
 | Hybrid Mamba and attention (for example, Nemotron-H style) | TP, PP, EP; chunked prefill, prefix caching including Mamba state, CUDA graphs | Most mature; primary optimization target to date |
 | GPT-style dense | TP, PP; chunked prefill, prefix caching, CUDA graphs, speculative decoding | Mature |
 | MoE | TP with EP; expert router replay, full CUDA-graph support, selectable grouped-GEMM backend | Supported. Additional throughput optimizations are in active development |
-| MLA (DeepSeek-style) | `cache_mla_latents=True`, KV block size 64, `flash_mla` | Supported, with the configuration constraints in [Known Limitations](#known-limitations) |
+| MLA (DeepSeek-style) | `cache_mla_latents=True`, KV block size 64, `flash_mla` (Hopper) | Supported, with the configuration constraints in [Known Limitations](#known-limitations) |
 | Gated Delta Net and Gated Delta Product | Dynamic batching only | Supported, with the feature gaps in [Known Limitations](#known-limitations) |
 | Vision-language | Image inputs only, `PP=1` | Supported, with the feature gaps in [Known Limitations](#known-limitations) |
 
@@ -166,6 +166,13 @@ workload rather than generalizing from any single comparison.
 > must be validated numerically rather than inferred from alignment.
 > Keep `use_transformer_engine_op_fuser=False`. Forward batch invariance does
 > not promise bitwise-identical gradients across different minibatches.
+>
+> MLA models with `cache_mla_latents` (required for dynamic batching) are
+> supported, with `flash_attention_version` 3 or 4 as above. Their decode-only
+> steps then skip FlashMLA, whose split-KV schedule depends on the whole batch.
+> Like mixed steps and training, they run unabsorbed attention: each layer
+> up-projects the latent cache to keys and values and runs FlashAttention with
+> one KV split. A decode step therefore costs about as much as a mixed step.
 >
 > Batch-invariant MoE matches training and inference only at the same expert-parallel
 > size: the expert combine adds per-EP-rank partials. To train and generate at different
@@ -1109,8 +1116,14 @@ is the opposite of the `MegatronLLM` constructor default.
   inference also requires `PP=1` (pipeline and virtual pipeline parallelism both
   raise), and in-core static-tiling preprocessing was removed — clients needing
   static tiling must submit a preprocessed tensor payload.
-- **MLA requires a specific configuration.** `cache_mla_latents=True`, a KV block
-  size of exactly 64, and the `flash_mla` package. RoPE fusion, sliding-window
+- **MLA requires a specific configuration.** `cache_mla_latents=True` and a KV block
+  size of exactly 64. Decode-only steps run absorbed attention over the latent
+  cache with FlashMLA (the `flash_mla` package), which only Hopper (SM90) has,
+  for a latent rank of 512 plus a 64-dim RoPE part. Batch-invariant mode skips
+  FlashMLA, and so do layers it does not cover (on Blackwell, for example), with a
+  warning when the model is built: each decode step up-projects the layer's whole
+  latent cache and runs FlashAttention 3 or 4, as in mixed steps, which makes
+  decoding much slower. RoPE fusion, sliding-window
   attention, Flash Decoding, and the Triton KV-append fast path are all
   incompatible with the latent cache.
 - **GDN2 is not supported.** `experimental_attention_variant='gdn2'` raises
