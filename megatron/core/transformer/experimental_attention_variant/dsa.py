@@ -2064,7 +2064,7 @@ def _dsa_weights_proj_wgrad(
     weight: torch.Tensor,
     linear: torch.nn.Module,
     is_first_microbatch: Optional[bool],
-) -> Tuple[torch.Tensor, None]:
+) -> Tuple[Optional[torch.Tensor], None]:
     """Compute or accumulate the high-precision weight gradient."""
     x_2d = x.reshape(-1, x.size(-1))
     grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
@@ -2081,8 +2081,11 @@ def _dsa_weights_proj_wgrad(
             else:
                 main_grad.add_(grad_weight)
             weight.main_grad = main_grad
-            if hasattr(weight, "grad_added_to_main_grad"):
-                weight.grad_added_to_main_grad = True
+            if not hasattr(weight, "grad_added_to_main_grad"):
+                # Like TE, return no gradient without DDP's flag (e.g. Megatron-FSDP v2), or it
+                # is added a second time.
+                return None, None
+            weight.grad_added_to_main_grad = True
             # The delayed-WGrad owner ignores this return value when accumulation is fused.
             return grad_weight, None
 

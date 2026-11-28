@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="215" viewBox="0 0 1500 215" font-family="Helvetica, Arial, sans-serif" font-size="18">
+<defs>
+<marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e1e1e"/></marker>
+<marker id="head-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7048e8"/></marker>
+</defs>
+<rect width="1500" height="215" fill="#ffffff"/>
+<line x1="10" y1="70" x2="1490" y2="70" stroke="#1e1e1e" stroke-width="1.5" stroke-dasharray="10,8"/>
+<line x1="10" y1="145" x2="1490" y2="145" stroke="#1e1e1e" stroke-width="1.5" stroke-dasharray="10,8"/>
+<text x="24" y="32" fill="#1e1e1e">allgather stream</text>
+<text x="24" y="107" fill="#1e1e1e">default stream</text>
+<text x="24" y="182" fill="#1e1e1e">reduce_scatter stream</text>
+<text x="300" y="32" fill="#1e1e1e" text-anchor="middle">AO_2</text>
+<text x="370" y="32" fill="#e03131" text-anchor="middle">AG_2</text>
+<text x="450" y="32" fill="#1e1e1e" text-anchor="middle">AO_1</text>
+<text x="520" y="32" fill="#e03131" text-anchor="middle">AG_1</text>
+<text x="620" y="32" fill="#1e1e1e" text-anchor="middle">DO_2</text>
+<text x="700" y="32" fill="#1e1e1e" text-anchor="middle">AO_0</text>
+<text x="770" y="32" fill="#e03131" text-anchor="middle">AG_0</text>
+<text x="900" y="32" fill="#1e1e1e" text-anchor="middle">DO_1</text>
+<text x="1180" y="32" fill="#1e1e1e" text-anchor="middle">DO_0</text>
+<text x="470" y="107" fill="#2f9e44" text-anchor="middle">Bwd_2</text>
+<text x="590" y="107" fill="#2f9e44" text-anchor="middle">CI_2</text>
+<text x="760" y="107" fill="#2f9e44" text-anchor="middle">Bwd_1</text>
+<text x="880" y="107" fill="#2f9e44" text-anchor="middle">CI_1</text>
+<text x="1060" y="107" fill="#2f9e44" text-anchor="middle">Bwd_0</text>
+<text x="1180" y="107" fill="#2f9e44" text-anchor="middle">CI_0</text>
+<text x="300" y="182" fill="#7048e8" text-anchor="middle">AI_2</text>
+<text x="370" y="182" fill="#7048e8" text-anchor="middle">AI_1</text>
+<text x="660" y="182" fill="#1971c2" text-anchor="middle">RS_2</text>
+<text x="730" y="182" fill="#1e1e1e" text-anchor="middle">DI_2</text>
+<text x="795" y="182" fill="#1e1e1e" text-anchor="middle">GA_2</text>
+<text x="860" y="182" fill="#7048e8" text-anchor="middle">AI_0</text>
+<text x="950" y="182" fill="#1971c2" text-anchor="middle">RS_1</text>
+<text x="1020" y="182" fill="#1e1e1e" text-anchor="middle">DI_1</text>
+<text x="1085" y="182" fill="#1e1e1e" text-anchor="middle">GA_1</text>
+<text x="1250" y="182" fill="#1971c2" text-anchor="middle">RS_0</text>
+<text x="1320" y="182" fill="#1e1e1e" text-anchor="middle">DI_0</text>
+<text x="1385" y="182" fill="#1e1e1e" text-anchor="middle">GA_0</text>
+<line x1="388.7" y1="39.7" x2="451.3" y2="86.7" stroke="#1e1e1e" stroke-width="1.6" marker-end="url(#head)"/>
+<line x1="325.4" y1="164.5" x2="439.5" y2="114.2" stroke="#7048e8" stroke-width="1.6" marker-end="url(#head-purple)"/>
+<line x1="498.0" y1="86.7" x2="594.6" y2="38.4" stroke="#1e1e1e" stroke-width="1.6" marker-end="url(#head)"/>
+<line x1="603.1" y1="114.7" x2="646.9" y2="161.7" stroke="#1e1e1e" stroke-width="1.6" marker-end="url(#head)"/>
+<line x1="545.4" y1="33.6" x2="729.5" y2="91.2" stroke="#1e1e1e" stroke-width="1.6" marker-end="url(#head)"/>
+<line x1="395.4" y1="170.8" x2="729.5" y2="106.6" stroke="#7048e8" stroke-width="1.6" marker-end="url(#head-purple)"/>
+<line x1="786.1" y1="86.7" x2="874.6" y2="39.3" stroke="#1e1e1e" stroke-width="1.6" marker-end="url(#head)"/>
+<line x1="893.1" y1="114.7" x2="936.9" y2="161.7" stroke="#1e1e1e" stroke-width="1.6" marker-end="url(#head)"/>
+<line x1="795.4" y1="32.3" x2="1029.5" y2="92.8" stroke="#1e1e1e" stroke-width="1.6" marker-end="url(#head)"/>
+<line x1="885.4" y1="166.2" x2="1029.5" y2="112.1" stroke="#7048e8" stroke-width="1.6" marker-end="url(#head-purple)"/>
+<line x1="1082.4" y1="86.7" x2="1157.6" y2="39.7" stroke="#1e1e1e" stroke-width="1.6" marker-end="url(#head)"/>
+<line x1="1193.1" y1="114.7" x2="1236.9" y2="161.7" stroke="#1e1e1e" stroke-width="1.6" marker-end="url(#head)"/>
+</svg>

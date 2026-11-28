@@ -598,6 +598,29 @@ def test_weights_projection_gradient_accumulation_and_deferred_wgrad():
 
 
 @pytest.mark.internal
+def test_weights_projection_fused_wgrad_without_ddp_flag_returns_no_grad():
+    """Without DDP's grad_added_to_main_grad (MFSDP v2), the wgrad lands only in main_grad."""
+    _skip_if_precision_unsupported("bf16")
+    config = _precision_config("bf16", gradient_accumulation_fusion=True)
+    config = dataclasses.replace(config, disable_parameter_transpose_cache=True)
+    indexer = _build_indexer(config)
+    projection = indexer.linear_weights_proj
+    projection.weight.main_grad = torch.zeros_like(projection.weight, dtype=torch.float32)
+
+    x = torch.randn(
+        4, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda", requires_grad=True
+    )
+    grad_output = torch.randn(4, 1, config.dsa_indexer_n_heads, dtype=torch.float32, device="cuda")
+    indexer._project_indexer_weights(x).backward(grad_output)
+
+    expected_wgrad = torch.mm(
+        grad_output.reshape(-1, grad_output.size(-1)).t(), x.float().squeeze(1)
+    )
+    torch.testing.assert_close(projection.weight.main_grad, expected_wgrad)
+    assert projection.weight.grad is None
+
+
+@pytest.mark.internal
 def test_weights_projection_deferred_fused_wgrad_preserves_dummy_for_hook():
     _skip_if_precision_unsupported("bf16")
     config = _precision_config("bf16", delay_wgrad_compute=True, gradient_accumulation_fusion=True)
