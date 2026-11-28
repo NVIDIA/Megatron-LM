@@ -15,8 +15,24 @@ from megatron.bridge.models.conversion.checkpoint import (
 from megatron.bridge.models.hybrid.model_config import BridgeHybridModelConfig
 from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.training.config import RootConfigContainer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_load_model_config_from_root_container(tmp_path, monkeypatch, run_config):
+    """Conversion reads the model from a root-wrapped training checkpoint."""
+    RootConfigContainer(training=run_config).to_yaml(str(tmp_path / "run_config.yaml"))
+    # This test only needs metadata, not a model-weight checkpoint directory.
+    monkeypatch.setattr(
+        "megatron.bridge.models.conversion.checkpoint.resolve_checkpoint_path",
+        lambda path: tmp_path,
+    )
+
+    restored, _ = load_model_config(tmp_path)
+
+    assert type(restored) is type(run_config.model)
+    assert restored.vocab_size == run_config.model.vocab_size
 
 
 @pytest.mark.parametrize("release", [False, True])

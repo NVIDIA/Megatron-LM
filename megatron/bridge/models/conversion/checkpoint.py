@@ -29,6 +29,7 @@ from megatron.training.models.base import ModelConfig
 from megatron.training.utils.checkpoint_utils import (
     get_checkpoint_run_config_filename,
     read_run_config,
+    run_config_sections,
 )
 from megatron.training.vocab_utils import model_vocab_size
 
@@ -71,7 +72,9 @@ def load_model_config(path: str | Path) -> tuple[ModelConfig, None]:
     from megatron.training.config.instantiate_utils import _resolve_target
 
     checkpoint = resolve_checkpoint_path(path)
-    metadata = read_run_config(get_checkpoint_run_config_filename(str(checkpoint)))
+    metadata = run_config_sections(
+        read_run_config(get_checkpoint_run_config_filename(str(checkpoint)))
+    )
     model_dict = metadata["model"]
 
     def check_targets(value: Any, key: str) -> None:
