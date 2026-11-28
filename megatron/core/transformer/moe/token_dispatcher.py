@@ -1328,6 +1328,13 @@ class _HybridEPManager(_DispatchManager):
             self.num_permuted_tokens = None
         self._original_num_tokens = None
         self._padded_num_tokens = None
+        if self.config.cuda_graph_impl == "none":
+            # Drop these references so the manager does not retain the router graph.
+            # Autograd keeps the state needed for backward.
+            self.token_probs = None
+            self.routing_map = None
+            self.topk_idx = None
+            self.dispatched_probs = None
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
