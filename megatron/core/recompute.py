@@ -7,6 +7,7 @@ from torch import Tensor
 from megatron.core.context_parallel import ContextParallelLayoutState, CPLayout
 from megatron.core.fp4_utils import get_fp4_context, get_layer_quantization_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.models.hybrid.layers import utils as hybrid_layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
@@ -34,6 +35,7 @@ def checkpointed_forward(
     input_ids_by_layout: Optional[dict[str, Tensor]] = None,
     cp_layout_state: Optional[ContextParallelLayoutState] = None,
     packed_sequence_cp_metadata: object | None = None,
+    strict_runtime_validation_frequency: Optional[str] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Forward method with activation checkpointing.
 
@@ -46,7 +48,14 @@ def checkpointed_forward(
             global indices when checking extract_layer_indices.
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
-        input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
+        input_ids (Tensor, optional): Boundary-layout token IDs for hash-routed MoE
+            and custom layers.
+        strict_runtime_validation_frequency (str, optional):
+            ``config.strict_runtime_validation_frequency`` of the calling stack. When given,
+            per-layer ``strict_runtime_validation`` flags are derived once per checkpointed
+            forward for layers that support validation, keyed on their config type, so a
+            recompute does not re-validate layers that the first forward already validated.
+            Other layers keep their original interface and need no validation config.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -55,6 +64,7 @@ def checkpointed_forward(
     if extract_layer_indices is None:
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
+    strictly_validated_layer_types: Set[type] = set()
 
     dsa_index_share_carrier = None
     dsa_index_share_carrier_scope = None
@@ -110,6 +120,22 @@ def checkpointed_forward(
                         index, padding_mask, padding_mask_by_layout
                     )
 
+                strict_runtime_validation = None
+                if strict_runtime_validation_frequency is not None and (
+                    isinstance(layer, TransformerLayer)
+                    or getattr(layer, "supports_hybrid_recompute_kwargs", False)
+                    or getattr(layer, "supports_strict_runtime_validation", False)
+                ):
+                    # Key on the per-layer config type (HybridStack builds every layer and mHC
+                    # wrapper with ``config=layer_config``); ``layer_type_list`` is a derived
+                    # property that is recomputed on every access.
+                    layer_type = type(layer.config)
+                    strict_runtime_validation = strict_runtime_validation_frequency == "always" or (
+                        strict_runtime_validation_frequency == "once_per_microbatch"
+                        and layer_type not in strictly_validated_layer_types
+                    )
+                    strictly_validated_layer_types.add(layer_type)
+
                 # Get appropriate inner quantization context
                 if use_inner_quantization_context:
                     if self.config.fp8:
@@ -149,14 +175,37 @@ def checkpointed_forward(
                 )
                 inner_layer = getattr(layer, "inner_layer", layer)
                 router = getattr(getattr(inner_layer, "mlp", None), "router", None)
-                if input_ids is not None and getattr(router, "is_hash_layer", False):
-                    layer_kwargs["input_ids"] = (
-                        input_ids_by_layout[cp_layout_state.manager.layer_layouts[index]]
-                        if input_ids_by_layout is not None
-                        else input_ids
-                    )
+                is_custom_layer = (
+                    hybrid_layer_utils.get_custom_layer_type(getattr(layer, "config", None))
+                    is not None
+                )
+                layer_input_ids = input_ids
+                if is_custom_layer and cp_layout_state is not None:
+                    layer_input_ids = cp_layout_state.get_layer_input_ids(index, input_ids)
+                elif input_ids_by_layout is not None:
+                    layer_input_ids = input_ids_by_layout[
+                        cp_layout_state.manager.layer_layouts[index]
+                    ]
+                if input_ids is not None and (
+                    is_custom_layer or getattr(router, "is_hash_layer", False)
+                ):
+                    layer_kwargs["input_ids"] = layer_input_ids
+                if strict_runtime_validation is not None:
+                    layer_kwargs["strict_runtime_validation"] = strict_runtime_validation
                 with inner_quantization_context:
-                    if isinstance(layer, TransformerLayer):
+                    if is_custom_layer and not getattr(
+                        layer, "supports_hybrid_recompute_kwargs", False
+                    ):
+                        hidden_states = hybrid_layer_utils.invoke_custom_layer(
+                            layer,
+                            hidden_states,
+                            attention_mask=attention_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            packed_seq_params=layer_packed_seq_params,
+                            padding_mask=layer_padding_mask,
+                            input_ids=layer_input_ids,
+                        )
+                    elif isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(hidden_states, **layer_kwargs)
                     elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
                         # HyperConnectionHybridLayer accepts the routing metadata

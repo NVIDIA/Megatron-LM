@@ -203,6 +203,7 @@ def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch, input_p
             freeze_base_model_for_mtp=False,
         ),
         hybrid_layer_config_list=None,
+        _has_custom_layers=False,
         pre_process=input_path != "pipeline",
         post_process=False,
         embedding=FakeEmbedding(),
@@ -1293,7 +1294,7 @@ class TestDecomposeReconstruct:
         kw = {'packed_seq_params': psp, 'other': 'kept'}
         layer._decompose_packed_seq_params_to_kwargs(kw)
         assert 'packed_seq_params' not in kw and 'cu_seqlens_q' in kw
-        layer._reconstruct_packed_seq_params_from_kwargs(kw)
+        layer._reconstruct_packed_graph_inputs(kw)
         r = kw['packed_seq_params']
         assert r.qkv_format == 'thd' and r.max_seqlen_q == 128
         assert r.pad_between_seqs is True
@@ -1321,7 +1322,7 @@ class TestDecomposeReconstruct:
         kw = {'packed_seq_params': psp}
 
         layer._decompose_packed_seq_params_to_kwargs(kw)
-        layer._reconstruct_packed_seq_params_from_kwargs(kw)
+        layer._reconstruct_packed_graph_inputs(kw)
 
         reconstructed = kw['packed_seq_params']
         assert reconstructed.pad_between_seqs is True
@@ -1379,7 +1380,7 @@ class TestDecomposeReconstruct:
         keys = set(kw.keys())
         layer._decompose_packed_seq_params_to_kwargs(kw)
         assert set(kw.keys()) == keys
-        layer._reconstruct_packed_seq_params_from_kwargs(kw)
+        layer._reconstruct_packed_graph_inputs(kw)
         assert set(kw.keys()) == keys
 
 
@@ -1733,10 +1734,17 @@ class TestChunkTokenMetadata:
 
     @staticmethod
     def _block(hidden_shape=(4, 1, 8), *, thd=True, moe=False, **config):
+        from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
         from megatron.core.transformer.chunk_cuda_graph import ChunkCudaGraphBlockMixin
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
-        class Base(torch.nn.Module):
+        class Base(TECudaGraphMixin, torch.nn.Module):
+            """Stands in for the per-layer defaults the block mixin builds on."""
+
+            def __init__(self, config):
+                self.config = config  # the shared mixin reads it while it initializes
+                super().__init__()
+
             def get_layer_static_inputs(self, seq_length, micro_batch_size):
                 return {"hidden_states": torch.ones(hidden_shape, requires_grad=True)}
 
@@ -1746,20 +1754,23 @@ class TestChunkTokenMetadata:
         class Block(ChunkCudaGraphBlockMixin, Base):
             pass
 
-        block = Block()
-        block.pre_process = True
-        block.config = SimpleNamespace(
-            **{
-                "sequence_parallel": True,
-                "enable_hyper_connections": False,
-                "max_seqlen_per_dp_cp_rank": 8,
-                "context_parallel_size": 1,
-                "thd_max_packed_sequences": 4,
-                "create_attention_mask_in_dataloader": False,
-                "moe_n_hash_layers": 0,
-                **config,
-            }
+        block = Block(
+            SimpleNamespace(
+                **{
+                    "cuda_graph_impl": "none",
+                    "fine_grained_activation_offloading": False,
+                    "sequence_parallel": True,
+                    "enable_hyper_connections": False,
+                    "max_seqlen_per_dp_cp_rank": 8,
+                    "context_parallel_size": 1,
+                    "thd_max_packed_sequences": 4,
+                    "create_attention_mask_in_dataloader": False,
+                    "moe_n_hash_layers": 0,
+                    **config,
+                }
+            )
         )
+        block.pre_process = True
         # Rank 1 of a TP group of two owns the second half of the CP-local tokens.
         block.tp_group = SimpleNamespace(size=lambda: 2, rank=lambda: 1)
         if moe:
@@ -2248,7 +2259,7 @@ class _ChunkCaptureEnv:
             torch.autograd.graph.set_override_stale_capture_stream(False)
         helper.create_cudagraphs()
         assert helper.graphs_created()
-        assert len(model.decoder.cuda_graphs) > 0
+        assert len(model.decoder.te_cuda_graphs) > 0
         return helper
 
     def capture_and_replay_against_eager(
@@ -2389,7 +2400,7 @@ class TestChunkGraphRegression:
         )
 
         assert helper.flattened_callables == [model.decoder, model.postprocess_block]
-        assert len(model.postprocess_block.cuda_graphs) > 0
+        assert len(model.postprocess_block.te_cuda_graphs) > 0
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
@@ -2494,7 +2505,7 @@ class TestChunkGraphRegression:
         )
 
         assert helper.flattened_callables == [model.decoder, model.postprocess_block]
-        assert len(model.postprocess_block.cuda_graphs) > 0
+        assert len(model.postprocess_block.te_cuda_graphs) > 0
         if recomputed_module is not None:
             # The eager reference recomputes: once in the forward, once in the backward.
             assert len(calls["twin", "plain"]) == len(batches)
@@ -2551,7 +2562,7 @@ class TestChunkGraphRegression:
         )
 
         assert helper.flattened_callables == [model.decoder, model.postprocess_block]
-        assert len(model.postprocess_block.cuda_graphs) > 0
+        assert len(model.postprocess_block.te_cuda_graphs) > 0
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_hybrid_mtp_hidden_state_mixing_rolls_its_history_like_eager(
@@ -2611,7 +2622,7 @@ class TestChunkGraphRegression:
         assert mixes, "the hidden-state mixing never ran"
         assert not local_rolls, f"local hidden-state roll taken (while capturing: {local_rolls})"
         assert helper.flattened_callables == [model.decoder, model.postprocess_block]
-        assert len(model.postprocess_block.cuda_graphs) > 0
+        assert len(model.postprocess_block.te_cuda_graphs) > 0
         assert model.postprocess_block._packed_boundaries_shared_seen is True
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -2756,7 +2767,7 @@ class TestChunkGraphRegression:
 
         helper = chunk_capture.capture(model, tokens)
         assert helper.flattened_callables == [model.decoder]
-        assert not model.postprocess_block.cuda_graphs
+        assert not model.postprocess_block.te_cuda_graphs
         assert "forward hooks" in (model.postprocess_block.eager_only_reason() or "")
         # The capture ran the decoder only.
         assert not logits_seen["model"]
@@ -3111,7 +3122,7 @@ class TestStaticInputs:
 
         assert static_inputs["padding_mask"].shape == (1, 128)
         assert not static_inputs["padding_mask"].any()
-        assert layer._cuda_graph_padding_mask_shape == (1, 128)
+        assert layer._te_cuda_graph_padding_mask_shape == (1, 128)
         mask = static_inputs["padding_mask"]
         assert layer._te_cuda_graph_padding_mask(mask, mask.device) is mask
         torch.testing.assert_close(layer._te_cuda_graph_padding_mask(None, mask.device), mask)
@@ -3126,6 +3137,9 @@ class TestStaticInputs:
         layer.config.context_parallel_size = 2
         layer.config.sequence_packing_scheduler = "dp_balanced" if packed else None
         layer.config.cuda_graph_impl = "transformer_engine"
+        # The layer was built without TE CUDA graphs; initialize the graph state that
+        # construction with cuda_graph_impl="transformer_engine" would have registered.
+        layer.register_te_cuda_graph()
         layer.config.moe_num_hash_layers = 1
         layer.is_moe_layer = True
         layer.mlp.router = torch.nn.Identity()
@@ -3580,6 +3594,7 @@ class TestGraphDynamicRouteMetadataArena:
         import transformer_engine.pytorch.graph as te_graph
 
         from megatron.core import parallel_state
+        from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
         from megatron.core.transformer.cuda_graphs import (
             TECudaGraphHelper,
             _set_capture_end,
@@ -3621,10 +3636,10 @@ class TestGraphDynamicRouteMetadataArena:
             def rank():
                 return 0
 
-        class RouteToyLayer(GraphableMegatronModule):
+        class RouteToyLayer(TECudaGraphMixin, GraphableMegatronModule):
             def __init__(self, layer_number):
                 # A tiny test-only Graphable module avoids constructing a full TransformerLayer,
-                # while exercising GraphableMegatronModule's real TE replay/slot selection.
+                # while exercising TECudaGraphMixin's real TE replay/slot selection.
                 torch.nn.Module.__init__(self)
                 self.config = config
                 self.pg_collection = SimpleNamespace(cp=LocalCPGroup())
@@ -3637,8 +3652,9 @@ class TestGraphDynamicRouteMetadataArena:
                 self.bias = torch.nn.Parameter(
                     torch.linspace(-0.2, 0.1, 4, device="cuda") + 0.05 * layer_number
                 )
-                self.cuda_graphs = []
-                self.cuda_graph_manual_hooks = []
+                self.te_cuda_graphs = []
+                self.te_cuda_graph_manual_hooks = []
+                self.te_cuda_graph_current_microbatch = 0
                 self._te_cuda_graph_route_replay_state = None
 
             @staticmethod
@@ -3649,13 +3665,14 @@ class TestGraphDynamicRouteMetadataArena:
                 # Exercise the production rank check and staged-slot tag plumbing.
                 return TransformerLayer._decompose_packed_seq_params_to_kwargs(self, kwargs)
 
-            def _te_cuda_graph_replay(self, *args, **kwargs):
-                # The production replay wrapper owns PackedSeqParams decomposition.
-                return TransformerLayer._te_cuda_graph_replay(self, *args, **kwargs)
-
-            def _te_cuda_graph_replay_impl(self, args, kwargs, context):
-                assert context is None
-                return GraphableMegatronModule._te_cuda_graph_replay(self, *args, **kwargs)
+            def _te_cuda_graph_prepare_replay(self, hidden_states, *args, **kwargs):
+                # As in TransformerLayer, replay preparation owns PackedSeqParams
+                # decomposition and pins the staged route slot before graph selection.
+                kwargs = dict(kwargs)
+                self._decompose_packed_seq_params_to_kwargs(kwargs)
+                return TECudaGraphMixin._te_cuda_graph_prepare_replay(
+                    self, hidden_states, *args, **kwargs
+                )
 
             def forward(
                 self,
@@ -3821,8 +3838,8 @@ class TestGraphDynamicRouteMetadataArena:
                         sample_kwargs[graph_idx]["dsa_cp_graph_layout_buffer"].data_ptr(),
                         sample_kwargs[graph_idx]["dsa_cp_graph_route_buffer"].data_ptr(),
                     ) == arena_ptrs
-                graph_layers[0].cuda_graphs.append(graphed[slot * 2])
-                graph_layers[1].cuda_graphs.append(graphed[slot * 2 + 1])
+                graph_layers[0].te_cuda_graphs.append(graphed[slot * 2])
+                graph_layers[1].te_cuda_graphs.append(graphed[slot * 2 + 1])
 
             arena_ptrs = tuple(tuple(owner.data_ptr() for owner in pair) for pair in arenas)
             suffixes = tuple(
@@ -3883,7 +3900,7 @@ class TestGraphDynamicRouteMetadataArena:
                 for layer in graph_layers:
                     # Simulate checkpoint recompute after the global layer state advanced to
                     # another slot. The staged invocation must still select its retained graph.
-                    layer.current_microbatch = replay_idx + 1
+                    layer.te_cuda_graph_current_microbatch = replay_idx + 1
                     graph_output = layer(graph_output, packed_seq_params=staged)
                     assert layer._te_cuda_graph_route_replay_state is None
                 # TE returns a detached view of its recyclable static output. With
@@ -3976,7 +3993,7 @@ class TestGraphDynamicRouteMetadataArena:
                 if hasattr(graph, "reset"):
                     graph.reset()
             for layer in graph_layers:
-                layer.cuda_graphs.clear()
+                layer.te_cuda_graphs.clear()
             block.clear_te_cuda_graph_route_metadata_arenas()
 
 

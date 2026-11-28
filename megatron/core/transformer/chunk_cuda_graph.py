@@ -17,16 +17,20 @@ from contextlib import nullcontext
 import torch
 
 from megatron.core import tensor_parallel
+from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import GraphableMegatronModule
 
 
-class ChunkCudaGraphBlockMixin:
+class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
     """Make a complete decoder block a Transformer Engine graph callable.
 
-    The mixin must precede ``GraphableMegatronModule`` in the bases. It contributes the static
+    The mixin must precede ``GraphableMegatronModule`` in the bases. It is the whole-block
+    counterpart of the per-layer ``TECudaGraphMixin`` users: the block registers its graph state
+    under ``cuda_graph_impl="chunk_wise"`` (its layers register under ``"transformer_engine"``
+    and therefore run their ordinary forward inside the block capture). It contributes the static
     capture inputs of the block-level call signature and the capture/replay adapters that convert
     between that signature and the tensor-only interface CUDA graphs accept (``PackedSeqParams``
     is decomposed into its ``cu_seqlens`` tensors, and the pipeline input tensor is exposed as the
@@ -35,6 +39,7 @@ class ChunkCudaGraphBlockMixin:
     copies are part of the captured graphs and every slot's graphs are self-contained.
     """
 
+    _te_cuda_graph_impl = "chunk_wise"
     is_cuda_graph_chunk_callable = True
     # Whether the graphs were captured with the dataloader's attention mask as a static input
     # (get_layer_static_inputs), and the mask a replay passes when the caller has none.
@@ -103,6 +108,26 @@ class ChunkCudaGraphBlockMixin:
 
             return get_fp4_context(self.config)
         return nullcontext()
+
+    def is_graphable_for_scope(self, modules):
+        """A block covers none of the per-layer scopes of ``cuda_graph_impl="transformer_engine"``:
+        there its layers are the callables (``_te_cuda_graph_layer_is_graphable``)."""
+        return False
+
+    def _should_call_te_cudagraph(self):
+        """Whether this call captures or replays the block graph.
+
+        Only a block the pipeline schedule drives is a callable; a stack nested in one (the
+        hybrid MTP stack, which runs inside the post-process callable) runs its forward.
+        """
+        # getattr: unit tests call blocks built on stand-in configs.
+        if getattr(self.config, "cuda_graph_impl", "none") != self._te_cuda_graph_impl:
+            return False
+        return self.is_cuda_graph_chunk_callable and super()._should_call_te_cudagraph()
+
+    def _te_cuda_graph_replay_microbatch(self):
+        """The schedule sets ``current_microbatch`` on the block (``set_current_microbatch``)."""
+        return getattr(self, "current_microbatch", 0)
 
     def __call__(self, *args, **kwargs):
         # Note a padding mask where the model hands it to the block: the hyper-connection
@@ -444,9 +469,6 @@ class ChunkCudaGraphBlockMixin:
 
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """Run the block forward on the static inputs so TE records it as one graph."""
-        if self.config.cuda_graph_impl != "chunk_wise":
-            return super()._te_cuda_graph_capture(*args, **kwargs)
-
         args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
         self._reconstruct_packed_seq_params_from_kwargs(kwargs)
         kwargs.setdefault("attention_mask", None)
@@ -475,19 +497,21 @@ class ChunkCudaGraphBlockMixin:
 
             # One offload handler per capture-time callable forward; the post-process block's
             # handler resumes where the decoder's groups end, like eager MTP, but is its own
-            # (the two callables are separate graphs). backward_record/forward_record mark the
-            # capture boundary of a callable: the backward graph's tail joins the H2D stream and
+            # (the two callables are separate graphs). The TE graph interface's
+            # backward_record/forward_record mark the capture boundary of a callable, as they
+            # do for a per-layer callable: the backward graph's tail joins the H2D stream and
             # the forward graph's tail joins the D2H stream.
+            te_graph_boundary = self.get_offload_interface()
             is_postprocess = getattr(self, "is_cuda_graph_postprocess_callable", False)
             off_interface.begin_block_capture_chunk(
                 getattr(self, "vp_stage", None), continue_current=is_postprocess
             )
             off_interface.block_capture_forward_start()
             if args:
-                hidden_states = off_interface.backward_record(args[0])
+                hidden_states = te_graph_boundary.backward_record(args[0])
                 args = (hidden_states,) + args[1:]
             else:
-                hidden_states = off_interface.backward_record(kwargs["hidden_states"])
+                hidden_states = te_graph_boundary.backward_record(kwargs["hidden_states"])
                 kwargs["hidden_states"] = hidden_states
             if not self.pre_process:
                 self.input_tensor = hidden_states
@@ -504,7 +528,7 @@ class ChunkCudaGraphBlockMixin:
 
         if self.config.fine_grained_activation_offloading:
             output = off_interface.block_capture_backward_start(output)
-            off_interface.forward_record()
+            te_graph_boundary.forward_record()
             off_interface.end_block_capture_chunk(record_decoder_end=not is_postprocess)
 
         if self.config.moe_paged_stash:
@@ -574,33 +598,35 @@ class ChunkCudaGraphBlockMixin:
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
         """Replay the graph of microbatch ``current_microbatch``."""
-        if self.config.cuda_graph_impl != "chunk_wise":
-            return super()._te_cuda_graph_replay(*args, **kwargs)
-
         args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
         self._decompose_packed_seq_params_to_kwargs(kwargs)
-        hidden_states = args[0] if args else kwargs["hidden_states"]
+        # The pipeline input is the positional graph input of the shared replay.
+        if args:
+            hidden_states, args = args[0], args[1:]
+        else:
+            hidden_states = kwargs.pop("hidden_states")
         self._align_token_metadata_to_block(hidden_states, kwargs)
         self._supply_attention_mask_of_a_fixed_length_graph(hidden_states, kwargs)
         # Only tensors are graph inputs; a keyword that is None at runtime was not captured.
         kwargs = {key: value for key, value in kwargs.items() if value is not None}
 
-        microbatch_id = getattr(self, "current_microbatch", 0)
+        microbatch_id = self._te_cuda_graph_replay_microbatch()
+        num_slots = len(self.te_cuda_graphs)
         # Without pipeline parallelism one slot serves every microbatch (a microbatch's backward
         # completes before the next forward). With PP the capture holds one slot per microbatch,
-        # so the base replay's ``current_microbatch % len(cuda_graphs)`` must not wrap: reusing a
+        # so the shared replay's ``microbatch % len(te_cuda_graphs)`` must not wrap: reusing a
         # slot whose backward has not retired would corrupt its static buffers.
-        if self.config.pipeline_model_parallel_size > 1 and microbatch_id >= len(self.cuda_graphs):
+        if self.config.pipeline_model_parallel_size > 1 and microbatch_id >= num_slots:
             # Not an assert: under ``python -O`` the replay below would wrap around silently.
             raise RuntimeError(
                 f"Chunk CUDA graph replay requested microbatch {microbatch_id}, but the capture "
-                f"only contains {len(self.cuda_graphs)} graph slots. The slots are sized at "
+                f"only contains {num_slots} graph slots. The slots are sized at "
                 "capture from the global batch size (one sequence per dataset item for packed "
                 "data). A step with more microbatches needs a new capture: keep the global "
                 "batch size fixed, or relaunch from a checkpoint after it changes."
             )
         with self._chunk_graph_replay_quantization_context():
-            return super()._te_cuda_graph_replay(*args, **kwargs)
+            return super()._te_cuda_graph_replay(hidden_states, *args, **kwargs)
 
 
 class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatronModule):

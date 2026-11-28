@@ -27,6 +27,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import dsa_layer_specs
 from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGQAAttentionSubmodules,
@@ -220,6 +221,40 @@ def test_dsa_stack_spec_preserves_dense_attention(derived, upstream):
     assert (
         core_attention.submodules.dense_core_attention
         is upstream_attention.submodules.core_attention
+    )
+
+
+@pytest.mark.parametrize("training_spec", ["dsa_stack_spec", "gdp_dsa_stack_spec"])
+@pytest.mark.parametrize("wide_residual", [False, True])
+def test_inference_optimized_resolves_dsa_inference_stack(training_spec, wide_residual):
+    """inference_optimized serving finds a DSA inference stack for each DSA training spec.
+
+    Without one, the lookup returns None and the server falls back to a stack with Mamba
+    mixers and plain attention, silently leaving the checkpoint's GDP and indexer weights
+    unloaded.
+    """
+    from megatron.training.argument_utils import _hybrid_inference_stack_spec
+
+    spec = _hybrid_inference_stack_spec(
+        [dsa_layer_specs.__name__, training_spec], wide_residual=wide_residual
+    )
+    assert spec is not None
+    expected = training_spec.removesuffix("_stack_spec") + "_inference_stack_spec"
+    if wide_residual:
+        expected = "wide_residual_" + expected
+    assert spec is getattr(dsa_layer_specs, expected)
+    layer_selections = [spec.submodules]
+    if wide_residual:
+        # MTP reuses the unwrapped layer selection; it must keep the indexer the checkpoint holds.
+        layer_selections.append(spec.submodules.mtp_stack_submodules)
+    for submodules in layer_selections:
+        self_attention = submodules.attention_layer.submodules.self_attention
+        assert self_attention.module is DSGroupedSelfAttention
+        assert self_attention.submodules.core_attention.module is DSGQACoreAttention
+    training_mixer = getattr(dsa_layer_specs, training_spec).submodules.mamba_layer
+    assert (
+        spec.submodules.mamba_layer.submodules.mixer.module
+        is training_mixer.submodules.mixer.module
     )
 
 
@@ -1175,6 +1210,50 @@ def _dsa_gqa_core_attention(indexer_loss_coeff, layer_number):
         attention_type="self",
         pg_collection=SimpleNamespace(tp=_DummyTPGroup(), cp=None),
     )
+
+
+@pytest.mark.parametrize("kpool", [1, 4])
+def test_dsa_gqa_core_attention_rejects_kpool(kpool):
+    """The simplified indexer has no pool compression, so a KPool config must not reach it.
+
+    TransformerConfig rejects simplified + KPool; this covers a config whose dsa_indexer_kpool
+    changed after construction, which skips that validation.
+    """
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
+        num_query_groups=1,
+        kv_channels=8,
+        experimental_attention_variant="dsa",
+        dsa_indexer_mode="simplified",
+        add_bias_linear=False,
+        dsa_indexer_topk=4,
+        dsa_kernel_backend="reference",
+    )
+    config.rotary_percent = 0.0
+    config.dsa_indexer_kpool = kpool
+    linear = ModuleSpec(module=_PlainIndexerLinear)
+    indexer = ModuleSpec(
+        module=SimplifiedDSGQAIndexer,
+        submodules=SimplifiedDSGQAIndexerSubmodules(linear_q=linear, linear_k=linear),
+    )
+
+    def build():
+        return DSGQACoreAttention(
+            config,
+            DSGQAAttentionSubmodules(indexer=indexer),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type="self",
+            pg_collection=SimpleNamespace(tp=_DummyTPGroup(), cp=None),
+        )
+
+    if kpool > 1:
+        with pytest.raises(ValueError, match="does not support KPool"):
+            build()
+    else:
+        assert isinstance(build(), DSGQACoreAttention)
 
 
 def _run_dsa_gqa_training_forward(core):

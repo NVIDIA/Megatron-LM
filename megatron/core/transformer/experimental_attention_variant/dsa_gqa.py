@@ -585,6 +585,14 @@ class DSGQACoreAttention(MegatronModule):
             f"dsa_indexer_mode={config.dsa_indexer_mode!r}. The standard DeepSeek indexer "
             "remains available for DSA over MLA."
         )
+        # The simplified indexer has no pool compression and never reads dsa_indexer_kpool, so
+        # a KPool config that reached it without TransformerConfig validation would be ignored.
+        if getattr(config, "dsa_indexer_kpool", 1) > 1:
+            raise ValueError(
+                "dsa_indexer_mode='simplified' does not support KPool selection "
+                "(dsa_indexer_kpool > 1): the simplified indexer has no pool compression; "
+                f"got dsa_indexer_kpool={config.dsa_indexer_kpool}."
+            )
         self.layer_number = layer_number
         self.indexer = build_module(submodules.indexer, config=config, pg_collection=pg_collection)
         self.dense_core_attention = None

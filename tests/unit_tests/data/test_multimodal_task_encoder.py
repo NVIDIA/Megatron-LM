@@ -2,6 +2,7 @@
 
 import importlib
 import io
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,26 @@ from examples.multimodal.data_loading.task_encoder import (
     MultiModalTaskEncoder,
     _normalize_thinking_trace,
 )
+
+
+@pytest.mark.parametrize("consumer", ["tiling", "task_encoder", "legacy_task_encoder"])
+def test_preprocessing_rejects_non_vision_model(monkeypatch, run_config, consumer):
+    # The legacy example imports sibling modules by name. Set its script path
+    # explicitly instead of relying on another test module to modify sys.path.
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "examples/multimodal"))
+    from examples.multimodal import dataset_helpers
+    from examples.multimodal.data_loading.image_processing import create_image_tiling_strategy
+
+    args = SimpleNamespace()
+    monkeypatch.setattr(task_encoder, "get_args", lambda: args)
+    monkeypatch.setattr(dataset_helpers, "get_args", lambda: args)
+    calls = {
+        "tiling": lambda: create_image_tiling_strategy(args, run_config),
+        "task_encoder": MultiModalTaskEncoder,
+        "legacy_task_encoder": dataset_helpers.TaskEncoder,
+    }
+    with pytest.raises(TypeError, match="Expected cfg.model.*got GPTModelConfig"):
+        calls[consumer]()
 
 
 def _encoder(thread_count=8):

@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from megatron.core import fp4_utils, fp8_utils
+from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import (
     get_fp4_recipe,
@@ -493,7 +494,9 @@ class TestChunkGraphPrecisionContexts:
 
         monkeypatch.setattr(fp4_utils, "get_fp4_context", recording_fp4_context)
 
-        class GraphedBase:
+        class GraphedBase(TECudaGraphMixin):
+            """Records the shared replay the block mixin hands over to."""
+
             def _te_cuda_graph_replay(self, *args, **kwargs):
                 events.append(("replay", len(args), tuple(sorted(kwargs))))
                 return "output"
@@ -502,7 +505,7 @@ class TestChunkGraphPrecisionContexts:
             def __init__(self, config):
                 self.config = config
                 self.pre_process = True
-                self.cuda_graphs = [object()]
+                self.te_cuda_graphs = [object()]
                 self.current_microbatch = 0
 
         def replay(**config):
@@ -868,7 +871,7 @@ class TestNvfp4ChunkGraphEndToEnd:
         cleanups.append(release)
         helper.create_cudagraphs()
         assert helper.graphs_created()
-        assert len(model.decoder.cuda_graphs) > 0
+        assert len(model.decoder.te_cuda_graphs) > 0
 
     @pytest.mark.parametrize("recompute", [None, "full"])
     def test_fixed_length_capture_and_replay_keep_the_eager_layer_precision(
@@ -1066,7 +1069,7 @@ class TestNvfp4ChunkGraphEndToEnd:
         recorder.check(["eager"], expected, recompute)
 
         self._capture(model, micro_batch_size, capture_cleanups)
-        assert len(model.postprocess_block.cuda_graphs) > 0
+        assert len(model.postprocess_block.te_cuda_graphs) > 0
         # Decoder and MTP layers are warmed up and recorded in the precision eager runs them in.
         recorder.check(["eager", "warmup", "capture"], expected, recompute)
         # Eager opens no autocast around the post-process; the capture opens the model's only

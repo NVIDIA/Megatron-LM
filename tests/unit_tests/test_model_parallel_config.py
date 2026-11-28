@@ -180,6 +180,18 @@ def test_pipeline_p2p_fixed_shape_warns_for_layout_derived_standalone_mtp(monkey
     assert config.mtp_standalone
 
 
+def test_invalid_strict_runtime_validation_frequency_is_rejected():
+    with pytest.raises(ValueError, match="strict_runtime_validation_frequency must be"):
+        ModelParallelConfig(strict_runtime_validation_frequency="sometimes")
+
+
+def test_disabling_strict_runtime_validation_warns():
+    with pytest.warns(UserWarning, match="Strict runtime validation is disabled"):
+        config = ModelParallelConfig(strict_runtime_validation_frequency="never")
+
+    assert config.strict_runtime_validation_frequency == "never"
+
+
 def test_contiguous_context_parallel_rejects_bshd_inputs():
     with pytest.raises(
         ValueError,
@@ -192,6 +204,23 @@ def test_contiguous_context_parallel_rejects_bshd_inputs():
             context_parallel_size=2,
             cp_partition_mode="contiguous",
         )
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None),
+        (False, None),
+        (True, ["ag", "rs"]),
+        ([], ["ag", "rs"]),
+        (["rs", "ag", "rs"], ["ag", "rs"]),
+    ],
+)
+def test_gtp_nccl_ub_is_normalized(value, expected):
+    config = ModelParallelConfig(gtp_remat_nccl_ub=value, gtp_expert_remat_nccl_ub=value)
+
+    assert config.gtp_remat_nccl_ub == expected
+    assert config.gtp_expert_remat_nccl_ub == expected
 
 
 def test_dynamic_cp_selects_default_scheduler_and_variable_lengths():

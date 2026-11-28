@@ -115,7 +115,6 @@ class MoETokenDispatcher:
         # Attributes that need to be captured in cudagraph. These attributes are returned
         # as cudagraph outputs when the cuda_graph_modules contains moe_preprocess.
         self.cudagraph_attrs = []
-        self.valid_cudagraph_attrs = None
 
     def get_cudagraph_attr(self, attr_name: str):
         """Resolve a cudagraph attribute path, including nested attributes."""

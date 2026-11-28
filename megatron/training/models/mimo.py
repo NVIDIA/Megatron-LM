@@ -28,6 +28,18 @@ class MimoBuildConfig(ModelConfig):
     seq_length: int
     """Language-model position capacity, not the data sequence length."""
 
+    img_h: int = 224
+    """Vision input height shared by the encoder and its data pipeline."""
+
+    img_w: int = 224
+    """Vision input width shared by the encoder and its data pipeline."""
+
+    patch_dim: int = 16
+    """Vision patch size."""
+
+    drop_vision_class_token: bool = False
+    """Drop vision class tokens before projecting image embeddings."""
+
     mimo_llm_world_size: int | None = None
     """Language-grid rank count, or None to use the full launch."""
 

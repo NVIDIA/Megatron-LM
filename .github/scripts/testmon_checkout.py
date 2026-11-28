@@ -45,13 +45,16 @@ def sha(value: object) -> str:
 
 
 def latest_baseline() -> tuple[str, str]:
-    """Find a successful trusted main producer with a common cache generation."""
+    """Find a completed trusted main producer with a common cache generation."""
     response = json.loads(
         run(
             "gh",
             "api",
             f"repos/{REPOSITORY}/actions/workflows/populate-build-cache.yml/"
-            "runs?branch=main&status=success&per_page=100",
+            "runs?branch=main&status=completed&per_page=100",
+            "--jq",
+            '{workflow_runs: [.workflow_runs[] | select(.conclusion == "success" or '
+            '.conclusion == "failure")]}',
         )
     )
     for candidate in response["workflow_runs"]:

@@ -171,6 +171,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
     Kimi Delta Attention.
     """
 
+    supports_strict_runtime_validation = True
+
     dt_bias_dim: int
     a_log_dim: int
     in_proj_extra_dim: int
@@ -186,6 +188,29 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
     accepts ``attention_mask`` only for signature compatibility with
     ``TransformerLayer`` and never reads it, and it has no ``attn_mask_type``. See
     ``Attention.uses_attention_mask`` for the contract."""
+
+    @classmethod
+    def _estimate_flops(
+        cls, config: TransformerConfig, total_real_tokens_in_batch: float, *, use_gdn2: bool
+    ) -> float:
+        """Share the GDN/GDN2 forward estimate without enabling it for other variants."""
+        qk_dim = (config.linear_key_head_dim or 128) * (config.linear_num_key_heads or 16)
+        value_head_dim = config.linear_value_head_dim or 128
+        value_heads = config.linear_num_value_heads or 32
+        value_dim = value_head_dim * value_heads
+        input_dim = (
+            4 * qk_dim + 3 * value_dim if use_gdn2 else 2 * qk_dim + 2 * value_dim + 2 * value_heads
+        )
+        return (
+            2
+            * total_real_tokens_in_batch
+            * (
+                config.hidden_size * input_dim
+                + (config.linear_conv_kernel_dim or 4) * (2 * qk_dim + value_dim)
+                + value_heads * value_head_dim**2 * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ.
+                + config.hidden_size * value_dim
+            )
+        )
 
     def __init__(
         self,
@@ -686,7 +711,13 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         raise NotImplementedError
 
     def _resolve_cu_seqlens(
-        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+        self,
+        cu_seqlens_padded,
+        cu_seqlens_actual,
+        total_seq_len,
+        name,
+        cp_size: int = 1,
+        strict_runtime_validation: bool = True,
     ) -> torch.Tensor:
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
         if cu_seqlens_padded is not None:
@@ -694,20 +725,21 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         else:
             cu_seqlens = cu_seqlens_actual
 
-        total_cu = cu_seqlens[-1].cpu().item()
-        if total_cu != total_seq_len:
-            raise ValueError(
-                f"GDN: {name}[-1]={total_cu} does not match "
-                f"total_sequence_length={total_seq_len}. "
-                f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
-            )
+        if strict_runtime_validation:
+            total_cu = cu_seqlens[-1].cpu().item()
+            if total_cu != total_seq_len:
+                raise ValueError(
+                    f"GDN: {name}[-1]={total_cu} does not match "
+                    f"total_sequence_length={total_seq_len}. "
+                    f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
+                )
 
-        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        if (seq_lengths % cp_size != 0).any():
-            raise ValueError(
-                f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
-                f"but got lengths: {seq_lengths.tolist()}"
-            )
+            seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            if (seq_lengths % cp_size != 0).any():
+                raise ValueError(
+                    "All per-sequence lengths in cu_seqlens must be divisible by "
+                    f"cp_size={cp_size}, but got lengths: {seq_lengths.tolist()}"
+                )
 
         return cu_seqlens
 

@@ -25,6 +25,7 @@ from megatron.core.inference.config import (
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
@@ -142,6 +143,24 @@ class TestInferenceConfig:
         assert (
             InferenceConfig().media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
         )
+
+    def test_resolve_pg_collection_does_not_store_the_global_groups(self, monkeypatch):
+        """The inference context and controller read ``pg_collection`` and treat None as unset."""
+        global_groups = ProcessGroupCollection(tp=object())
+        monkeypatch.setattr(
+            ProcessGroupCollection,
+            "use_mpu_process_groups",
+            classmethod(lambda cls, required_pgs=None: global_groups),
+        )
+
+        config = InferenceConfig()
+        assert config.resolve_pg_collection() is global_groups
+        assert config.pg_collection is None
+
+        explicit_groups = ProcessGroupCollection(tp=object())
+        config = InferenceConfig(pg_collection=explicit_groups)
+        assert config.resolve_pg_collection() is explicit_groups
+        assert config.pg_collection is explicit_groups
 
     def test_multimodal_prompt_config_builds_independent_specs_from_dict(self):
         config = MultimodalPromptConfig.from_dict(
@@ -643,6 +662,47 @@ def test_shortcut_overlap_model_validation():
     model_config.fp8 = "e4m3"
     with pytest.raises(ValueError, match="requires further testing"):
         config.validate_shortcut_moe_model(model_config)
+
+
+def test_shortcut_overlap_parallelism_validation():
+    """TP>1 is accepted with sequence parallelism; CP>1 and TP-stream hazards are not."""
+    model_config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_router_dtype="fp32",
+        moe_shortcut_connection=True,
+        transformer_impl="inference_optimized",
+        normalization="RMSNorm",
+        add_bias_linear=False,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        inference_moe_token_dispatcher_type="nvls",
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+    )
+    config = InferenceConfig(inference_shortcut_moe_overlap=True, verbose=False)
+    config.validate_shortcut_moe_model(model_config)
+    config.validate_shortcut_moe_model(
+        dataclasses.replace(model_config, expert_tensor_parallel_size=2)
+    )
+    rejected = {
+        "requires CP=1": dict(context_parallel_size=2),
+        "requires sequence_parallel": dict(sequence_parallel=False),
+        # TransformerConfig already rejects these two for Shortcut MoE; the overlap
+        # validator repeats the check because either one would race the streams.
+        "moe_shared_expert_overlap": dict(moe_shared_expert_overlap=True),
+        "inference_fuse_tp_communication": dict(inference_fuse_tp_communication=True),
+    }
+    for message, overrides in rejected.items():
+        candidate = dataclasses.replace(model_config)
+        for name, value in overrides.items():
+            setattr(candidate, name, value)
+        with pytest.raises(ValueError, match=message):
+            config.validate_shortcut_moe_model(candidate)
 
 
 def test_shortcut_overlap_setup_validation():

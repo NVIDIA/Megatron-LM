@@ -9,7 +9,7 @@ from torch import nn
 
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.streamwise_residual_ops import streamwise_sigmoid_writeback
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -21,9 +21,11 @@ from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     StreamwiseSigmoidWideResidualRead,
     expand_wide_residual_stream,
+    has_combined_residual_keys,
 )
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
+from tests.unit_tests.test_utilities import Utils
 
 
 def _wide_config(
@@ -619,9 +621,11 @@ class TestWideResidualStaticConstruction:
             module=WideResidualTransformerLayer,
             submodules=TransformerLayerSubmodules(
                 self_attention=self_attention,
-                self_attn_bda=get_bias_dropout_add,
+                self_attn_bda=(
+                    get_bias_dropout_add if self_attention is not IdentityOp else IdentityFuncOp
+                ),
                 mlp=mlp,
-                mlp_bda=get_bias_dropout_add,
+                mlp_bda=get_bias_dropout_add if mlp is not IdentityOp else IdentityFuncOp,
             ),
         )
 
@@ -953,3 +957,29 @@ class TestWideResidualLayerIntegration:
             ("mlp", "read"),
             ("mlp", "write"),
         ]
+
+
+def test_sharded_state_dict_addresses_combined_residual_keys():
+    """torch_dist loads must address residual_connection_{branch} tensors when told to."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        layer = build_module(
+            TestWideResidualLayerIntegration._layer_spec(),
+            config=_wide_config(learned_retention=True),
+            layer_number=1,
+            add_layer_offset=False,
+            pg_collection=_process_groups(),
+        )
+        sharded = layer.sharded_state_dict(
+            "decoder.layers.0.", metadata={"combined_residual_keys": True}
+        )
+    finally:
+        Utils.destroy_model_parallel()
+    keys = {key: value.key for key, value in sharded.items()}
+    assert keys["decoder.layers.0.residual_read_mlp.read_map.logit"] == (
+        "decoder.layers.0.residual_connection_mlp.read_map.logit"
+    )
+    assert keys["decoder.layers.0.residual_write_self_attn.retention.retention_logit"] == (
+        "decoder.layers.0.residual_connection_self_attn.retention.retention_logit"
+    )
+    assert has_combined_residual_keys(keys.values())

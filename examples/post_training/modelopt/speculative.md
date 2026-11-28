@@ -27,7 +27,7 @@ For EAGLE, set `--export-algorithm eagle` and provide `--export-eagle-algorithm`
 the resulting model stored in `${MLM_MODEL_SAVE}` will have randomly initialized draft model weights.
 
 ```
-python examples/post_training/modelopt/convert_model.py \
+python examples/post_training/modelopt/convert_speculative.py \
     --export-algorithm eagle \
     --export-eagle-algorithm eagle3 \
     --load ${MLM_MODEL_CKPT} --save ${MLM_MODEL_SAVE} ${MLM_EXTRA_ARGS}

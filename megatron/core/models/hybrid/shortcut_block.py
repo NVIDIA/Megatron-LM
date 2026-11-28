@@ -24,10 +24,15 @@ import torch
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+from megatron.core.transformer.moe.router import InferenceTopKRouter
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
@@ -36,15 +41,11 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualRead
 from megatron.core.typed_torch import apply_module
+from megatron.core.utils import get_pg_size
 
-# Layer symbols that may precede a shortcut MoE
-SUPPORTED_SHORTCUT_PREDECESSORS = frozenset(
-    {LayerSymbols.MAMBA, LayerSymbols.GDN}
-    | {
-        symbol
-        for symbol, layer_config in LayerSymbols.LAYER_CONFIG_MAP.items()
-        if layer_config in LayerSymbols.ATTENTION_LAYER_CONFIGS
-    }
+# Built-in config types that may precede a shortcut MoE.
+SUPPORTED_SHORTCUT_PREDECESSOR_CONFIGS = frozenset(
+    {MambaLayerConfig, GDNLayerConfig} | LayerSymbols.ATTENTION_LAYER_CONFIGS
 )
 
 
@@ -59,7 +60,7 @@ def _get_offloading_interface():
 
 def group_layers_into_shortcut_blocks(
     layers: torch.nn.ModuleList,
-    layer_type_list: Sequence[str],
+    layer_config_list: Sequence[TransformerConfig],
     config: TransformerConfig,
     pp_layer_offset: int = 0,
 ) -> torch.nn.ModuleList:
@@ -70,7 +71,7 @@ def group_layers_into_shortcut_blocks(
 
     Args:
         layers: Physical layers in execution order.
-        layer_type_list: Physical layer symbols in execution order.
+        layer_config_list: Physical layer configs in execution order.
         config: Transformer configuration controlling shortcut scheduling.
         pp_layer_offset: Global offset of this pipeline stage's first physical layer.
 
@@ -82,7 +83,7 @@ def group_layers_into_shortcut_blocks(
             pipeline-stage boundary.
     """
 
-    if pp_layer_offset > 0 and layer_type_list and layer_type_list[0] == LayerSymbols.MOE:
+    if pp_layer_offset > 0 and layer_config_list and type(layer_config_list[0]) is MoELayerConfig:
         raise ValueError(
             "Shortcut MoE pairs cannot cross pipeline-stage boundaries; this pipeline stage "
             f"begins with an MoE layer (global layer {pp_layer_offset + 1}). Move the stage "
@@ -94,7 +95,7 @@ def group_layers_into_shortcut_blocks(
     while physical_index < len(layers):
         next_is_moe = (
             physical_index + 1 < len(layers)
-            and layer_type_list[physical_index + 1] == LayerSymbols.MOE
+            and type(layer_config_list[physical_index + 1]) is MoELayerConfig
         )
         if not next_is_moe:
             grouped_layers.append(layers[physical_index])
@@ -102,8 +103,8 @@ def group_layers_into_shortcut_blocks(
             continue
 
         compute_layer = layers[physical_index]
-        paired_type = layer_type_list[physical_index]
-        if paired_type not in SUPPORTED_SHORTCUT_PREDECESSORS:
+        paired_type = type(layer_config_list[physical_index])
+        if paired_type not in SUPPORTED_SHORTCUT_PREDECESSOR_CONFIGS:
             raise ValueError(
                 "Shortcut MoE must be preceded by a Mamba, GDN, or supported attention layer"
             )
@@ -114,7 +115,7 @@ def group_layers_into_shortcut_blocks(
         )
         if not supports_two_stage:
             raise ValueError(
-                f"Shortcut attention layer {paired_type!r} does not support two-stage attention"
+                f"Shortcut layer {paired_type.__name__} does not support two-stage attention"
             )
         moe_layer = layers[physical_index + 1]
         grouped_layers.append(
@@ -240,9 +241,23 @@ class ShortcutMoEBlock(MegatronModule):
         self.route_ready_event = torch.cuda.Event() if self.overlap_mode else None
 
     def setup_inference_overlap(self) -> None:
-        """Create synchronization state before inference CUDA graph capture."""
+        """Create synchronization state and check stream ownership before graph capture.
+
+        At TP>1 the shortcut stream must not issue any TP-group collective (see
+        `_forward_inference_overlap`). The inference router and grouped experts communicate
+        only through the NVLS dispatcher, so require them rather than trusting a custom spec.
+        """
         if self.route_ready_event is None:
             self.route_ready_event = torch.cuda.Event()
+        if get_pg_size(self.tp_group) > 1:
+            mlp = self.moe_layer.mlp
+            if not isinstance(getattr(mlp, "router", None), InferenceTopKRouter) or not (
+                isinstance(getattr(mlp, "experts", None), InferenceGroupedMLP)
+            ):
+                raise RuntimeError(
+                    "Shortcut MoE inference overlap at TP>1 requires InferenceTopKRouter and "
+                    "InferenceGroupedMLP, which issue no TP-group collectives"
+                )
 
     def _read_shortcut_hidden(
         self,
@@ -477,6 +492,26 @@ class ShortcutMoEBlock(MegatronModule):
         main stream. Routing, dispatch, experts and combine run on the MoE
         stream. CUDA graphs capture the input-ready fork and the join before
         the residual write.
+
+        Collective ownership, which makes TP>1 safe without ordering the two streams:
+
+        - Main stream: every TP-group collective. That is the predecessor's and the shared
+          expert's sequence-parallel all-gathers and reduce-scatters, on the "tp" symmetric
+          buffer or, when a tensor does not fit it, on the NCCL TP communicator.
+        - Shortcut stream: only the NVLS dispatcher's metadata exchange, AllGather-V and
+          ReduceScatter-V over the tp_ep group, on its own "ep_*" symmetric buffers. Each
+          buffer has its own signal pad, so the two streams share no buffer, barrier slot
+          or communicator. The shortcut norm, inference router, latent projections
+          ("duplicated") and grouped experts are local. With sequence parallelism each rank
+          routes its own token shard, and the experts receive tokens only through the
+          AllGather-V, so no TP gather is needed first. Expert-TP partial sums are added by
+          the ReduceScatter-V.
+
+        Each stream therefore issues its collectives in program order, which is the same on
+        every rank, and nothing on the main stream waits on the shortcut stream before the
+        join. Configurations that would break this (shared-expert overlap, fused TP
+        communication, batch-invariant collectives, non-NVLS dispatch) are rejected by
+        `InferenceConfig.validate_shortcut_moe_model` and `setup_inference_overlap`.
         """
         if attn_recompute_context is not None or moe_recompute_context is not None:
             raise RuntimeError("Shortcut MoE inference cannot use residual-stream recomputation")

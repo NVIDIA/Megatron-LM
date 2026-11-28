@@ -334,7 +334,7 @@ def _capture_replay_and_compare(
     if module.postprocess_block is not None:
         callables.append(module.postprocess_block)
     # One slot (a forward and a backward graph) per captured block.
-    assert [len(block.cuda_graphs) for block in callables] == [1] * len(callables)
+    assert [len(block.te_cuda_graphs) for block in callables] == [1] * len(callables)
 
     replays = []
     original_replay = torch.cuda.CUDAGraph.replay

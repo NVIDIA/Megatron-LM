@@ -253,58 +253,43 @@ def test_multiple_runs_per_plan_require_explicit_backend_support():
     assert NixlCopyService.supports_multiple_runs_per_plan is False
 
 
-def test_nccl_service_eagerly_connects_before_first_run(monkeypatch):
-    """Idle ranks must join NCCL setup before active ranks issue their first P2P."""
-    device = torch.device("cuda", 1)
+def test_nccl_service_reuses_connected_group_with_idle_ranks():
+    """Refit can reuse a warm group while some ranks never submit P2P work."""
+    Utils.initialize_distributed()
+    world_size = dist.get_world_size()
+    if world_size < 3:
+        pytest.skip("Requires two transfer ranks and at least one idle rank")
+    rank = dist.get_rank()
+    group = dist.new_group(backend="nccl")
+    try:
+        token = torch.ones(1, device="cuda", dtype=torch.int32)
+        dist.all_reduce(token, group=group)
+        assert token.item() == world_size
 
-    class Backend:
-        def __init__(self):
-            self.connected_devices = []
-
-        def eager_connect_single_device(self, connected_device):
-            self.connected_devices.append(connected_device)
-
-    class Group:
-        def __init__(self, backend):
-            self.backend = backend
-            self.requested_devices = []
-
-        def rank(self):
-            return 1
-
-        def size(self):
-            return 4
-
-        def _get_backend(self, requested_device):
-            self.requested_devices.append(requested_device)
-            return self.backend
-
-    class Stream:
-        def wait_stream(self, _stream):
-            pass
-
-    backend = Backend()
-    group = Group(backend)
-    stream = Stream()
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: device.index)
-    monkeypatch.setattr(torch.cuda, "Stream", lambda: stream)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
-
-    service = NCCLCopyService(group=group)
-    service.run()
-    service.run()
-
-    assert group.requested_devices == [device]
-    assert backend.connected_devices == [device]
+        for publication in range(2):
+            service = NCCLCopyService(group=group)
+            try:
+                service.run()
+                source = torch.full((4,), publication + 1, device="cuda")
+                destination = torch.zeros_like(source)
+                if rank == 0:
+                    service.submit_send(source, 1, task_id=0)
+                elif rank == 1:
+                    service.submit_recv(destination, 0, task_id=0)
+                service.run()
+                torch.cuda.synchronize()
+                if rank == 1:
+                    torch.testing.assert_close(destination, source, rtol=0, atol=0)
+            finally:
+                service.close()
+        dist.barrier(group=group)
+    finally:
+        dist.destroy_process_group(group)
 
 
 def _windowing_fixture(monkeypatch, *, rank=0, world=2):
     """NCCL service with fakes for the process group, streams, and batch_isend_irecv."""
     device = torch.device("cuda", rank)
-
-    class Backend:
-        def eager_connect_single_device(self, _device):
-            pass
 
     class Group:
         def rank(self):
@@ -312,9 +297,6 @@ def _windowing_fixture(monkeypatch, *, rank=0, world=2):
 
         def size(self):
             return world
-
-        def _get_backend(self, _device):
-            return Backend()
 
     class Stream:
         def wait_stream(self, _stream):
@@ -338,7 +320,9 @@ def _windowing_fixture(monkeypatch, *, rank=0, world=2):
 
     monkeypatch.setattr(dist, "batch_isend_irecv", fake_batch_isend_irecv)
     monkeypatch.setattr(dist, "P2POp", lambda op, tensor, peer, group=None: (op, peer))
-    return NCCLCopyService(group=Group()), calls
+    service = NCCLCopyService(group=Group())
+    service._nccl_connected = True
+    return service, calls
 
 
 class _Plan:

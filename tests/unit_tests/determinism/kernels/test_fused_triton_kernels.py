@@ -155,17 +155,29 @@ def test_dsa_weights_projection_replays():
     assert outputs["out"].dtype == torch.float32
 
 
-def test_dsa_kpool_chunked_selection_replays(monkeypatch):
-    """Replay the fixed-memory KPool score and top-k path across query chunks."""
+@pytest.mark.parametrize("left_padded_mask", [False, True], ids=["no_mask", "left_padded"])
+def test_dsa_kpool_chunked_selection_replays(monkeypatch, left_padded_mask):
+    """Replay the fixed-memory KPool score and top-k path across query chunks.
+
+    The left-padded case gives an explicit mask whose first valid key (2) is off the pool
+    grid, so the selection runs on the key axis shifted by its pool phase.
+    """
     from megatron.core.transformer.experimental_attention_variant import dsa
 
     seeded()
     monkeypatch.setattr(dsa, "_KPOOL_SCORE_CHUNK_BYTES", 128)
-    q = torch.randn(9, 1, 2, 8, device="cuda", dtype=torch.bfloat16)
+    rows = 16 if left_padded_mask else 9
+    q = torch.randn(rows, 1, 2, 8, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(16, 1, 8, device="cuda", dtype=torch.bfloat16)
-    weights = torch.randn(9, 1, 2, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(rows, 1, 2, device="cuda", dtype=torch.bfloat16)
     gate = torch.randn_like(k)
     ape = torch.randn(4, 8, device="cuda")
+    mask = None
+    if left_padded_mask:
+        positions = torch.arange(16, device="cuda")
+        valid = positions >= 2
+        visible = (positions[None, :] <= positions[:, None]) & valid[None, :] & valid[:, None]
+        mask = torch.zeros(16, 16, device="cuda").masked_fill(~visible, float("-inf"))
 
     def run(query, key, head_weights, gate_score, positional_bias):
         _, topk = dsa.fused_qk_topk_kpool(
@@ -176,18 +188,22 @@ def test_dsa_kpool_chunked_selection_replays(monkeypatch):
             pool_size=4,
             gate_score=gate_score,
             ape=positional_bias,
+            mask=mask,
             rotate_activation_enabled=False,
             return_index_scores=False,
         )
         return topk
 
-    assert_replays_bit_exact(
+    outputs, _ = assert_replays_bit_exact(
         run,
         (q, k, weights, gate, ape),
         backward=False,
         contention=True,
         what="DSA KPool chunked selection",
     )
+    if left_padded_mask:
+        # Padded query rows see no key, so they select nothing.
+        assert torch.all(outputs["out"][:, :2] == -1)
 
 
 @pytest.mark.parametrize("with_attention_mask", [False, True])

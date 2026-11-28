@@ -95,7 +95,7 @@ def invariant_runtime(case):
     backend = os.environ.get("MCORE_BI_TEST_BACKEND", "triton")
     # Default to the newest installed FlashAttention; the variable pins one explicitly.
     fa_version = int(os.environ.get("MCORE_BI_TEST_FA_VERSION") or (4 if attention.HAVE_FA4 else 3))
-    assert backend in ("triton", "te_native", "deepgemm")
+    assert backend in ("triton", "te_native")
     assert not bik.is_batch_invariant_mode_enabled(), "inherited a live backend from another test"
     if backend == "te_native":
         assert (
@@ -342,8 +342,7 @@ class ForwardWitness:
         observe(MLASelfAttention, "uncompress_kv_from_cache", "mla")
         for layout in ("varlen", "bshd"):
             observe(attention.Attention, f"_apply_sink_softmax_correction_{layout}", "sinks")
-        for name in ("matmul_persistent", "_mm_deepgemm"):
-            observe(bik, name, "gemms")
+        observe(bik, "matmul_persistent", "gemms")
         # Native TE binds GEMM locally; the other dense providers use torch.matmul.
         if bik.get_batch_invariant_backend() == "te_native":
             from transformer_engine.pytorch.module import layernorm_linear, linear

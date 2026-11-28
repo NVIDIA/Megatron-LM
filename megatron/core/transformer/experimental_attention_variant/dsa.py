@@ -22,7 +22,10 @@ from megatron.core.models.common.embeddings import (
     should_use_fused_mla_rope,
 )
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
@@ -81,6 +84,88 @@ def _dsa_index_share_carrier_scope(carrier: object) -> Iterator[None]:
         yield
     finally:
         _CURRENT_DSA_INDEX_SHARE_CARRIER.reset(token)
+
+
+def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_topk):
+    """Fraction of dense causal (query, key) pairs that DSA actually attends to.
+
+    A DSA layer scores every past position with the indexer but runs attention
+    only over the ``dsa_indexer_topk`` highest-scoring keys, so its core
+    attention cost is ``sum_i(min(i, topk))`` pairs per sequence instead of the
+    dense causal ``L^2 / 2``. Returns the ratio between the two, i.e. the
+    factor the dense core-attention coefficient must be scaled by.
+
+    The caller only has the batch aggregates ``sum_i(L_i)`` and
+    ``sum_i(L_i ** 2)``, not the individual sequence lengths, so the ratio is
+    evaluated at the length-weighted mean ``sum(L^2) / sum(L)``. For equal-length
+    sequences, this aggregation introduces no additional approximation, but
+    the pair counts still use the continuous approximation described below.
+    For ragged batches, it weights toward the long sequences that dominate
+    attention cost. Collapses to ``1.0`` when the sequences are
+    no longer than ``topk``, where top-k selects everything and attention is
+    dense.
+    """
+    if not dsa_indexer_topk or total_real_tokens <= 0 or seqlen_squared_sum <= 0:
+        return 1.0
+    mean_seqlen = seqlen_squared_sum / total_real_tokens
+    # Average attended KV entries per query: ``min(i, topk)`` averaged over the
+    # sequence, approximated as ``eff * (1 - eff / (2 * L))`` with
+    # ``eff = min(topk, floor(L))``. The exact discrete average has ``eff - 1``
+    # in the correction term; the O(1/L) difference is below the precision of
+    # this estimate.
+    eff = min(dsa_indexer_topk, math.floor(mean_seqlen))
+    attended = eff * (1 - eff / (2 * mean_seqlen))
+    # Dense causal attention averages ~``mean_seqlen / 2`` keys per query.
+    return attended / (mean_seqlen / 2)
+
+
+def _dsa_kpool_pairs(mean_seqlen, pool_size, max_pools=None):
+    """Sum complete causal pools per query, optionally capped by selection.
+
+    Interpolate adjacent integer lengths for a fractional length-weighted mean;
+    individual document boundaries cannot be recovered from batch aggregates.
+    """
+    length = math.floor(mean_seqlen)
+    pools, next_pools = length // pool_size, (length + 1) // pool_size
+    if max_pools is not None:
+        pools, next_pools = min(pools, max_pools), min(next_pools, max_pools)
+    return (
+        pool_size * pools * (pools - 1) / 2
+        + pools * (length - pool_size * pools + 1)
+        + (mean_seqlen - length) * next_pools
+    )
+
+
+def _dsa_kpool_attention_scale(
+    total_tokens: float,
+    seqlen_squared_sum: float,
+    topk: int | None,
+    pool_size: int,
+    always_select_tail: bool,
+) -> float:
+    """Return the selected attention-pair fraction for pooled keys.
+
+    Expand at most topk / pool_size complete pools to tokens and optionally
+    append the incomplete tail. Normalize by discrete dense pairs so a dense
+    selection retains the caller's existing L^2 / 2 FLOPs convention.
+    """
+    if topk is None or topk <= 0 or topk % pool_size:
+        raise ValueError("KPool FLOPs require a positive top-k divisible by the pool size.")
+    if total_tokens <= 0 or seqlen_squared_sum <= 0:
+        return 0.0
+    mean_seqlen = seqlen_squared_sum / total_tokens
+    length = math.floor(mean_seqlen)
+    fraction = mean_seqlen - length
+    pools, tail = divmod(length, pool_size)
+    attention_pairs = pool_size * _dsa_kpool_pairs(mean_seqlen, pool_size, topk // pool_size)
+    if always_select_tail:
+        attention_pairs += (
+            pools * pool_size * (pool_size - 1) / 2
+            + tail * (tail + 1) / 2
+            + fraction * ((length + 1) % pool_size)
+        )
+    dense_pairs = length * (length + 1) / 2 + fraction * (length + 1)
+    return attention_pairs / dense_pairs
 
 
 def is_dsa_skip_topk_layer(layer_number: int, skip_topk_offset: int, topk_freq: int) -> bool:
@@ -883,6 +968,50 @@ def _expand_query_bounds_for_batch(bounds: torch.Tensor, batch: int, seqlen: int
     )
 
 
+def _kpool_explicit_mask_pool_phase(mask: torch.Tensor, pool_size: int) -> torch.Tensor:
+    """Return the pool-grid phase of each sample's first valid key in an explicit mask.
+
+    A key that no query row can see is padding, so the first valid key is the first key
+    visible to any row: one value for a shared [sq, sk] mask, or [batch] for a
+    [batch, sq, sk] mask. The Hugging Face reference KPool indexer starts pools at that
+    key; earlier pools are invalid, so only its offset modulo pool_size matters. Samples
+    without a visible key get phase 0. Computed on device without a host sync.
+    """
+    sk = mask.size(-1)
+    key_visible = torch.isfinite(mask).any(dim=-2)
+    positions = torch.arange(sk, device=mask.device, dtype=torch.int64).expand_as(key_visible)
+    first_key = positions.masked_fill(~key_visible, sk).amin(dim=-1)
+    return first_key.masked_fill(first_key == sk, 0).remainder(pool_size)
+
+
+def _shift_kpool_explicit_mask_inputs(
+    k: torch.Tensor, gate_score: Optional[torch.Tensor], mask: torch.Tensor, phase: torch.Tensor
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """Shift each sample's key axis left by its pool phase: x'[t] = x[t + phase].
+
+    Keys and gates are [keys, batch, dim]; the mask is [sq, sk] or [batch, sq, sk] and
+    phase matches its leading shape. Positions past the last key get zero keys and
+    gates and are masked, so they only belong to invalid pools. A zero phase is an
+    exact identity.
+    """
+    sk, batch = k.shape[:2]
+    positions = torch.arange(sk, device=k.device, dtype=torch.int64)
+    source = positions + phase.unsqueeze(-1)
+    in_range = source < sk
+    source = source.clamp_max(sk - 1)
+    shifted_mask = torch.gather(mask, -1, source.unsqueeze(-2).expand_as(mask))
+    shifted_mask = shifted_mask.masked_fill(~in_range.unsqueeze(-2), float("-inf"))
+
+    key_source = source.reshape(-1, sk).t().expand(sk, batch).unsqueeze(-1)
+    key_in_range = in_range.reshape(-1, sk).t().expand(sk, batch).unsqueeze(-1)
+
+    def shift(x: torch.Tensor) -> torch.Tensor:
+        shifted = torch.gather(x, 0, key_source.expand(-1, -1, x.size(-1)))
+        return shifted.masked_fill(~key_in_range, 0)
+
+    return shift(k), shift(gate_score) if gate_score is not None else None, shifted_mask
+
+
 _KPOOL_SCORE_CHUNK_BYTES = 2 * 1024 * 1024 * 1024
 
 
@@ -988,11 +1117,46 @@ def fused_qk_topk_kpool(
     coordinates. Output indices are [batch, queries, index_topk + pool_size - 1]
     when always_select_tail is enabled, with -1 for unused slots.
     Set return_index_scores=False to select in query chunks without retaining scores.
+
+    Without packing, an explicit mask starts the pool grid at each sample's first
+    valid key, as the Hugging Face reference KPool indexer (transformers v5.16.1,
+    Glm5NextTextIndexer) does. That key is the first one visible to any query
+    row of the sample's [batch, sq, sk] mask, or of a shared [sq, sk] mask; earlier
+    keys are padding. Index scores use the same grid: pool c covers keys from
+    phase + c * pool_size, where phase is the first valid key modulo pool_size.
+    Explicit-mask support:
+
+    - Contiguous left and/or right padding with causal rows: HF parity. Padded query
+      rows must be fully masked. A mask that lets padded rows see every key hides
+      the padding, so pools keep the global grid.
+    - Masks with gaps, sliding windows or row-dependent starts: tokens stay inside
+      the mask, but leading partial pools only use unused slots and there is no HF
+      parity claim.
+    - Packed THD (cu_seqlens_kv) restarts pools per document; no mask and varlen
+      bounds use the global grid. Neither is shifted.
+
+    Model-level left padding is unsupported: causal DSA layers ignore the attention
+    mask and treat padded tokens as real keys.
     """
     sk = k.size(0)
+    if q.size(0) == 0:
+        # Empty packed-CP ranks still need a fixed-width index tensor; reshape
+        # with an inferred dimension is ambiguous when there are no query rows.
+        width = index_topk + (pool_size - 1 if always_select_tail else 0)
+        scores = q.new_empty((q.size(1), 0, sk // pool_size), dtype=torch.float32)
+        indices = torch.empty((q.size(1), 0, width), dtype=torch.int32, device=q.device)
+        return scores if return_index_scores else None, indices
 
     # Packed pools restart at each document boundary.
     use_per_seg = cu_seqlens_kv is not None and cu_seqlens_kv.numel() >= 2
+    # Explicit masks pool from each sample's first valid key. Select on a key axis
+    # shifted by its pool phase, then map tokens back and mask with the caller's mask.
+    token_mask = mask
+    pool_phase = None
+    explicit_mask = mask is not None and mask.ndim in (2, 3) and mask.size(-1) == sk
+    if explicit_mask and not use_per_seg and sk > 0:
+        pool_phase = _kpool_explicit_mask_pool_phase(mask, pool_size)
+        k, gate_score, mask = _shift_kpool_explicit_mask_inputs(k, gate_score, mask, pool_phase)
     if use_per_seg:
         k_pooled, pool_token_base = _kpool_compress_keys_per_seg(
             k, gate_score, ape, pool_size, cu_seqlens_kv
@@ -1111,8 +1275,9 @@ def fused_qk_topk_kpool(
             starts = torch.zeros_like(ends)
         lengths = ends - starts
         if mask is not None and v_starts is None:
-            # Explicit masks use globally aligned pools. Fill a leading partial pool into
-            # unused expanded-pool slots, then append only the trailing global-grid tail.
+            # Pools are aligned to the shifted key axis. Fill a leading partial pool, which
+            # only a row starting off the grid has, into unused expanded-pool slots, then
+            # append the trailing tail on the same grid.
             starts = _expand_query_bounds_for_batch(starts, batch, sq).to(
                 device=token_topk.device, dtype=torch.int64
             )
@@ -1139,8 +1304,11 @@ def fused_qk_topk_kpool(
             tail_count_override=tail_counts.reshape(-1) if tail_counts is not None else None,
         ).reshape(batch, sq, -1)
 
-    if mask is not None:
-        token_topk = _mask_topk_tokens_with_token_mask(token_topk, mask)
+    if pool_phase is not None:
+        phase = pool_phase.view(-1, 1, 1).to(token_topk.dtype)
+        token_topk = torch.where(token_topk >= 0, token_topk + phase, token_topk)
+    if token_mask is not None:
+        token_topk = _mask_topk_tokens_with_token_mask(token_topk, token_mask)
 
     return index_scores, token_topk
 
@@ -1919,6 +2087,88 @@ class DSAIndexer(MegatronModule):
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L431-L480
     """
 
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
+    ) -> float:
+        """Estimate one indexer execution, optionally including its loss-dependent backward.
+
+        Detached inputs require no projection dgrad. With loss enabled, projections
+        cost fwd + wgrad and scoring costs dense fwd plus dense or sparse dq/dk.
+        Do not apply the ordinary x3 multiplier when include_backward is true.
+        """
+        total_tokens = total_real_tokens_in_batch
+        seqlen_squared_sum = seqlen_squared_sum_in_batch
+        dsa_indexer_loss_enabled = (config.dsa_indexer_loss_coeff or 0) > 0
+        hidden_size = config.hidden_size
+        q_lora_rank = config.q_lora_rank
+        n_heads = config.dsa_indexer_n_heads
+        head_dim = config.dsa_indexer_head_dim
+        dsa_indexer_use_sparse_loss = config.dsa_indexer_use_sparse_loss
+        dsa_indexer_topk = config.dsa_indexer_topk
+        dsa_indexer_kpool = config.dsa_indexer_kpool
+        if dsa_indexer_kpool > 1:
+            if dsa_indexer_loss_enabled:
+                raise ValueError(
+                    "KPool FLOPs require indexer loss to be disabled, as in DSAttention."
+                )
+            if (
+                dsa_indexer_topk is None
+                or dsa_indexer_topk <= 0
+                or dsa_indexer_topk % dsa_indexer_kpool
+            ):
+                raise ValueError("KPool FLOPs require a positive top-k divisible by the pool size.")
+        if q_lora_rank is None:
+            # Mirrors DSAIndexer's own fallback when the model has no q lora rank.
+            q_lora_rank = hidden_size
+        index_dim = n_heads * head_dim
+        token_linear = (
+            q_lora_rank * index_dim  # wq_b
+            + hidden_size * head_dim  # wk
+            + hidden_size * n_heads  # weights_proj
+        )
+        # Scoring each query against every past token under a causal mask (/2).
+        core = index_dim / 2
+        fma_expansion_factor = 2
+        core_expansion: float
+        if not (include_backward and dsa_indexer_loss_enabled):
+            token_expansion, core_expansion = 1, 1
+        else:
+            # Projections: fwd + wgrad (input is detached, no dgrad).
+            token_expansion = 2
+            # Scoring: dense fwd + dq + dk, where dq/dk cover only the top-k pairs
+            # under the sparse KL loss (see docstring).
+            sparse_core_scale = (
+                _dsa_sparse_core_scale(total_tokens, seqlen_squared_sum, dsa_indexer_topk)
+                if dsa_indexer_use_sparse_loss
+                else 1.0
+            )
+            core_expansion = 1 + 2 * sparse_core_scale
+        token_linear = token_expansion * fma_expansion_factor * token_linear
+        core = core_expansion * fma_expansion_factor * core
+        if dsa_indexer_kpool > 1:
+            indexer_scale = compression_scale = 0.0
+            if total_tokens > 0 and seqlen_squared_sum > 0:
+                mean_seqlen = seqlen_squared_sum / total_tokens
+                length = math.floor(mean_seqlen)
+                fraction = mean_seqlen - length
+                pool_size = dsa_indexer_kpool
+                pools, next_pools = length // pool_size, (length + 1) // pool_size
+                dense_pairs = length * (length + 1) / 2 + fraction * (length + 1)
+                indexer_scale = _dsa_kpool_pairs(mean_seqlen, pool_size) / dense_pairs
+                compression_scale = (
+                    pool_size * (pools + fraction * (next_pools - pools)) / mean_seqlen
+                )
+            # Gate on every token; one FMA per key component in complete pools.
+            token_linear += 2 * head_dim * (hidden_size + compression_scale)
+            core *= indexer_scale
+        return total_tokens * token_linear + seqlen_squared_sum * core
+
     def _projection_quantization_context(self, *, is_init: bool = False):
         """Use the enclosing quantization context only when explicitly enabled."""
         if not self.config.dsa_indexer_qk_proj_use_quantization:
@@ -1955,6 +2205,7 @@ class DSAIndexer(MegatronModule):
         self.softmax_scale: float = self.index_head_dim**-0.5
 
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         self.pg_collection = pg_collection
 
@@ -2570,6 +2821,76 @@ class DSAttention(MegatronModule):
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L491-L597
     """
 
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+        absorbed_mla: bool = True,
+    ) -> float:
+        """Estimate forward DSA projections and attention, excluding indexer FLOPs.
+
+        The estimator includes FMA x2. The indexer has separate execution counts and
+        loss-dependent backward work; account for it with DSAIndexer.estimate_flops.
+        """
+        total_tokens = total_real_tokens_in_batch
+        seqlen_squared_sum = seqlen_squared_sum_in_batch
+        hidden_size = config.hidden_size
+        num_attention_heads = config.num_attention_heads
+        q_lora_rank = config.q_lora_rank
+        kv_lora_rank = config.kv_lora_rank
+        qk_head_dim = config.qk_head_dim
+        qk_pos_emb_head_dim = config.qk_pos_emb_head_dim
+        v_head_dim = config.v_head_dim
+        dsa_indexer_topk = config.dsa_indexer_topk
+        dsa_indexer_kpool = config.dsa_indexer_kpool
+        dsa_indexer_kpool_always_select_tail = config.dsa_indexer_kpool_always_select_tail
+        if q_lora_rank is None:
+            q_term = hidden_size * num_attention_heads * (qk_head_dim + qk_pos_emb_head_dim)
+        else:
+            q_term = q_lora_rank * (
+                hidden_size + num_attention_heads * (qk_head_dim + qk_pos_emb_head_dim) + 1
+            )
+        fma_expansion_factor = 2
+        token_linear = fma_expansion_factor * (
+            ## q lora + rope + q norm
+            q_term
+            ## kv lora + rope + kv norm
+            + kv_lora_rank * (hidden_size + num_attention_heads * (qk_head_dim + v_head_dim) + 1)
+            + hidden_size * qk_pos_emb_head_dim
+            ## o proj
+            + (num_attention_heads * v_head_dim) * hidden_size
+        )
+        if dsa_indexer_kpool > 1:
+            sparse_core_scale = _dsa_kpool_attention_scale(
+                total_tokens,
+                seqlen_squared_sum,
+                dsa_indexer_topk,
+                dsa_indexer_kpool,
+                dsa_indexer_kpool_always_select_tail,
+            )
+        else:
+            sparse_core_scale = _dsa_sparse_core_scale(
+                total_tokens, seqlen_squared_sum, dsa_indexer_topk
+            )
+        core = (
+            fma_expansion_factor
+            * (
+                num_attention_heads * (kv_lora_rank + qk_pos_emb_head_dim) / 2
+                + num_attention_heads * kv_lora_rank / 2
+            )
+            * sparse_core_scale
+        )
+        if not absorbed_mla:
+            core = (
+                num_attention_heads
+                * (qk_head_dim + qk_pos_emb_head_dim + v_head_dim)
+                * sparse_core_scale
+            )
+        return total_tokens * token_linear + seqlen_squared_sum * core
+
     consumes_absorbed_v_up_projection = True
     requires_dsa_inputs = True
     logs_dsa_indexer_loss = True
@@ -2611,6 +2932,7 @@ class DSAttention(MegatronModule):
         )
 
         if pg_collection is None:
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
         self.pg_collection = pg_collection
 
@@ -3452,8 +3774,11 @@ class DSAttention(MegatronModule):
         # ===================================
         # Run sparse attention kernel
         # ===================================
+        # KPool selection without its tail leaves the rows before a query's first complete
+        # pool without a key, which the layout checks cannot see, so it certifies nothing.
+        kpool_may_leave_rows_empty = _is_kpool and not self.indexer.index_kpool_always_select_tail
         all_topk_rows_nonempty = dsa_masking.can_prove_all_topk_rows_nonempty(
-            computes_topk=computes_topk,
+            computes_topk=computes_topk and not kpool_may_leave_rows_empty,
             indexer_topk=self.index_topk,
             kv_sequence_length=skv,
             attention_mask=float_mask,

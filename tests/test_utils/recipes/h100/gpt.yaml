@@ -134,7 +134,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       # - environment: [lts]
       #   scope: [nightly] # outdated TE: #501
@@ -146,14 +146,14 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_resume_torch_dist_disable_bias_linear]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       # - environment: [lts]
       #   scope: [nightly] # non-determinism: #436
   - test_case: [gpt3_mcore_te_tp1_pp4_resume_torch_dist_persistent_disable_bias_linear]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp1_pp4_resume_torch_dist_swiglu]
     products:
@@ -165,7 +165,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_resume_torch_dist_untie_embeddings_and_outputs]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1]
     products:
@@ -184,7 +184,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_calculate_per_token_loss]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       # - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist]
       #   products:
@@ -196,7 +196,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       # - environment: [dev]
       #   scope: [mr]
@@ -225,7 +225,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_cp2_nondeterministic]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_resume_torch_dist_multi_dist_optimizer_instances]
     products:
@@ -257,7 +257,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_dp_last]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_nondeterministic]
     products:
@@ -282,7 +282,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_cp2_etp4_calculate_per_token_loss_nondeterministic_dp_last]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_cross_entropy_loss_fusion]
     products:
@@ -293,17 +293,17 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist_cp2_nondeterministic]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist_cross_entropy_loss_fusion]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_gdn]
     products:
       - environment: [dev]
-        scope: [mr, mr-github, mr-github-slim]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_mhc]
     products:
@@ -338,7 +338,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_mla]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp2_dsa]
     products:
@@ -358,7 +358,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp2_resume_torch_dist]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
       # - environment: [dev]
       #   scope: [mr] # Hangs: #513
@@ -371,7 +371,7 @@ products:
   - test_case: [gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp4_pp1_resume_torch_dist_qk_layernorm_test_mode]
     products:

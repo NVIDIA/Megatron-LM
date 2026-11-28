@@ -5,7 +5,10 @@
 import pytest
 import torch
 
+from megatron.core.ssm.gated_delta_net import GatedDeltaNet2
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.training.models import GPTModelConfig, HybridModelConfig
 from megatron.training.training import num_floating_point_operations
@@ -141,6 +144,82 @@ def test_plain_attention_and_dense_mlp_flops_are_unchanged(layout, mtp_depth):
     actual = num_floating_point_operations(config, batch_size=3, sequence_length=8, **stats)
 
     assert actual == _expected_flops(tokens, squared_lengths, (0, 3 + depth, 3 + depth, 0), depth)
+
+
+@pytest.mark.parametrize("hybrid_pattern", [False, True])
+def test_legacy_non_silu_glu_flops_are_preserved(hybrid_pattern):
+    config = _make_config(
+        num_layers=2 if hybrid_pattern else 1,
+        num_moe_experts=None,
+        experimental_attention_variant=None,
+        linear_attention_freq=None,
+        attention_output_gate=False,
+        activation_func=torch.nn.functional.gelu,
+    )
+    if hybrid_pattern:
+        config = HybridModelConfig(
+            transformer=config.transformer, hybrid_layer_pattern="*-", vocab_size=32
+        )
+
+    # Legacy reporting uses the two-projection FFN coefficient for non-SiLU GLU.
+    # One GQA, one FFN and logits contribute 4224 per token and 48 per squared length.
+    assert (
+        num_floating_point_operations(
+            config,
+            batch_size=1,
+            sequence_length=8,
+            total_real_tokens_in_batch=5,
+            seqlen_squared_sum_in_batch=13,
+        )
+        == 21744
+    )
+    assert config.transformer.gated_linear_unit is True
+
+
+@pytest.mark.parametrize("q_lora_rank,expected", [(None, 2222), (3, 2092)])
+def test_mla_forward_flops_with_optional_query_projection(q_lora_rank, expected):
+    config = _make_config(
+        transformer_cls=MLATransformerConfig,
+        experimental_attention_variant=None,
+        linear_attention_freq=None,
+        multi_latent_attention=True,
+        attention_output_gate=False,
+        apply_rope_fusion=False,
+        num_query_groups=2,
+        q_lora_rank=q_lora_rank,
+        kv_lora_rank=4,
+        qk_head_dim=2,
+        qk_pos_emb_head_dim=2,
+        v_head_dim=3,
+    ).transformer
+
+    # Projection MACs per token are 204 without Q LoRA, or 191 with it.
+    # Causal attention contributes 14 FLOPs per squared sequence length.
+    assert (
+        MLASelfAttention.estimate_flops(
+            config, total_real_tokens_in_batch=5, seqlen_squared_sum_in_batch=13
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "layer_type,overrides,expected",
+    [
+        # GDN2: 368 MACs per token across projections, convolution and recurrence.
+        (GatedDeltaNet2, {"experimental_attention_variant": "gdn2"}, 3680),
+        # MoE: 480 routed + 128 latent projections + 192 shared FLOPs per token.
+        (MoELayer, {"moe_latent_size": 4}, 4000),
+    ],
+)
+def test_layer_forward_flops_include_variant_projections(layer_type, overrides, expected):
+    config = _make_config(**overrides).transformer
+    assert (
+        layer_type.estimate_flops(
+            config, total_real_tokens_in_batch=5, seqlen_squared_sum_in_batch=13
+        )
+        == expected
+    )
 
 
 def _make_dsv4_config(pattern, **overrides):

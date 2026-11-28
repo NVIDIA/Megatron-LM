@@ -91,6 +91,7 @@ def test_flashinfer_clamped_relu2_replays(precision, ep_rank):
     clamp_scale = 0.5
     module = SimpleNamespace(
         _uses_mxfp8_weights=precision == "mxfp8",
+        _nvfp4_weights=None,
         _fc1_weight=execution_weights[0],
         _fc2_weight=execution_weights[1],
         _flashinfer_activation_type=ActivationType.ClampedRelu2,

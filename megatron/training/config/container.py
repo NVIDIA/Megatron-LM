@@ -570,7 +570,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 raise ValueError("FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.")
             if transformer is not None and transformer.moe_shortcut_connection:
                 raise ValueError("FSDP does not support MoE shortcut connections.")
-            if transformer is not None and transformer.moe_megakernel_backend == "mok":
+            if transformer is not None and transformer.moe_megakernel_backend in ("mok", "cutemok"):
                 raise ValueError("MOK has not been validated with FSDP.")
         if transformer is not None:
             if self.ddp.fp8_param_gather and not transformer.fp8:

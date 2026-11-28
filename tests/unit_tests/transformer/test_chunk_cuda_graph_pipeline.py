@@ -435,16 +435,16 @@ def _recorded_slots(helper):
         return replay
 
     for block in helper.flattened_callables:
-        originals.append((block, block.cuda_graphs))
-        block.cuda_graphs = [
+        originals.append((block, block.te_cuda_graphs))
+        block.te_cuda_graphs = [
             recording(graph, (type(block).__name__, slot))
-            for slot, graph in enumerate(block.cuda_graphs)
+            for slot, graph in enumerate(block.te_cuda_graphs)
         ]
     try:
         yield log
     finally:
         for block, graphs in originals:
-            block.cuda_graphs = graphs
+            block.te_cuda_graphs = graphs
 
 
 class TestChunkCudaGraphPipeline:
@@ -547,7 +547,7 @@ class TestChunkCudaGraphPipeline:
                 ]
                 for callables in helper.callables_per_chunk:
                     for block in callables:
-                        assert len(block.cuda_graphs) == num_microbatches
+                        assert len(block.te_cuda_graphs) == num_microbatches
 
                 with _recorded_slots(helper) as replayed:
 
@@ -647,7 +647,7 @@ class TestChunkCudaGraphPipeline:
             with _captured_graphs(models, config, seq_length, micro_batch_size):
                 # Fixed-length batches keep the eager post-process.
                 assert core.postprocess_block is None
-                assert len(core.decoder.cuda_graphs) == num_microbatches
+                assert len(core.decoder.te_cuda_graphs) == num_microbatches
                 for step in range(2):
                     results, _ = _run_pipeline_order(models, feeds, order)
                     for key, result in results.items():
@@ -724,7 +724,7 @@ class TestChunkCudaGraphPipeline:
             reference, _ = _run_pipeline_order(eager_models, feeds, order)
 
             with _captured_graphs(models, config, seq_length, micro_batch_size):
-                assert len(core.decoder.cuda_graphs) == num_microbatches
+                assert len(core.decoder.te_cuda_graphs) == num_microbatches
                 for step in range(2):
                     results, _ = _run_pipeline_order(models, feeds, order)
                     for key, result in results.items():
@@ -800,7 +800,7 @@ class TestChunkCudaGraphPipeline:
             reference, reference_weight_grad = step_with_deferred_weight_gradient(eager_models)
             assert reference_weight_grad.norm() > 0
             with _captured_graphs(models, config, seq_length, micro_batch_size):
-                assert len(models[0].module.decoder.cuda_graphs) == num_microbatches
+                assert len(models[0].module.decoder.te_cuda_graphs) == num_microbatches
                 for step in range(2):
                     results, weight_grad = step_with_deferred_weight_gradient(models)
                     for key, result in results.items():

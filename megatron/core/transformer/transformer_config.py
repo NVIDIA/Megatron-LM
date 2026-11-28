@@ -7,7 +7,7 @@ import math
 import os
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from typing import Any, Callable, Dict, List, Literal, Optional, Self, Tuple, Union
 
 import torch
@@ -66,6 +66,56 @@ except ImportError:
     HAVE_PACKAGING = False
 
 
+def _validate_dsa_index_share_pipeline_layout(
+    layout: PipelineParallelLayerLayout, num_layers: int, topk_freq: int, skip_topk_offset: int
+) -> None:
+    """Reject a pipeline layout whose model chunks would start on a DSA index-sharing layer.
+
+    With ``dsa_indexer_topk_freq > 1`` a skip layer reuses the top-k of the most recent
+    computing layer through the index-share holders of one model chunk's forward, so that
+    computing layer must run earlier in the same (PP rank, VPP stage) chunk. The model
+    builders check each local chunk once the model is built; this checks every chunk of the
+    layout at configuration time, so an invalid PP or VPP layout fails on every rank alike
+    and without a GPU.
+
+    Decoder layers are numbered 1..``num_layers`` in the layout's execution order (VPP stage
+    major, then PP rank) and MTP layers continue from ``num_layers + 1``. Within a chunk the
+    numbers are consecutive, so a chunk is valid exactly when its first DSA layer computes
+    its own top-k: every later skip layer of the chunk then finds its source inside the chunk.
+    """
+    # Lazy import: the DSA module imports this one.
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        is_dsa_skip_topk_layer,
+        source_dsa_compute_layer,
+    )
+
+    next_decoder_layer = 1
+    for vp_stage in range(layout.virtual_pipeline_model_parallel_size):
+        for pp_rank in range(layout.pipeline_model_parallel_size):
+            chunk = layout.layout[pp_rank][vp_stage]
+            num_decoder_layers = chunk.count(LayerType.decoder)
+            if num_decoder_layers > 0:
+                first_layer = next_decoder_layer
+                next_decoder_layer += num_decoder_layers
+            elif LayerType.mtp in chunk:
+                first_layer = num_layers + 1
+            else:
+                continue
+            if not is_dsa_skip_topk_layer(first_layer, skip_topk_offset, topk_freq):
+                continue
+            source_layer = source_dsa_compute_layer(first_layer, skip_topk_offset, topk_freq)
+            kind = "decoder" if num_decoder_layers > 0 else "MTP"
+            raise ValueError(
+                f"pipeline_model_parallel_layout {layout!r} is invalid for DSA top-k sharing: "
+                f"the chunk at PP rank {pp_rank}, VPP stage {vp_stage} starts on {kind} layer "
+                f"{first_layer}, which reuses the top-k of layer {source_layer} from an earlier "
+                "chunk. Cross-layer top-k sharing does not cross PP/VPP chunk boundaries, so "
+                "every chunk must start on a layer that computes its own top-k "
+                f"(dsa_indexer_topk_freq={topk_freq}, "
+                f"dsa_indexer_skip_topk_offset={skip_topk_offset})."
+            )
+
+
 @dataclass
 @experimental_api
 class TransformerConfig(ModelParallelConfig):
@@ -103,6 +153,18 @@ class TransformerConfig(ModelParallelConfig):
     variation objective directly optimizes the normalized expected acceptance
     length under rejection-sampling verification.
     """
+
+    mtp_ce_loss_weight: float = 1.0
+    """Nonnegative weight of the MTP cross-entropy objective."""
+
+    mtp_kl_loss_weight: float = 0.0
+    """Nonnegative weight of training-only KL(main-model teacher || MTP student)."""
+
+    mtp_kd_logit_temperature: float = 1.0
+    """Positive temperature for the teacher and student MTP distillation distributions."""
+
+    mtp_kd_loss_scale: Optional[float] = None
+    """KL multiplier before mtp_kl_loss_weight. None uses mtp_kd_logit_temperature squared."""
 
     mtp_normalize_loss_by_main_tokens: bool = False
     """Normalize summed MTP losses with the global main-loss token count.
@@ -989,7 +1051,7 @@ class TransformerConfig(ModelParallelConfig):
     fp8_output_proj: bool = False
     """If True, run the LM-head output projection with a TE ColumnParallelLinear
     under the MXFP8 autocast context. Only active when fp8=True and
-    fp8_recipe='mxfp8'."""
+    fp8_recipe='mxfp8', or with fp4, where the LM head runs under its own MXFP8 autocast."""
 
     fp8_recipe_attrs: Optional[Dict[str, Any]] = None
     """Attributes to set in the FP8 recipe."""
@@ -1119,8 +1181,11 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_megakernel_backend: Optional[str] = None
     """Optional backend that replaces MoE dispatch, expert computation, and combine.
-    Supported values: None and "mok". When set, the megakernel owns dispatch/combine;
-    moe_token_dispatcher_type and moe_flex_dispatcher_backend do not select its transport.
+    Supported values: None, "cutemok" (cuDNN frontend's CuTe MoK, an optimized version of MOK;
+    NVIDIA/cudnn-frontend#2767) and the deprecated "mok", which runs as "cutemok" when CuTe MoK is
+    available and otherwise through the standalone mok package, with a FutureWarning either way.
+    When set, the megakernel owns dispatch/combine; moe_token_dispatcher_type and
+    moe_flex_dispatcher_backend do not select its transport.
     """
 
     moe_megakernel_backend_config: Optional[dict] = None
@@ -1489,19 +1554,23 @@ class TransformerConfig(ModelParallelConfig):
     symm-mem buffers are a fixed [recv_capacity, hidden] and cannot be resized per step) and the
     fused op (use_transformer_engine_op_fuser). Defaults to False."""
 
-    moe_dispatch_fwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
+    moe_dispatch_fwd_dtype: Literal['bf16', 'mxfp8', 'nvfp4'] = 'bf16'
     """Wire dtype of the MoE dispatch forward payload ('ncclep' flex dispatcher only). With
     'mxfp8', TransformerEngine quantizes the payload before the all-to-all and the receive
     buffer comes back as a per-expert MXFP8 GroupedTensor that the grouped GEMM consumes
-    directly. Requires moe_grouped_gemm and use_transformer_engine_op_fuser. Defaults to
-    'bf16' (no quantization on the wire)."""
+    directly. With 'nvfp4' (FP4 models only), TransformerEngine packs each token to NVFP4 with
+    a per-token scale for the wire and builds the NVFP4 GroupedTensor that the grouped GEMM
+    consumes on the receiver. Requires moe_grouped_gemm and use_transformer_engine_op_fuser.
+    Defaults to 'bf16' (no quantization on the wire)."""
 
-    moe_combine_bwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
+    moe_combine_bwd_dtype: Literal['bf16', 'mxfp8', 'nvfp4'] = 'bf16'
     """Wire dtype of the MoE combine backward gradient ('ncclep' flex dispatcher only). With
     'mxfp8', TransformerEngine quantizes the gradient before the all-to-all and the
     expert-output gradient comes back as a per-expert MXFP8 GroupedTensor that the grouped
-    GEMM backward consumes directly. Same requirements as moe_dispatch_fwd_dtype. Defaults to
-    'bf16' (no quantization on the wire)."""
+    GEMM backward consumes directly. With 'nvfp4' (FP4 models only), the gradient goes over the
+    wire in NVFP4 with stochastic rounding, as the NVFP4 recipe quantizes gradients. Same
+    requirements as moe_dispatch_fwd_dtype. Defaults to 'bf16' (no quantization on the
+    wire)."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
@@ -1729,16 +1798,17 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     mhc_recompute_layer_num: Optional[int] = None
-    """Number of layers per MHC recompute block.
+    """Number of layers per mHC recompute block, used when 'mhc' is in recompute_modules.
 
-    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
-    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
-    layer in the transformer block) will:
-    - NOT checkpoint its final MLP BDA
-    - Register the unified recompute hook on its MLP BDA output
-    - A new CheckpointWithoutOutputManager is created for subsequent layers
+    Each TransformerBlock or HybridStack instance splits the layers it holds, in order, into
+    blocks of this many layers; its last layer always ends a block, so blocks never cross a
+    pipeline stage boundary. Within a block, mHC checkpoints its residual-stream operations
+    and separate norms into one CheckpointWithoutOutputManager. The block's last residual
+    write is not checkpointed; its output is the block boundary. After that layer, the
+    manager releases the checkpointed outputs and registers one hook on the boundary that
+    recomputes them during backward.
 
-    If None, all layers in the transformer block share a single recompute block.
+    If None, all layers of a TransformerBlock or HybridStack form a single recompute block.
 
     Must be a positive integer when set."""
 
@@ -1890,8 +1960,10 @@ class TransformerConfig(ModelParallelConfig):
     enabled: "te_native" (default: keep the native cuBLASLt kernels and obtain
     invariance via workspace starvation — lowest overhead, no extra
     dependencies, and the configuration verified bitwise-identical to the TE
-    training forward), "deepgemm" (DeepGEMM bf16 kernels), or "triton"
-    (persistent Triton matmul; any dtype)."""
+    training forward) or "triton" (persistent Triton matmul for dense GEMMs, any
+    dtype; grouped expert GEMMs stay native under the same workspace starvation).
+    "deepgemm" is deprecated: it is accepted with a DeprecationWarning and runs
+    as "te_native"."""
 
     batch_invariant_collective: Literal["ordered", "multimem"] = "ordered"
     """Cross-rank EP combine collective under batch_invariant_mode. "ordered"
@@ -2220,9 +2292,11 @@ class TransformerConfig(ModelParallelConfig):
     def from_config(cls, config: "TransformerConfig") -> Self:
         """Create this config type from an existing normalized transformer config.
 
-        The source config's complete instance state is deep-copied without invoking
+        The source config's instance dictionary is deep-copied without invoking
         the target class's initializer or ``__post_init__``. This preserves normalized
         values and dynamically added attributes while producing an independent config.
+        Fields introduced by the target class receive their declared defaults;
+        required new fields must be supplied by constructing the target config directly.
 
         Args:
             config: The transformer config to copy.
@@ -2233,6 +2307,21 @@ class TransformerConfig(ModelParallelConfig):
         new_config = cls.__new__(cls)
         memo = {id(config): new_config}
         new_config.__dict__ = deepcopy(config.__dict__, memo)
+
+        for target_field in fields(cls):
+            name = target_field.name
+            if name in new_config.__dict__:
+                continue
+            if target_field.default is not MISSING:
+                value = deepcopy(target_field.default, memo)
+            elif target_field.default_factory is not MISSING:
+                value = target_field.default_factory()
+            else:
+                raise TypeError(
+                    f"{cls.__name__}.from_config requires a value for {name!r}; "
+                    "construct the config directly."
+                )
+            setattr(new_config, name, value)
         for config_type in type(config).__mro__:
             for attr in getattr(config_type, "__slots__", ()):
                 if attr not in ("__dict__", "__weakref__") and hasattr(config, attr):
@@ -2619,6 +2708,17 @@ class TransformerConfig(ModelParallelConfig):
         self._normalize_sync_compatibility_fields()
         self._validate_dsv4_execution_scope()
         self._validate_cp_layouts()
+
+        for name in ("mtp_ce_loss_weight", "mtp_kl_loss_weight"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name} must be finite and nonnegative")
+        if not math.isfinite(self.mtp_kd_logit_temperature) or self.mtp_kd_logit_temperature <= 0:
+            raise ValueError("MTP KD temperature must be finite and positive")
+        if self.mtp_kd_loss_scale is not None and (
+            not math.isfinite(self.mtp_kd_loss_scale) or self.mtp_kd_loss_scale < 0
+        ):
+            raise ValueError("MTP KD loss scale must be finite and nonnegative")
 
         if self.attn_logit_softcapping is not None and not (
             math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
@@ -3192,6 +3292,15 @@ class TransformerConfig(ModelParallelConfig):
                         " by dsa_indexer_kpool for pool selection; "
                         f"got topk={self.dsa_indexer_topk}, kpool={self.dsa_indexer_kpool}."
                     )
+            if self.dsa_indexer_kpool > 1 and self.dsa_indexer_mode == "simplified":
+                # The simplified (GQA) indexer has no pool code; without this rule a KPool
+                # config would be accepted and KPool silently ignored.
+                raise ValueError(
+                    "dsa_indexer_mode='simplified' does not support KPool selection "
+                    "(dsa_indexer_kpool > 1): the simplified indexer has no pool compression, "
+                    "so the pools would be silently ignored; got "
+                    f"dsa_indexer_kpool={self.dsa_indexer_kpool}."
+                )
             if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
                 raise ValueError(
                     "DSA indexer loss is not supported with kpool selection; set "
@@ -3403,9 +3512,10 @@ class TransformerConfig(ModelParallelConfig):
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
 
-        if self.fp8_output_proj:
+        if self.fp8_output_proj and not self.fp4:
+            # FP4 models run the LM head under its own MXFP8 autocast.
             if not self.fp8:
-                raise ValueError("fp8_output_proj must be used together with fp8 mode.")
+                raise ValueError("fp8_output_proj must be used together with fp8 or fp4 mode.")
             if self.fp8_recipe != Fp8Recipe.mxfp8:
                 raise ValueError(
                     f"fp8_output_proj requires fp8_recipe='mxfp8', got " f"'{self.fp8_recipe}'."
@@ -3834,10 +3944,25 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if not (self.use_transformer_engine_op_fuser and self.moe_grouped_gemm):
                 raise ValueError(
-                    "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' require BOTH "
-                    "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
-                    "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
+                    "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' or 'nvfp4' require "
+                    "BOTH use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
+                    "grouped GEMM path consumes the pre-quantized GroupedTensor payload."
                 )
+            if 'nvfp4' in (self.moe_dispatch_fwd_dtype, self.moe_combine_bwd_dtype):
+                if not (self.fp4 and self.fp4_recipe == Fp4Recipe.nvfp4):
+                    raise ValueError(
+                        "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'nvfp4' require fp4 "
+                        "with fp4_recipe='nvfp4': the experts then quantize their inputs and "
+                        "output gradients to NVFP4 anyway."
+                    )
+                if self.first_last_layers_bf16:
+                    # The dispatcher builds one wire recipe from the global config, so the
+                    # layers kept in BF16 would still get NVFP4 payloads and gradients.
+                    raise ValueError(
+                        "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'nvfp4' cannot be "
+                        "combined with first_last_layers_bf16: the layers kept in BF16 would "
+                        "still receive NVFP4 payloads from the dispatcher."
+                    )
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
@@ -3907,7 +4032,7 @@ class TransformerConfig(ModelParallelConfig):
             ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
 
         if self.moe_virtual_expert_load_balance:
-            if self.moe_megakernel_backend == "mok":
+            if self.moe_megakernel_backend in ("mok", "cutemok"):
                 raise ValueError("MOK does not support MoonEP (moe_virtual_expert_load_balance)")
             MAX_VIRTUAL_EXPERT_EP_SIZE = 64
 
@@ -4017,16 +4142,16 @@ class TransformerConfig(ModelParallelConfig):
             self.moe_router_load_balancing_type = "quantile_balancing"
             self.moe_aux_loss_coeff = self.moe_aux_loss_coeff[0]
 
-        if self.moe_megakernel_backend not in (None, "mok"):
+        if self.moe_megakernel_backend not in (None, "mok", "cutemok"):
             raise ValueError(
-                "moe_megakernel_backend must be None or 'mok', got "
+                "moe_megakernel_backend must be None, 'mok' or 'cutemok', got "
                 f"{self.moe_megakernel_backend!r}"
             )
         if self.moe_megakernel_backend is None and self.moe_megakernel_backend_config:
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
             )
-        if self.moe_megakernel_backend == "mok":
+        if self.moe_megakernel_backend in ("mok", "cutemok"):
             from megatron.core.transformer.moe.megakernel import megakernel_fuses_shared_expert
 
             fuse_shared = megakernel_fuses_shared_expert(self)
@@ -4800,6 +4925,13 @@ class TransformerConfig(ModelParallelConfig):
                 # The base config cannot see layout-derived standalone MTP. Warn once when this
                 # post-layout transition makes the fixed-shape flag a no-op.
                 self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
+            if self.experimental_attention_variant == "dsa" and self.dsa_indexer_topk_freq > 1:
+                _validate_dsa_index_share_pipeline_layout(
+                    self.pipeline_model_parallel_layout,
+                    num_layers=self.num_layers,
+                    topk_freq=self.dsa_indexer_topk_freq,
+                    skip_topk_offset=self.dsa_indexer_skip_topk_offset,
+                )
 
         # Uneven PP
         elif (
@@ -5516,7 +5648,7 @@ class TransformerConfig(ModelParallelConfig):
             )
         is_te_chunk_graph = self.cuda_graph_impl == "chunk_wise"
 
-        if self.moe_megakernel_backend == "mok":
+        if self.moe_megakernel_backend in ("mok", "cutemok"):
             if self.cuda_graph_impl in ("local", "transformer_engine"):
                 # Empty modules mean whole-layer capture here, not full_iteration.
                 # Per-layer replay needs per-microbatch ownership or recomputation
@@ -6164,6 +6296,13 @@ class TransformerConfig(ModelParallelConfig):
                     "capacities in them, before the capture."
                 )
 
+            if self.cuda_graph_impl == "full_iteration" and self.moe_paged_stash:
+                assert self.cuda_graph_warmup_steps >= 2, (
+                    "Full-iteration CUDA graphs with paged stash require at least two eager "
+                    "warmup steps to discover the stash schedule and allocate its buffers "
+                    "before capture."
+                )
+
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
                     # Both captures record the checkpointed forward and its recompute as one unit.
@@ -6783,8 +6922,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.batch_invariant_mode:
             from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
                 _BATCH_INVARIANT_BACKENDS,
+                _resolve_backend,
             )
 
+            # "deepgemm" is deprecated: warn and run as "te_native".
+            self.batch_invariant_backend = _resolve_backend(self.batch_invariant_backend)
             # argparse validates via the Literal annotation; guard here too so
             # programmatic TransformerConfig construction fails at build time
             # rather than inside enable_batch_invariant_mode() after model init.
@@ -6841,51 +6983,33 @@ class TransformerConfig(ModelParallelConfig):
                 self.attention_dropout == 0.0
             ), "Batch invariant mode does not support attention dropout"
             if (self.num_moe_experts or 0) > 0:
-                from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-                    HAVE_DEEPGEMM_BF16,
-                )
-
                 if self.transformer_impl != "inference_optimized":
                     assert self.moe_token_dispatcher_type == "alltoall", (
                         "Batch-invariant MoE training requires "
                         "moe_token_dispatcher_type='alltoall'."
                     )
-                    if self.batch_invariant_backend == "te_native":
-                        # Import lazily: the TE extension imports TransformerConfig.
-                        from megatron.core.extensions.transformer_engine import (
-                            TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
-                        )
+                    # Both backends run TE's native grouped GEMMs for the experts.
+                    # Import lazily: the TE extension imports TransformerConfig.
+                    from megatron.core.extensions.transformer_engine import (
+                        TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+                    )
 
-                        assert (
-                            not self.use_transformer_engine_op_fuser
-                        ), "Batch-invariant training does not support TE op fuser."
-                        assert self.moe_use_grouped_tensor or not bool(
-                            int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))
-                        ), (
-                            "Enable device-metadata GEMM with moe_use_grouped_tensor=True, "
-                            "not just NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM, so expert "
-                            "padding uses the required "
-                            f"{TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}-row alignment."
-                        )
+                    assert (
+                        not self.use_transformer_engine_op_fuser
+                    ), "Batch-invariant training does not support TE op fuser."
+                    assert self.moe_use_grouped_tensor or not bool(
+                        int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))
+                    ), (
+                        "Enable device-metadata GEMM with moe_use_grouped_tensor=True, "
+                        "not just NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM, so expert "
+                        "padding uses the required "
+                        f"{TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}-row alignment."
+                    )
                 mxfp8_params_enabled = (
                     bool(self.fp8)
                     and self.fp8_recipe == Fp8Recipe.mxfp8
                     and self.fp8_param
                     and not self.fp4
-                )
-                # DeepGEMM is used by the "deepgemm"/"triton" backends, and by
-                # the torch inference path for BF16 experts. MXFP8 experts use
-                # torch scaled_grouped_mm directly and do not need DeepGEMM.
-                needs_deepgemm = self.batch_invariant_backend in ("deepgemm", "triton") or (
-                    self.transformer_impl == "inference_optimized"
-                    and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
-                    and not mxfp8_params_enabled
-                )
-                assert not needs_deepgemm or HAVE_DEEPGEMM_BF16, (
-                    "batch_invariant_mode=True with MoE requires DeepGEMM with bf16 "
-                    "grouped-GEMM bindings (m_grouped_bf16_gemm_nt_contiguous) for "
-                    "this backend combination. "
-                    "Install via `uv pip install -e .[batch_invariant]`."
                 )
                 squared_relu_or_swiglu = (
                     not self.gated_linear_unit and self.activation_func == squared_relu
@@ -6959,21 +7083,25 @@ class TransformerConfig(ModelParallelConfig):
                     "('alltoall', 'flex'), "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
-                # Chunk-wise CUDA graphs pad every rank's microbatch to
-                # max_seqlen_per_dp_cp_rank (checked below), which already equalizes the token
-                # counts across the dispatcher ranks, and turn the runtime padding off (its
-                # all-reduce plus host read per MoE layer cannot be captured).
+                # pad_packed_seq_alignment='max', or an integer alignment equal to
+                # max_seqlen_per_dp_cp_rank, pads every pack to max_seqlen_per_dp_cp_rank tokens
+                # per CP rank before the CP slice (pad_packed_batch_before_cp_slice), so every
+                # dispatcher rank holds the same token count, the upstream padding the field's
+                # contract asks for; the per-layer all-reduce of the group maximum (a host
+                # synchronization) is then not needed.
                 if (
                     self.moe_megakernel_backend is None
                     and self.moe_token_dispatcher_type == "flex"
                     and self.moe_flex_dispatcher_backend == "hybridep"
                     and not self.moe_hybridep_pad_variable_tokens
-                    and self.cuda_graph_impl != "chunk_wise"
+                    and self.pad_packed_seq_alignment not in ("max", self.max_seqlen_per_dp_cp_rank)
                 ):
                     raise ValueError(
                         "sequence_packing with HybridEP requires "
                         "moe_hybridep_pad_variable_tokens=True because packed token "
-                        "counts can differ across dispatcher ranks"
+                        "counts can differ across dispatcher ranks, unless "
+                        "pad_packed_seq_alignment ('max' or max_seqlen_per_dp_cp_rank) pads "
+                        "every pack to max_seqlen_per_dp_cp_rank"
                     )
 
         if self.cuda_graph_impl != "none" and (
@@ -7073,7 +7201,9 @@ class MLATransformerConfig(TransformerConfig):
     """Split the key/value up-projection output, apply RoPE to the key and quantize key and value
     for MXFP8 attention in one Transformer Engine kernel (SM100 only), and quantize the RoPE'd
     query before attention, instead of writing BF16 key and value that attention then
-    quantizes. Bitwise identical. Requires apply_rope_fusion=True, MXFP8 DPA, zero attention
+    quantizes. Bitwise identical. Requires apply_rope_fusion=True, MXFP8 DPA (with fp4, Transformer
+    Engine's NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling and NVTE_DPA_FP8_FORMAT=HYBRID or E4M3, checked
+    at run time; custom recipes use the unfused path), zero attention
     dropout and qk_head_dim=128, qk_pos_emb_head_dim=64, v_head_dim=128; layers with TP or CP
     above 1, THD inputs, FP16 inputs, recomputed up-projections or checkpointed core attention,
     NVTE_FP8_DPA_BWD=0 and evaluation use the unfused path."""
@@ -7177,14 +7307,17 @@ class MLATransformerConfig(TransformerConfig):
                 "backward does not support dropout."
             )
 
+        # FP4 models can run attention in MXFP8 (TE's NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling).
+        # The fused kernel is then used only when that holds at run time; see
+        # _is_mxfp8_attention_active.
+        mxfp8_linear_recipe = self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8
         if self.use_fused_mla_kv_rope_quant and (
-            self.fp8 is None
-            or self.fp8_recipe != Fp8Recipe.mxfp8
+            not (mxfp8_linear_recipe or self.fp4)
             or not self.fp8_dot_product_attention
             or self.attention_dropout != 0.0
         ):
             raise ValueError(
-                "use_fused_mla_kv_rope_quant requires FP8 with fp8_recipe='mxfp8' and "
+                "use_fused_mla_kv_rope_quant requires FP8 with fp8_recipe='mxfp8' or FP4, and "
                 "fp8_dot_product_attention=True, because it feeds MXFP8 Q/K/V to attention, "
                 "plus attention_dropout=0.0 because MXFP8 attention backward does not support "
                 "dropout."

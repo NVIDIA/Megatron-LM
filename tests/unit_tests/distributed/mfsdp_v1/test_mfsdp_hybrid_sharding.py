@@ -91,7 +91,7 @@ class TestHybridFsdpOverReplicatedWeights:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def hybrid_shard_model(model, device_mesh, dp_shard_strategy, experts_strategy=None):
+    def hybrid_shard_model(model, device_mesh, dp_shard_strategy, experts_strategy=None, **kwargs):
         """Fully shard `model` with DP-Outer optimizer state sharding enabled."""
         hybrid_group = device_mesh[HSDP].get_group()
         return fully_shard_model(
@@ -107,6 +107,7 @@ class TestHybridFsdpOverReplicatedWeights:
             zero_dp_strategy=dp_shard_strategy,
             expert_zero_dp_strategy=experts_strategy,
             outer_dp_sharding_strategy=OPTIM,
+            **kwargs,
         )
 
     @pytest.mark.parametrize("mesh_shape", HYBRID_MESHES)
@@ -146,6 +147,36 @@ class TestHybridFsdpOverReplicatedWeights:
         )
 
         assert_loss_curve_matches_reference(fsdp_model, optimizer, reference_model)
+        destroy_device_mesh(device_mesh)
+
+    @pytest.mark.parametrize("fsdp_double_buffer", [False, True])
+    def test_forced_param_sync_matches_reference(self, fsdp_double_buffer):
+        """
+        A forced param sync must leave the next forward pass with the stepped weights.
+
+        The optimizer forces one after loading a checkpoint with FP8 or FP4 param gather.
+        Gathering every FSDP unit there overflows the two-unit double buffer, and a gather
+        without DP-Outer leaves stale weight slices for the next forward pass.
+        """
+        world_size = torch.distributed.get_world_size()
+        if world_size < 4 or world_size % 2:
+            pytest.skip("Requires an even world of at least 4 ranks for a (2, N) hybrid mesh.")
+        device_mesh = build_hybrid_mesh(2, world_size // 2)
+        reference_model, model = build_replicated_models()
+
+        fsdp_model = self.hybrid_shard_model(
+            model, device_mesh, OPTIM_GRADS_PARAMS, fsdp_double_buffer=fsdp_double_buffer
+        )
+        optimizer = fully_shard_optimizer(
+            torch.optim.SGD(fsdp_model.parameters(), lr=LEARNING_RATE)
+        )
+
+        assert_loss_curve_matches_reference(
+            fsdp_model,
+            optimizer,
+            reference_model,
+            after_step=lambda: fsdp_model.start_param_sync(force_sync=True),
+        )
         destroy_device_mesh(device_mesh)
 
     # A DP-Shard width of one is the case under test, and it is reached both by sharding

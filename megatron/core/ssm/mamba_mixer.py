@@ -195,6 +195,28 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageAttentionLaye
             parallel.
     """
 
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward projection and scan FLOPs using the existing SSD approximation."""
+        tokens = total_real_tokens_in_batch
+        hidden = config.hidden_size
+        inner = 2 * hidden
+        heads = config.mamba_num_heads or inner // config.mamba_head_dim
+        return (
+            2
+            * tokens
+            * hidden
+            * (2 * inner + 2 * config.mamba_num_groups * config.mamba_state_dim + heads)
+            + 7 * tokens * inner * config.mamba_state_dim  # Approximate scan cost.
+            + 2 * tokens * inner * hidden
+        )
+
     def __init__(
         self,
         config: TransformerConfig,

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.models.common.embeddings import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings import rope_utils as rope_utils_module
 from megatron.core.models.common.embeddings import should_use_fused_mla_rope
@@ -373,7 +374,11 @@ def _test_fused_mla_rope_inplace(
         cu_seqlens = None
         seqlen = 1024
         batch_size = 2
-        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+        yarn_rope = YarnRotaryEmbedding(
+            emb_dim,
+            original_max_position_embeddings=seqlen,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+        )
         freqs, mscale = yarn_rope(seqlen, 0)
         cos = (torch.cos(freqs) * mscale).to(dtype)
         sin = (torch.sin(freqs) * mscale).to(dtype)
@@ -391,7 +396,11 @@ def _test_fused_mla_rope_inplace(
         for i in range(len(cu_seqlens) - 1):
             max_seqlen = max(max_seqlen, cu_seqlens[i + 1] - cu_seqlens[i])
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device='cuda')
-        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=max_seqlen)
+        yarn_rope = YarnRotaryEmbedding(
+            emb_dim,
+            original_max_position_embeddings=max_seqlen,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+        )
         freqs, mscale = yarn_rope(max_seqlen, 0)
         cos = (torch.cos(freqs) * mscale).to(dtype)
         sin = (torch.sin(freqs) * mscale).to(dtype)
@@ -835,7 +844,11 @@ def _check_fused_mla_rope_kv_split(
         cu_seqlens = None
         seqlen = 1024
         batch_size = 2
-        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+        yarn_rope = YarnRotaryEmbedding(
+            emb_dim,
+            original_max_position_embeddings=seqlen,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+        )
         freqs, mscale = yarn_rope(seqlen, 0)
         cos = (torch.cos(freqs) * mscale).to(dtype)
         sin = (torch.sin(freqs) * mscale).to(dtype)
@@ -859,7 +872,11 @@ def _check_fused_mla_rope_kv_split(
         for i in range(len(cu_seqlens) - 1):
             max_seqlen = max(max_seqlen, cu_seqlens[i + 1] - cu_seqlens[i])
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32, device='cuda')
-        yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=max_seqlen)
+        yarn_rope = YarnRotaryEmbedding(
+            emb_dim,
+            original_max_position_embeddings=max_seqlen,
+            cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+        )
         freqs, mscale = yarn_rope(max_seqlen, 0)
         cos = (torch.cos(freqs) * mscale).to(dtype)
         sin = (torch.sin(freqs) * mscale).to(dtype)
@@ -1375,6 +1392,75 @@ class TestFusedMLARope:
             input_format, remove_interleaving, num_heads, k_dim, v_dim, emb_dim
         )
 
+    def test_every_block_size_masks_a_partial_head_block(self, input_format):
+        """Every BLOCK_H candidate must match one-head blocks, since a tuner may pick any.
+
+        127 heads is not a multiple of any candidate above one, so each launch with more
+        than one head block ends in a partial block.
+        """
+        from megatron.core.fusions import fused_mla_yarn_rope_apply as mla
+
+        heads, nope_dim, emb_dim, v_dim, dtype = 127, 128, 64, 128, torch.bfloat16
+        if input_format == "sbhd":
+            lead, cu_seqlens, max_seqlen = (256, 2), None, 256
+        else:
+            lead, max_seqlen = (128,), 45
+            cu_seqlens = torch.tensor([0, 27, 54, 99, 128], dtype=torch.int32, device="cuda")
+        torch.manual_seed(0)
+        freqs = torch.rand(max_seqlen, 1, 1, emb_dim, device="cuda") * 6.28
+        cos, sin = freqs.cos().to(dtype), freqs.sin().to(dtype)
+        q = torch.randn(*lead, heads, nope_dim + emb_dim, dtype=dtype, device="cuda")
+        kv = torch.randn(*lead, heads, nope_dim + v_dim, dtype=dtype, device="cuda")
+        k_pos_emb = torch.randn(*lead, 1, emb_dim, dtype=dtype, device="cuda")
+        grads = (
+            torch.randn(*lead, heads, nope_dim + emb_dim, dtype=dtype, device="cuda"),
+            # Keeps the 127-head sum in the k_pos_emb gradient at unit scale.
+            torch.randn(*lead, heads, emb_dim + nope_dim, dtype=dtype, device="cuda") / heads**0.5,
+            torch.randn(*lead, heads, v_dim, dtype=dtype, device="cuda"),
+        )
+
+        def run():
+            inputs = [t.clone().requires_grad_() for t in (q, kv, k_pos_emb)]
+            query = mla.fused_mla_rope_inplace(
+                inputs[0] * 1, cos, sin, nope_dim, emb_dim, cu_seqlens
+            )
+            key, value = mla.fused_mla_rope_kv_split(
+                inputs[1], inputs[2], cos, sin, emb_dim, nope_dim, v_dim, cu_seqlens
+            )
+            torch.autograd.backward((query, key, value), [grad.clone() for grad in grads])
+            return [query.detach(), key.detach(), value.detach()] + [t.grad for t in inputs]
+
+        kernels = [
+            mla._autotuned_mla_rope_fwd_inplace_kernel,
+            mla._autotuned_mla_rope_bwd_inplace_kernel,
+            mla._mla_rope_fwd_kv_split_kernel,
+            mla._mla_rope_bwd_kv_split_kernel,
+        ]
+        candidates = [list(kernel.configs) for kernel in kernels]
+        block_sizes = [config.kwargs["BLOCK_H"] for config in candidates[0]]
+        assert all([c.kwargs["BLOCK_H"] for c in configs] == block_sizes for configs in candidates)
+        results = []
+        try:
+            for index, block_h in enumerate(block_sizes):
+                for kernel, configs in zip(kernels, candidates):
+                    kernel.configs = [configs[index]]
+                results.append((block_h, run()))
+        finally:
+            for kernel, configs in zip(kernels, candidates):
+                kernel.configs = configs
+        (one_head, expected), *others = results
+        assert one_head == 1
+        names = ("query", "key", "value", "q grad", "kv grad", "k_pos_emb grad")
+        for block_h, actual in others:
+            for name, want, got in zip(names, expected, actual):
+                torch.testing.assert_close(
+                    got.float(),
+                    want.float(),
+                    rtol=1.6e-2,
+                    atol=3e-2,
+                    msg=lambda msg: f"{name} with BLOCK_H={block_h}: {msg}",
+                )
+
 
 @pytest.mark.experimental
 @pytest.mark.internal
@@ -1391,7 +1477,11 @@ def test_out_of_place_inverse_rope_preserves_upstream_saved_output(input_format)
     emb_dim = 64
     dtype = torch.bfloat16
 
-    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+    yarn_rope = YarnRotaryEmbedding(
+        emb_dim,
+        original_max_position_embeddings=seqlen,
+        cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+    )
     freqs, mscale = yarn_rope(seqlen, 0)
     cos = (torch.cos(freqs) * mscale).to(dtype)
     sin = (torch.sin(freqs) * mscale).to(dtype)
@@ -1468,7 +1558,11 @@ def test_legacy_query_api_remains_in_place(input_format):
     emb_dim = 64
     dtype = torch.bfloat16
 
-    yarn_rope = YarnRotaryEmbedding(emb_dim, original_max_position_embeddings=seqlen)
+    yarn_rope = YarnRotaryEmbedding(
+        emb_dim,
+        original_max_position_embeddings=seqlen,
+        cp_group=parallel_state.get_context_parallel_group(check_initialized=False),
+    )
     freqs, mscale = yarn_rope(seqlen, 0)
     cos = (torch.cos(freqs) * mscale).to(dtype)
     sin = (torch.sin(freqs) * mscale).to(dtype)

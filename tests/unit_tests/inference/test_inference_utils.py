@@ -5,8 +5,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.inference import utils as inference_utils
 from megatron.core.inference.utils import (
     Counter,
+    check_flashinfer_jit_cache_installed,
     detokenize_tokens,
     get_language_model,
     lm_head_can_emit,
@@ -136,3 +138,14 @@ class TestInferenceUtils:
         assert model.lm_head_can_emit_fp32 is False
         mode["enabled"] = False
         assert model.lm_head_can_emit_fp32 is True
+
+    @pytest.mark.parametrize(
+        "cuda_version, expected",
+        [("13.0", "uv sync --extra inference"), ("12.9", "whl/cu129"), (None, "is not installed")],
+    )
+    def test_flashinfer_jit_cache_missing_hint(self, monkeypatch, cuda_version, expected):
+        monkeypatch.setattr(inference_utils, "FLASHINFER_JIT_CACHE_VERSION", None)
+        monkeypatch.setattr(torch.version, "cuda", cuda_version)
+        with pytest.raises(RuntimeError, match="flashinfer-jit-cache") as excinfo:
+            check_flashinfer_jit_cache_installed()
+        assert expected in str(excinfo.value)

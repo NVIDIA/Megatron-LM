@@ -22,8 +22,9 @@ import megatron.training.training as training_module
 from megatron.core.activations import situlu
 from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer, DSAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.training.logging.dsa_flops import dsa_indexer_flops, dsa_layer_flops
+from megatron.training.logging.dsa_flops import dsa_indexer_flops
 from megatron.training.models import GPTModelConfig, HybridModelConfig
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
@@ -2489,7 +2490,7 @@ class TestDSA:
         ``dsa_indexer_topk_freq=1`` makes ``is_dsa_skip_topk_layer``
         unconditionally False, so the layer-counting logic is only actually
         exercised with sharing on. Here ``freq=4, offset=1`` leaves layers 1 and
-        5 computing out of 8, and ``_num_dsa_indexer_layers`` has to stay in
+        5 computing out of 8, and the Training execution count has to stay in
         lockstep with the predicate in megatron.core.
         """
         args, cfg = _make_dsa_args()
@@ -2566,7 +2567,7 @@ class TestDSA:
 
 
 class TestDSAHelperEdgeCases:
-    """Direct coverage of the helper guards and the hybrid rejection."""
+    """Direct coverage of the helper guards and the hybrid rejections."""
 
     def test_indexer_flops_zero_layers(self):
         """No indexer layers contribute nothing."""
@@ -2615,6 +2616,35 @@ class TestDSAHelperEdgeCases:
             **common, dsa_indexer_loss_enabled=False, dsa_indexer_use_sparse_loss=True
         ) == _dsa_indexer_flops(**common, dsa_indexer_loss_enabled=False)
 
+    @pytest.mark.parametrize(
+        "loss_coeff,sparse_loss,topk,expected",
+        [
+            (0.0, False, 16, 22_020_096),
+            (0.0, True, 16, 22_020_096),
+            (0.01, False, 16, 48_234_496),
+            (0.01, True, 16, 41_811_968),
+            (0.01, True, 128, 48_234_496),
+        ],
+    )
+    def test_dsa_indexer_estimate_flops_sparse_loss_expansion(
+        self, loss_coeff, sparse_loss, topk, expected
+    ):
+        """Projections cost 69,632 FLOPs/token and scoring costs 128 FLOPs/pair.
+        Loss doubles projections; scoring pays x3 for dense KL or x(1+2*15/64)
+        for top-k=16 at L=128. The sparse flag has no effect without the loss.
+        """
+        args, _ = _make_dsa_args(loss_coeff, sparse_loss)
+        args.dsa_indexer_topk = topk
+        assert (
+            DSAIndexer.estimate_flops(
+                args.transformer,
+                total_real_tokens_in_batch=256,
+                seqlen_squared_sum_in_batch=32768,
+                include_backward=True,
+            )
+            == expected
+        )
+
     def test_sparse_core_scale_degenerate_inputs(self):
         """Zero tokens or an unset top-k fall back to the dense scale of 1.0."""
         from megatron.training.training import _dsa_sparse_core_scale
@@ -2622,12 +2652,13 @@ class TestDSAHelperEdgeCases:
         assert _dsa_sparse_core_scale(0, 0, 2048) == 1.0
         assert _dsa_sparse_core_scale(512, 512 * 4096, None) == 1.0
 
-    def test_hybrid_dsa_rejected(self):
-        """A hybrid layer pattern with DSA must fail loud, not fall through
-        to the dense full-MLA estimate (which overcounts core attention and
-        drops the indexer)."""
+    def test_hybrid_implicit_dsa_rejected(self):
+        """A model-wide 'dsa' variant without explicit 'D' layers binds DSA to
+        other attention layers through a custom spec (e.g. DSA over GQA), which
+        has no FLOPs model on the hybrid path. It must fail loud rather than
+        be counted as dense attention."""
         args, cfg = _make_dsa_args()
-        args.hybrid_layer_pattern = "D-D-"
+        args.hybrid_layer_pattern = "+-+-"
         args.mamba_state_dim = 128
         args.mamba_head_dim = 64
         args.mamba_num_groups = 8
@@ -2636,21 +2667,18 @@ class TestDSAHelperEdgeCases:
         with pytest.raises(AssertionError, match="hybrid-model path"):
             _flops(args, cfg, 2)
 
-    def test_hybrid_dsa_rejected_without_variant_attribute(self):
-        """The guard must key off the 'D' symbols in the layer pattern, not
-        just ``args.experimental_attention_variant``: on the hybrid path a
-        'D' pattern sets the variant only in the config kwargs (never back
-        onto ``args``), so a real ``--hybrid-layer-pattern "D..."`` launch
-        reaches this code with the attribute still ``None``."""
+    def test_hybrid_dsa_conflicting_variant_rejected(self):
+        """Explicit 'D' layers must not be silently counted under a
+        conflicting model-wide attention variant."""
         args, cfg = _make_dsa_args()
-        args.experimental_attention_variant = None
+        args.experimental_attention_variant = "gdn"
         args.hybrid_layer_pattern = "D-D-"
         args.mamba_state_dim = 128
         args.mamba_head_dim = 64
         args.mamba_num_groups = 8
         args.mamba_num_heads = 128
 
-        with pytest.raises(AssertionError, match="hybrid-model path"):
+        with pytest.raises(ValueError, match="Hybrid DSA FLOPs"):
             _flops(args, cfg, 2)
 
 
@@ -2765,17 +2793,10 @@ class TestDSAFlopsHelpers:
             args, total_tokens, sum_sq, num_dsa_layers=1, num_indexer_layers=0
         )
         expected = (total_tokens * token_term + sum_sq * core_term) / 3
-        assert dsa_layer_flops(
-            total_tokens=total_tokens,
-            seqlen_squared_sum=sum_sq,
-            hidden_size=args.hidden_size,
-            num_attention_heads=args.num_attention_heads,
-            q_lora_rank=q_lora_rank,
-            kv_lora_rank=args.kv_lora_rank,
-            qk_head_dim=args.qk_head_dim,
-            qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
-            v_head_dim=args.v_head_dim,
-            dsa_indexer_topk=args.dsa_indexer_topk,
+        assert DSAttention.estimate_flops(
+            args.transformer,
+            total_real_tokens_in_batch=total_tokens,
+            seqlen_squared_sum_in_batch=sum_sq,
         ) == pytest.approx(expected, rel=1e-15)
 
     @pytest.mark.parametrize("pattern, num_indexer_layers", [(None, 2), ("D-D-|D-D-/D-/D-", 4)])
@@ -2869,8 +2890,10 @@ class TestDSAKPool:
     @pytest.mark.parametrize("length", [3, 4, 7, 17, 33])
     @pytest.mark.parametrize("select_tail", [False, True])
     def test_attention_pairs_match_runtime_selection(self, length, select_tail):
-        from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_kpool
-        from megatron.training.logging.dsa_flops import _dsa_kpool_attention_scale
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            _dsa_kpool_attention_scale,
+            fused_qk_topk_kpool,
+        )
 
         _, indices = fused_qk_topk_kpool(
             q=torch.ones(length, 1, 2, 8),
@@ -2893,39 +2916,37 @@ class TestDSAKPool:
     @pytest.mark.parametrize("length", [1, 3, 4, 5, 8, 9, 16, 17, 33, 256, 5 / 3, 12.5])
     @pytest.mark.parametrize("select_tail", [False, True])
     def test_causal_pool_counts(self, pool_size, length, select_tail):
-        from megatron.training.logging.dsa_flops import (
-            _dsa_indexer_flops,
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
             _dsa_kpool_attention_scale,
         )
 
         attention, scoring, compression = _kpool_golden_scales(length, pool_size, 16, select_tail)
         actual = _dsa_kpool_attention_scale(2 * length, 2 * length**2, 16, pool_size, select_tail)
-        token_linear, core = _dsa_indexer_flops(
-            total_tokens=2 * length,
-            seqlen_squared_sum=2 * length**2,
-            hidden_size=512,
-            q_lora_rank=128,
-            n_heads=4,
-            head_dim=32,
-            num_indexer_layers=1,
-            dsa_indexer_loss_enabled=False,
-            dsa_indexer_topk=16,
-            dsa_indexer_kpool=pool_size,
-        )
+        args, _ = _make_dsa_args(dsa_indexer_loss_coeff=0)
+        args.dsa_indexer_kpool = pool_size
         projections = 2 * (128 * 4 * 32 + 512 * 32 + 512 * 4 + 512 * 32)
+        expected = 2 * length * (projections + 2 * 32 * compression) + 2 * length**2 * (
+            4 * 32 * scoring
+        )
+        flops = DSAIndexer.estimate_flops(
+            args.transformer,
+            total_real_tokens_in_batch=2 * length,
+            seqlen_squared_sum_in_batch=2 * length**2,
+        )
         assert actual == pytest.approx(attention)
-        assert token_linear == pytest.approx(projections + 2 * 32 * compression)
-        assert core == pytest.approx(4 * 32 * scoring)
+        assert flops == pytest.approx(expected)
         assert 0 <= actual <= 1
         if select_tail and length <= 16:
             assert actual == pytest.approx(1)
         if length < pool_size - 1:
-            assert (token_linear, core) == (projections, 0)
+            assert flops == 2 * length * projections
 
     @pytest.mark.parametrize("q_lora_rank", [None, 128])
     @pytest.mark.parametrize("length", [3, 4, 19, 256])
     def test_forward_indexer_cost(self, q_lora_rank, length):
         args, _ = _make_dsa_args(dsa_indexer_loss_coeff=0)
+        args.q_lora_rank = q_lora_rank
+        args.dsa_indexer_kpool = 4
         tokens, sum_sq = 2 * length, 2 * length**2
         _, scoring_scale, compression_scale = _kpool_golden_scales(length, 4, 16, True)
         # Ordinary Q/K/weight projections plus one extra hidden -> head_dim gate.
@@ -2941,17 +2962,9 @@ class TestDSAKPool:
         )
         compression = 2 * tokens * compression_scale * args.dsa_indexer_head_dim
         scoring = sum_sq * index_dim * scoring_scale
-        assert dsa_indexer_flops(
-            total_tokens=tokens,
-            seqlen_squared_sum=sum_sq,
-            hidden_size=args.hidden_size,
-            q_lora_rank=q_lora_rank,
-            dsa_indexer_n_heads=args.dsa_indexer_n_heads,
-            dsa_indexer_head_dim=args.dsa_indexer_head_dim,
-            dsa_indexer_topk=16,
-            num_dsa_layers=3,
-            dsa_indexer_kpool=4,
-        ) == pytest.approx(3 * (projections + compression + scoring))
+        assert DSAIndexer.estimate_flops(
+            args.transformer, total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=sum_sq
+        ) == pytest.approx(projections + compression + scoring)
 
     @pytest.mark.parametrize("pool_size", [2, 4, 8])
     @pytest.mark.parametrize("select_tail", [False, True])
@@ -3013,42 +3026,132 @@ class TestDSAKPool:
         assert after - before == pytest.approx(expected_delta, rel=0, abs=1)
 
     def test_invalid_indexer_loss(self):
+        args, _ = _make_dsa_args()
+        args.dsa_indexer_kpool = 4
         with pytest.raises(ValueError, match="indexer loss to be disabled"):
-            dsa_indexer_flops(
-                total_tokens=512,
-                seqlen_squared_sum=131072,
-                hidden_size=512,
-                q_lora_rank=128,
-                dsa_indexer_n_heads=4,
-                dsa_indexer_head_dim=32,
-                dsa_indexer_topk=16,
-                num_dsa_layers=1,
-                dsa_indexer_loss_coeff=0.01,
-                dsa_indexer_kpool=4,
+            DSAIndexer.estimate_flops(
+                args.transformer,
+                total_real_tokens_in_batch=512,
+                seqlen_squared_sum_in_batch=131072,
+                include_backward=True,
             )
 
     @pytest.mark.parametrize("topk", [None, 0, 3])
     def test_invalid_pool_budget(self, topk):
-        from megatron.training.logging.dsa_flops import _dsa_kpool_attention_scale
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            _dsa_kpool_attention_scale,
+        )
 
         with pytest.raises(ValueError, match="positive top-k divisible"):
             _dsa_kpool_attention_scale(512, 131072, topk, 4, True)
 
     def test_empty_batch(self):
-        from megatron.training.logging.dsa_flops import _dsa_kpool_attention_scale
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            _dsa_kpool_attention_scale,
+        )
 
         assert _dsa_kpool_attention_scale(0, 0, 16, 4, True) == 0
+        args, _ = _make_dsa_args(dsa_indexer_loss_coeff=0)
+        args.dsa_indexer_kpool = 4
         assert (
-            dsa_indexer_flops(
-                total_tokens=0,
-                seqlen_squared_sum=0,
-                hidden_size=512,
-                q_lora_rank=128,
-                dsa_indexer_n_heads=4,
-                dsa_indexer_head_dim=32,
-                dsa_indexer_topk=16,
-                num_dsa_layers=1,
-                dsa_indexer_kpool=4,
+            DSAIndexer.estimate_flops(
+                args.transformer, total_real_tokens_in_batch=0, seqlen_squared_sum_in_batch=0
             )
             == 0
         )
+
+
+def _as_dsa_hybrid(args, pattern):
+    """Express a standard-path DSA model through an explicit hybrid layer pattern.
+
+    The hybrid model gets its own copy of the transformer config, so later edits of either
+    model (which the model configs forward to their transformer config) stay apart.
+    """
+    hybrid = HybridModelConfig(
+        transformer=deepcopy(args.transformer),
+        seq_length=args.seq_length,
+        vocab_size=args.vocab_size,
+        hybrid_layer_pattern=pattern,
+    )
+    hybrid.num_layers = len(pattern.split("/")[0].replace("|", ""))
+    hybrid.mamba_state_dim = 128
+    hybrid.mamba_head_dim = 64
+    hybrid.mamba_num_groups = 8
+    hybrid.mamba_num_heads = 128
+    hybrid.gdp_num_householder = 3
+    return hybrid
+
+
+class TestHybridDSA:
+    """Explicit hybrid 'D' layers are counted with the standard-path DSA terms."""
+
+    @pytest.mark.parametrize("variant", [None, "dsa"])
+    @pytest.mark.parametrize("loss_coeff", [0.0, 0.01])
+    @pytest.mark.parametrize("sparse_loss", [False, True])
+    @pytest.mark.parametrize("mtp_num_layers", [None, 1])
+    def test_explicit_d_matches_standard_pool_one(
+        self, variant, loss_coeff, sparse_loss, mtp_num_layers
+    ):
+        """Each standard DSA layer is one 'D' plus one '-' hybrid layer.
+
+        A real hybrid launch leaves ``experimental_attention_variant`` unset on
+        ``args``; an explicit 'dsa' must give the same count.
+        """
+        standard, cfg = _make_dsa_args(loss_coeff, sparse_loss)
+        standard.mtp_num_layers = mtp_num_layers
+        pattern = "D-" * standard.num_layers + ("/D-" if mtp_num_layers else "")
+        hybrid = _as_dsa_hybrid(standard, pattern)
+        hybrid.experimental_attention_variant = variant
+        assert _flops(hybrid, cfg, 2) == _flops(standard, cfg, 2)
+        stats = dict(total_real_tokens_in_batch=384, seqlen_squared_sum_in_batch=32768)
+        assert _flops(hybrid, cfg, 2, **stats) == _flops(standard, cfg, 2, **stats)
+
+    @pytest.mark.parametrize("select_tail", [False, True])
+    @pytest.mark.parametrize("lengths", [(256, 256), (17, 19, 25)])
+    def test_standard_and_hybrid_kpool_match(self, select_tail, lengths):
+        """KPool selection, gate and pool compression match the standard path."""
+        args, cfg = _make_dsa_args(dsa_indexer_loss_coeff=0.0)
+        args.dsa_indexer_kpool = 4
+        args.dsa_indexer_kpool_always_select_tail = select_tail
+        hybrid = _as_dsa_hybrid(args, "D-" * args.num_layers)
+        stats = dict(
+            total_real_tokens_in_batch=sum(lengths),
+            seqlen_squared_sum_in_batch=sum(length**2 for length in lengths),
+        )
+        assert _flops(hybrid, cfg, 2, **stats) == _flops(args, cfg, 2, **stats)
+
+    def test_indexer_uses_physical_main_and_mtp_layer_numbers(self, monkeypatch):
+        """Indexer executions follow DSAttention's layer numbers.
+
+        Main 'D' layers sit at pattern positions 1, 3 and 5 (pipes stripped);
+        the MTP 'D' layer is number ``num_layers + 1 = 7`` at both depths. With
+        frequency four only layers 1 and 5 compute their own top-k. Restarting
+        the MTP numbering at 1 would wrongly add one execution per depth.
+        """
+        args, cfg = _make_dsa_args(0.0)
+        args = _as_dsa_hybrid(args, "D-DE|DE/DE/DE")
+        args.dsa_indexer_topk_freq = 4
+        args.mtp_num_layers = 2
+        counts = []
+        original = training_module._dsa_indexer_flops
+
+        def capture(**kwargs):
+            counts.append(kwargs["num_indexer_layers"])
+            return original(**kwargs)
+
+        monkeypatch.setattr(training_module, "_dsa_indexer_flops", capture)
+        _flops(args, cfg, 2)
+        assert counts == [2]
+
+    @pytest.mark.parametrize(
+        "topk, loss_coeff, error",
+        [(6, 0.0, "positive top-k divisible"), (8, 0.1, "indexer loss to be disabled")],
+    )
+    def test_invalid_kpool_is_not_silently_estimated(self, topk, loss_coeff, error):
+        """KPool without a pool-aligned top-k, or with the dense indexer loss, is rejected."""
+        args, cfg = _make_dsa_args(loss_coeff, dsa_indexer_use_sparse_loss=False)
+        args = _as_dsa_hybrid(args, "D-")
+        args.dsa_indexer_kpool = 4
+        args.dsa_indexer_topk = topk
+        with pytest.raises(ValueError, match=error):
+            _flops(args, cfg, 2)

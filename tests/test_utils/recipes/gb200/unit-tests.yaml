@@ -107,6 +107,15 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # The GDP packed-sequence suite takes about 17 minutes on GB200. Keep it out of
+  # the catch-all bucket so that bucket fits its 60-minute job limit.
+  - test_case: [tests/unit_tests/ssm/test_gdp_packed_seq.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention_cp_cuda_graph.py]
     products:
       - environment: [dev]

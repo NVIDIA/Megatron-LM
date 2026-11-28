@@ -17,6 +17,7 @@ import torch
 
 from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
+    CoordinatorState,
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
@@ -321,6 +322,43 @@ def test_kv_handoff_rejects_legacy_single_frame_payload():
     assert coordinator.sent == []
 
 
+@pytest.mark.skipif(not HAVE_ZMQ, reason="requires pyzmq")
+@pytest.mark.parametrize(
+    "initial_state, state_after_resume, resume_broadcast",
+    [
+        (CoordinatorState.RUNNING, CoordinatorState.RUNNING, False),
+        (CoordinatorState.SUSPENDED, CoordinatorState.PAUSED, True),
+    ],
+)
+def test_coordinator_initial_state_decides_whether_resume_is_honored(
+    initial_state, state_after_resume, resume_broadcast
+):
+    """Engines built suspended launch the coordinator SUSPENDED: from RUNNING the same
+    RESUME is dropped, which would leave every engine waiting forever."""
+    parent, child = multiprocessing.Pipe()
+    coordinator = DataParallelInferenceCoordinator(
+        child,
+        data_parallel_size=0,
+        tokenizer=DummyTokenizer(),
+        max_requests=1,
+        hostname="127.0.0.1",
+        initial_state=initial_state,
+    )
+    try:
+        assert parent.recv().startswith("tcp://")
+        assert coordinator.state is initial_state
+
+        coordinator.known_clients.add(b"client-0")
+        broadcasts = []
+        coordinator._broadcast_to_engines = broadcasts.append
+        HANDLERS[Headers.RESUME](coordinator, b"client-0", [Headers.RESUME.value], [])
+        assert coordinator.state is state_after_resume
+        assert broadcasts == ([[Headers.RESUME.value]] if resume_broadcast else [])
+    finally:
+        coordinator.stop()
+        parent.close()
+
+
 class DummyTokenizer:
     """Dummy tokenizer."""
 
@@ -351,9 +389,12 @@ class DummyContext:
     def __init__(self):
         self.active_cnt = 0
         self.step_count = 0
+        self.max_requests = 16
         self.block_size_tokens = 64
         self.enable_prefix_caching = False
         self.prefix_caching_coordinator_policy = None
+        self.prefix_caching_routing_alpha = 1.0
+        self.prefix_cache_ttl_seconds = 300.0
         self.prefix_cache_lru_clock = 0
 
     def get_active_request_count(self) -> int:
@@ -390,6 +431,7 @@ class DummyEngine(DynamicInferenceEngine):
         self.pending_microbatch = deque()
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.rank = torch.distributed.get_rank()
+        self.vision_embedding_cache_max_bytes = 0
 
         # State machine (mirrors dynamic_engine.py reset()).
         self.state = EngineState.RUNNING
@@ -633,6 +675,35 @@ def coordinator():
             proc.join(timeout=5.0)
 
 
+# States where paused stays set: once set during PAUSE, it's only cleared by UNPAUSE.
+PAUSED_FAMILY = {
+    EngineState.PAUSED,
+    EngineState.UNPAUSING,
+    EngineState.SUSPENDING,
+    EngineState.SUSPENDED,
+    EngineState.RESUMING,
+    EngineState.STOPPING,
+    EngineState.STOPPED,
+}
+
+
+def assert_state(eng, expected):
+    """Assert engine state and all four event flags are consistent."""
+    assert eng.state == expected, f"Expected state {expected}, got {eng.state}"
+    assert eng._state_events[EngineState.RUNNING].is_set() == (
+        expected == EngineState.RUNNING
+    ), f"RUNNING.is_set()={eng._state_events[EngineState.RUNNING].is_set()} for state={expected}"
+    assert eng._state_events[EngineState.PAUSED].is_set() == (
+        expected in PAUSED_FAMILY
+    ), f"PAUSED.is_set()={eng._state_events[EngineState.PAUSED].is_set()} for state={expected}"
+    assert eng._state_events[EngineState.SUSPENDED].is_set() == (
+        expected == EngineState.SUSPENDED
+    ), f"SUSPENDED.is_set()={eng._state_events[EngineState.SUSPENDED].is_set()} for state={expected}"
+    assert eng._state_events[EngineState.STOPPED].is_set() == (
+        expected == EngineState.STOPPED
+    ), f"STOPPED.is_set()={eng._state_events[EngineState.STOPPED].is_set()} for state={expected}"
+
+
 class TestCoordinator:
     """Test class for Data Parallel Inference Coordinator."""
 
@@ -748,33 +819,6 @@ class TestCoordinator:
         self, initialize_model_parallel, coordinator, test_case_communicator
     ):
         """Comprehensive lifecycle test for the engine state machine."""
-        # States where paused stays set: once set during PAUSE, it's only cleared by UNPAUSE.
-        PAUSED_FAMILY = {
-            EngineState.PAUSED,
-            EngineState.UNPAUSING,
-            EngineState.SUSPENDING,
-            EngineState.SUSPENDED,
-            EngineState.RESUMING,
-            EngineState.STOPPING,
-            EngineState.STOPPED,
-        }
-
-        def assert_state(eng, expected):
-            """Assert engine state and all four event flags are consistent."""
-            assert eng.state == expected, f"Expected state {expected}, got {eng.state}"
-            assert eng._state_events[EngineState.RUNNING].is_set() == (
-                expected == EngineState.RUNNING
-            ), f"RUNNING.is_set()={eng._state_events[EngineState.RUNNING].is_set()} for state={expected}"
-            assert eng._state_events[EngineState.PAUSED].is_set() == (
-                expected in PAUSED_FAMILY
-            ), f"PAUSED.is_set()={eng._state_events[EngineState.PAUSED].is_set()} for state={expected}"
-            assert eng._state_events[EngineState.SUSPENDED].is_set() == (
-                expected == EngineState.SUSPENDED
-            ), f"SUSPENDED.is_set()={eng._state_events[EngineState.SUSPENDED].is_set()} for state={expected}"
-            assert eng._state_events[EngineState.STOPPED].is_set() == (
-                expected == EngineState.STOPPED
-            ), f"STOPPED.is_set()={eng._state_events[EngineState.STOPPED].is_set()} for state={expected}"
-
         dp_addr = coordinator
         port = int(dp_addr.rsplit(":", 1)[-1])
         requests = self.build_requests(num_requests=16)
@@ -925,6 +969,82 @@ class TestCoordinator:
         if torch.distributed.get_rank() == 0:
             for f in doomed_futures:
                 assert f.cancelled(), "Client futures should be cancelled after client.stop()"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("resume_first", [False, True], ids=["stop", "resume-then-stop"])
+    async def test_start_suspended_lifecycle(
+        self, initialize_model_parallel, test_case_communicator, resume_first
+    ):
+        """An engine built suspended answers pause and stop before its first resume().
+
+        The engine spawns its own coordinator here, so the coordinator starts SUSPENDED too.
+        """
+        requests = self.build_requests(num_requests=2)
+        engine = DummyEngine()
+        # Mirrors the engine's start_suspended construction.
+        engine.state = EngineState.SUSPENDED
+        engine._state_events[EngineState.RUNNING].clear()
+        engine._state_events[EngineState.PAUSED].set()
+        engine._state_events[EngineState.SUSPENDED].set()
+        rank = torch.distributed.get_rank()
+        client = None
+        dp_addr = None
+
+        try:
+            dp_addr = await engine.start_listening_to_data_parallel_coordinator(
+                inference_coordinator_port=None, launch_inference_coordinator=True
+            )
+            # Synchronize all ranks so every engine has registered.
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
+
+            if rank == 0:
+                client = InferenceClient(dp_addr)
+                client.start()
+                assert_state(engine, EngineState.SUSPENDED)
+
+                # The coordinator drops PAUSE while suspended, so this returns only because the
+                # engine was built with PAUSED set, as after pause() then suspend().
+                client.pause_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
+                assert_state(engine, EngineState.SUSPENDED)
+
+                if resume_first:
+                    client.resume_engines()
+                    await asyncio.wait_for(engine.wait_until(EngineState.RESUMED), timeout=5.0)
+                    assert_state(engine, EngineState.PAUSED)
+                    client.unpause_engines()
+                    await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
+                    futures = [client.add_request(prompt=p, sampling_params=s) for p, s in requests]
+                    results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
+                    for result in results:
+                        assert result["status"] == Status.COMPLETED.name
+                    client.pause_engines()
+                    await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
+                    assert_state(engine, EngineState.PAUSED)
+
+            # Synchronize all ranks before STOP.
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
+            if rank == 0:
+                client.stop_engines()
+            await asyncio.wait_for(engine.wait_until(EngineState.STOPPED), timeout=60.0)
+            assert_state(engine, EngineState.STOPPED)
+        finally:
+            await cleanup_engine(engine, client)
+            process = getattr(engine, "inference_coordinator_process", None)
+            if process is not None:
+                if dp_addr is not None:
+                    shutdown_client = InferenceClient(dp_addr)
+                    shutdown_client.start(connect_timeout_seconds=10)
+                    shutdown_client.shutdown_coordinator()
+                    process.join(timeout=10)
+                    shutdown_client.stop()
+                alive = process.is_alive()
+                if alive:
+                    process.terminate()
+                    process.join(timeout=5)
+                assert not alive, "the engine-spawned coordinator did not shut down"
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")

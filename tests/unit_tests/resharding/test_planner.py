@@ -742,6 +742,42 @@ def _recv_sig(plan):
 class TestBuildPlanFromRosters:
     """Local plan building replayed independently per rank."""
 
+    @pytest.mark.parametrize("destination_ranks", [(2,), (3,), (2, 3)])
+    def test_partial_destination_mesh_keeps_generic_plan(self, destination_ranks):
+        """A subset of a TP mesh can receive weights through the generic schedule."""
+        sources = _tp_metadata(shape=(2, 4), partition_dim=0, tp_ranks=[0, 1])
+        destinations = _tp_metadata(shape=(2, 4), partition_dim=0, tp_ranks=[2, 3])
+        gathered = [([sources[0]], []), ([sources[1]], [])] + [
+            ([], [metadata] if metadata.owner_rank in destination_ranks else [])
+            for metadata in destinations
+        ]
+
+        plans = _build_all(gathered)
+
+        sends, receives = _plan_edges(plans)
+        assert sends == receives
+        assert {destination for _, _, destination in sends} == set(destination_ranks)
+        for plan in plans.values():
+            if len(destination_ranks) == 2:
+                assert plan.tensor_reshard_specs is not None
+                assert plan.tensor_reshard_error is None
+            else:
+                assert plan.tensor_reshard_specs is None
+                assert (
+                    "destination TP metadata does not cover its mesh" in plan.tensor_reshard_error
+                )
+
+        full_weight = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+        source_shards = full_weight.chunk(2)
+        for rank in destination_ranks:
+            received = torch.full((2, 4), float("nan"))
+            for receive in plans[rank].recv_ops:
+                send = next(
+                    op for op in plans[receive.peer_rank].send_ops if op.task_id == receive.task_id
+                )
+                received[receive.my_slice].copy_(source_shards[receive.peer_rank][send.my_slice])
+            torch.testing.assert_close(received, source_shards[rank - 2], rtol=0, atol=0)
+
     def test_gtp_schedule_matches_across_ranks(self):
         """Every GTP shard send has the matching deterministic receive."""
         src = [

@@ -1924,7 +1924,7 @@ class TestDSv4HybridAttentionTHDCP:
             graphed = make_graphed_callables((graph_layer,), ((static_hidden,),), **capture_kwargs)
         finally:
             _set_capture_end()
-        graph_layer.cuda_graphs = [graphed[0]]
+        graph_layer.te_cuda_graphs = [graphed[0]]
         graph_layer.current_microbatch = 0
 
         def _source_owner_kwargs(packed):
@@ -2048,9 +2048,9 @@ class TestDSv4HybridAttentionTHDCP:
             == 1
         )
 
-        if hasattr(graph_layer.cuda_graphs[0], "reset"):
-            graph_layer.cuda_graphs[0].reset()
-        graph_layer.cuda_graphs.clear()
+        if hasattr(graph_layer.te_cuda_graphs[0], "reset"):
+            graph_layer.te_cuda_graphs[0].reset()
+        graph_layer.te_cuda_graphs.clear()
         del (
             graph_layer,
             eager_layer,

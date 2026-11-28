@@ -65,6 +65,20 @@ def _te_do_not_offload(tensor):
     )
 
 
+def _allocator_tracks_storage(tensor: torch.Tensor) -> bool:
+    """Return whether ``record_stream`` protects the memory behind ``tensor``.
+
+    The CUDA caching allocator only tracks stream uses of memory it allocated; it silently
+    ignores ``record_stream`` for any other storage, such as the ``from_blob`` views that
+    Transformer Engine's ``bulk_allocate`` carves out of one buffer (grouped GEMM split offsets,
+    grouped MXFP8 data). Such storages are not resizable, while allocator-owned ones are.
+    """
+    try:
+        return tensor.untyped_storage().resizable()
+    except (RuntimeError, NotImplementedError):
+        return False
+
+
 def _covers_whole_storage(tensor: torch.Tensor) -> bool:
     """Return whether a contiguous tensor spans every byte of its underlying storage."""
     return (
@@ -504,6 +518,10 @@ class OffloadTensorGroup:
         # Whole-block capture: the device tensors this group copied out, kept until the main
         # stream joined the copies and released their blocks.
         self._block_capture_sources = []
+        # Offloaded sources whose memory record_stream cannot protect (see
+        # ChunkOffloadHandler.bulk_offload_group). The first offload hook of any chunk after their
+        # D2H copies have finished drops them; the group's reload drops whatever is left.
+        self._unrecorded_sources = []
         # Using memory pool is for the compatibility with cuda graph.
         # Variable MoE shapes bypass the shape/dtype cache. ChunkOffloadHandler
         # overrides this when the pool has fixed byte storage for cross-shape reuse.
@@ -527,6 +545,27 @@ class OffloadTensorGroup:
     def wait_offload_event(self, stream):
         """Wait for the offload event."""
         stream.wait_event(self._offload_event)
+
+    def hold_offload_source(self, tensor):
+        """Keep the source of a pending D2H copy alive until release_offload_sources."""
+        self._unrecorded_sources.append(tensor)
+
+    def release_offload_sources(self, wait_stream=None, force=False):
+        """Drop the held offload sources once their D2H copies can no longer be overtaken.
+
+        With ``wait_stream``, that stream first waits for the offload event, so memory the
+        allocator returns to it is only reused after the copies. With ``force``, the caller
+        guarantees the ordering. Otherwise the sources are dropped only if the offload event
+        has completed. Returns whether no source is held anymore.
+        """
+        if not self._unrecorded_sources:
+            return True
+        if wait_stream is not None:
+            wait_stream.wait_event(self._offload_event)
+        elif not force and not self._offload_event.query():
+            return False
+        self._unrecorded_sources.clear()
+        return True
 
     def record_reload_event(self, stream):
         """Record the reload event."""
@@ -578,19 +617,14 @@ class PipelineOffloadManager:
         # allocate streams and events for synchronization
         self._d2h_stream = torch.cuda.Stream()
         self._h2d_stream = torch.cuda.Stream()
-        # TE CUDA graph offload paths need a stream/event pair that lives outside
-        # individual layer objects so capture, replay, and backward hooks order
-        # the same D2H/H2D work with the same synchronization primitives.
-        self._cuda_graph_stream = torch.cuda.Stream()
-        self._cuda_graph_event = torch.cuda.Event(external=True)
         # Shared CPU tensor pool for all chunks to improve reuse efficiency
         self._cpu_tensor_pool = OffloadTensorPool(device="cpu", pin_memory=True)
         self._offload_buffer_size_gib = None
 
         # Whether the manager is in warmup phase.
         self._is_warmup = True
-        # Whether the manager is in CUDA graph replay phase.
-        self._in_replay = False
+        # Whether eligible group commits should be queued until explicitly flushed.
+        self.defer_group_commits = False
         # Whole-block (chunk-wise TE CUDA graph) capture mode, see enter_block_capture().
         self._block_capture = False
         self._block_capture_keep_last_group = False
@@ -630,6 +664,9 @@ class PipelineOffloadManager:
         # Sometimes we need to delay the offloading and launch it later.
         # The delayed offload groups are stored in a queue.
         self._delayed_offload_groups = []
+        # Groups of any chunk that hold offload sources record_stream cannot protect; every
+        # offload hook polls them, so a source is freed soon after its copy, not at its reload.
+        self._groups_holding_sources = []
         self.reset()
 
         # Keep the hook context object around so each offload scope can enter/exit
@@ -649,16 +686,6 @@ class PipelineOffloadManager:
         return self._h2d_stream
 
     @property
-    def cuda_graph_stream(self):
-        """Get the CUDA graph stream."""
-        return self._cuda_graph_stream
-
-    @property
-    def cuda_graph_event(self):
-        """Get the CUDA graph event."""
-        return self._cuda_graph_event
-
-    @property
     def cpu_tensor_pool(self):
         """Get the shared CPU tensor pool."""
         return self._cpu_tensor_pool
@@ -666,7 +693,7 @@ class PipelineOffloadManager:
     def push_offload_groups(self, group_hook, name, forced_released_tensors):
         """Push the offload groups to the delayed queue."""
         debug_rank(f"pushing offload groups to the delayed queue")
-        # Store the group name because delayed CUDA graph replay flushes later,
+        # Store the group name because the delayed queue is flushed later,
         # after the original group-start site has already moved on.
         self._delayed_offload_groups.append((group_hook, name, forced_released_tensors))
 
@@ -678,6 +705,20 @@ class PipelineOffloadManager:
         for group_hook, name, forced_released_tensors in self._delayed_offload_groups:
             group_hook(name, forced_released_tensors)
         self._delayed_offload_groups = []
+
+    def track_held_offload_sources(self, group):
+        """Poll ``group`` from every later offload hook until its held sources are dropped."""
+        if group not in self._groups_holding_sources:
+            self._groups_holding_sources.append(group)
+
+    def release_copied_offload_sources(self):
+        """Drop the held sources of groups, in any chunk, whose D2H copies have finished."""
+        if is_graph_capturing() or torch.cuda.is_current_stream_capturing():
+            # Events cannot be queried during capture; the group's reload releases them.
+            return
+        self._groups_holding_sources = [
+            group for group in self._groups_holding_sources if not group.release_offload_sources()
+        ]
 
     def reset(self, process_group: Optional[torch.distributed.ProcessGroup] = None):
         """Reset manager state for a new training iteration."""
@@ -1605,15 +1646,26 @@ class ChunkOffloadHandler:
                         # recycled after the capture ends. Keep the source alive instead and
                         # free it on the main stream once that stream has joined the copy
                         # (_block_capture_release), so the forward graph reuses the memory.
+                        # That hold covers every source, also one record_stream cannot protect.
                         sources.append(tensor_on_device)
                     else:
                         # record_stream on the view marks the shared storage
                         # allocation, so this also covers base-storage offloads.
                         tensor_on_device.record_stream(self.d2h_stream)
+                        if not _allocator_tracks_storage(tensor_on_device):
+                            # record_stream was a no-op: once the last reference is dropped, the
+                            # producer's stream may reuse the memory before this copy reads it.
+                            group_to_offload.hold_offload_source(tensor_on_device)
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
         if block_capture:
             group_to_offload._block_capture_sources = sources
+        elif group_to_offload._unrecorded_sources and not (
+            is_graph_capturing() or torch.cuda.is_current_stream_capturing()
+        ):
+            # A hold made during capture is dropped by the reload in the backward capture; its
+            # event cannot be queried from an eager hook.
+            PipelineOffloadManager.get_instance().track_held_offload_sources(group_to_offload)
         nvtx_range_pop(nvtx_msg)
         # Under full-iteration CG capture, the main stream may not wait on d2h
         # events; optional max-inflight enqueues each group's offload event and
@@ -1722,6 +1774,13 @@ class ChunkOffloadHandler:
                 debug_rank(f"----recovered_tensor {recovered_tensor.shape}")
                 group_to_reload.push_tensor(tensor_tag, recovered_tensor)
             group_to_reload.record_reload_event(self.h2d_stream)
+        # The copies are complete before the consumer can see the reloaded tensors. Outside
+        # capture, the consumer stream waits for them before the held sources are dropped;
+        # under capture the reload is ordered behind the forward's copies, as for the H2D wait.
+        if is_graph_capturing():
+            group_to_reload.release_offload_sources(force=True)
+        else:
+            group_to_reload.release_offload_sources(wait_stream=consumer_stream)
         group_to_reload._reload_graph_task_id = _capturing_graph_task_id()
         self._groups_to_reload.pop()
         # Add the group to the reloading group to wait for the reload event.
@@ -1841,9 +1900,15 @@ class ChunkOffloadHandler:
         if not self.do_offload:
             return
         debug_rank(f"--on_group_commit_forward {name}")
+        self._release_copied_offload_sources()
         # Wait for compute to finish before starting offload
         self.d2h_stream.wait_stream(torch.cuda.current_stream())
         self.bulk_offload(name, forced_released_tensors)
+
+    @staticmethod
+    def _release_copied_offload_sources():
+        """Drop the held offload sources of every chunk whose D2H copies have finished."""
+        PipelineOffloadManager.get_instance().release_copied_offload_sources()
 
     def bulk_reload(self):
         """Reload the next group of tensors from CPU to GPU."""
@@ -1899,6 +1964,7 @@ class ChunkOffloadHandler:
         if not self.do_offload:
             return
         debug_rank("--on_group_commit_backward")
+        self._release_copied_offload_sources()
         if PipelineOffloadManager.get_instance()._block_capture:
             # Whole-block capture: the autograd context names this handler and the cursor names
             # the group. Reload it now if no in-graph prefetch covered it, and record its wait
@@ -1944,6 +2010,7 @@ class ChunkOffloadHandler:
         if not self.do_offload:
             return
         debug_rank(f"--on_group_start_forward {name}")
+        self._release_copied_offload_sources()
         self._offloaded_group_index = self._offloaded_group_index + 1
         if self.is_warmup:
             self.offload_groups.append(OffloadTensorGroup(name))
@@ -1968,6 +2035,7 @@ class ChunkOffloadHandler:
         if not self.do_offload:
             return
         debug_rank(f"--on_group_start_backward {self}")
+        self._release_copied_offload_sources()
         self.h2d_stream.wait_stream(torch.cuda.current_stream())
         # The forward-start marker runs after this group's internal backward.
         # At backward entry, a GPU-resident final group may still have its slot
@@ -2011,9 +2079,8 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         # pylint: disable=missing-function-docstring
         debug_rank("FineGrainedOffloadingGroupCommitFunction forward")
 
-        if delay_offload and PipelineOffloadManager.get_instance()._in_replay:
-            # During TE CUDA graph replay, queue D2H work and launch it after
-            # replay returns, where CPU scheduling can overlap with graph/comm gaps.
+        if delay_offload and PipelineOffloadManager.get_instance().defer_group_commits:
+            # Queue eligible D2H work until the caller flushes the delayed groups.
             PipelineOffloadManager.get_instance().push_offload_groups(
                 cur_forward_chunk.on_group_commit_forward, name, forced_released_tensors
             )
@@ -2121,46 +2188,6 @@ def fine_grained_offloading_group_start(tensor, name=None):
     return FineGrainedOffloadingGroupStartFunction.apply(tensor, cur_forward_chunk, name)
 
 
-class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
-    """
-    Identity operation that marks a Transformer Engine per-callable capture boundary.
-
-    This is inserted by ``_te_cuda_graph_capture``; MCore local and full-iteration
-    CUDA graph runners do not use this callback-based boundary.
-    """
-
-    @staticmethod
-    def forward(ctx, tensor) -> torch.Tensor:
-        """Forward pass for cuda graph capture."""
-        debug_rank("FineGrainedOffloadingBackwardRecordFunction forward")
-        return tensor
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Queue the event and H2D join at the current TE callable's GraphTask tail."""
-        debug_rank("FineGrainedOffloadingBackwardRecordFunction backward")
-
-        def record_backward_completion():
-            mgr = PipelineOffloadManager.get_instance()
-            current_stream = torch.cuda.current_stream()
-            # TE uses this external event to synchronize the main stream after
-            # replay. Record it only after the entire GraphTask, including all
-            # requested parameter and input gradients, has completed. The following
-            # H2D join remains after the event so next-group reload can overlap
-            # main-stream work while still belonging to the captured graph.
-            current_stream.record_event(mgr.cuda_graph_event)
-            current_stream.wait_stream(mgr.h2d_stream)
-
-        # TE warms up and captures every callable with a separate autograd.backward(),
-        # so this callback runs before that callable's backward capture context closes.
-        # Its CUDA commands become the tail of that callable's backward graph; normal
-        # training replay calls bwd_graph.replay() and does not run this Python callback
-        # again. Keep backward_record's node on this outer per-callable boundary: moving
-        # it into a reentrant checkpoint would instead target the inner GraphTask tail.
-        torch.autograd.Variable._execution_engine.queue_callback(record_backward_completion)
-        return (grad_output,)
-
-
 class FineGrainedOffloadingBlockBackwardStartFunction(torch.autograd.Function):
     """Identity op at a whole-block callable's output: fork the H2D stream when its backward
     graph starts, so the tail join in ``backward_record`` never depends on uncaptured work.
@@ -2205,16 +2232,6 @@ class FineGrainedActivationOffloadingInterface:
             PipelineOffloadManager.get_instance().__exit__()
 
     @staticmethod
-    def cuda_graph_stream():
-        """Get the CUDA graph stream."""
-        return PipelineOffloadManager.get_instance().cuda_graph_stream
-
-    @staticmethod
-    def cuda_graph_event():
-        """Get the CUDA graph event."""
-        return PipelineOffloadManager.get_instance().cuda_graph_event
-
-    @staticmethod
     def init_chunk_handler(
         pp_rank,
         vp_size,
@@ -2256,18 +2273,6 @@ class FineGrainedActivationOffloadingInterface:
         PipelineOffloadManager.get_instance().mark_not_offload(tensor)
 
     @staticmethod
-    def forward_record() -> None:
-        """Record the forward event for cuda graph capture."""
-        mgr = PipelineOffloadManager.get_instance()
-        torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
-        torch.cuda.current_stream().wait_stream(mgr.d2h_stream)
-
-    @staticmethod
-    def backward_record(tensor) -> torch.Tensor:
-        """Record the backward event for cuda graph capture."""
-        return FineGrainedOffloadingBackwardRecordFunction.apply(tensor)
-
-    @staticmethod
     def reset(process_group: Optional[torch.distributed.ProcessGroup] = None):
         """Reset the chunk handler."""
         PipelineOffloadManager.get_instance().reset(process_group=process_group)
@@ -2291,16 +2296,6 @@ class FineGrainedActivationOffloadingInterface:
     def enable_offload():
         """Enable the offload."""
         PipelineOffloadManager.get_instance().enable_offload()
-
-    @staticmethod
-    def enter_replay():
-        """Enter CUDA graph replay mode to enable delayed offloading."""
-        PipelineOffloadManager.get_instance()._in_replay = True
-
-    @staticmethod
-    def exit_replay():
-        """Exit CUDA graph replay mode."""
-        PipelineOffloadManager.get_instance()._in_replay = False
 
     @staticmethod
     def enter_block_capture(keep_last_group=False):

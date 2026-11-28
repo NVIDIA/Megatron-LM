@@ -666,14 +666,15 @@ def _build_tensor_reshard_specs(
         for metadata in src_meta_list:
             mesh = _tensor_mesh(metadata)
             src_groups.setdefault(mesh, {})[metadata.owner_rank] = metadata
+        error = _validate_native_mesh_metadata(resolved_name, "destination", dst_mesh, dst_by_rank)
+        if error is not None:
+            return None, error
         dst_metadata = dst_by_rank[dst_mesh[0]]
         selected_src = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_mesh[0])
         src_mesh = _tensor_mesh(selected_src)
         src_by_rank = src_groups[src_mesh]
 
-        error = _validate_native_mesh_metadata(
-            resolved_name, "source", src_mesh, src_by_rank
-        ) or _validate_native_mesh_metadata(resolved_name, "destination", dst_mesh, dst_by_rank)
+        error = _validate_native_mesh_metadata(resolved_name, "source", src_mesh, src_by_rank)
         if error is not None:
             return None, error
         if set(src_mesh) & set(dst_mesh):
