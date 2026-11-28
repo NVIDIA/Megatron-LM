@@ -1271,7 +1271,9 @@ def format_chat_response(batch_results, sampling_params, tokenizer, options, *, 
             )
         total_completion_tokens += len(result["generated_tokens"])
 
-    usage = build_usage(prompt_tokens_counts, total_completion_tokens, cached_tokens_counts)
+    usage = build_usage(
+        prompt_tokens_counts, total_completion_tokens, cached_tokens_counts, shared_prompt=True
+    )
     return build_response(response_uid, "chat.completion", choices, usage, response_metadata)
 
 
