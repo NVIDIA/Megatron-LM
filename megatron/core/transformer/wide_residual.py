@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 from functools import partial
 from typing import Literal
 
@@ -13,6 +14,17 @@ from torch import Tensor, nn
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.enums import Fp8Recipe
+from megatron.core.fusions.wide_residual_shortcut import (
+    ColumnSlot,
+    PendingWideResidualWrites,
+    ReplayInterval,
+    check_mxfp8_call,
+    fused_seam,
+    install_columns,
+)
+from megatron.core.fusions.wide_residual_shortcut.residual_replay import column_slot
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
@@ -25,7 +37,10 @@ from megatron.core.transformer.streamwise_residual_ops import (
     streamwise_sigmoid_read,
     streamwise_sigmoid_writeback,
 )
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import (
+    TransformerConfig,
+    _validate_shortcut_fusion_config,
+)
 
 _MIN_CONTROLLER_NUMEL = 128
 
@@ -488,3 +503,377 @@ def wide_residual_recompute_enabled(config: TransformerConfig, training: bool) -
         and config.recompute_modules is not None
         and "residual_stream" in config.recompute_modules
     )
+
+
+class _FusedWideResidualConnection(StreamwiseSigmoidWideResidualConnection):
+    def __init__(self, config, *args, **kwargs):
+        if not config.moe_shortcut_wide_residual_norm_fusion:
+            raise ValueError("a fused residual spec requires moe_shortcut_wide_residual_norm_fusion")
+        super().__init__(config, *args, **kwargs)
+
+
+class WriteReadNorm(_FusedWideResidualConnection):
+    """Apply a deferred write, streamwise read and RMSNorm in one kernel.
+
+    Each linked consumer receives its own BF16 or MXFP8 operand. A shortcut block
+    can apply both reads early and hand the compute layer its completed read result.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_number: int,
+        branch_name: str,
+        operation: ResidualConnectionOperation = "read",
+    ) -> None:
+        if operation != "read":
+            raise ValueError(f"WriteReadNorm is a read connection, got operation={operation!r}")
+        super().__init__(config, layer_number, branch_name, operation=operation)
+        device = "cpu" if config.use_cpu_initialization else torch.cuda.current_device()
+        self.weight = nn.Parameter(
+            torch.ones(config.hidden_size, dtype=config.params_dtype, device=device)
+        )
+        setattr(self.weight, "sequence_parallel", config.sequence_parallel)
+        self.eps = config.layernorm_epsilon
+        self.fuse_wgrad_accumulation = config.gradient_accumulation_fusion
+        # Stack links must not register neighboring layers as checkpoint submodules.
+        self.consumers, self.previous_read = (), None
+        self.consumer_formats = ()
+        self.interval = self.pending = None
+        # The first seam applies layer one's write at the read of layer two.
+        every = config.residual_stream_recompute_num_layers
+        self.starts_replay = every is None or every <= 1 or (layer_number - 2) % every == 0
+
+    def resolve_formats(self, gemm_format) -> None:
+        """Choose formats in consumer order and hook Linears that need replayed columns."""
+        if not 1 <= len(self.consumers) <= 2:
+            raise RuntimeError("a fused read feeds one or two linked consumers")
+        self.consumer_formats = tuple(gemm_format(*consumer) for consumer in self.consumers)
+        self.compact_scales_for_tp = False
+        for (module, _), fmt in zip(self.consumers, self.consumer_formats):
+            if fmt != "mxfp8":
+                continue
+            if getattr(module, "_shortcut_replays_columns", False):
+                raise RuntimeError("a Linear takes at most one fused read as MXFP8")
+            # TE gathers the input (and its replayed columns for wgrad) along tokens.
+            self.compact_scales_for_tp |= (
+                module.parallel_mode == "column" and module.sequence_parallel
+            )
+            module._shortcut_replays_columns = True
+            module.register_forward_hook(self._install_replayed_columns_for_wgrad, with_kwargs=True)
+
+    @staticmethod
+    def _install_replayed_columns_for_wgrad(module, args, kwargs, output):
+        if not torch.is_grad_enabled():
+            return
+        operand = args[0] if args else next(iter(kwargs.values()))
+        slot = column_slot(operand)
+        if slot is None:
+            raise RuntimeError("an MXFP8 consumer took a fused read emitted without gradients")
+        install_columns(output, operand, slot)
+
+    def hand(self, item) -> None:
+        """Hand a deferred write or a completed (branch_input, state) pair to this read."""
+        if self.pending is not None:
+            raise RuntimeError("a deferred residual write for this read was not applied")
+        self.pending = item
+
+    def take(self):
+        """Take the item handed to this read, leaving it empty."""
+        item, self.pending = self.pending, None
+        if item is None:
+            raise RuntimeError("no deferred residual write was handed to this fused read")
+        return item
+
+    def _open_interval(self) -> ReplayInterval:
+        """Start a linked replay interval or continue the previous read's interval."""
+        previous = self.previous_read.interval if self.previous_read is not None else None
+        self.interval = ReplayInterval(previous) if self.starts_replay else previous
+        return self.interval
+
+    def _hooked_weight(self) -> Tensor:
+        """The norm weight after the forward pre-hooks calling this read would run (DDP's
+        overlapped parameter all-gather waits for the weight there), for a kernel applying it
+        before this read is called."""
+        for hook_id, hook in tuple(self._forward_pre_hooks.items()):
+            if hook_id in self._forward_pre_hooks_with_kwargs:
+                hook(self, (), {})
+            else:
+                hook(self, ())
+        return self.weight
+
+    def apply_write(self, pending, shortcut: WriteReadNorm | None = None):
+        """Apply the write and emit normalized operands for one or two reads."""
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            is_batch_invariant_mode_enabled,
+        )
+
+        reads = (self,) if shortcut is None else (self, shortcut)
+        # Inference builds no autograd graph (and uses the inference MXFP8 eligibility) even with
+        # gradients enabled.
+        with torch.no_grad() if InferenceMode.is_active() else nullcontext():
+            outputs = tuple(read.consumer_formats for read in reads)
+            if any("mxfp8" in formats for formats in outputs):
+                check_mxfp8_call(pending.routed)  # never falls back to BF16
+            interval, slots = None, (None,) * len(reads)
+            if torch.is_grad_enabled():
+                interval = self._open_interval()
+                slots = tuple(ColumnSlot() if "mxfp8" in formats else None for formats in outputs)
+            # A shortcut seam runs before this read's layer calls it: run its weight's hooks now.
+            weight = self.weight if shortcut is None else self._hooked_weight()
+            return fused_seam(
+                pending,
+                tuple(read.read_map(return_logits=True) for read in reads),
+                (weight, *(read.weight for read in reads[1:])),
+                outputs=outputs,
+                compact_scales_for_tp=tuple(read.compact_scales_for_tp for read in reads),
+                columns=slots,
+                interval=interval,
+                num_streams=self.num_streams,
+                epsilon=self.eps,
+                batch_invariant=is_batch_invariant_mode_enabled(),
+                fuse_wgrad_accumulation=self.fuse_wgrad_accumulation,
+            )
+
+    def forward(
+        self,
+        hidden_states,
+        *,
+        fp32_residual_connection=False,
+        branch_input_dtype=None,
+        execution_context=None,
+        recompute_context=None,
+    ):
+        """Apply the write handed to this read with this read and norm."""
+        # The kernel keeps the residual's dtype; ``hidden_states`` is the unwritten input residual.
+        # Fusion rejects residual-stream recomputation (seams replay through their intervals).
+        del hidden_states, fp32_residual_connection, branch_input_dtype
+        del execution_context, recompute_context
+        item = self.take()
+        if isinstance(item, tuple):
+            return item
+        residual, branch_input = self.apply_write(item)
+        return branch_input, (residual,)
+
+
+class ShortcutAddWideResidualWriteReadNorm(WriteReadNorm):
+    """Apply both shortcut-block reads and hand the compute read its normalized input."""
+
+    compute_read: WriteReadNorm | None = None
+
+    def link(self, compute_read: WriteReadNorm) -> None:
+        """Serve ``compute_read``, the block's compute layer read (references, not submodules)."""
+        object.__setattr__(self, "compute_read", compute_read)
+        object.__setattr__(compute_read, "shortcut", self)
+
+    def forward(self) -> tuple[Tensor, Tensor]:  # pylint: disable=arguments-differ
+        compute_read = self.compute_read
+        # This seam is the compute read's (its replay interval and epsilon).
+        residual, branch_input, shortcut_input = compute_read.apply_write(
+            compute_read.take(), shortcut=self
+        )
+        compute_read.hand((branch_input, (residual,)))
+        return residual, shortcut_input
+
+
+class DeferredWrite(_FusedWideResidualConnection):
+    """Hand branch updates to the next layer's read and return the unwritten residual."""
+
+    target: nn.Module | None = None
+    # Shortcut adds supply both producers in forward argument order (routed, shared).
+    producers: tuple = ()
+    update_formats: tuple | None = None
+
+    def link(self, target, layer, gemm_format) -> None:
+        """Bind the next read and resolve each update's gradient format."""
+        object.__setattr__(self, "target", target)
+        producers = self.producers or (layer.seam_output_projection(),)
+        self.update_formats = tuple(gemm_format(p, layer, gradients=True) for p in producers)
+        # Shared updates use one gradient. Compact scales also work for a local GEMM.
+        self.compact_grad_scales_for_tp = any(
+            fmt == "mxfp8" and p.parallel_mode == "row" and p.sequence_parallel
+            for p, fmt in zip(producers, self.update_formats)
+        )
+
+    def forward(  # pylint: disable=arguments-differ
+        self,
+        branch_output,
+        *,
+        state,
+        dropout_probability,
+        training,
+        shared=None,
+        execution_context=None,
+        recompute_context=None,
+    ):
+        """Defer this write, including the shared expert for a shortcut add."""
+        update, bias = branch_output
+        if bias is not None:
+            raise ValueError("fused residual seams require a bias-free branch projection")
+        retain = None if self.retention is None else self.retention(return_logits=True)
+        write_logits = self.write_map(return_logits=True)
+        pending = PendingWideResidualWrites(
+            state[0],
+            update,
+            shared,
+            write_logits,
+            retain,
+            update_formats=self.update_formats,
+            compact_grad_scales_for_tp=self.compact_grad_scales_for_tp,
+        )
+        self.target.hand(pending)
+        return state[0]
+
+
+def takes_mxfp8(
+    linear, autocast_recipe, fp8_format="e4m3", *, gradients=False, recipe_attrs=None
+) -> bool:
+    """Resolve a TE Linear's MXFP8 handoff using its inherited recipe and module override.
+    An MXFP8 gradient handoff also requires E4M3 grad_output."""
+
+    from megatron.core.extensions.transformer_engine import TELinear
+
+    if not isinstance(linear, TELinear):
+        return False
+    params = getattr(linear, "te_quant_params", None)
+    if params is not None and params.training_recipe is not None:
+        recipe = params.training_recipe
+        if params.evaluation_recipe not in (None, recipe):
+            return False
+        applies = (
+            recipe.override_quantized_autocast
+            if autocast_recipe
+            else recipe.override_nonquantized_autocast
+        )
+        if applies:
+            if recipe.fp4_quantization_recipe is not None or recipe.recipe_attrs:
+                return False
+            autocast_recipe, fp8_format = recipe.fp8_quantization_recipe, recipe.fp8_format
+            recipe_attrs = recipe.recipe_attrs
+    if autocast_recipe != Fp8Recipe.mxfp8 or (gradients and fp8_format != "e4m3"):
+        return False
+
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+
+    # TE initializes this default from NVTE_BACKWARD_OVERRIDE at import. An override
+    # can require the original BF16 input for wgrad and a BF16 output gradient for dgrad.
+    default_backward = getattr(MXFP8BlockScaling, "backward_override", None)
+    return (recipe_attrs or {}).get("backward_override", default_backward) is None
+
+
+def _gemm_autocast_recipe(stack_config, layer):
+    """The recipe a GEMM inherits from HybridStack.forward before its own TE override."""
+    from megatron.core.fp8_utils import is_first_last_bf16_layer
+    from megatron.core.ssm.kda_layer_config import KDALayerConfig
+
+    config = layer.config
+    if isinstance(config, KDALayerConfig) and config.kda_disable_fp8:
+        return None
+    if stack_config.fp8 and stack_config.fp8_recipe == Fp8Recipe.delayed:
+        return Fp8Recipe.delayed
+    if is_first_last_bf16_layer(config, layer.layer_number - 1):
+        return None
+    if stack_config.fp8 and config.fp8:
+        return config.fp8_recipe
+    if not stack_config.fp8 and stack_config.fp4 and config.fp4:
+        return config.fp4_recipe
+    return None
+
+
+def _unfused_error(layer) -> ValueError:
+    """The error rejecting ``layer``, which was not built as a fused-seam layer, with the reason."""
+    layer_class = type(layer)
+    if not hasattr(layer_class, "get_input_layernorm_module"):
+        reason = f"{layer_class.__name__} is not a wide-residual layer"
+    else:
+        try:
+            location = layer_class.get_input_layernorm_module(layer.submodules_config)
+            reason = (
+                f"its input RMSNorm ({'.'.join(location)}) was not moved into its read: build the "
+                "stack from hybrid_layer_specs.shortcut_fusion_stack_spec"
+            )
+        except ValueError as error:
+            reason = str(error)
+    return ValueError(
+        f"moe_shortcut_wide_residual_norm_fusion cannot fuse layer {layer.layer_number} "
+        f"({layer_class.__name__}): {reason}"
+    )
+
+
+def link_residual_seams(stack, *, prefix: str) -> None:
+    """Link adjacent writes and reads in physical layer order, then close the replay chain.
+
+    Standalone MoE reads serve the whole MoE as one BF16 consumer. Shortcut blocks
+    have already linked their individual consumers.
+    """
+    from megatron.core.quantization.utils import get_quant_config_or_none
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
+    # Grouping changes recipe paths. Apply the stack recipe to the final names before
+    # binding formats, including clearing any override inherited from a layer config.
+    recipe = stack.config.quant_recipe
+    if recipe is not None or any(c.quant_recipe is not None for c in stack.layer_config_list):
+        for path, module in stack.named_modules(prefix=prefix):
+            if hasattr(module, "finish_init"):
+                module.finish_init(get_quant_config_or_none(path, recipe))
+
+    connections = []
+    for layer in stack.physical_layers():
+        if not hasattr(layer, "seam_connections"):
+            raise _unfused_error(layer)
+        try:
+            connections.append((layer, *layer.seam_connections()))
+        except ValueError:
+            raise _unfused_error(layer) from None
+
+    def gemm_format(linear, layer, *, gradients=False):
+        if linear is not None and takes_mxfp8(
+            linear,
+            _gemm_autocast_recipe(stack.config, layer),
+            layer.config.fp8,
+            gradients=gradients,
+            recipe_attrs=layer.config.fp8_recipe_attrs,
+        ):
+            if getattr(linear, "te_quant_params", None) is not None:
+                # An override can opt in on a BF16 stack, after initial config validation.
+                _validate_shortcut_fusion_config(layer.config, mxfp8_handoff=True)
+            return "mxfp8"
+        return "bf16"
+
+    last_read = None
+    for (layer, _, write), (successor, read, _) in zip(connections, connections[1:]):
+        if not isinstance(write, DeferredWrite):
+            raise _unfused_error(layer)
+        if not isinstance(read, WriteReadNorm):
+            raise _unfused_error(successor)
+        write.link(read, layer, gemm_format)
+        object.__setattr__(read, "previous_read", last_read)
+        if last_read is None and not read.starts_replay:
+            raise ValueError("a fused stack's first seam must start a replay interval")
+        last_read = read
+        if not read.consumers:
+            if isinstance(getattr(successor, "mlp", None), MoELayer):
+                consumer = successor.mlp
+            else:
+                location = successor.get_input_layernorm_module(successor.submodules_config)
+                if len(location) != 2:
+                    raise _unfused_error(successor)
+                branch, projection = location
+                consumer = getattr(getattr(successor, branch), projection)
+            read.consumers = ((consumer, successor),)
+        for fused in (read, getattr(read, "shortcut", None)):
+            if fused is not None:
+                fused.resolve_formats(gemm_format)
+    if connections:
+        layer, _, write = connections[-1]
+        if isinstance(write, DeferredWrite):
+            raise ValueError(
+                "moe_shortcut_wide_residual_norm_fusion requires at least two layers: the "
+                f"write of layer {layer.layer_number} is deferred to no following read"
+            )
+        if last_read is not None:
+            write.register_forward_hook(
+                lambda module, args, output: (
+                    output if last_read.interval is None else last_read.interval.replay_before(output)
+                )
+            )

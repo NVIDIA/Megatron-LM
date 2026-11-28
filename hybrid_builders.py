@@ -2,6 +2,7 @@
 
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_inference_stack_spec,
+    shortcut_fusion_stack_spec,
     with_norm_backend,
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -31,6 +32,8 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         hybrid_stack_spec = import_module(args.spec)
         if not isinstance(hybrid_stack_spec, ModuleSpec):
             raise TypeError("--spec must refer to a static ModuleSpec for HybridModel.")
+        if config.moe_shortcut_wide_residual_norm_fusion:
+            hybrid_stack_spec = shortcut_fusion_stack_spec(hybrid_stack_spec)
         hybrid_stack_spec = with_norm_backend(hybrid_stack_spec, config.rmsnorm_impl)
     else:
         raise ValueError("You must provide a valid hybrid layer spec via --spec")

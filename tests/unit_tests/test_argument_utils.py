@@ -68,8 +68,8 @@ class CapturingTransformerConfig:
         self.__dict__.update(kwargs)
 
 
-def _minimal_training_args(monkeypatch):
-    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py', '--freeze-base-model-for-mtp'])
+def _minimal_training_args(monkeypatch, flags=("--freeze-base-model-for-mtp",)):
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py', *flags])
     args = parse_args()
     args.num_layers = 2
     args.hidden_size = 128
@@ -393,6 +393,20 @@ def test_shortcut_connection_rejects_fsdp(monkeypatch, fsdp_flag):
     setattr(args, fsdp_flag, True)
 
     with pytest.raises(AssertionError, match="FSDP is not supported"):
+        validate_args(args)
+
+
+@pytest.mark.parametrize(
+    "metric", ["layer-residual-accumulator-l2:10", "layer-residual-contribution-l2:5"]
+)
+def test_shortcut_fusion_rejects_residual_tensor_metrics(monkeypatch, metric):
+    """A fused layer returns its unwritten input residual, so its residual metrics are rejected."""
+    args = _minimal_training_args(
+        monkeypatch, ("--moe-shortcut-connection", "--moe-shortcut-wide-residual-norm-fusion")
+    )
+    args.tensor_metrics = ["global-param-l2:10", metric]
+
+    with pytest.raises(AssertionError, match="does not support the tensor metrics"):
         validate_args(args)
 
 
