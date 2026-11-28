@@ -531,15 +531,15 @@ def create_packed_seq_params_for_bin(
 
 
 def pack_inference_logprobs(
-    inference_logprobs: List[torch.Tensor],
+    inference_logprobs: List[Optional[torch.Tensor]] | torch.Tensor,
     packing_info: PackingInfo,
     generation_masks: torch.Tensor,
     bin_size: int,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Pack inference logprobs into bins aligned with packed sequences.
 
     Args:
-        inference_logprobs: List of inference logprobs tensors for each sequence
+        inference_logprobs: Per-sequence logprobs or a padded tensor of rows
         packing_info: PackingInfo object containing bin assignments and sequence positions
         generation_masks: Tensor indicating which tokens were generated
         bin_size: Size of each bin
@@ -558,47 +558,47 @@ def pack_inference_logprobs(
     )
     filled_mask = torch.zeros((num_bins, bin_size - 1), dtype=torch.bool, device='cpu')
 
-    # Create mapping from global sequence index to local bin index
-    # This is needed because seq_to_bin_idx uses global bin indices,
-    # but after distribution each rank only has a subset of bins
-    seq_to_local_bin = {}
-    for local_bin_idx, seq_indices in enumerate(packing_info.bin_seq_indices):
-        for seq_idx in seq_indices:
-            seq_to_local_bin[seq_idx] = local_bin_idx
+    # Traverse only bins assigned to this rank. Gather rows on the device and copy them
+    # to the host together instead of synchronizing for each sequence's nonzero result.
+    entries = [
+        (bin_idx, seq_idx, start)
+        for bin_idx, seq_indices in enumerate(packing_info.bin_seq_indices)
+        if seq_indices
+        for seq_idx, start in zip(seq_indices, packing_info.seq_starts[bin_idx])
+        if seq_idx < len(inference_logprobs)
+        and isinstance(inference_logprobs[seq_idx], torch.Tensor)
+    ]
+    if not entries:
+        return packed_inference_logprobs, filled_mask
 
-    # Align and pack inference logprobs based on generation masks
-    device = packed_inference_logprobs.device
-    for seq_idx in range(len(inference_logprobs)):
-        if seq_idx not in seq_to_local_bin:
-            continue  # Skip sequences not on this rank
+    rows = [seq_idx for _, seq_idx, _ in entries]
+    masks_on_host = generation_masks.device.type == 'cpu'
+    if not masks_on_host:
+        generation_masks = generation_masks[rows].cpu()
+    masks = generation_masks.to(torch.bool).numpy()
 
-        local_bin_idx = seq_to_local_bin[seq_idx]
+    gathered_logprobs = (
+        inference_logprobs[rows].cpu()
+        if isinstance(inference_logprobs, torch.Tensor) and inference_logprobs.device.type != 'cpu'
+        else None
+    )
 
-        # Get the position of this sequence within the bin
-        seq_positions = packing_info.bin_seq_indices[local_bin_idx]
-        seq_pos_in_bin = seq_positions.index(seq_idx)
-        seq_start = packing_info.seq_starts[local_bin_idx][seq_pos_in_bin]
-
-        # Get the inference logprobs for this sequence
-        if not isinstance(inference_logprobs[seq_idx], torch.Tensor):
-            continue  # Skip if no inference logprobs
-        seq_inf_logprobs = inference_logprobs[seq_idx].to(device)
-
-        # Scatter logprobs to their generated token slots.
-        # Generation can span multiple regions for multi-turn rollouts; place each logprob at the
-        # slot for its token: a token at position `p` occupies packed slot `seq_start + (p - 1)`.
-        gen_positions = generation_masks[seq_idx].nonzero(as_tuple=True)[0].to(device)
-        if gen_positions.numel() == 0:
+    for row, (bin_idx, seq_idx, start) in enumerate(entries):
+        logprobs = (
+            gathered_logprobs[row] if gathered_logprobs is not None else inference_logprobs[seq_idx]
+        )
+        mask = masks[seq_idx if masks_on_host else row]
+        length = packing_info.seq_lengths[seq_idx]
+        # Generated positions outside the sequence are all after its valid positions.
+        # Position zero has no preceding logprob slot, but still consumes a source
+        # logprob if marked generated.
+        positions = np.flatnonzero(mask[:length])[:logprobs.numel()]
+        begin = int(positions.size > 0 and positions[0] == 0)
+        if positions.size == begin:
             continue
-        target = seq_start + gen_positions - 1
-        n = min(seq_inf_logprobs.numel(), target.numel())
-        target = target[:n]
-        # Keep within this sequence's logprob span in the bin.
-        seq_lp_end = seq_start + packing_info.seq_lengths[seq_idx] - 1
-        in_range = (target >= seq_start) & (target < seq_lp_end)
-        target_in_range = target[in_range]
-        packed_inference_logprobs[local_bin_idx, target_in_range] = seq_inf_logprobs[:n][in_range]
-        filled_mask[local_bin_idx, target_in_range] = True
+        slots = torch.from_numpy(start + positions[begin:] - 1)
+        packed_inference_logprobs[bin_idx, slots] = logprobs[begin : positions.size].cpu()
+        filled_mask[bin_idx, slots] = True
 
     return packed_inference_logprobs, filled_mask
 
