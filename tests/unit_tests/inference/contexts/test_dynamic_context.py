@@ -108,11 +108,14 @@ def _processed_rows_context(sampling_and_counts, num_sampled=None):
         total_request_count=len(sampling_and_counts),
         paused_request_count=0,
         active_request_metadata={
-            name: torch.tensor([sp[name] for sp, _ in sampling_and_counts], dtype=dtype)
+            name: torch.tensor(
+                [{"is_greedy": False, **sp}[name] for sp, _ in sampling_and_counts], dtype=dtype
+            )
             for name, dtype in (
                 ("temperature", torch.float32),
                 ("top_k", torch.long),
                 ("top_p", torch.float32),
+                ("is_greedy", torch.bool),
             )
         },
     )
@@ -4978,11 +4981,20 @@ def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite
     temperature = torch.ones(n)
     top_k = torch.tensor(top_k, dtype=torch.int32)
     top_p = torch.tensor(top_p)
+    is_greedy = torch.zeros(n, dtype=torch.bool)
     context = SimpleNamespace(
         gpu_view=SimpleNamespace(
-            temperature=temperature.cuda(), top_k=top_k.cuda(), top_p=top_p.cuda()
+            temperature=temperature.cuda(),
+            top_k=top_k.cuda(),
+            top_p=top_p.cuda(),
+            is_greedy=is_greedy.cuda(),
         ),
-        active_request_metadata={"temperature": temperature, "top_k": top_k, "top_p": top_p},
+        active_request_metadata={
+            "temperature": temperature,
+            "top_k": top_k,
+            "top_p": top_p,
+            "is_greedy": is_greedy,
+        },
         total_request_count=n,
         paused_request_count=0,
     )
@@ -5032,12 +5044,17 @@ def test_flashinfer_sample_kernel_dispatch(
         getattr(fake.sampling, name).return_value = torch.zeros(n, dtype=torch.int32)
     monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
 
+    metadata = {
+        "temperature": torch.ones(n),
+        "top_k": torch.tensor(top_k, dtype=torch.int32),
+        "top_p": torch.tensor(top_p),
+        "is_greedy": torch.zeros(n, dtype=torch.bool),
+    }
     context = SimpleNamespace(
-        gpu_view=SimpleNamespace(
-            temperature=torch.ones(n),
-            top_k=torch.tensor(top_k, dtype=torch.int32),
-            top_p=torch.tensor(top_p),
-        )
+        gpu_view=SimpleNamespace(**metadata),
+        active_request_metadata=metadata,
+        total_request_count=n,
+        paused_request_count=0,
     )
     rng = torch.Generator()
     backend = FlashInferSampling(vocab_size, rng)

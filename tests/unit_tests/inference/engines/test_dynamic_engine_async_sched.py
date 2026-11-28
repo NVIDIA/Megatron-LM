@@ -2188,12 +2188,14 @@ def test_async_compaction_preserves_all_request_metadata(survivor_idxs, expected
         "return_log_probs": torch.tensor([True, False, True, False]),
         "skip_prompt_log_probs": torch.tensor([False, True, False, True]),
         "top_n_logprobs": torch.tensor([2, 0, 5, 1]),
+        "is_greedy": torch.tensor([False, True, False, True]),
         "custom_metadata": torch.tensor([101, 202, 303, 404]),
     }
     gpu_view = SimpleNamespace(
         temperature=metadata["temperature"].clone(),
         top_k=metadata["top_k"].clone(),
         top_p=metadata["top_p"].clone(),
+        is_greedy=metadata["is_greedy"].to(torch.int32),
     )
     context = SimpleNamespace(active_request_metadata=metadata, gpu_view=gpu_view)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
@@ -2208,6 +2210,9 @@ def test_async_compaction_preserves_all_request_metadata(survivor_idxs, expected
     assert torch.equal(gpu_view.temperature[: len(survivor_idxs)], expected["temperature"])
     assert torch.equal(gpu_view.top_k[: len(survivor_idxs)], expected["top_k"])
     assert torch.equal(gpu_view.top_p[: len(survivor_idxs)], expected["top_p"])
+    assert torch.equal(
+        gpu_view.is_greedy[: len(survivor_idxs)], expected["is_greedy"].to(torch.int32)
+    )
     assert torch.equal(controller._all_logits_cuda, original_logits[:, expected_token_rows])
     assert torch.equal(
         controller._async_sched_forward.token_row_indices, torch.tensor(expected_token_rows)

@@ -124,7 +124,7 @@ def generation_config_sampling_defaults(tokenizer):
         # bool is an int subclass; reject it explicitly.
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             defaults[key] = value
-    # Greedy decoding is expressed here as top_k=1, matching the temperature==0 path.
+    # Greedy decoding is expressed here as top_k=1, from which SamplingParams derives is_greedy.
     if gen_cfg.get("do_sample") is False:
         defaults["top_k"] = 1
     return defaults
@@ -204,9 +204,6 @@ def parse_sampling_params(req, app_config, tokenizer, *, completions_mode, retur
     _log_sampling_defaults_once(
         tokenizer, {"temperature": temperature, "top_p": top_p, "top_k": top_k}
     )
-    if temperature == 0.0:
-        top_k = 1
-        top_p = 0.0
 
     if completions_mode:
         echo = bool(req.get("echo", False))

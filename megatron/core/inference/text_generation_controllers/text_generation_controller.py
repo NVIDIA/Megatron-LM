@@ -713,6 +713,9 @@ class TextGenerationController(MTPControllerMixin):
                         top_n_logprobs_dict,
                     )
 
+        if sampling_params.is_greedy:
+            return torch.argmax(last_token_logits, dim=-1)
+
         top_p = sampling_params.top_p
         top_k = sampling_params.top_k
         temperature = sampling_params.temperature
@@ -2241,9 +2244,11 @@ class TextGenerationController(MTPControllerMixin):
         compacted_temperature = gpu_view.temperature[survivor_idxs_cuda].contiguous()
         compacted_top_k = gpu_view.top_k[survivor_idxs_cuda].contiguous()
         compacted_top_p = gpu_view.top_p[survivor_idxs_cuda].contiguous()
+        compacted_is_greedy = gpu_view.is_greedy[survivor_idxs_cuda].contiguous()
         gpu_view.temperature[:survivor_count].copy_(compacted_temperature)
         gpu_view.top_k[:survivor_count].copy_(compacted_top_k)
         gpu_view.top_p[:survivor_count].copy_(compacted_top_p)
+        gpu_view.is_greedy[:survivor_count].copy_(compacted_is_greedy)
 
         self._async_sched_forward.token_row_indices = survivor_token_row_indices
 

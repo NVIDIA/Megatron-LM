@@ -23,12 +23,7 @@ from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.moe.vllm_fused_moe import VllmFusedMoeBuffers
 from megatron.core.inference.sampling.base import Sampling
-from megatron.core.inference.sampling_params import (
-    MIN_SAMPLING_TEMPERATURE,
-    SamplingParams,
-    is_no_op_top_k,
-    is_no_op_top_p,
-)
+from megatron.core.inference.sampling_params import SamplingParams, is_no_op_top_k, is_no_op_top_p
 from megatron.core.inference.unified_memory import (
     UnifiedMemoryUnsupportedError,
     create_unified_mempool,
@@ -1514,8 +1509,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # Track request metadata. Backed by pinned CPU memory: bookkeeping is
         # CPU-resident; GPU consumers read from the active-slice mirror in
         # `active_request_metadata` (also CPU pinned, refreshed each step).
+        # Zero-filled, so a column nothing has written yet reads as False / 0 (e.g. no
+        # request is greedy) rather than as stale memory.
         self.request_metadata = {
-            label: torch.empty((self.max_requests,), dtype=dtype, device='cpu', pin_memory=True)
+            label: torch.zeros((self.max_requests,), dtype=dtype, device='cpu', pin_memory=True)
             for label, dtype in self.request_metadata_types
         }
 
@@ -1523,7 +1520,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # kernels. Pinned CPU mirrors of `request_metadata`, refreshed each
         # step by `build_active_slices()` from the active subrange.
         self.active_request_metadata = {
-            label: torch.empty_like(tensor, pin_memory=True)
+            label: torch.empty_like(tensor, pin_memory=True).zero_()
             for label, tensor in self.request_metadata.items()
         }
 
@@ -1544,6 +1541,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         #   temperature                      (staging) (float32, max_requests)
         #   top_k                            (staging) (int32,   max_requests)
         #   top_p                            (staging) (float32, max_requests)
+        #   is_greedy                        (staging) (int32,   max_requests)
         #   active_request_last_token_idxs   (alias)   (int32,   max_requests)
         #
         # Token fields are aliased with the source-of-truth attributes
@@ -1555,7 +1553,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # slice from the persistent `request_*` tensors above.
         _tok_int64_bytes = self.max_tokens * 8
         _tok_int32_bytes = self.max_tokens * 4
-        # Request-level fields are all 4 bytes wide (5 int32 + 2 float32 = 7 fields).
+        # Request-level fields are all 4 bytes wide (6 int32 + 2 float32 = 8 fields).
         _req_4byte_bytes = self.max_requests * 4
         # Scalar: real (unpadded) token count for the current step. Refreshed
         # in transfer_bookkeeping_to_gpu(); read on GPU via
@@ -1571,7 +1569,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         _pre_mamba_bytes = (
             3 * _tok_int64_bytes
             + 3 * _tok_int32_bytes
-            + 7 * _req_4byte_bytes
+            + 8 * _req_4byte_bytes
             + _real_token_count_bytes
             + _mha_query_lengths_bytes
             + _mha_cu_query_seq_lengths_bytes
@@ -1705,7 +1703,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         # Sampling-parameter staging slots, refreshed from `active_request_metadata`
         # in transfer_bookkeeping_to_gpu(). FlashInfer reads these via
-        # `gpu_view.{temperature, top_k, top_p}`.
+        # `gpu_view.{temperature, top_k, top_p, is_greedy}`.
         self._staging_temperature = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
             torch.float32
         )
@@ -1716,6 +1714,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         _off += _req_4byte_bytes
         self._staging_top_p = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
             torch.float32
+        )
+        _off += _req_4byte_bytes
+        self._staging_is_greedy = self._cpu_bookkeeping_buf[_off : _off + _req_4byte_bytes].view(
+            torch.int32
         )
         _off += _req_4byte_bytes
 
@@ -2211,6 +2213,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.active_request_metadata["temperature"][padding_request_slice].fill_(1.0)
         self.active_request_metadata["top_k"][padding_request_slice].fill_(0)
         self.active_request_metadata["top_p"][padding_request_slice].fill_(0.0)
+        self.active_request_metadata["is_greedy"][padding_request_slice].fill_(False)
         # Padded gather indices fan in to row 0 harmlessly when used by FlashInfer.
         self.active_request_last_token_idxs[padding_request_slice].fill_(0)
 
@@ -3325,6 +3328,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         ]
         self._staging_top_k[:padded_active] = self.active_request_metadata["top_k"][:padded_active]
         self._staging_top_p[:padded_active] = self.active_request_metadata["top_p"][:padded_active]
+        self._staging_is_greedy[:padded_active] = self.active_request_metadata["is_greedy"][
+            :padded_active
+        ]
 
         # Full-iteration CUDA graphs may have captured GPU consumers with the
         # padded graph request count. Keep those padded staging rows bounded so
@@ -5547,9 +5553,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     temperature = self.gpu_view.temperature[
                         row_to_request.to(logits.device, non_blocking=True)
                     ]
-                scaled = active_logits / temperature.clamp(min=MIN_SAMPLING_TEMPERATURE).unsqueeze(
-                    1
-                )
+                # Greedy rows carry the neutral temperature 1.0, so every divisor is positive.
+                scaled = active_logits / temperature.unsqueeze(1)
                 gathered = scaled.gather(1, new_tokens.view(-1, 1).long()).squeeze(1)
                 tempered = gathered - scaled.logsumexp(dim=1)
                 selected_log_probs = torch.where(
@@ -5591,7 +5596,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if num_sampled > 0 and not all(self.active_sampling_filter_flags(n_active)):
             # Sampled tokens outside the filtered support fall back to the tempered logprob.
             temperature = self.gpu_view.temperature[:num_sampled]
-            scaled = sampled_logits / temperature.clamp(min=MIN_SAMPLING_TEMPERATURE).unsqueeze(1)
+            scaled = sampled_logits / temperature.unsqueeze(1)
             gathered = scaled.gather(1, new_tokens[:num_sampled].view(-1, 1).long()).squeeze(1)
             tempered = gathered - scaled.logsumexp(dim=1)
             sampled = selected_log_probs[sampled_idx]
