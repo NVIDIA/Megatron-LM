@@ -189,6 +189,19 @@ def test_distributed_optimizer_source_uses_expert_dp_axis():
     assert views[0].storage_relations[0].placement == FlatShard((2,), 0, 1)
 
 
+def test_distributed_optimizer_source_rejects_an_extra_parameter_domain():
+    # Its optimizer shards over the domain's own replica group, not over dp_cp or expert_dp.
+    model_parameter = torch.nn.Parameter(torch.tensor([1.0, 2.0]))
+    model_parameter.allreduce = False
+    model_parameter.parallel_domain = "engram"
+    main_parameter = torch.nn.Parameter(torch.tensor([1.0]))
+    model_parameter.main_grad = torch.tensor([3.0, 4.0])
+    optimizer = _distributed_optimizer(model_parameter, main_parameter, 0, 1)
+
+    with pytest.raises(NotImplementedError, match="parameter domain 'engram'"):
+        _local_optimizer_tensor_views(optimizer, _pg_collection(expert_dp_size=2))
+
+
 @pytest.mark.parametrize("is_expert", (False, True))
 @pytest.mark.parametrize(("gtp_rank", "expected_rows"), ((0, 2), (1, 1), (2, 0), (3, 0)))
 def test_optimizer_source_trims_rank_local_gtp_logical_prefix(is_expert, gtp_rank, expected_rows):

@@ -141,6 +141,7 @@ from megatron.core.utils import (
     get_attr_wrapped_model,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
+    get_extra_parameter_replica_groups,
     get_model_config,
     get_pg_rank,
     get_pg_size,
@@ -2054,7 +2055,8 @@ def wrap_model_chunks_with_ddp(
             variant).
         pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
             forwarded to both standard DDP and FSDP variants, and used to source
-            DP world sizes for layout computation.
+            DP world sizes for layout computation. Extra parameter domains registered
+            in its ``parameter_replica_groups`` require the standard DDP.
         bucket_sizes: Optional per-chunk bucket size override; defaults to
             ``[ddp_config.bucket_size] * len(model_chunks)``.
         disable_bucketing_per_chunk: Optional per-chunk disable_bucketing flag;
@@ -2063,6 +2065,12 @@ def wrap_model_chunks_with_ddp(
     Returns:
         List of DDP-wrapped chunks.
     """
+    extra_replica_groups = get_extra_parameter_replica_groups(pg_collection=pg_collection)
+    if extra_replica_groups and DP is not DDP:
+        raise ValueError(
+            f"Parameter replica domains {sorted(extra_replica_groups)} require the standard "
+            "DistributedDataParallel; Megatron FSDP and Torch FSDP2 do not support them."
+        )
     n = len(model_chunks)
     if bucket_sizes is None:
         bucket_sizes = [ddp_config.bucket_size] * n
@@ -2110,6 +2118,13 @@ def wrap_model_chunks_with_ddp(
                 if intra_expt_dp_group is not None
                 else getattr(layout_pgs, "expt_dp", None)
             )
+            # Buffers of an extra domain are sharded over the domain's whole replica group.
+            # The argument is passed only when such domains exist (the MPU groups have none).
+            layout_kwargs = {}
+            if extra_replica_groups:
+                layout_kwargs["parallel_group_sizes"] = {
+                    name: get_pg_size(group) for name, group in extra_replica_groups.items()
+                }
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -2118,6 +2133,7 @@ def wrap_model_chunks_with_ddp(
                     data_parallel_world_size,
                     ddp_config,
                     expert_data_parallel_world_size=expert_data_parallel_world_size,
+                    **layout_kwargs,
                 )
 
     # Wrap each chunk.
@@ -2421,6 +2437,11 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         if ddp_stream is not current_stream:
             ddp_stream.wait_stream(current_stream)
 
+        # Standard DDP keeps the MPU groups unless extra parameter domains are registered:
+        # their replica groups exist only in pg_collection.
+        use_pg_collection = ddp_config.use_megatron_fsdp or bool(
+            get_extra_parameter_replica_groups(pg_collection=pg_collection)
+        )
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
                 model,
@@ -2429,7 +2450,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 use_layer_wise_param_layout=cfg.optimizer.use_layer_wise_param_layout,
                 DP=DP,
-                pg_collection=pg_collection if ddp_config.use_megatron_fsdp else None,
+                pg_collection=pg_collection if use_pg_collection else None,
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
@@ -5443,7 +5464,7 @@ def train(
 
         for model_module in model:
             if isinstance(model_module, DDP):
-                for buf in model_module.buffers + model_module.expert_parallel_buffers:
+                for buf in model_module.all_buffers:
                     buf.deregister_nccl_mem_pools()
         one_logger and one_logger.log_metrics(
             {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}

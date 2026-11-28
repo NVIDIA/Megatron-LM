@@ -51,6 +51,7 @@ from ..dist_checkpointing.mapping import (
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import (
     _ParamAndGradBuffer,
+    get_all_bucket_groups,
     group_params_for_buffers,
     partition_buckets,
 )
@@ -73,6 +74,7 @@ from .optimizer import (
     copy_optimizer_param_metadata,
     find_saved_param_group,
     get_param_group_identifier_tuple,
+    keep_current_parallel_domain,
 )
 from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
@@ -762,12 +764,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         data_parallel_world_size: int,
         ddp_config,
         expert_data_parallel_world_size: Optional[int] = None,
+        parallel_group_sizes: Optional[Dict[str, int]] = None,
     ) -> 'FullParamLayout':
         """Compute parameter layouts for all buffer groups.
 
-        Groups parameters by (param_dtype, grad_dtype, is_expert_parallel), then
-        computes a padded PerBufferParamLayout for each group. Expert-parallel groups use
-        expert_data_parallel_world_size for padding alignment.
+        Groups parameters by :class:`BufferKey` (param_dtype, grad_dtype, is_expert_parallel,
+        parameter domain, ...), then computes a padded PerBufferParamLayout for each group.
+        Expert-parallel groups use expert_data_parallel_world_size for padding alignment, and
+        extra parameter domains the size of their replica group.
 
         Args:
             params: List of all parameters to lay out.
@@ -777,6 +781,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             expert_data_parallel_world_size: Size of the expert data-parallel group.
                 Required if any expert-parallel params are present. Defaults to
                 data_parallel_world_size if not provided.
+            parallel_group_sizes: Replica-group size of each extra parameter domain (see
+                ``ProcessGroupCollection.parameter_replica_groups``). Required for every extra
+                domain among the params.
 
         Returns:
             FullParamLayout with a PerBufferParamLayout per buffer group.
@@ -784,7 +791,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         buffer_groups = group_params_for_buffers(params, ddp_config.grad_reduce_in_fp32)
         layouts = {}
         for buffer_key, (group_params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
+            if buffer_key.parallel_domain is not None:
+                if buffer_key.parallel_domain not in (parallel_group_sizes or {}):
+                    raise ValueError(
+                        "No replica-group size was given for parameter domain "
+                        f"{buffer_key.parallel_domain!r}; pass parallel_group_sizes."
+                    )
+                dp_world_size = parallel_group_sizes[buffer_key.parallel_domain]
+            elif buffer_key.is_expert_parallel:
                 dp_world_size = (
                     expert_data_parallel_world_size
                     if expert_data_parallel_world_size is not None
@@ -1276,9 +1290,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             saved_param_group = find_saved_param_group(needed_groups, param_groups_map)
             if saved_param_group is None:
                 raise ValueError(_missing_param_group_message(needed_groups, param_groups_map))
-            state_dict_param_groups.append(
-                {**saved_param_group, "params": inner_param_group['params']}
-            )
+            param_group = {**saved_param_group, "params": inner_param_group['params']}
+            keep_current_parallel_domain(param_group, inner_param_group)
+            state_dict_param_groups.append(param_group)
 
         # Allocate or retrieve optimizer state (i.e., tensors).
         if len(self.optimizer.state) == 0:
@@ -1587,6 +1601,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             state[gbuf_idx] = dtype_state
         return state
 
+    def _owns_single_rank_extra_domain(self) -> bool:
+        """Whether this optimizer shards an extra parameter domain over a single-rank group.
+
+        That rank holds every shard of the domain, so gathering or scattering its state is the
+        identity and needs neither a Gloo group nor a communicator.
+        """
+        return self.data_parallel_group.size() == 1 and any(
+            group.get('parallel_domain') is not None for group in self.optimizer.param_groups
+        )
+
+    def _missing_gloo_group_error(self, operation: str) -> RuntimeError:
+        """Error for an ``operation`` that needs the Gloo data-parallel group this lacks."""
+        return RuntimeError(
+            f"Cannot {operation}: that needs a Gloo data-parallel group, and this distributed "
+            "optimizer has none (Gloo groups are disabled, or it owns an extra parameter domain, "
+            "which never has one). Avoid the checkpoint paths that gather or scatter over Gloo: "
+            "--ckpt-format torch, --distrib-optim-fully-reshardable-mem-efficient, and loading a "
+            "dp_zero_gather_scatter optimizer checkpoint."
+        )
+
     def get_parameter_state_dp_zero(
         self,
         use_gloo_comm: bool = True,
@@ -1619,9 +1653,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             dict or None: optimizer state dict on DP rank 0, or all ranks if return_on_all_ranks.
                 Returns None on non-zero DP ranks when return_on_all_ranks=False.
         """
-        # Data parallelism variables.
-        if use_gloo_comm:
+        # Data parallelism variables. The optimizer of a single-rank extra domain holds every
+        # shard, so its gather is a local copy.
+        gather_is_identity = self._owns_single_rank_extra_domain()
+        if use_gloo_comm and not gather_is_identity:
             data_parallel_group = self.data_parallel_group_gloo
+            if data_parallel_group is None:
+                raise self._missing_gloo_group_error("gather the optimizer state on DP rank 0")
         else:
             data_parallel_group = self.data_parallel_group
         assert data_parallel_group is not None
@@ -1702,7 +1740,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             # Gather.
                             if not use_gloo_comm:
                                 send_tensor = send_tensor.cuda()
-                            if return_on_all_ranks:
+                            if gather_is_identity:
+                                recv_tensors[0].copy_(send_tensor)
+                            elif return_on_all_ranks:
                                 torch.distributed.all_gather(
                                     recv_tensors, send_tensor, data_parallel_group
                                 )
@@ -2543,7 +2583,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         # Data parallelism variables.
-        assert self.data_parallel_group_gloo is not None
+        if self.data_parallel_group_gloo is None:
+            raise self._missing_gloo_group_error(
+                "scatter a legacy-format optimizer state from DP rank 0"
+            )
         data_parallel_world_size = self.data_parallel_group_gloo.size()
         data_parallel_rank = self.data_parallel_group_gloo.rank()
         data_parallel_group_gloo = self.data_parallel_group_gloo
@@ -2669,14 +2712,23 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         if update_legacy_format:
             return self.load_parameter_state_from_dp_zero_legacy(state_dict)
 
-        # Data parallelism variables.
-        assert self.data_parallel_group_gloo is not None
-        data_parallel_world_size = self.data_parallel_group_gloo.size()
-        data_parallel_rank = self.data_parallel_group_gloo.rank()
-        data_parallel_group_gloo = self.data_parallel_group_gloo
-        data_parallel_global_ranks = torch.distributed.get_process_group_ranks(
-            self.data_parallel_group_gloo
-        )
+        # Data parallelism variables. The optimizer of a single-rank extra domain holds every
+        # shard, so its scatter is a local copy.
+        scatter_is_identity = self._owns_single_rank_extra_domain()
+        if scatter_is_identity:
+            data_parallel_world_size = 1
+            data_parallel_rank = 0
+            data_parallel_group_gloo = None
+            data_parallel_global_ranks = None
+        else:
+            if self.data_parallel_group_gloo is None:
+                raise self._missing_gloo_group_error("scatter the optimizer state from DP rank 0")
+            data_parallel_world_size = self.data_parallel_group_gloo.size()
+            data_parallel_rank = self.data_parallel_group_gloo.rank()
+            data_parallel_group_gloo = self.data_parallel_group_gloo
+            data_parallel_global_ranks = torch.distributed.get_process_group_ranks(
+                self.data_parallel_group_gloo
+            )
 
         if data_parallel_rank == 0:
             # Do nothing if "--fp8-param-gather" is not used.
@@ -2736,12 +2788,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                             send_tensors = None
 
                         # Scatter.
-                        torch.distributed.scatter(
-                            recv_tensor,
-                            send_tensors,
-                            data_parallel_global_ranks[0],
-                            data_parallel_group_gloo,
-                        )
+                        if scatter_is_identity:
+                            recv_tensor.copy_(send_tensors[0])
+                        else:
+                            torch.distributed.scatter(
+                                recv_tensor,
+                                send_tensors,
+                                data_parallel_global_ranks[0],
+                                data_parallel_group_gloo,
+                            )
 
                         for model_param, param_range_map in gbuf_range_map["param_map"].items():
                             # Copy states into contiguous shard.
@@ -3627,9 +3682,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
 
         for model_chunk in self.model_chunks:
-            for bucket_group in (
-                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
-            ):
+            for bucket_group in get_all_bucket_groups(model_chunk):
                 if not bucket_group.buckets:
                     continue
                 if _bucket_is_managed_by_layer_wise_optimizer(

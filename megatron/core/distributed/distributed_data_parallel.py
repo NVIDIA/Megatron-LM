@@ -4,13 +4,18 @@ import logging
 import math
 import weakref
 from contextlib import contextmanager
-from typing import Optional
+from typing import Dict, List, Optional
 
 import torch
 
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..optimizer.param_layout import FullParamLayout
-from ..process_groups_config import ProcessGroupCollection
+from ..process_groups_config import (
+    IMPLICIT_PARAMETER_DOMAINS,
+    ProcessGroupCollection,
+    get_parameter_parallel_domain,
+    replica_group_shard,
+)
 from ..transformer.cuda_graphs import is_graph_capturing
 from ..transformer.transformer_config import TransformerConfig
 from ..utils import PARAM_READY_CALLBACK_ATTR, log_single_rank
@@ -22,7 +27,13 @@ except ImportError:
 
 from .data_parallel_base import _BaseDataParallel
 from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers, partition_buckets
+from .param_and_grad_buffer import (
+    _ParamAndGradBucketGroup,
+    _ParamAndGradBuffer,
+    get_all_buffers,
+    group_params_for_buffers,
+    partition_buckets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +204,59 @@ class DistributedDataParallel(_BaseDataParallel):
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_dist_opt_group = process_group_dict['inter_dist_opt_group']
 
+        # Replica group of each parameter domain (see get_parameter_parallel_domain). Besides
+        # dense and expert parameters, a model can register extra domains, e.g. tables sharded
+        # by rows over part of dp_cp and replicated over the rest, in
+        # pg_collection.parameter_replica_groups.
+        extra_replica_groups = process_group_dict.get('parameter_replica_groups') or {}
+        reserved_domains = set(IMPLICIT_PARAMETER_DOMAINS) & extra_replica_groups.keys()
+        if reserved_domains:
+            raise ValueError(
+                f"Parameter domains {sorted(reserved_domains)} are implicit and cannot be "
+                "registered in pg_collection.parameter_replica_groups."
+            )
+        if extra_replica_groups:
+            if self.ddp_config.num_distributed_optimizer_instances != 1:
+                raise ValueError(
+                    "Extra parameter domains require num_distributed_optimizer_instances == 1, "
+                    f"got {self.ddp_config.num_distributed_optimizer_instances}."
+                )
+            # The gradient scaling below, and the parameter norm, take each extra domain to
+            # replicate over part of dp_cp, whose other ranks hold the domain's other row
+            # shards, and apply no GTP-remat correction to it. These checks do not communicate.
+            if ProcessGroupCollection.is_gtp_remat_active(process_group_dict):
+                raise ValueError("Extra parameter domains do not support GTP weight remat.")
+            dp_cp_ranks = torch.distributed.get_process_group_ranks(self.dp_cp_group)
+            for domain, group in extra_replica_groups.items():
+                group_ranks = torch.distributed.get_process_group_ranks(group)
+                try:
+                    replica_group_shard(dp_cp_ranks, group_ranks)
+                except ValueError:
+                    raise ValueError(
+                        f"The replica group of parameter domain {domain!r} (ranks {group_ranks}) "
+                        f"must be part of dp_cp (ranks {dp_cp_ranks}) as a strided slice "
+                        "dp_cp[o::n], as create_row_parallel_groups(dp_cp, ...) builds it."
+                    ) from None
+        self.parameter_replica_groups = {
+            'dense': self.dp_cp_group,
+            'expert': self.expt_dp_group,
+            **extra_replica_groups,
+        }
+        for name, param in self.module.named_parameters():
+            domain = get_parameter_parallel_domain(param)
+            if domain not in self.parameter_replica_groups:
+                raise ValueError(
+                    f"Parameter {name} belongs to domain {domain!r}, which has no replica group "
+                    "in pg_collection.parameter_replica_groups."
+                )
+            # An extra domain may accumulate gradients into main_grad itself and hand autograd a
+            # placeholder .grad; the backward hook would still add that placeholder to main_grad
+            # for a zero_out_wgrad param.
+            if domain not in IMPLICIT_PARAMETER_DOMAINS and getattr(param, 'zero_out_wgrad', False):
+                raise ValueError(
+                    f"Parameter {name} of domain {domain!r} must not set zero_out_wgrad."
+                )
+
         # Turn off bucketing if we are on a pipeline stage that is not the first (since
         # data-parallel communication on these stages is not on the critical path), or if
         # disable_bucketing is True (e.g., we might not want to break up model parameters
@@ -247,6 +311,9 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.intra_dp_cp_group.size(),
                 self.ddp_config,
                 expert_data_parallel_world_size=self.intra_expt_dp_group.size(),
+                parallel_group_sizes={
+                    domain: group.size() for domain, group in extra_replica_groups.items()
+                },
             )
 
         # When a full_param_layout is provided, verify that the grouping is consistent
@@ -328,6 +395,8 @@ class DistributedDataParallel(_BaseDataParallel):
         # Allocate buffers for each group.
         self.buffers = []
         self.expert_parallel_buffers = []
+        # Every extra domain gets an entry, empty on ranks that hold none of its parameters.
+        self._extra_domain_buffers = {domain: [] for domain in extra_replica_groups}
         pg_collection = ProcessGroupCollection(
             tp=self.tp_group,
             dp_cp=self.dp_cp_group,
@@ -335,7 +404,19 @@ class DistributedDataParallel(_BaseDataParallel):
             expt_gtp_remat=self.expt_gtp_remat_group,
         )
         for buffer_key, (params, param_indices) in buffer_groups.items():
-            if buffer_key.is_expert_parallel:
+            if buffer_key.parallel_domain is not None:
+                # An extra domain reduces over its whole replica group. Its gradients arrive
+                # already summed over the rest of dp_cp (e.g. the lookup backward of a table
+                # sharded by rows delivers every requester's contribution to the row's owner),
+                # so the scaling yields the usual 1/dp_cp mean.
+                data_parallel_group = self.parameter_replica_groups[buffer_key.parallel_domain]
+                if config.calculate_per_token_loss:
+                    scaling_factor = 1.0
+                elif self.ddp_config.average_in_collective:
+                    scaling_factor = data_parallel_group.size() / self.dp_cp_group.size()
+                else:
+                    scaling_factor = 1.0 / self.dp_cp_group.size()
+            elif buffer_key.is_expert_parallel:
                 data_parallel_group = self.intra_expt_dp_group
                 scaling_factor = expert_gradient_scaling_factor
             else:
@@ -374,6 +455,11 @@ class DistributedDataParallel(_BaseDataParallel):
                 full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
             )
             params_with_names = [(p, param_to_name[p]) for p in params]
+            # Extra-domain buffers skip NCCL user-buffer registration. Its warm-up runs barriers
+            # over the whole world, whose count would then differ between the pipeline stages
+            # that hold a domain and those that do not; it would also initialize the
+            # communicator of a single-rank replica group, whose collectives are skipped (see
+            # the identity bucket groups below).
             buffer = _ParamAndGradBuffer(
                 self.ddp_config,
                 buffer_key.param_dtype,
@@ -384,11 +470,13 @@ class DistributedDataParallel(_BaseDataParallel):
                 param_to_name,
                 scaling_factor,
                 param_indices,
-                self.ddp_config.nccl_ub,
+                self.ddp_config.nccl_ub and buffer_key.parallel_domain is None,
                 pg_collection,
                 param_layout=param_layout,
             )
-            if buffer_key.is_expert_parallel:
+            if buffer_key.parallel_domain is not None:
+                self._extra_domain_buffers[buffer_key.parallel_domain].append(buffer)
+            elif buffer_key.is_expert_parallel:
                 self.expert_parallel_buffers.append(buffer)
             else:
                 self.buffers.append(buffer)
@@ -416,12 +504,30 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.reduce_scatter_with_fp32_accumulation
             ),
         )
+        # Domains never share a bucket group: each one reduces over its own replica group.
+        self._extra_domain_bucket_groups = {
+            domain: partition_buckets(
+                buffers,
+                force_single_bucket_group=disable_bucketing,
+                reduce_scatter_with_fp32_accumulation=(
+                    self.ddp_config.reduce_scatter_with_fp32_accumulation
+                ),
+            )
+            for domain, buffers in self._extra_domain_buffers.items()
+        }
+        # With a single-rank replica group, an extra domain's reduce-scatter and all-gather are
+        # identities: skip them, so its communicator is never initialized. Dense and expert
+        # bucket groups keep their collectives whatever their group size.
+        for domain, bucket_groups in self._extra_domain_bucket_groups.items():
+            if self.parameter_replica_groups[domain].size() == 1:
+                for bucket_group in bucket_groups:
+                    bucket_group.collectives_are_identity = True
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             assert (
                 self.ddp_config.use_distributed_optimizer
             ), 'Partial DistOpt cannot be used without DistOpt'
-            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+            for bucket_groups in self.bucket_groups_by_domain.values():
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 for bucket_group in bucket_groups:
                     bucket_group.inter_distributed_optimizer_instance_group = (
@@ -435,7 +541,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True
         # without use_distributed_optimizer.
         if self.ddp_config.overlap_param_gather:
-            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+            for bucket_groups in self.bucket_groups_by_domain.values():
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
                     bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (
@@ -455,12 +561,12 @@ class DistributedDataParallel(_BaseDataParallel):
             and self.ddp_config.reduce_scatter_with_fp32_accumulation
             and self.ddp_config.num_distributed_optimizer_instances == 1
         ):
-            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+            for bucket_groups in self.bucket_groups_by_domain.values():
                 for i in range(1, len(bucket_groups)):
                     bucket_groups[i].previous_grad_reduce_bucket_group = bucket_groups[i - 1]
 
         # Create map from param to bucket group, used in pre_hook.
-        for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+        for bucket_groups in self.bucket_groups_by_domain.values():
             for bucket_group in bucket_groups:
                 # One readiness callback per bucket group, stamped on all its params, so a
                 # consumer reading param.data outside the owning module's pre-hook can publish it
@@ -544,6 +650,53 @@ class DistributedDataParallel(_BaseDataParallel):
         if self.use_forward_hook:
             self.enable_forward_pre_hook()
         self.overlap_param_gather_with_optimizer_step = False
+
+    # The properties below read the extra-domain dicts with getattr: an instance built without
+    # __init__ (e.g. a test double that sets only the dense and expert lists) has no extra domain.
+
+    @property
+    def buffers_by_domain(self) -> Dict[str, List[_ParamAndGradBuffer]]:
+        """Buffers of each parameter domain: 'dense', 'expert', then the extra domains.
+
+        The 'dense' and 'expert' entries are the ``buffers`` and ``expert_parallel_buffers``
+        lists themselves.
+        """
+        return {
+            'dense': self.buffers,
+            'expert': self.expert_parallel_buffers,
+            **getattr(self, '_extra_domain_buffers', {}),
+        }
+
+    @property
+    def bucket_groups_by_domain(self) -> Dict[str, List[_ParamAndGradBucketGroup]]:
+        """Bucket groups of each parameter domain: 'dense', 'expert', then the extra domains.
+
+        The 'dense' and 'expert' entries are the ``bucket_groups`` and
+        ``expert_parallel_bucket_groups`` lists themselves.
+        """
+        return {
+            'dense': self.bucket_groups,
+            'expert': self.expert_parallel_bucket_groups,
+            **getattr(self, '_extra_domain_bucket_groups', {}),
+        }
+
+    @property
+    def all_buffers(self) -> List[_ParamAndGradBuffer]:
+        """Buffers of every parameter domain, in the order of ``buffers_by_domain``."""
+        if not getattr(self, '_extra_domain_buffers', None):
+            return self.buffers + self.expert_parallel_buffers
+        return [buffer for buffers in self.buffers_by_domain.values() for buffer in buffers]
+
+    @property
+    def all_bucket_groups(self) -> List[_ParamAndGradBucketGroup]:
+        """Bucket groups of every parameter domain, in the order of ``bucket_groups_by_domain``."""
+        if not getattr(self, '_extra_domain_bucket_groups', None):
+            return self.bucket_groups + self.expert_parallel_bucket_groups
+        return [
+            bucket_group
+            for bucket_groups in self.bucket_groups_by_domain.values()
+            for bucket_group in bucket_groups
+        ]
 
     def enable_forward_pre_hook(self):
         """
@@ -653,12 +806,12 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         Context manager that turns off gradient synchronization.
         """
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.all_bucket_groups:
             bucket_group.is_last_microbatch = False
         try:
             yield
         finally:
-            for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+            for bucket_group in self.all_bucket_groups:
                 bucket_group.is_last_microbatch = True
 
     def _start_bucket_group_param_sync(
@@ -698,12 +851,12 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
                 return
 
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.all_bucket_groups:
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
     def reset_param_sync_dispatch_state(self):
         """Mark DDP param all-gathers as not dispatched for the next forward pre-hook."""
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.all_bucket_groups:
             # A non-None handle means the previous all-gather is still in flight. Resetting only
             # the dispatch flag would create the invalid state
             # `param_gather_dispatched=False, param_gather_handle!=None` and could dispatch a
@@ -724,7 +877,7 @@ class DistributedDataParallel(_BaseDataParallel):
         calls. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.all_bucket_groups:
             bucket_group.start_grad_sync()
 
     @_otel_trace_fn('communication', 'megatron.grad_sync.finish')
@@ -737,17 +890,17 @@ class DistributedDataParallel(_BaseDataParallel):
         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.all_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
 
     def free_overlap_buffers(self):
         """Free overlap param-gather GPU buffers across all bucket groups."""
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.all_bucket_groups:
             bucket_group.free_overlap_buffers()
 
     def scale_gradients(self, scaling_factor: torch.Tensor):
         """Scale all gradients inside the buffers by `scaling_factor`."""
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        for buffer in self.all_buffers:
             buffer.scale_gradients(scaling_factor)
 
     def zero_grad_buffer(self):
@@ -761,9 +914,9 @@ class DistributedDataParallel(_BaseDataParallel):
             # to True, and there will be a double-GA.
             for param in self.params_with_grad:
                 param.grad_added_to_main_grad = False
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        for buffer in self.all_buffers:
             buffer.reset()
-        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
+        for bucket_group in self.all_bucket_groups:
             bucket_group.reset()
 
     def broadcast_params(self):
@@ -771,12 +924,12 @@ class DistributedDataParallel(_BaseDataParallel):
         Syncs parameters across all DP ranks.
         """
         for param in self.module.parameters():
-            is_expert_parallel = not getattr(param, 'allreduce', True)
-
-            if is_expert_parallel:
-                data_parallel_group = self.expt_dp_group
-            else:
-                data_parallel_group = self.dp_cp_group
+            domain = get_parameter_parallel_domain(param)
+            data_parallel_group = self.parameter_replica_groups[domain]
+            if domain not in IMPLICIT_PARAMETER_DOMAINS and data_parallel_group.size() == 1:
+                # This rank holds the only copy; a broadcast would just initialize the
+                # group's communicator.
+                continue
             torch.distributed.broadcast(
                 param.data,
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),
@@ -808,7 +961,7 @@ class DistributedDataParallel(_BaseDataParallel):
         if synchronize:
             torch.cuda.synchronize()
 
-        buffers = self.buffers + self.expert_parallel_buffers
+        buffers = get_all_buffers(self)
         # Only registered buffers own pools that need collective deregistration and release;
         # every buffer still offloads its gradient storage in the full buffers loop below.
         registered_buffers = [buffer for buffer in buffers if buffer.nccl_mem_pool is not None]
@@ -852,7 +1005,7 @@ class DistributedDataParallel(_BaseDataParallel):
         Args:
             synchronize: Whether to call torch.cuda.synchronize() after allocation.
         """
-        for buffer in self.buffers + self.expert_parallel_buffers:
+        for buffer in get_all_buffers(self):
             if buffer.nccl_grad_pool_is_separate and buffer.nccl_mem_pool is None:
                 buffer.reload_grad_buffer_into_nccl_pool()
             else:

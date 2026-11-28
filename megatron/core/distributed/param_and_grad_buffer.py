@@ -16,7 +16,11 @@ from torch.distributed import _coalescing_manager
 import megatron.core.allocator.vmm_symm_allocator as vmm_symm_allocator
 import megatron.core.nccl_allocator as nccl_allocator
 from megatron.core import parallel_state
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    IMPLICIT_PARAMETER_DOMAINS,
+    ProcessGroupCollection,
+    get_parameter_parallel_domain,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
 
@@ -220,6 +224,17 @@ class _LayerwiseAllGatherHandle:
         self.handles = None
 
 
+class _CompletedCollectiveHandle:
+    """Handle of a collective that was skipped because it is the identity.
+
+    Stands in for an asynchronous handle so that the finish_* methods, which wait on the handle
+    and then run their post-processing, behave as after a real collective.
+    """
+
+    def wait(self):
+        """Return at once: nothing was launched."""
+
+
 class _ParamAndGradBucketGroup:
     """
     Put multiple buckets into a group so that their communications can be aggregated together.
@@ -234,6 +249,11 @@ class _ParamAndGradBucketGroup:
             optimizer, data_parallel_group if not.
         collective_group_size: World size using the intra data-parallel group.
     """
+
+    # Set by DistributedDataParallel for the bucket groups of an extra parameter domain whose
+    # collective group has a single rank. Their reductions and all-gathers are identities, so
+    # they are skipped and the group never initializes a communicator.
+    collectives_are_identity = False
 
     def __init__(
         self,
@@ -559,6 +579,16 @@ class _ParamAndGradBucketGroup:
                     # latest parameter all-gather instead of zero.
                     bucket.grad_data.zero_()
                 self.param_gather_handle = None
+
+        elif self.collectives_are_identity:
+            # This rank's shard is the whole bucket, so the all-gather is the identity. Keep
+            # only the MXFP8 staging that feeds it. When overlapping, a completed handle makes
+            # finish_param_sync run the post-all-gather processing as after a real gather.
+            if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                for bucket in self.buckets:
+                    bucket._stage_layerwise_mxfp8_params(bucket.param_data, 0)
+            self.param_gather_handle = _CompletedCollectiveHandle() if async_op else None
+
         else:
             # Standard distributed optimizer path: use _coalescing_manager.
             # all_gather_into_tensor writes directly into a contiguous output buffer and
@@ -745,6 +775,11 @@ class _ParamAndGradBucketGroup:
             self.ddp_config.overlap_grad_reduce
             and self.ddp_config.num_distributed_optimizer_instances == 1
         )
+        if self.collectives_are_identity:
+            # A single rank holds every replica, so the scaled gradients are already reduced.
+            # When overlapping, finish_grad_sync waits on the completed handle as usual.
+            self.grad_reduce_handle = _CompletedCollectiveHandle() if async_op else None
+            return
         if (
             self.ddp_config.num_distributed_optimizer_instances > 1
             and self.ddp_config.overlap_grad_reduce
@@ -952,13 +987,17 @@ def group_params_for_buffers(
 ) -> Dict['BufferKey', Tuple[List[torch.nn.Parameter], List[int]]]:
     """Group parameters by buffer identity for buffer allocation.
 
-    Each distinct buffer is identified by a BufferKey with three dimensions:
+    Each distinct buffer is identified by a BufferKey with these dimensions:
     - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
     - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
     - is_expert_parallel: whether the parameter uses the expert topology (param.allreduce == False),
       which requires a separate buffer for the expert data-parallel group. This is true for experts
       when expert-parallelism > 1, expert-tensor-parallelism != tensor-parallelism, or expert-GTP
       != GTP.
+    - is_managed_by_layer_wise_optimizer: whether LayerWiseDistributedOptimizer owns the param.
+    - parallel_domain: the extra parameter domain of the param (see
+      get_parameter_parallel_domain), which replicates over its own group and so needs its own
+      buffer; None for dense and expert params.
 
     The param_indices track each parameter's position among same-dtype params (using
     the "fake" high-precision dtype for FP8/NVFP4 params), needed for loading non-native-fp8
@@ -984,13 +1023,19 @@ def group_params_for_buffers(
         if _param_uses_quantized_storage(param):
             param_dtype = torch.uint8
         grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
-        is_expert_parallel = not getattr(param, 'allreduce', True)
+        domain = get_parameter_parallel_domain(param)
+        is_expert_parallel = domain == 'expert'
+        parallel_domain = None if domain in IMPLICIT_PARAMETER_DOMAINS else domain
         is_managed_by_layer_wise_optimizer = getattr(
             param, 'is_managed_by_layer_wise_optimizer', False
         )
 
         key = BufferKey(
-            param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+            param_dtype,
+            grad_dtype,
+            is_expert_parallel,
+            is_managed_by_layer_wise_optimizer,
+            parallel_domain,
         )
         param_list = key_to_params.get(key, [])
         param_list.append(param)
@@ -999,7 +1044,11 @@ def group_params_for_buffers(
         # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
         # logical high-precision dtype, needed for checkpoint compatibility.
         offset_key = BufferKey(
-            param.dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+            param.dtype,
+            grad_dtype,
+            is_expert_parallel,
+            is_managed_by_layer_wise_optimizer,
+            parallel_domain,
         )
         offset = dtype_to_offsets.get(offset_key, 0)
         dtype_to_offsets[offset_key] = offset + 1
@@ -2036,3 +2085,33 @@ def partition_buckets(
                 )
             )
         return bucket_groups
+
+
+def get_all_buffers(model_chunk) -> List[_ParamAndGradBuffer]:
+    """Return the buffers of every parameter domain of a DDP model chunk.
+
+    Dense buffers come first, then expert buffers, then those of each extra parameter domain.
+    Only DistributedDataParallel provides the ``all_buffers`` list. Any other chunk, including a
+    test double whose attributes are mocks, has no extra domain, so its ``buffers`` and
+    ``expert_parallel_buffers`` are read instead.
+    """
+    all_buffers = getattr(model_chunk, 'all_buffers', None)
+    if not isinstance(all_buffers, list):
+        all_buffers = model_chunk.buffers + model_chunk.expert_parallel_buffers
+    return all_buffers
+
+
+def get_all_bucket_groups(model_chunk) -> List[_ParamAndGradBucketGroup]:
+    """Return the bucket groups of every parameter domain of a DDP model chunk.
+
+    Dense bucket groups come first, then expert ones, then those of each extra parameter
+    domain. Only DistributedDataParallel provides the ``all_bucket_groups`` list; any other
+    chunk is read through ``bucket_groups`` and ``expert_parallel_bucket_groups``, a missing
+    list counting as empty (see ``get_all_buffers``).
+    """
+    all_bucket_groups = getattr(model_chunk, 'all_bucket_groups', None)
+    if not isinstance(all_bucket_groups, list):
+        all_bucket_groups = getattr(model_chunk, 'bucket_groups', []) + getattr(
+            model_chunk, 'expert_parallel_bucket_groups', []
+        )
+    return all_bucket_groups

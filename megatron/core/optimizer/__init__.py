@@ -53,7 +53,12 @@ from megatron.core.optimizer_param_scheduler import (
     combine_param_group_overrides,
     param_group_override_to_tuple,
 )
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    IMPLICIT_PARAMETER_DOMAINS,
+    ProcessGroupCollection,
+    get_parameter_parallel_domain,
+    replica_group_shard,
+)
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 
 from ..distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
@@ -387,7 +392,7 @@ def _get_param_groups(
         List of parameter groups.
     """
 
-    # Map (pg_overrides, is_expert_parallel, is_dsa_indexer) to params.
+    # Map (pg_overrides, is_expert_parallel, is_dsa_indexer, extra parameter domain) to params.
     params_map = {}
     model_order: Dict[int, int] = {}
 
@@ -411,14 +416,19 @@ def _get_param_groups(
             else:
                 param_override = None
 
-            is_expert_parallel = not getattr(param, 'allreduce', True)
+            # Extra parameter domains report is_expert_parallel=True ("not replicated over the
+            # dense DP group"), so a group keeps its checkpoint identifier when a layout moves it
+            # between the expert domain and an extra one; the domain name sets them apart here.
+            domain = get_parameter_parallel_domain(param)
+            is_expert_parallel = domain != 'dense'
+            extra_domain = None if domain in IMPLICIT_PARAMETER_DOMAINS else domain
             is_dsa_indexer = name.startswith("indexer.") or ".indexer." in name
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
             )
-            key = (param_override_tuple, is_expert_parallel, is_dsa_indexer)
+            key = (param_override_tuple, is_expert_parallel, is_dsa_indexer, extra_domain)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
@@ -441,16 +451,24 @@ def _get_param_groups(
     param_groups = []
 
     # Sort keys, None first.
-    # Keys gathered from other ranks or module domains may predate the is_dsa_indexer
-    # element; treat a missing element as False so ordering stays total either way.
+    # Keys gathered from other ranks or module domains may predate the is_dsa_indexer and
+    # extra-domain elements; treat a missing element as False (no domain) so ordering stays
+    # total either way.
     def _key_order(key):
-        return (key[0] is not None, key[0], key[1], key[2] if len(key) > 2 else False)
+        return (
+            key[0] is not None,
+            key[0],
+            key[1],
+            key[2] if len(key) > 2 else False,
+            (key[3] if len(key) > 3 else None) or '',
+        )
 
     _tag_pre_split_param_index(params_map, params_key, model_order, _key_order)
 
     for key in sorted(params_key, key=_key_order):
         param_override_tuple, is_expert_parallel = key[0], key[1]
         is_dsa_indexer = key[2] if len(key) > 2 else False
+        extra_domain = key[3] if len(key) > 3 else None
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
@@ -489,6 +507,8 @@ def _get_param_groups(
             **param_override,  # keep **param_override last so that users can override other fields.
         }
         param_group['is_dsa_indexer'] = is_dsa_indexer
+        if extra_domain is not None:
+            param_group['parallel_domain'] = extra_domain
         param_groups.append(param_group)
 
     return param_groups
@@ -510,13 +530,16 @@ def _tag_pre_split_param_index(params_map, params_key, model_order, key_order) -
     of indexer and backbone parameters that the old group had.
 
     Numbered separately for expert-parallel and dense parameters, because those go to
-    different optimizers and torch numbers from zero within each.
+    different optimizers and torch numbers from zero within each. Extra parameter domains have
+    optimizers of their own and post-date the split, so they are not numbered.
 
     The index is written onto the parameter rather than onto the group, so it stays out of the
     checkpoint: it describes the model in front of us, not anything that was saved.
     """
     collapsed = {}
     for key in params_key:
+        if len(key) > 3 and key[3] is not None:
+            continue
         collapsed.setdefault((key[0], key[1]), []).append(key)
 
     for is_expert_parallel in (False, True):
@@ -569,6 +592,69 @@ def _get_param_groups_and_buffers(
             buffers[model_chunk_idx + model_chunk_offset] = getattr(model_chunk, buffer_name)
 
     return param_groups, buffers
+
+
+def _get_extra_parameter_replica_groups(
+    model_chunks: List[MegatronModule],
+) -> Dict[str, torch.distributed.ProcessGroup]:
+    """Return the replica group of each extra parameter domain of the model chunks.
+
+    Extra domains (beyond dense and expert, see ``get_parameter_parallel_domain``) are
+    registered on DistributedDataParallel through ``pg_collection.parameter_replica_groups``
+    and come in the same order on every rank. A trainable parameter tagged with a domain the
+    chunks do not know would be left out of every optimizer, so it raises.
+    """
+    replica_groups = getattr(model_chunks[0], 'parameter_replica_groups', None)
+    # Only DistributedDataParallel registers domains; other chunks (and test doubles) have none.
+    if not isinstance(replica_groups, dict):
+        replica_groups = {}
+    extra_replica_groups = {
+        domain: group
+        for domain, group in replica_groups.items()
+        if domain not in IMPLICIT_PARAMETER_DOMAINS
+    }
+    for model_chunk in model_chunks:
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            domain = get_parameter_parallel_domain(param)
+            if domain not in IMPLICIT_PARAMETER_DOMAINS and domain not in extra_replica_groups:
+                raise ValueError(
+                    f"Parameter {name} belongs to domain {domain!r}, which the model chunks do "
+                    "not register; extra parameter domains need DistributedDataParallel with "
+                    "the domain in pg_collection.parameter_replica_groups."
+                )
+    return extra_replica_groups
+
+
+def _get_extra_domain_buffers(
+    model_chunks: List[MegatronModule], domain: str
+) -> Dict[int, List[_ParamAndGradBuffer]]:
+    """Return each model chunk's buffers of an extra parameter domain, possibly empty."""
+    return {
+        model_chunk_idx: model_chunk.buffers_by_domain[domain]
+        for model_chunk_idx, model_chunk in enumerate(model_chunks)
+    }
+
+
+def _extra_domain_optimizer_index(
+    mp_group: torch.distributed.ProcessGroup,
+    dp_cp_group: torch.distributed.ProcessGroup,
+    replica_group: torch.distributed.ProcessGroup,
+) -> int:
+    """Index that names an extra domain's DistributedOptimizer in its checkpoint keys.
+
+    The model-parallel rank and the row shard ``o`` of ``n`` (``replica_group_shard``) do not
+    change when DP or CP is resized at a fixed number of row shards, as the model-parallel rank
+    that names a dense DistributedOptimizer does not, so a dp_reshardable checkpoint loads at
+    another data-parallel size. The global rank of a replica group's first member would change
+    on every pipeline stage but the first.
+    """
+    shard, num_shards = replica_group_shard(
+        torch.distributed.get_process_group_ranks(dp_cp_group),
+        torch.distributed.get_process_group_ranks(replica_group),
+    )
+    return get_pg_rank(mp_group) * num_shards + shard
 
 
 def _omit_empty_local_shards(param_groups: List[Dict]) -> List[Dict]:
@@ -990,8 +1076,15 @@ def _get_megatron_emerging_optimizer(
         model_chunks, config, config_overrides, param_group_process_group
     )
     grouped_param_groups = defaultdict(list)
+    # Groups of each extra parameter domain, by optimizer name. They get DistributedOptimizers
+    # of their own, built after all the others.
+    extra_replica_groups = _get_extra_parameter_replica_groups(model_chunks)
+    extra_domain_param_groups = {domain: defaultdict(list) for domain in extra_replica_groups}
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
+        if 'parallel_domain' in group:
+            extra_domain_param_groups[group['parallel_domain']][opt_name].append(group)
+            continue
         is_expert = group['is_expert_parallel'] and not use_layer_wise
         grouped_param_groups[(opt_name, is_expert)].append(group)
 
@@ -1017,13 +1110,27 @@ def _get_megatron_emerging_optimizer(
             "is hardcoded to 0 in this path. Disable use_layer_wise_param_layout to "
             "fall back to the legacy LayerWise ping-pong path."
         )
-    if use_separate_distributed_optimizer and any(
-        # A separate DistributedOptimizer with byte-level sharding handles any group
-        # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
-        # e.g., Muon). This includes scalar optimizers like Adam or Lion.
-        not (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
-        for (opt_name, _), groups in grouped_param_groups.items()
-        if groups
+    if extra_replica_groups and not use_separate_distributed_optimizer:
+        raise ValueError(
+            "Extra parameter domains with an emerging optimizer require the layer-wise "
+            "optimizer and DistributedDataParallel with use_distributed_optimizer=True."
+        )
+    for domain, groups_by_optimizer in extra_domain_param_groups.items():
+        if eopt_name in groups_by_optimizer:
+            raise ValueError(
+                f"Parameters of domain {domain!r} are routed to {eopt_name}, whose layer-wise "
+                "optimizer cannot manage them; route them to the scalar optimizer."
+            )
+    if use_separate_distributed_optimizer and (
+        any(
+            # A separate DistributedOptimizer with byte-level sharding handles any group
+            # whose optimizer is not the primary emerging optimizer (stored in ``eopt_name``,
+            # e.g., Muon). This includes scalar optimizers like Adam or Lion.
+            not (opt_name == eopt_name and opt_name in _EMERGING_OPTIMIZERS)
+            for (opt_name, _), groups in grouped_param_groups.items()
+            if groups
+        )
+        or any(extra_domain_param_groups.values())
     ):
         distopt_process_groups = ProcessGroupCollection.setup_process_groups_for_optimizer(
             pg_collection, model_chunks, use_gloo_process_groups=use_gloo_process_groups
@@ -1188,6 +1295,40 @@ def _get_megatron_emerging_optimizer(
                         result.config = config
                     results.append(result)
 
+    # One DistributedOptimizer per extra parameter domain (and scalar optimizer), over the
+    # domain's replica group. They follow LayerWise and the dense and expert fallbacks whatever
+    # order the overrides sort in, so those keep their chain positions. Param groups are
+    # aligned across ranks: a rank without parameters of a domain builds an empty optimizer.
+    for domain, groups_by_optimizer in extra_domain_param_groups.items():
+        replica_group = extra_replica_groups[domain]
+        for opt_name, groups in groups_by_optimizer.items():
+            fallback_config = copy.copy(config)
+            fallback_config.optimizer = opt_name
+            fallback_config.use_distributed_optimizer = True
+            result = _get_megatron_optimizer_based_on_param_groups(
+                config=fallback_config,
+                model_chunks=model_chunks,
+                param_groups=groups,
+                per_model_buffers=_get_extra_domain_buffers(model_chunks, domain),
+                model_parallel_group=distopt_process_groups['mp_group'],
+                data_parallel_group=replica_group,
+                # No Gloo group: checkpoint formats that gather over Gloo are rejected.
+                data_parallel_group_gloo=None,
+                data_parallel_group_idx=_extra_domain_optimizer_index(
+                    distopt_process_groups['mp_group'],
+                    distopt_process_groups['dp_cp_group'],
+                    replica_group,
+                ),
+                intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
+                distributed_optimizer_instance_id=0,
+                pg_collection=pg_collection,
+                skip_megatron_wrapping=False,
+            )
+            # ChainedOptimizer asserts that its members share one config, as above.
+            if hasattr(result, 'config'):
+                result.config = config
+            results.append(result)
+
     if use_layer_wise:
         log_single_rank(
             logger, logging.INFO, f'Using LayerWiseDistributedOptimizer for {eopt_name}'
@@ -1312,7 +1453,9 @@ def get_megatron_optimizer(
     """Retrieve the Megatron optimizer for model chunks.
 
     Handles both standard optimizers (Adam, SGD) and emerging optimizers (e.g. Muon).
-    We use separate optimizers for expert parameters and non-expert parameters.
+    We use separate optimizers for expert parameters and non-expert parameters, and a
+    DistributedOptimizer for each extra parameter domain registered on the DDP-wrapped chunks
+    (see ``ProcessGroupCollection.parameter_replica_groups``), last in the chain.
     For emerging optimizers with ``config.use_layer_wise_distributed_optimizer=True``,
     the optimizer is automatically wrapped with :class:`LayerWiseDistributedOptimizer`.
 
@@ -1383,6 +1526,27 @@ def get_megatron_optimizer(
         raise ValueError(
             "--use-precision-aware-optimizer only supported with distributed optimizer"
         )
+
+    # Each extra parameter domain gets a DistributedOptimizer over its replica group.
+    extra_replica_groups = _get_extra_parameter_replica_groups(model_chunks)
+    if extra_replica_groups:
+        if (
+            is_mfsdp_v2
+            or model_chunks[0].ddp_config.use_megatron_fsdp
+            or not config.use_distributed_optimizer
+        ):
+            raise ValueError(
+                "Extra parameter domains require DistributedDataParallel with the distributed "
+                "optimizer."
+            )
+        if config.overlap_param_gather_with_optimizer_step:
+            raise ValueError(
+                "Extra parameter domains do not support overlap_param_gather_with_optimizer_step."
+            )
+        if model_chunks[0].ddp_config.num_distributed_optimizer_instances != 1:
+            raise ValueError(
+                "Extra parameter domains require num_distributed_optimizer_instances == 1."
+            )
 
     # Separate out first model chunk if overlapping param AG with optimizer step.
     if config.overlap_param_gather_with_optimizer_step:
@@ -1505,7 +1669,7 @@ def get_megatron_optimizer(
             model_chunk_offset=model_chunk_offset,
             config=config,
             config_overrides=config_overrides,
-            filter_fn=lambda g: not g['is_expert_parallel'],
+            filter_fn=lambda g: get_parameter_parallel_domain(g) == 'dense',
             buffer_name='buffers',
             process_group=param_group_process_group,
         )
@@ -1543,7 +1707,7 @@ def get_megatron_optimizer(
         model_chunk_offset=0,
         config=config,
         config_overrides=config_overrides,
-        filter_fn=lambda g: g['is_expert_parallel'],
+        filter_fn=lambda g: get_parameter_parallel_domain(g) == 'expert',
         buffer_name='expert_parallel_buffers',
         process_group=param_group_process_group,
     )
@@ -1585,6 +1749,46 @@ def get_megatron_optimizer(
                 pg_collection=pg_collection,
             )
         )
+
+    # The DistributedOptimizers of the extra domains come last, so the dense and MoE ones keep
+    # their chain positions. Param groups are aligned across ranks: every rank builds the same
+    # chain, with an empty optimizer where it holds no parameter of a domain.
+    if extra_replica_groups:
+        all_param_groups = _get_param_groups(
+            model_chunks, config, config_overrides, param_group_process_group
+        )
+        for domain, replica_group in extra_replica_groups.items():
+            domain_param_groups = [
+                group
+                for group in all_param_groups
+                if get_parameter_parallel_domain(group) == domain
+            ]
+            if not domain_param_groups:
+                continue
+            if dump_param_to_param_group_map is not None:
+                for param_group in domain_param_groups:
+                    for param in param_group["params"]:
+                        param_name = get_global_unique_param_name(model_chunks, param)
+                        param_to_param_group[param_name] = param_group_id
+                    param_group_id += 1
+            optimizers.append(
+                _get_megatron_optimizer_based_on_param_groups(
+                    config=config,
+                    model_chunks=model_chunks,
+                    param_groups=domain_param_groups,
+                    per_model_buffers=_get_extra_domain_buffers(model_chunks, domain),
+                    model_parallel_group=mp_group,
+                    data_parallel_group=replica_group,
+                    # No Gloo group: checkpoint formats that gather over Gloo are rejected.
+                    data_parallel_group_gloo=None,
+                    data_parallel_group_idx=_extra_domain_optimizer_index(
+                        mp_group, dp_cp_group, replica_group
+                    ),
+                    intra_dist_opt_group=intra_dist_opt_group,
+                    distributed_optimizer_instance_id=0,
+                    pg_collection=pg_collection,
+                )
+            )
 
     if dump_param_to_param_group_map is not None:
         torch.distributed.checkpoint.save(

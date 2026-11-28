@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Model and data parallel groups.
 
@@ -32,6 +32,7 @@
 
 import logging
 import os
+import sys
 import warnings
 from datetime import timedelta
 from typing import Callable, Dict, List, Optional, Sequence
@@ -3083,6 +3084,16 @@ def destroy_model_parallel():
         nccl_ep_finalize()
     except Exception:  # finalize must never block teardown
         pass
+
+    # Forget the Engram table groups and flags that initialize_engram_parallel_state cached, so
+    # the next model-parallel setup creates its own. Nothing is cached unless the module was
+    # loaded, so it is not imported here.
+    try:
+        engram_table_sharding = sys.modules.get("megatron.core.models.engram.table_sharding")
+        if engram_table_sharding is not None:
+            engram_table_sharding.clear_engram_parallel_state()
+    except Exception:
+        logger.warning("Failed to clear the Engram parallel state during teardown", exc_info=True)
 
     global _MODEL_PARALLEL_GROUP
     _MODEL_PARALLEL_GROUP = None

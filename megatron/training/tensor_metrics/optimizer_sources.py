@@ -16,7 +16,11 @@ from megatron.core.optimizer import (
     MegatronOptimizer,
 )
 from megatron.core.parameter_names import CanonicalParameterNameMap
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    IMPLICIT_PARAMETER_DOMAINS,
+    ProcessGroupCollection,
+    get_parameter_parallel_domain,
+)
 
 from .core import (
     FlatShard,
@@ -744,4 +748,11 @@ def _model_parameter_wgrad(model_parameter: torch.nn.Parameter) -> torch.Tensor 
 
 
 def _data_parallel_axis(model_parameter: torch.nn.Parameter) -> str:
-    return "dp_cp" if getattr(model_parameter, "allreduce", True) else "expert_dp"
+    domain = get_parameter_parallel_domain(model_parameter)
+    if domain not in IMPLICIT_PARAMETER_DOMAINS:
+        # An extra domain's optimizer shards over the domain's own replica group, which is
+        # neither of the two axes below.
+        raise NotImplementedError(
+            f"Tensor metric observation does not yet support parameter domain {domain!r}."
+        )
+    return "dp_cp" if domain == "dense" else "expert_dp"
