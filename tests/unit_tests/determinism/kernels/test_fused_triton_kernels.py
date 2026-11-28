@@ -496,7 +496,9 @@ def test_fused_mla_rope_is_independent_of_block_h(path):
             out = fused_mla_rope_out_of_place(
                 t, cos, sin, nope_dim, emb_dim, cu_seqlens_q=cu_seqlens
             )
-            out.backward(grad.clone())
+            upstream = grad.clone()
+            out.backward(upstream)
+            torch.testing.assert_close(upstream, grad, rtol=0, atol=0)
             return [out.detach(), t.grad]
 
     else:

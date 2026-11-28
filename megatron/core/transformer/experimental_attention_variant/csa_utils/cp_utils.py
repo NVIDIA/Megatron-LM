@@ -12,6 +12,7 @@ from megatron.core.models.common.embeddings.rope_utils import _apply_rotary_pos_
 
 from . import packed_layout
 from .packed_sparse_attention import indexer_topk
+from .thd_utils import metadata_checks_enabled
 
 
 def _thd_cp_position_ids(
@@ -186,6 +187,14 @@ def exchange_cp_boundary_hidden(
     return boundary_hidden.reshape((d_window,) + tuple(hidden_states.shape[1:]))
 
 
+def get_cp_compressor_capacity(local_rows: int, ratio: int) -> int:
+    """Return the aligned per-rank capacity without reading device prefix contents."""
+    halo = 8 if ratio == 4 else ratio
+    alignment = 32 // math.gcd(32, ratio)
+    capacity = max(1, (local_rows + halo) // ratio)
+    return (capacity + alignment - 1) // alignment * alignment
+
+
 def prepare_cp_compressor_input(
     hidden_local: torch.Tensor,
     boundary_hidden: torch.Tensor,
@@ -216,9 +225,7 @@ def prepare_cp_compressor_input(
     d_comp = 8 if ratio == 4 else ratio
     global_start = int(global_start)
     l_local = hidden_local.shape[0]
-    group_alignment = 32 // math.gcd(32, ratio)
-    c_cap = max(1, (l_local + d_comp) // ratio)
-    c_cap = ((c_cap + group_alignment - 1) // group_alignment) * group_alignment
+    c_cap = get_cp_compressor_capacity(l_local, ratio)
     return packed_layout.compact_compressor_input(
         hidden_local, boundary_hidden, cu_seqlens, global_start, ratio, d_comp, c_cap, cp_size
     )
@@ -359,13 +366,14 @@ def validate_packed_inputs(packed_seq_params, config, cp_group):
                 "Packed DSv4 cumulative lengths must be matching int32 tensors on one device."
             )
 
-    if q.data_ptr() != kv.data_ptr():
+    # Device-side value checks are opt-in (MCORE_CSA2_DEVICE_CHECKS, see thd_utils).
+    if metadata_checks_enabled(q.device) and q.data_ptr() != kv.data_ptr():
         torch._assert_async((q == kv).all(), "DSv4 packed CSA supports self attention only.")
     padded_q = packed_seq_params.cu_seqlens_q_padded
     padded_kv = packed_seq_params.cu_seqlens_kv_padded
     physical_q = q if padded_q is None else padded_q
     physical_kv = kv if padded_kv is None else padded_kv
-    if physical_q.data_ptr() != physical_kv.data_ptr():
+    if metadata_checks_enabled(q.device) and physical_q.data_ptr() != physical_kv.data_ptr():
         torch._assert_async(
             (physical_q == physical_kv).all(),
             "Packed CSA requires matching physical Q/KV document boundaries.",

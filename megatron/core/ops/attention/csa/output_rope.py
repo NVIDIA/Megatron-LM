@@ -19,6 +19,7 @@ from megatron.core.fusions.fused_mla_yarn_rope_apply import (
     _autotuned_mla_rope_bwd_inplace_kernel,
     _autotuned_mla_rope_fwd_inplace_kernel,
     _get_thd_token_idx,
+    fused_mla_rope_out_of_place,
     tl,
     triton,
 )
@@ -308,6 +309,19 @@ class OutputRopeParams:
             **self._kernel_kwargs(),
         )
         return out_flat
+
+    def apply(self, out_flat: Tensor) -> Tensor:
+        """Rotate a reference-path activation while preserving its autograd edge."""
+        if out_flat.numel() == 0:
+            return out_flat
+        return fused_mla_rope_out_of_place(
+            self._kernel_view(out_flat),
+            self.cos,
+            self.sin,
+            self.nope_dim,
+            self.pos_dim,
+            **self._kernel_kwargs(),
+        ).view_as(out_flat)
 
     def undo(self, t: Tensor, out: Optional[Tensor] = None) -> Tensor:
         """Recover the pre-RoPE values of ``t``, in place or into ``out``.

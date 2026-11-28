@@ -62,6 +62,12 @@ def test_output_rope_reconstruction(layout, dtype, heads):
     ).view_as(x)
     expected.backward(grad.clone())
 
+    reference_path = x.detach().clone().requires_grad_(True)
+    rotated = params.apply(reference_path)
+    torch.testing.assert_close(rotated, expected, rtol=0, atol=0)
+    torch.testing.assert_close(torch.autograd.grad(rotated, reference_path, grad)[0], ref.grad)
+    torch.testing.assert_close(reference_path, original, rtol=0, atol=0)
+
     def run(value, upstream):
         # Exercise the real adapter's padded-head slice before RoPE reconstruction.
         backend_out = value.new_zeros((rows, 64, 512))

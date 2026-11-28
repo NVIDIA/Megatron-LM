@@ -6,10 +6,15 @@ import torch
 
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     cp_utils,
+    csa2_indexer,
     csa_indexer_loss_kernels,
     packed_layout,
 )
-from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
+from tests.unit_tests.determinism.kernels.harness import (
+    assert_replays_bit_exact,
+    count_differing_replays,
+    seeded,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -98,3 +103,97 @@ def test_async_context_parallel_collectives_replay():
         assert_replays_bit_exact(reduce, (global_grad,), backward=False, contention=True)
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_csa2_loss_replays_and_shared_key_gradient_can_differ():
+    """The KL reduction is repeatable; the shared-key score backward uses FP32 atomic adds."""
+    seeded()
+    rows, keys = 2048, 192
+    q = torch.randn(rows, 32, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(keys, 128, device="cuda", dtype=q.dtype)
+    weights = torch.randn(rows, 32, device="cuda", dtype=q.dtype)
+    teacher_q = torch.randn(rows, 16, 16, device="cuda", dtype=q.dtype)
+    teacher_k = torch.randn(keys, 16, device="cuda", dtype=q.dtype)
+    lse = torch.zeros(rows, 16, device="cuda")
+    starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    visible = torch.full_like(starts, keys)
+    ids = starts.new_empty((rows, 0))
+    divisor = weights.new_tensor(rows, dtype=torch.float32)
+
+    def evaluate(q, k, weights):
+        return csa2_indexer._precompute_indexer_loss(
+            q,
+            k,
+            weights,
+            teacher_q,
+            teacher_k,
+            lse,
+            ids,
+            visible,
+            starts,
+            visible,
+            divisor,
+            (keys, 0, 1, 0.25, 1.0),
+        )
+
+    inputs = (q, k, weights)
+    assert_replays_bit_exact(
+        lambda *x: evaluate(*x)[0],
+        inputs,
+        backward=False,
+        replays=3,
+        contention=True,
+        what="CSA2 indexer KL",
+    )
+    # Every query contributes to the same K rows, making accumulation order observable.
+    assert (
+        count_differing_replays(lambda *x: evaluate(*x)[1][1], inputs, backward=False, replays=8)
+        > 0
+    )
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_cp_projected_compaction_replay_and_live_graph_maps(ratio):
+    """Unique-source backward remains bit exact when captured padding maps change."""
+    from megatron.core.ops.attention.csa.compressor_projection import (
+        compact_cp_projection,
+        cp_projection_maps,
+    )
+
+    seeded()
+    sources = torch.arange(32, device="cuda").reshape(-1, ratio)
+    valid = torch.ones(sources.shape[0], dtype=torch.bool, device="cuda")
+    local = torch.randn(32, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    halo = torch.randn(ratio, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    def run(x, boundary):
+        mapping, inverse = cp_projection_maps(sources, valid, ratio, ratio, x.shape[0])
+        return compact_cp_projection(x, boundary, mapping, inverse)
+
+    assert_replays_bit_exact(
+        run, (local, halo), contention=True, what="CSA2 projected CP compaction"
+    )
+    probe = torch.randn(32, 1, 128, device="cuda", dtype=torch.bfloat16)
+
+    def forward_backward():
+        output = run(local, halo)
+        return output, *torch.autograd.grad(output, (local, halo), probe)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        forward_backward()
+        forward_backward()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = forward_backward()
+    for shift in (0, 1):
+        sources.copy_(torch.arange(32, device="cuda").roll(shift).reshape_as(sources))
+        valid.fill_(True)
+        valid[shift::3] = False
+        expected = forward_backward()
+        graph.replay()
+        torch.cuda.synchronize()
+        for actual, wanted in zip(captured, expected):
+            torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
