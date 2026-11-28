@@ -1,5 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import gc
 import random
+import weakref
 from copy import deepcopy
 
 import numpy as np
@@ -586,7 +588,9 @@ def test_overlap_cpu_optimizer_d2h_h2d_sync_correctness(
         ), f"Weight {k} value mismatch, max error: {(v - ref_params[k]).abs().max()}"
 
 
-def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param():
+def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Test that DistributedOptimizer works with HybridDeviceOptimizer (CPU offloading)
     when the model has mark_keep_in_fp32 parameters without raising non-leaf Tensor ValueError.
     """
@@ -624,7 +628,28 @@ def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param():
             optimizer_offload_fraction=1.0,
         )
 
-        optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
+        initialized = []
+        initialize = HybridDeviceOptimizer._init_sub_optimizers
+
+        def record_initialization(self: HybridDeviceOptimizer) -> None:
+            initialize(self)
+            initialized.append(
+                (weakref.ref(self), [weakref.ref(p) for p in self.gpu_params_map_cpu_copy.values()])
+            )
+
+        monkeypatch.setattr(HybridDeviceOptimizer, "_init_sub_optimizers", record_initialization)
+        gc_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            optimizer = get_megatron_optimizer(optimizer_config, [ddp_model])
+            assert initialized
+            for owner_ref, copy_refs in initialized[:-1]:
+                assert owner_ref() is None
+                assert all(param_ref() is None for param_ref in copy_refs)
+            assert initialized[-1][0]() is not None
+        finally:
+            if gc_enabled:
+                gc.enable()
 
         inputs = torch.ones(2, 4, device="cuda", dtype=torch.bfloat16)
         output = ddp_model(inputs)
@@ -635,3 +660,60 @@ def test_distributed_optimizer_with_cpu_offload_and_fp32_marked_param():
         assert update_successful
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("offload_fraction", [0.0, 0.5, 1.0])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_hybrid_optimizer_releases_copies_without_gc(
+    offload_fraction: float, overlap: bool
+) -> None:
+    """Dropping HDO releases its CPU copies and GPU masters without cyclic collection."""
+    params = [nn.Parameter(torch.ones(16, device="cuda", dtype=torch.bfloat16)) for _ in range(2)]
+    gc_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        optimizer = HybridDeviceOptimizer(
+            params,
+            offload_fraction=offload_fraction,
+            cpu_optimizer_cls=Adam,
+            gpu_optimizer_cls=Adam,
+            param_update_in_fp32=True,
+            overlap_cpu_optimizer_d2h_h2d=overlap,
+            lr=1e-3,
+        )
+        owner_ref = weakref.ref(optimizer)
+        copy_refs = [weakref.ref(param) for param in optimizer.param_to_inner_param.values()]
+        for param in params:
+            param.grad = torch.ones_like(param)
+        optimizer.step()
+        torch.cuda.synchronize()
+        del optimizer
+        assert owner_ref() is None
+        assert all(copy_ref() is None for copy_ref in copy_refs)
+    finally:
+        if gc_enabled:
+            gc.enable()
+
+
+@pytest.mark.parametrize("offload_fraction", [0.0, 1.0])
+def test_sub_optimizer_hook_after_owner_release(offload_fraction: float) -> None:
+    """A retained child optimizer must not copy into the model after its owner is gone."""
+    param = nn.Parameter(torch.ones(16, device="cuda", dtype=torch.bfloat16))
+    optimizer = HybridDeviceOptimizer(
+        [param],
+        offload_fraction=offload_fraction,
+        cpu_optimizer_cls=Adam,
+        gpu_optimizer_cls=Adam,
+        param_update_in_fp32=True,
+        overlap_cpu_optimizer_d2h_h2d=False,
+        lr=1e-3,
+    )
+    child = optimizer.sub_optimizers[0]
+    owner_ref = weakref.ref(optimizer)
+    del optimizer
+    assert owner_ref() is None
+    for inner_param in child.param_groups[0]["params"]:
+        inner_param.grad = torch.ones_like(inner_param)
+    child.step()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(param, torch.ones_like(param), rtol=0, atol=0)

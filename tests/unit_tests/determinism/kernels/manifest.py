@@ -711,12 +711,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
             "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
+            "tests/unit_tests/test_optimizer_cpu_offloading.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
         "optimizer.py (gradient unscaling) and training/utils/common_utils.py (param / grad norm "
         "logging) launch the same multi_tensor kernels through multi_tensor_applier. "
-        "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies.",
+        "Hybrid CPU/GPU Adam replay also covers overlapped parameter and gradient copies. "
+        "The CPU offload tests check exact resume parity and verify that retained child "
+        "optimizers leave model weights unchanged after their owner is released.",
     ),
     KernelEntry(
         name="tensor_metric_l2",
