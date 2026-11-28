@@ -16,7 +16,10 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    gated_delta_product_inference_stack_spec,
+    hybrid_stack_spec,
+)
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
@@ -56,7 +59,7 @@ class TestBatchInvariantMambaPrefixCaching:
         torch.use_deterministic_algorithms(self._previous_deterministic)
 
     @staticmethod
-    def _run(*, prefix, graphs, chunked):
+    def _run(*, prefix, graphs, chunked, mixer_family="mamba"):
         model_parallel_cuda_manual_seed(321, inference_rng_tracker=True, force_reset_rng=True)
         torch.manual_seed(321)
         cfg = TransformerConfig(
@@ -68,6 +71,8 @@ class TestBatchInvariantMambaPrefixCaching:
             mamba_head_dim=32,
             mamba_num_groups=1,
             mamba_state_dim=16,
+            gdp_num_householder=3,
+            gdp_batch_invariant_block_size=32,
             use_cpu_initialization=True,
             hidden_dropout=0.0,
             attention_dropout=0.0,
@@ -84,7 +89,11 @@ class TestBatchInvariantMambaPrefixCaching:
         model = (
             HybridModel(
                 config=cfg,
-                hybrid_stack_spec=hybrid_stack_spec,
+                hybrid_stack_spec=(
+                    gated_delta_product_inference_stack_spec
+                    if mixer_family == "gdp"
+                    else hybrid_stack_spec
+                ),
                 hybrid_layer_pattern="M*-",
                 vocab_size=128,
                 max_sequence_length=1024,
@@ -172,15 +181,20 @@ class TestBatchInvariantMambaPrefixCaching:
         gc.collect()
         return outputs
 
+    @pytest.mark.parametrize("mixer_family", ["mamba", "gdp"])
     @pytest.mark.parametrize("graphs", [False, True])
     @pytest.mark.parametrize("chunked", [False, True])
     @torch.inference_mode()
-    def test_cache_matches_uncached_eager(self, graphs, chunked, monkeypatch):
+    def test_cache_matches_uncached_eager(self, graphs, chunked, mixer_family, monkeypatch):
         monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
         monkeypatch.setenv("NVTE_FLASH_ATTN", "1")
         monkeypatch.setenv("NVTE_FUSED_ATTN", "0")
         monkeypatch.setenv("NVTE_UNFUSED_ATTN", "0")
         with set_batch_invariant_mode(True, backend="te_native"):
-            baseline = self._run(prefix=False, graphs=False, chunked=False)
-            cached = self._run(prefix=True, graphs=graphs, chunked=chunked)
+            baseline = self._run(
+                prefix=False, graphs=False, chunked=False, mixer_family=mixer_family
+            )
+            cached = self._run(
+                prefix=True, graphs=graphs, chunked=chunked, mixer_family=mixer_family
+            )
         assert cached == baseline
