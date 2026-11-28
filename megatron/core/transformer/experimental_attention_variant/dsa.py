@@ -1852,10 +1852,16 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
             raise TypeError("DSAIndexerLossAutoScaler.set_loss_scale requires a torch.Tensor.")
         scale = scale.detach()
 
-        if DSAIndexerLossAutoScaler.main_loss_backward_scale is None:
+        current = DSAIndexerLossAutoScaler.main_loss_backward_scale
+        if current is None:
             DSAIndexerLossAutoScaler.main_loss_backward_scale = scale
+        elif current.numel() == 1 and scale.numel() == 1:
+            # A backward that ran before the first scale was set (the eager passes of a CUDA
+            # graph capture at the first iteration) created the default as a 0-dim tensor, and
+            # a captured backward keeps its address; the training loop's scale has shape [1].
+            current.copy_(scale.reshape(current.shape))
         else:
-            DSAIndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
+            current.copy_(scale)
 
 
 @dataclass

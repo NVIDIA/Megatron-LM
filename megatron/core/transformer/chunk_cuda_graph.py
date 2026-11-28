@@ -129,21 +129,144 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
         """The schedule sets ``current_microbatch`` on the block (``set_current_microbatch``)."""
         return getattr(self, "current_microbatch", 0)
 
+    def _recipes_of_te_modules(self):
+        """``(module, recipe)`` for the Transformer Engine modules of this callable that hold a
+        quantization recipe in their metadata."""
+        from transformer_engine.pytorch.module.base import TransformerEngineBaseModule
+
+        return [
+            (module, module.fp8_meta["recipe"])
+            for module in self.modules()
+            if isinstance(module, TransformerEngineBaseModule)
+            and module.fp8_meta.get("recipe") is not None
+        ]
+
+    def _replay_under_quantization_context(self, replay):
+        """Run ``replay`` under the block-wide quantization context of this callable.
+
+        Inside an autocast, Transformer Engine's graphed callable writes that autocast's recipe
+        into the metadata of every TE module of the callable. A module that quantizes under a
+        recipe of its own (it opens its own autocast in its forward: the MXFP8 LM head of an
+        NVFP4 model, a module with a per-module recipe of another kind than the model's) would
+        find the replay's recipe on its next eager forward (evaluation runs the eager
+        post-process), take it for a change of the recipe type and drop its cached quantized
+        weight, which is the very tensor the captured graphs write and read. Such modules get
+        their recipe back after each replay. Which ones they are is read off the first replay;
+        most models have none.
+
+        A module whose evaluation recipe is of another kind than the one it trains with drops
+        that cached weight at every evaluation whatever the replay does (in eager the next
+        training forward quantizes a new one). The graphs keep writing to and reading from the
+        tensor they were recorded with, so the block keeps those tensors for as long as its
+        graphs exist, and hands such a module the quantization state its graphs address back
+        before every replay.
+        """
+        context = self._chunk_graph_replay_quantization_context()
+        own_recipes = getattr(self, "_te_modules_with_their_own_recipe", None)
+        self._hand_back_the_state_the_graphs_address()
+        recipes_before = ()
+        if own_recipes is None and not isinstance(context, nullcontext):
+            recipes_before = self._recipes_of_te_modules()
+        with context:
+            output = replay()
+        if own_recipes is None:
+            own_recipes = [
+                (module, recipe)
+                for module, recipe in recipes_before
+                if not _is_the_same_kind_of_recipe(module.fp8_meta.get("recipe"), recipe)
+            ]
+            self._te_modules_with_their_own_recipe = own_recipes
+        for module, recipe in own_recipes:
+            module.fp8_meta["recipe"] = recipe
+        return output
+
+    def _hand_back_the_state_the_graphs_address(self):
+        """Give the modules that evaluate under another recipe the quantization state of the
+        capture back (``_state_of_modules_evaluated_otherwise``): the cached weights the graphs
+        write and read, with the quantizers, recipe and scaling state that belong to them."""
+        for module, workspaces, quantizers, meta in self._state_of_modules_evaluated_otherwise():
+            module._fp8_workspaces.clear()
+            module._fp8_workspaces.update(workspaces)
+            if quantizers is not None:
+                module.quantizers.update(quantizers)
+            module.fp8_meta.update(meta)
+
+    def keep_what_the_graphs_address(self):
+        """Hold the quantization state the just-recorded graphs write and read.
+
+        Called where a capture ends, before any eager forward (an evaluation, an eager
+        post-process) can make Transformer Engine drop or rebuild it.
+        """
+        self._chunk_graph_weight_caches = [
+            cache
+            for module in self.modules()
+            for cache in (getattr(module, "_fp8_workspaces", None) or {}).values()
+        ]
+        self._chunk_graph_state_of_modules_evaluated_otherwise = None
+        self._state_of_modules_evaluated_otherwise()
+
+    def _state_of_modules_evaluated_otherwise(self):
+        """Quantization state, as the graphs address it, of the modules of this callable that
+        evaluate under a quantized recipe of their own (``evaluation_recipe`` of a per-module
+        precision config): ``(module, cached weights, quantizers, recipe and scaling state)``.
+
+        Read once, where the capture ends (``keep_what_the_graphs_address``); most models have
+        none.
+        """
+        state = getattr(self, "_chunk_graph_state_of_modules_evaluated_otherwise", None)
+        if state is not None:
+            return state
+        state = []
+        for module in self.modules():
+            evaluation = getattr(
+                getattr(module, "te_quant_params", None), "evaluation_recipe", None
+            )
+            if evaluation is None or not (
+                evaluation.fp8_quantization_recipe or evaluation.fp4_quantization_recipe
+            ):
+                continue
+            if not isinstance(getattr(module, "_fp8_workspaces", None), dict):
+                continue
+            if "scaling_fwd" not in module.fp8_meta:
+                # Recorded unquantized (it trains in BF16 and has not run quantized yet): its
+                # graphs address no quantization state, and handing Transformer Engine's
+                # initial, empty quantizers back after an evaluation built real ones would
+                # leave the module without any.
+                continue
+            quantizers = getattr(module, "quantizers", None)
+            state.append(
+                (
+                    module,
+                    dict(module._fp8_workspaces),
+                    dict(quantizers) if isinstance(quantizers, dict) else None,
+                    {
+                        key: module.fp8_meta[key]
+                        for key in ("recipe", "scaling_fwd", "scaling_bwd")
+                        if key in module.fp8_meta
+                    },
+                )
+            )
+        self._chunk_graph_state_of_modules_evaluated_otherwise = state
+        return state
+
     def __call__(self, *args, **kwargs):
-        # Note a padding mask where the model hands it to the block: the hyper-connection
-        # layers consume it without going through TransformerLayer._forward_attention, the
-        # only place that records it per layer.
+        chunk_wise = getattr(self.config, "cuda_graph_impl", "none") == "chunk_wise"
+        # What the training forwards hand this block decides the inputs of its graph. An
+        # evaluation forward never replays one, and its batch may have another shape.
+        notes_graph_inputs = chunk_wise and self.training
+        # Note a padding mask where the model hands it to the block: every layer gets its mask
+        # from here. (The layers record theirs only as callables of the per-layer capture.)
         if (
-            kwargs.get("padding_mask") is not None
+            notes_graph_inputs
+            and kwargs.get("padding_mask") is not None
             and getattr(self, "_padding_mask_shape_seen", None) is None
-            and getattr(self.config, "cuda_graph_impl", "none") == "chunk_wise"
         ):
             self._padding_mask_shape_seen = tuple(kwargs["padding_mask"].shape)
+        # Likewise the token ids: the model hands them to the stages that have them.
+        if notes_graph_inputs and kwargs.get("input_ids") is not None:
+            self._input_ids_shape_seen = tuple(kwargs["input_ids"].shape)
         packed_seq_params = kwargs.get("packed_seq_params")
-        if (
-            packed_seq_params is not None
-            and getattr(self.config, "cuda_graph_impl", "none") == "chunk_wise"
-        ):
+        if packed_seq_params is not None and notes_graph_inputs:
             # Some data paths hand over one tensor as both the query boundaries and the padded
             # ones (the physical boundaries of a zigzag layout), and code inside the block
             # tells the two cases apart by the identity of the tensors (the roll of the MTP
@@ -231,13 +354,9 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
                     .tile(micro_batch_size, 1, 1, 1)
                 )
             # Fixed-length batches carry a padding mask only for some datasets. Like the
-            # per-layer capture, reserve the input when this block (__call__) or one of its
-            # layers (TransformerLayer._padding_mask_shape_seen) received a mask during the
-            # eager warm-up steps.
-            captures_padding_mask = any(
-                getattr(module, "_padding_mask_shape_seen", None) is not None
-                for module in self.modules()
-            )
+            # per-layer capture, reserve the input when the model handed this block a mask
+            # during the eager warm-up steps (__call__).
+            captures_padding_mask = getattr(self, "_padding_mask_shape_seen", None) is not None
 
         # padding_mask and the hash router's input_ids are batch-first token metadata. They are
         # captured in the block's own token frame, that of its hidden_states ([tokens, batch,
@@ -250,13 +369,36 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
             )
         self._chunk_graph_captures_padding_mask = captures_padding_mask
         self._chunk_graph_captures_attention_mask = "attention_mask" in static_inputs
-        if config.moe_n_hash_layers > 0 and any(
+        custom_layer_ids_shape = self._input_ids_shape_for_custom_layers()
+        if custom_layer_ids_shape is not None:
+            static_inputs["input_ids"] = torch.zeros(
+                custom_layer_ids_shape, dtype=torch.long, device=device
+            )
+        elif config.moe_n_hash_layers > 0 and any(
             getattr(module, "is_hash_layer", False) for module in self.modules()
         ):
             static_inputs["input_ids"] = torch.zeros(
                 (batch, tokens), dtype=torch.long, device=device
             )
+        self._chunk_graph_captures_input_ids = "input_ids" in static_inputs
+        self._chunk_graph_takes_input_ids_as_handed = custom_layer_ids_shape is not None
         return static_inputs
+
+    def _input_ids_shape_for_custom_layers(self):
+        """Shape of the token ids the model hands this block for its custom layers, or ``None``.
+
+        A hybrid stack passes the ids it receives to its custom layers (layer configs with a
+        ``layer_type``), and the model hands them to the stages that have them (``None``
+        elsewhere). Like the padding mask of fixed-length batches, the graph reserves the input
+        where a call of the eager warm-up steps brought it. A custom layer has no contract about
+        the frame of the ids (under sequence parallelism the model hands the rank's shard on the
+        embedding stage and the unsharded ids on a later one), so the graph takes them exactly
+        as the model hands them; the hash routers of such a stack take their shard inside the
+        graph, as they do in eager.
+        """
+        if not getattr(self, "_has_custom_layers", False):
+            return None
+        return getattr(self, "_input_ids_shape_seen", None)
 
     def _check_packed_layers_are_capturable(self):
         """Refuse layers that derive host-side state from the values of a pack's ``cu_seqlens``.
@@ -290,19 +432,24 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
 
         The models differ in what they hand the block under sequence parallelism: ``GPTModel``
         scatters the padding mask on the first stage only and never the ids, ``HybridModel``
-        scatters both. In eager mode every consumer shards full-length metadata itself
+        scatters both. In eager mode the MoE layers shard full-length metadata themselves
         (``MoELayer._align_batch_first_to_sequence_parallel``); a graph input has one fixed
         shape, so the same shard is taken here, before the replay copies it into the static
-        buffer.
+        buffer. The ids of a stack with custom layers are the exception: the graph takes them
+        as the model hands them (``_input_ids_shape_for_custom_layers``).
 
         The graph's keyword set is fixed at capture as well: a graph that reserved a mask gets
         an all-False one when a batch has none, and a mask arriving at a graph captured without
         one would be dropped silently by the graphed callable, so it raises when the block
-        routes tokens (the routers would diverge from eager) and is dropped when nothing in the
-        block reads it.
+        routes tokens or holds custom layers (they would diverge from eager) and is dropped
+        when nothing in the block reads it. Token ids arriving at a graph captured without
+        them raise for the same reason when the block holds custom layers.
         """
         if self.config.sequence_parallel:
-            for key in ("padding_mask", "input_ids"):
+            keys = ["padding_mask"]
+            if not getattr(self, "_chunk_graph_takes_input_ids_as_handed", False):
+                keys.append("input_ids")
+            for key in keys:
                 value = kwargs.get(key)
                 if value is not None and value.shape[1] != hidden_states.shape[0]:
                     kwargs[key] = (
@@ -321,13 +468,27 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
         elif kwargs.pop("padding_mask", None) is not None:
             from megatron.core.transformer.moe.moe_layer import MoELayer
 
-            if any(isinstance(module, MoELayer) for module in self.modules()):
+            if getattr(self, "_has_custom_layers", False) or any(
+                isinstance(module, MoELayer) for module in self.modules()
+            ):
                 raise RuntimeError(
                     "padding_mask was passed to a chunk CUDA graph that was captured without a "
                     "padding_mask input: no mask reached this block during "
-                    "cuda_graph_warmup_steps (is it 0?). The graphed MoE routers would silently "
-                    "ignore the mask. Run at least one eager warm-up step with masked batches."
+                    "cuda_graph_warmup_steps (is it 0?). The graphed MoE routers and custom "
+                    "layers would silently ignore the mask. Run at least one eager warm-up step "
+                    "with masked batches."
                 )
+        if (
+            kwargs.get("input_ids") is not None
+            and getattr(self, "_has_custom_layers", False)
+            and not getattr(self, "_chunk_graph_captures_input_ids", False)
+        ):
+            raise RuntimeError(
+                "input_ids was passed to a chunk CUDA graph that was captured without an "
+                "input_ids input: no token ids reached this block during "
+                "cuda_graph_warmup_steps (is it 0?). The graphed custom layers would silently "
+                "run without them. Run at least one eager warm-up step."
+            )
 
     def _add_graph_dynamic_dsa_route_static_inputs(self, static_inputs, cu_seqlens, max_tokens):
         """Add the balanced-CP route pair (full-capacity sample) to the block's static inputs."""
@@ -409,7 +570,7 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
                 packed_seq_params, kwargs, required=True
             )
 
-    def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
+    def _reconstruct_packed_graph_inputs(self, kwargs):
         """Rebuild the graph-static ``PackedSeqParams`` inside the captured block."""
         if "cu_seqlens_q" not in kwargs:
             return
@@ -446,15 +607,24 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
             )
         kwargs["packed_seq_params"] = packed_seq_params
 
-    def _prepare_pipeline_input_for_chunk_cuda_graph(self, args, kwargs):
-        """Expose the pipeline input tensor as the positional graph input."""
+    def _prepare_pipeline_input_for_chunk_cuda_graph(self, args, kwargs, replay=False):
+        """Expose the pipeline input tensor as the positional graph input.
+
+        A decoder block of a later stage computes on the activations of the previous stage
+        (``input_tensor``) whatever the model passes as ``hidden_states`` (``decoder_input``
+        there): so does its replay. A capture gets Transformer Engine's sample tensor, and the
+        post-process block its argument (the decoder's output).
+        """
         args = tuple(args)
         kwargs = kwargs.copy()
         if self.pre_process:
             return args, kwargs
 
         hidden_states = args[0] if args else kwargs.get("hidden_states")
-        if hidden_states is None:
+        takes_pipeline_input = replay and not getattr(
+            self, "is_cuda_graph_postprocess_callable", False
+        )
+        if hidden_states is None or (takes_pipeline_input and self.input_tensor is not None):
             hidden_states = self.input_tensor
         assert torch.is_tensor(
             hidden_states
@@ -470,13 +640,13 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
     def _te_cuda_graph_capture(self, *args, **kwargs):
         """Run the block forward on the static inputs so TE records it as one graph."""
         args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
-        self._reconstruct_packed_seq_params_from_kwargs(kwargs)
+        self._reconstruct_packed_graph_inputs(kwargs)
         kwargs.setdefault("attention_mask", None)
 
         if self.config.moe_paged_stash:
             from megatron.core.transformer.moe.paged_stash import (
                 PagedStashManager,
-                paged_stash_init_chunk_handler,
+                paged_stash_init_capture_chunk_handler,
             )
 
             # TE calls the block directly, so the model-level chunk handler does not run: start
@@ -485,7 +655,7 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
             if PagedStashManager.get_instance().enabled and not getattr(
                 self, "is_cuda_graph_postprocess_callable", False
             ):
-                paged_stash_init_chunk_handler(
+                paged_stash_init_capture_chunk_handler(
                     self.config.virtual_pipeline_model_parallel_size,
                     getattr(self, "vp_stage", None),
                 )
@@ -524,7 +694,9 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
                 if torch.is_tensor(value):
                     off_interface.register_block_static_input(value)
 
+        self._receive_dsa_topk_of_the_decoder_graph(kwargs)
         output = self.forward(*args, **kwargs)
+        self._keep_dsa_topk_for_layers_outside_this_graph(kwargs)
 
         if self.config.fine_grained_activation_offloading:
             output = off_interface.block_capture_backward_start(output)
@@ -540,6 +712,93 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
             paged_stash_wait_for_stash_to_complete()
 
         return output
+
+    # DSA top-k sharing across graphs (dsa_indexer_topk_freq > 1). A DSA layer that reuses the
+    # top-k indices of an earlier layer finds them in a dict on the object the model hands every
+    # layer of the forward: the packed-sequence metadata, else the attention mask, else the
+    # config (DSAttention._get_index_share_carrier). MTP layers continue the decoder's layer
+    # numbering, so the first of them may reuse a decoder layer's indices, and the MTP runs
+    # outside the decoder block's graph: in the post-process graph, or eagerly after a replay.
+    # A replay runs none of the Python that fills the dict, and each captured callable rebuilds
+    # packed-sequence metadata of its own. So the decoder block keeps the index tensors of each
+    # slot's captured forward (a replay of that slot rewrites them in place) and hands them on:
+    # to the post-process capture that follows it, and after every replay to the object the
+    # model passes to the eager layers.
+
+    def _dsa_index_share_carrier(self, packed_seq_params, attention_mask):
+        """The object DSA layers outside a recompute scope hang their shared top-k on."""
+        if packed_seq_params is not None:
+            return packed_seq_params
+        return attention_mask if attention_mask is not None else self.config
+
+    @staticmethod
+    def _dsa_index_share_holders():
+        """Names of the attributes that carry the shared top-k indices and their lengths."""
+        from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+
+        return DSAttention._HOLDER_ATTR, DSAttention._LENGTH_HOLDER_ATTR
+
+    def forget_what_earlier_graphs_addressed(self):
+        """Drop the tensors this block kept for the graphs of a previous capture."""
+        self.reset_dsa_topk_shared_across_graphs()
+        # Read off the first replay of the new graphs again.
+        self._te_modules_with_their_own_recipe = None
+        # Read again where the next capture ends (keep_what_the_graphs_address).
+        self._chunk_graph_weight_caches = None
+        self._chunk_graph_state_of_modules_evaluated_otherwise = None
+
+    def reset_dsa_topk_shared_across_graphs(self):
+        """Forget the index tensors of a previous capture (they belong to its graphs)."""
+        self._chunk_graph_dsa_topk_of_slots = []
+        self._chunk_graph_dsa_topk_of_last_capture_forward = None
+
+    def _keep_dsa_topk_for_layers_outside_this_graph(self, kwargs):
+        """After a capture-time forward: keep the top-k indices that later layers reuse."""
+        shared_layers = getattr(self, "_chunk_graph_dsa_topk_shared_layers", ())
+        if not shared_layers:
+            return
+        carrier = self._dsa_index_share_carrier(
+            kwargs.get("packed_seq_params"), kwargs.get("attention_mask")
+        )
+        kept = {}
+        for holder_name in self._dsa_index_share_holders():
+            holder = getattr(carrier, holder_name, None) or {}
+            kept[holder_name] = {layer: holder[layer] for layer in shared_layers if layer in holder}
+        # Transformer Engine runs a callable's forward eagerly a few times before it records
+        # it, and runs the post-process right after its decoder block either way.
+        self._chunk_graph_dsa_topk_of_last_capture_forward = kept
+        if torch.cuda.is_current_stream_capturing():
+            # Recorded forwards arrive in slot order. The tensors stay referenced for as long
+            # as the graphs exist, so no later allocation of the shared pool takes their place.
+            self._chunk_graph_dsa_topk_of_slots.append(kept)
+
+    def _receive_dsa_topk_of_the_decoder_graph(self, kwargs):
+        """Before a capture-time forward of the post-process: take the decoder's top-k."""
+        decoder = getattr(self, "_chunk_graph_dsa_topk_source_block", None)
+        kept = getattr(decoder, "_chunk_graph_dsa_topk_of_last_capture_forward", None)
+        if not kept:
+            return
+        carrier = self._dsa_index_share_carrier(
+            kwargs.get("packed_seq_params"), kwargs.get("attention_mask")
+        )
+        self._write_dsa_topk(carrier, kept)
+
+    def _hand_dsa_topk_to_layers_outside_this_graph(self, carrier, slot):
+        """After a replay: the layers that run eagerly next read this slot's top-k."""
+        slots = getattr(self, "_chunk_graph_dsa_topk_of_slots", None)
+        if slots and slot < len(slots):
+            self._write_dsa_topk(carrier, slots[slot])
+
+    @staticmethod
+    def _write_dsa_topk(carrier, kept):
+        for holder_name, entries in kept.items():
+            if not entries:
+                continue
+            holder = getattr(carrier, holder_name, None)
+            if holder is None:
+                holder = {}
+                setattr(carrier, holder_name, holder)
+            holder.update(entries)
 
     def _supply_attention_mask_of_a_fixed_length_graph(self, hidden_states, kwargs):
         """Give a fixed-length graph that was captured with an attention mask one at replay.
@@ -562,6 +821,15 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
             return
         if kwargs.get("attention_mask") is not None:
             return
+        if getattr(self, "_has_custom_layers", False):
+            # What a missing mask means to a custom layer is its own business.
+            raise ValueError(
+                "cuda_graph_impl='chunk_wise' captured this block with the dataloader's "
+                "attention mask, but the block was called without one (a pipeline stage that "
+                "is neither the first nor the last receives no batch). The block holds custom "
+                "layers, which the stack hands the attention mask: pass the attention mask on "
+                "every stage or set create_attention_mask_in_dataloader=False."
+            )
         # hidden_states is [tokens, batch, hidden] in the block's own frame: CP-local and, with
         # sequence parallelism, TP-local. The mask is [batch, 1, CP-local tokens, tokens].
         local_seq_length, micro_batch_size = hidden_states.shape[0], hidden_states.shape[1]
@@ -598,7 +866,11 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
 
     def _te_cuda_graph_replay(self, *args, **kwargs):
         """Replay the graph of microbatch ``current_microbatch``."""
-        args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
+        args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs, replay=True)
+        # What the model hands this block it also hands the layers that run after it.
+        dsa_topk_carrier = self._dsa_index_share_carrier(
+            kwargs.get("packed_seq_params"), kwargs.get("attention_mask")
+        )
         self._decompose_packed_seq_params_to_kwargs(kwargs)
         # The pipeline input is the positional graph input of the shared replay.
         if args:
@@ -625,8 +897,15 @@ class ChunkCudaGraphBlockMixin(TECudaGraphMixin):
                 "data). A step with more microbatches needs a new capture: keep the global "
                 "batch size fixed, or relaunch from a checkpoint after it changes."
             )
-        with self._chunk_graph_replay_quantization_context():
-            return super()._te_cuda_graph_replay(hidden_states, *args, **kwargs)
+        output = self._replay_under_quantization_context(
+            lambda: super(ChunkCudaGraphBlockMixin, self)._te_cuda_graph_replay(
+                hidden_states, *args, **kwargs
+            )
+        )
+        self._hand_dsa_topk_to_layers_outside_this_graph(
+            dsa_topk_carrier, microbatch_id % num_slots
+        )
+        return output
 
 
 class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
@@ -781,6 +1060,13 @@ class ChunkCudaGraphPostProcessBlock(ChunkCudaGraphBlockMixin, GraphableMegatron
             # copy.
             inputs["padding_mask"] = torch.zeros(1, tokens, dtype=torch.bool, device=device)
         return inputs
+
+
+def _is_the_same_kind_of_recipe(recipe, other) -> bool:
+    """Transformer Engine's test for an unchanged recipe type (``init_fp8_metadata``)."""
+    return recipe is not None and (
+        isinstance(recipe, type(other)) or isinstance(other, type(recipe))
+    )
 
 
 def _thd_max_packed_sequences(config) -> int:

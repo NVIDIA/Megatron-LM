@@ -1641,7 +1641,7 @@ class TestChunkStaticInputs:
         assert attention_mask.shape == (micro_batch_size, 1, local_seq_length, seq_length)
         causal = ~torch.tril(torch.ones(local_seq_length, seq_length, dtype=torch.bool)).cuda()
         assert torch.equal(attention_mask, causal.expand(micro_batch_size, 1, -1, -1))
-        # No packed metadata, and no mask input unless a layer received one in eager warm-up.
+        # No packed metadata, and no mask input unless the block received one in eager warm-up.
         assert "cu_seqlens_q" not in static_inputs
         assert "padding_mask" not in static_inputs
 
@@ -1814,31 +1814,18 @@ class TestChunkTokenMetadata:
         static_inputs = block.get_layer_static_inputs(seq_length=16, micro_batch_size=2)
 
         assert static_inputs["input_ids"].shape == (2, 8)
-        # No layer of the block received a padding mask in the eager warm-up steps.
+        # The block received no padding mask in the eager warm-up steps.
         assert "padding_mask" not in static_inputs
         assert block._chunk_graph_captures_padding_mask is False
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_fixed_length_capture_reserves_the_padding_mask_a_layer_received(self):
-        """Like the per-layer capture: a layer that saw a mask during the eager warm-up steps
-        makes the block graph take one, in the block's token frame."""
-        block = self._block((8, 2, 8), thd=False, sequence_parallel=False)
-        block.layer = torch.nn.Identity()
-        block.layer._padding_mask_shape_seen = (2, 8)
-
-        static_inputs = block.get_layer_static_inputs(seq_length=8, micro_batch_size=2)
-
-        assert static_inputs["padding_mask"].shape == (2, 8)
-        assert not static_inputs["padding_mask"].any()
-        assert block._chunk_graph_captures_padding_mask is True
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("cuda_graph_impl", ["chunk_wise", "transformer_engine"])
     def test_fixed_length_capture_reserves_the_padding_mask_the_block_received(
         self, cuda_graph_impl
     ):
-        """The hyper-connection layers consume the mask without recording it per layer, so a
-        chunk-wise block also notes a mask where the model hands it over."""
+        """Like the per-layer capture: a mask the model handed the block during the eager
+        warm-up steps makes the block graph take one, in the block's token frame. The note is
+        the block's own (the layers record theirs for the per-layer capture only)."""
         block = self._block(
             (8, 2, 8), thd=False, sequence_parallel=False, cuda_graph_impl=cuda_graph_impl
         )
@@ -1855,6 +1842,136 @@ class TestChunkTokenMetadata:
             assert block._chunk_graph_captures_padding_mask is True
         else:
             assert "padding_mask" not in static_inputs
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_custom_layers_take_the_token_ids_the_model_handed_the_block(self):
+        """A hybrid stack passes the token ids it receives to its custom layers, and the model
+        hands them to the stages that have them. The block graph takes the ids as an input
+        where an eager warm-up call brought them, exactly as the model hands them; ids that
+        arrive at a graph captured without them are refused instead of being dropped."""
+
+        def block_with_custom_layers(has_custom_layers=True):
+            block = self._block(
+                (8, 2, 8), thd=False, sequence_parallel=False, cuda_graph_impl="chunk_wise"
+            )
+            block._has_custom_layers = has_custom_layers
+            block.forward = lambda hidden_states, input_ids=None: hidden_states
+            return block
+
+        hidden_states = torch.zeros(8, 2, 8)
+        input_ids = torch.zeros(2, 8, dtype=torch.long)
+
+        # A stage the model hands no ids (a later pipeline stage): eager and captured alike,
+        # the custom layers run without them.
+        block = block_with_custom_layers()
+        block(hidden_states)
+        assert "input_ids" not in block.get_layer_static_inputs(seq_length=8, micro_batch_size=2)
+        kwargs = {}
+        block._align_token_metadata_to_block(hidden_states, kwargs)
+        assert kwargs == {}
+        with pytest.raises(RuntimeError, match="captured without an input_ids input"):
+            block._align_token_metadata_to_block(hidden_states, {"input_ids": input_ids})
+
+        block = block_with_custom_layers()
+        block(hidden_states, input_ids=input_ids)
+        static_inputs = block.get_layer_static_inputs(seq_length=8, micro_batch_size=2)
+        assert static_inputs["input_ids"].shape == (2, 8)
+        assert static_inputs["input_ids"].dtype == torch.long
+        kwargs = {"input_ids": input_ids}
+        block._align_token_metadata_to_block(hidden_states, kwargs)
+        assert kwargs["input_ids"] is input_ids
+
+        # Nothing reads the ids in a block without custom layers or hash routers.
+        block = block_with_custom_layers(has_custom_layers=False)
+        block(hidden_states, input_ids=input_ids)
+        assert "input_ids" not in block.get_layer_static_inputs(seq_length=8, micro_batch_size=2)
+        kwargs = {"input_ids": input_ids}
+        block._align_token_metadata_to_block(hidden_states, kwargs)
+        assert kwargs["input_ids"] is input_ids
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_an_evaluation_forward_does_not_decide_the_inputs_of_the_graph(self):
+        """Only training forwards replay a graph. An evaluation between the eager warm-up
+        steps and the capture may bring a batch of another shape, or inputs the training
+        forwards of this stage never get: neither sizes nor adds a graph input."""
+        block = self._block(
+            (8, 2, 8), thd=False, sequence_parallel=False, cuda_graph_impl="chunk_wise"
+        )
+        block._has_custom_layers = True
+        block.forward = lambda hidden_states, input_ids=None, padding_mask=None: hidden_states
+        hidden_states = torch.zeros(8, 2, 8)
+
+        block.train()
+        block(hidden_states, input_ids=torch.zeros(2, 8, dtype=torch.long))
+        block.eval()
+        block(
+            torch.zeros(8, 3, 8),
+            input_ids=torch.zeros(3, 8, dtype=torch.long),
+            padding_mask=torch.zeros(3, 8, dtype=torch.bool),
+        )
+        block.train()
+
+        static_inputs = block.get_layer_static_inputs(seq_length=8, micro_batch_size=2)
+        assert static_inputs["input_ids"].shape == (2, 8)
+        assert "padding_mask" not in static_inputs
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_custom_layers_take_unsharded_ids_where_the_model_hands_them_unsharded(self):
+        """Sequence parallelism, a stage after the embedding: the model hands the stack the
+        unsharded ids (8 tokens) next to the rank's 4 tokens of activations, and the eager
+        stack passes them to its custom layers as they are. So does the graph; the hash
+        routers of a stack without custom layers get the rank's shard, which is what they
+        take from full-length ids themselves."""
+
+        def later_stage_block(has_custom_layers):
+            block = self._block(cuda_graph_impl="chunk_wise", moe_n_hash_layers=1)
+            block.pre_process = False
+            block._has_custom_layers = has_custom_layers
+            block.router = torch.nn.Identity()
+            block.router.is_hash_layer = True
+            block.forward = lambda hidden_states, input_ids=None: hidden_states
+            return block
+
+        hidden_states = torch.zeros(4, 1, 8)
+        unsharded_ids = torch.arange(8).unsqueeze(0)
+
+        block = later_stage_block(has_custom_layers=True)
+        block(hidden_states, input_ids=unsharded_ids)
+        static_inputs = block.get_layer_static_inputs(seq_length=8, micro_batch_size=1)
+        assert static_inputs["input_ids"].shape == (1, 8)
+        kwargs = {"input_ids": unsharded_ids}
+        block._align_token_metadata_to_block(hidden_states, kwargs)
+        assert kwargs["input_ids"] is unsharded_ids
+
+        block = later_stage_block(has_custom_layers=False)
+        block(hidden_states, input_ids=unsharded_ids)
+        static_inputs = block.get_layer_static_inputs(seq_length=8, micro_batch_size=1)
+        assert static_inputs["input_ids"].shape == (1, 4)
+        kwargs = {"input_ids": unsharded_ids}
+        block._align_token_metadata_to_block(hidden_states, kwargs)
+        assert kwargs["input_ids"].tolist() == [[4, 5, 6, 7]]
+
+    def test_custom_layers_get_no_stand_in_for_a_missing_attention_mask(self):
+        """A stage that receives no batch calls a block captured with the dataloader's attention
+        mask without one. For the attention modules of Megatron and Transformer Engine the
+        replay passes the mask that means the same as none; what a missing mask means to a
+        custom layer is not known, so a stack with custom layers refuses."""
+        block = self._block((8, 2, 8), thd=False, sequence_parallel=False)
+        block._chunk_graph_captures_attention_mask = True
+        hidden_states = torch.zeros(8, 2, 8)
+
+        kwargs = {}
+        block._supply_attention_mask_of_a_fixed_length_graph(hidden_states, kwargs)
+        assert kwargs["attention_mask"].shape == (2, 1, 8, 8) and not kwargs["attention_mask"].any()
+
+        block._has_custom_layers = True
+        with pytest.raises(ValueError, match="holds custom layers"):
+            block._supply_attention_mask_of_a_fixed_length_graph(hidden_states, {})
+        # A mask the model does hand over is passed on.
+        mask = torch.zeros(2, 1, 8, 8, dtype=torch.bool)
+        kwargs = {"attention_mask": mask}
+        block._supply_attention_mask_of_a_fixed_length_graph(hidden_states, kwargs)
+        assert kwargs["attention_mask"] is mask
 
     def test_replay_shards_full_length_metadata_like_the_layers_do(self):
         block = self._block()
@@ -1896,7 +2013,8 @@ class TestChunkTokenMetadata:
 
     def test_mask_arriving_at_a_graph_captured_without_one(self):
         """The graphed callable would drop the keyword silently. Nothing reads it in a block
-        without MoE routers; with them the replay would diverge from eager, so it raises."""
+        without MoE routers or custom layers; with them the replay would diverge from eager, so
+        it raises."""
         hidden_states = torch.zeros(4, 1, 8)
         mask = torch.zeros(1, 4, dtype=torch.bool)
 
@@ -1910,6 +2028,11 @@ class TestChunkTokenMetadata:
         block._chunk_graph_captures_padding_mask = False
         with pytest.raises(RuntimeError, match="captured without a padding_mask input"):
             block._align_token_metadata_to_block(hidden_states, {"padding_mask": mask})
+        custom = self._block()
+        custom._has_custom_layers = True
+        custom._chunk_graph_captures_padding_mask = False
+        with pytest.raises(RuntimeError, match="captured without a padding_mask input"):
+            custom._align_token_metadata_to_block(hidden_states, {"padding_mask": mask})
         # No mask, no complaint.
         kwargs = {}
         block._align_token_metadata_to_block(hidden_states, kwargs)
@@ -2184,6 +2307,424 @@ def _record_graph_replays(monkeypatch):
 
     monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", recording_replay)
     return replays
+
+
+@pytest.mark.internal
+class TestChunkCallableHostState:
+    """Host-side state a replay does not refresh: what a block keeps or hands on so that the
+    code running outside its graph (the eager post-process, an evaluation, the next capture,
+    the training loop's loss scales) finds what an eager forward would have left."""
+
+    _block = staticmethod(TestChunkTokenMetadata._block)
+
+    def test_dsa_topk_a_later_layer_reuses_crosses_the_graph_boundary(self, monkeypatch):
+        """``dsa_indexer_topk_freq > 1``: the first MTP layer may reuse the top-k indices of a
+        decoder layer, which DSA layers pass on through a dict on the object the model hands
+        every layer (packed-sequence metadata, else the attention mask, else the config). The
+        MTP runs outside the decoder block's graph and a replay runs none of the Python that
+        fills the dict, so the block keeps the index tensors of each slot's recorded forward
+        and hands them on: to the post-process capture that follows, and after every replay
+        to the object the model passes to the layers that run eagerly."""
+        from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+
+        topk_name, length_name = DSAttention._HOLDER_ATTR, DSAttention._LENGTH_HOLDER_ATTR
+        decoder = self._block(cuda_graph_impl="chunk_wise")
+        decoder._chunk_graph_dsa_topk_shared_layers = (3,)
+        decoder.reset_dsa_topk_shared_across_graphs()
+        postprocess = self._block(cuda_graph_impl="chunk_wise")
+        object.__setattr__(postprocess, "_chunk_graph_dsa_topk_source_block", decoder)
+
+        def capture_time_forward(recorded):
+            """What a decoder forward leaves on the metadata its capture rebuilt: layers 1 and
+            3 selected their keys, the MTP reuses layer 3's."""
+            carrier = SimpleNamespace()
+            topk, length = torch.zeros(2, 4), torch.zeros(2)
+            setattr(carrier, topk_name, {1: torch.zeros(2, 4), 3: topk})
+            setattr(carrier, length_name, {3: length})
+            monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: recorded)
+            decoder._keep_dsa_topk_for_layers_outside_this_graph({"packed_seq_params": carrier})
+            return topk, length
+
+        def carried(carrier):
+            return getattr(carrier, topk_name, None), getattr(carrier, length_name, None)
+
+        # Transformer Engine's eager warm-up passes: the post-process that runs right after
+        # the decoder gets the indices, no slot is recorded.
+        topk, length = capture_time_forward(recorded=False)
+        rebuilt = SimpleNamespace()
+        postprocess._receive_dsa_topk_of_the_decoder_graph({"packed_seq_params": rebuilt})
+        assert carried(rebuilt)[0].keys() == {3} and carried(rebuilt)[0][3] is topk
+        assert carried(rebuilt)[1][3] is length
+        assert decoder._chunk_graph_dsa_topk_of_slots == []
+
+        # The recorded forwards, in slot order.
+        slots = [capture_time_forward(recorded=True) for _ in range(2)]
+        rebuilt = SimpleNamespace()
+        postprocess._receive_dsa_topk_of_the_decoder_graph({"packed_seq_params": rebuilt})
+        assert carried(rebuilt)[0][3] is slots[1][0]
+
+        # After a replay: whatever the model hands the eager layers next carries the slot's.
+        packed, mask = SimpleNamespace(), torch.zeros(1)
+        assert decoder._dsa_index_share_carrier(packed, mask) is packed
+        assert decoder._dsa_index_share_carrier(None, mask) is mask
+        assert decoder._dsa_index_share_carrier(None, None) is decoder.config
+        for carrier in (packed, mask, decoder.config):
+            # What an evaluation forward left behind is replaced, other layers stay.
+            setattr(carrier, topk_name, {1: "other", 3: "stale"})
+            for slot, (topk, length) in enumerate(slots):
+                decoder._hand_dsa_topk_to_layers_outside_this_graph(carrier, slot)
+                assert carried(carrier)[0] == {1: "other", 3: topk}
+                assert carried(carrier)[0][3] is topk and carried(carrier)[1][3] is length
+
+        # A new capture starts from nothing; so does a block no later layer reuses.
+        decoder.reset_dsa_topk_shared_across_graphs()
+        untouched = SimpleNamespace()
+        decoder._hand_dsa_topk_to_layers_outside_this_graph(untouched, 0)
+        postprocess._receive_dsa_topk_of_the_decoder_graph({"packed_seq_params": untouched})
+        assert carried(untouched) == (None, None)
+        plain = self._block(cuda_graph_impl="chunk_wise")
+        plain.reset_dsa_topk_shared_across_graphs()
+        carrier = SimpleNamespace()
+        setattr(carrier, topk_name, {3: torch.zeros(1)})
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        plain._keep_dsa_topk_for_layers_outside_this_graph({"packed_seq_params": carrier})
+        assert plain._chunk_graph_dsa_topk_of_slots == []
+
+    @pytest.mark.parametrize("scaler_name", ["moe_aux_loss", "dsa_indexer_loss"])
+    def test_loss_scale_set_after_a_capture_at_the_first_iteration(self, scaler_name):
+        """With ``cuda_graph_warmup_steps=0`` the capture's eager passes run a backward before
+        the training loop has published a loss scale: the scaler creates its default, a 0-dim
+        tensor, and the captured backward keeps that address. The loop's scale has shape [1]
+        and has to be written into that same tensor."""
+        if scaler_name == "moe_aux_loss":
+            from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler as scaler
+        else:
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                DSAIndexerLossAutoScaler as scaler,
+            )
+        previous = scaler.main_loss_backward_scale
+        try:
+            scaler.main_loss_backward_scale = None
+            loss = torch.ones(1, requires_grad=True)
+            scaler.apply(torch.zeros(1, requires_grad=True), loss).sum().backward()
+            captured = scaler.main_loss_backward_scale
+            assert captured.shape == () and loss.grad.item() == 1.0
+
+            scaler.set_loss_scale(torch.full((1,), 0.25))
+            assert scaler.main_loss_backward_scale is captured and captured.item() == 0.25
+            # The usual order (a scale of shape [1] first, then more of them) is unchanged.
+            scaler.main_loss_backward_scale = None
+            first = torch.ones(1)
+            scaler.set_loss_scale(first)
+            scaler.set_loss_scale(torch.full((1,), 0.5))
+            assert scaler.main_loss_backward_scale.shape == (1,)
+            assert scaler.main_loss_backward_scale.item() == 0.5
+        finally:
+            scaler.main_loss_backward_scale = previous
+
+    def test_per_expert_bias_takes_the_token_counts_the_dispatch_knew_on_the_host(
+        self, monkeypatch
+    ):
+        """Grouped-tensor experts move the per-expert token counts to the device. A per-expert
+        bias (a list, without ``moe_single_grouped_bias``) is added expert by expert and needs
+        the counts as Python ints: reading them back from the device is a host read a block
+        capture cannot record. The counts of a drop-and-pad dispatch were on the host before
+        they moved, and the bias takes them from there."""
+        from megatron.core.transformer.moe import experts
+
+        assert experts._host_token_counts([2, 1]) == [2, 1]
+        assert experts._host_token_counts(torch.tensor([2, 1])) == [2, 1]
+        if torch.cuda.is_available():
+            assert experts._host_token_counts(torch.tensor([2, 1], device="cuda")) is None
+
+        output = torch.arange(12.0).view(3, 4)
+        probs = torch.tensor([[1.0], [0.5], [2.0]])
+        biases = [torch.full((4,), 10.0), torch.full((4,), 100.0)]
+        counts_on_device = torch.tensor([2, 1])
+        expected = experts.TEGroupedMLP._apply_bias(None, output, biases, [2, 1], probs)
+        assert torch.equal(expected[2], output[2] + 200.0)
+
+        def host_read(tensor):
+            raise AssertionError("the token counts were read back from the device")
+
+        monkeypatch.setattr(torch.Tensor, "tolist", host_read)
+        # Counts that only exist on the device are still read (eager, as before).
+        with pytest.raises(AssertionError, match="read back from the device"):
+            experts.TEGroupedMLP._apply_bias(None, output, biases, counts_on_device, probs)
+        # The forward hangs the counts it had on the host on the tensor it moves to the device.
+        counts_on_device.host_token_counts = [2, 1]
+        actual = experts.TEGroupedMLP._apply_bias(None, output, biases, counts_on_device, probs)
+        assert torch.equal(actual, expected)
+
+    def test_grouped_tensor_experts_hand_the_bias_the_counts_they_had_on_the_host(
+        self, monkeypatch
+    ):
+        """``TEGroupedMLP.forward`` hangs the token counts it had on the host (a list, or the
+        CPU tensor of a drop-and-pad dispatch) on the tensor it hands the expert computation,
+        and the per-expert bias takes them from that tensor without a read back; counts that
+        only exist on the device carry none."""
+        from megatron.core.transformer.moe import experts
+
+        module = experts.TEGroupedMLP.__new__(experts.TEGroupedMLP)
+        module.config = SimpleNamespace(fp8=False, fp4=False, moe_paged_stash=False)
+        module._with_fused_impl = False
+        module._use_grouped_tensor = True
+        monkeypatch.setattr(experts, "skip_routed_expert_padding", lambda _config: True)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        biases = [torch.full((4,), 10.0, device=device), torch.full((4,), 100.0, device=device)]
+        handed_over = []
+
+        def host_read(tensor):
+            raise AssertionError("the token counts were read back from the device")
+
+        def unfused_forward(hidden_states, tokens_per_expert, permuted_probs):
+            handed_over.append(tokens_per_expert)
+            if not hasattr(tokens_per_expert, "host_token_counts"):
+                return hidden_states
+            with monkeypatch.context() as patched:
+                patched.setattr(torch.Tensor, "tolist", host_read)
+                return module._apply_bias(hidden_states, biases, tokens_per_expert, permuted_probs)
+
+        module._unfused_forward = unfused_forward
+        output = torch.arange(16.0, device=device).view(4, 4)
+        probs = torch.tensor([1.0, 0.5, 2.0, 4.0], device=device)
+        # Uniform counts (every expert padded to its capacity) and counts that differ.
+        for counts in ([2, 2], [3, 1]):
+            expected = experts.TEGroupedMLP._apply_bias(
+                None, output, biases, counts, probs.unsqueeze(-1)
+            )
+            assert torch.equal(expected[3], output[3] + 400.0)
+            for on_host in (counts, torch.tensor(counts)):
+                actual, output_bias = module.forward(output, on_host, probs)
+                assert output_bias is None and torch.equal(actual, expected)
+                counts_for_te = handed_over.pop()
+                assert counts_for_te.device.type == device and counts_for_te.dtype == torch.int64
+                assert counts_for_te.host_token_counts == counts
+        if device == "cuda":
+            on_device = torch.tensor([3, 1], device=device)
+            module.forward(output, on_device, probs)
+            assert handed_over.pop() is on_device
+            assert not hasattr(on_device, "host_token_counts")
+
+    def test_token_counts_that_differ_per_expert_are_uploaded_without_waiting(self, monkeypatch):
+        """Counts on the host that are the same for every expert are created on the device.
+        Counts that differ are uploaded: from a host tensor without waiting for the stream
+        (as without this helper), except inside a capture, which would record the address of
+        a temporary host buffer; there the blocking upload makes the capture stop."""
+        if not torch.cuda.is_available():
+            pytest.skip("needs a CUDA device")
+        from megatron.core.transformer.moe import experts
+
+        uploads = []
+        original_to = torch.Tensor.to
+
+        def recording_to(tensor, *args, **kwargs):
+            uploads.append(kwargs.get("non_blocking"))
+            return original_to(tensor, *args, **kwargs)
+
+        counts = torch.tensor([3, 1])
+        monkeypatch.setattr(torch.Tensor, "to", recording_to)
+        assert experts._token_counts_on_device(torch.tensor([2, 2]), "cuda").tolist() == [2, 2]
+        assert uploads == []
+        on_device = experts._token_counts_on_device(counts, "cuda")
+        assert uploads == [True]
+        monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        captured = experts._token_counts_on_device(counts, "cuda")
+        assert uploads == [True]
+        monkeypatch.undo()
+        assert on_device.tolist() == captured.tolist() == [3, 1]
+        assert on_device.is_cuda and captured.is_cuda
+
+    @pytest.mark.parametrize("natively", [True, False])
+    def test_grouped_tensor_experts_follow_transformer_engine_under_a_block_capture(
+        self, monkeypatch, natively
+    ):
+        """Where Transformer Engine leaves its native grouped-tensor path (FP8 delayed scaling,
+        FP32 parameters, ...) it reads the split sizes on the host. The predicate that decides
+        it gets the model-wide recipe and parameter dtype of the config."""
+        grouped_linear = pytest.importorskip("transformer_engine.pytorch.module.grouped_linear")
+        if not hasattr(grouped_linear, "is_module_grouped_tensor_path_supported"):
+            pytest.skip("this Transformer Engine has no grouped-tensor predicate")
+        from megatron.core.transformer.moe import experts
+
+        seen = []
+
+        def predicate(recipe, dtype):
+            seen.append((recipe, dtype))
+            return natively
+
+        monkeypatch.setattr(grouped_linear, "is_module_grouped_tensor_path_supported", predicate)
+        config = SimpleNamespace(bf16=True, fp16=False, fp8=None, fp4=None)
+        assert experts._te_runs_grouped_tensors_natively(config) is natively
+        assert seen == [(None, torch.bfloat16)]
+        config = SimpleNamespace(bf16=False, fp16=False, fp8=None, fp4=None)
+        assert experts._te_runs_grouped_tensors_natively(config) is natively
+        assert seen[-1] == (None, torch.float32)
+        # A model-wide FP8 mode: the predicate gets the recipe the model trains with.
+        from megatron.core import fp8_utils
+
+        monkeypatch.setattr(fp8_utils, "get_fp8_recipe", lambda config: "the model's recipe")
+        config = SimpleNamespace(bf16=True, fp16=False, fp8="hybrid", fp4=None)
+        assert experts._te_runs_grouped_tensors_natively(config) is natively
+        assert seen[-1] == ("the model's recipe", torch.bfloat16)
+
+    def test_grouped_tensor_experts_keep_their_token_counts_on_the_host_where_te_reads_them(
+        self, monkeypatch
+    ):
+        """Under a whole-block capture, grouped-tensor experts of a drop-and-pad MoE hand
+        Transformer Engine the token counts as a host list exactly where it would read them on
+        the host (it leaves its native grouped path): not for another graph implementation,
+        another dispatch, the operation fuser, paged stash or single grouped parameters. The
+        last follows the parameters Transformer Engine built, not the options: without
+        ``NVTE_GROUPED_LINEAR_SINGLE_PARAM`` it builds per-expert parameters whatever
+        ``moe_single_grouped_weight`` / ``moe_single_grouped_bias`` ask for."""
+        from megatron.core.transformer.moe import experts
+
+        natively = [False]
+        monkeypatch.setattr(experts, "_te_runs_grouped_tensors_natively", lambda _: natively[0])
+
+        def needs_host_counts(with_fused_impl=False, single_grouped_parameters=False, **settings):
+            config = SimpleNamespace(
+                **{
+                    "cuda_graph_impl": "chunk_wise",
+                    "moe_paged_stash": False,
+                    "moe_expert_capacity_factor": 1.0,
+                    "moe_pad_expert_input_to_capacity": True,
+                    **settings,
+                }
+            )
+            return experts._block_capture_needs_host_token_counts(
+                config, with_fused_impl, single_grouped_parameters
+            )
+
+        assert needs_host_counts()
+        # The options alone decide nothing.
+        assert needs_host_counts(moe_single_grouped_weight=True, moe_single_grouped_bias=True)
+        for unaffected in (
+            dict(cuda_graph_impl="none"),
+            dict(cuda_graph_impl="transformer_engine"),
+            dict(moe_expert_capacity_factor=None),
+            dict(moe_pad_expert_input_to_capacity=False),
+            dict(moe_paged_stash=True),
+            dict(single_grouped_parameters=True),
+            dict(with_fused_impl=True),
+        ):
+            assert not needs_host_counts(**unaffected), unaffected
+        natively[0] = True
+        assert not needs_host_counts()
+
+    def test_block_keeps_the_weight_caches_its_graphs_address(self):
+        """With a model-wide FP8 / FP4 mode the graphs re-quantize the weights into Transformer
+        Engine's per-module caches in place and read them back. A module drops its cache when
+        an eager forward finds another kind of recipe on it (an evaluation recipe of another
+        kind than the training one); the graphs would then address freed memory. The block
+        holds the tensors from the end of the capture until its graphs are gone."""
+        block = self._block(cuda_graph_impl="chunk_wise")
+        block.linear = torch.nn.Identity()
+        cached_weight = object()
+        block.linear._fp8_workspaces = {"weight": cached_weight}
+        block.plain = torch.nn.Identity()
+
+        block.keep_what_the_graphs_address()  # where the capture ends
+        assert block._chunk_graph_weight_caches == [cached_weight]
+        # Transformer Engine drops the cache at an evaluation; the block still holds it, and
+        # replays do not look again.
+        block.linear._fp8_workspaces.clear()
+        assert block._replay_under_quantization_context(lambda: "replayed") == "replayed"
+        assert block._chunk_graph_weight_caches == [cached_weight]
+        # New graphs: nothing of the old ones is kept, and their capture reads again.
+        block.forget_what_earlier_graphs_addressed()
+        assert block._chunk_graph_weight_caches is None
+        assert block._te_modules_with_their_own_recipe is None
+        block.keep_what_the_graphs_address()
+        assert block._chunk_graph_weight_caches == []
+
+    def test_module_evaluated_under_another_recipe_gets_the_state_of_the_graphs_back(self):
+        """A module with a quantized ``evaluation_recipe`` of another kind than its training
+        recipe changes its recipe type at every evaluation: Transformer Engine then drops its
+        cached weight and rebuilds its scaling state. The graphs address what the capture
+        left, so the block hands exactly that back before every replay; modules without an
+        evaluation recipe of their own are not touched."""
+        block = self._block(cuda_graph_impl="chunk_wise")
+
+        def te_module(evaluation_recipe):
+            module = torch.nn.Identity()
+            module.te_quant_params = SimpleNamespace(evaluation_recipe=evaluation_recipe)
+            module._fp8_workspaces = {"weight": object()}
+            module.quantizers = {"scaling_fwd": [object()]}
+            module.fp8_meta = {"recipe": object(), "scaling_fwd": object(), "other": 1}
+            return module
+
+        quantized = SimpleNamespace(fp8_quantization_recipe="mxfp8", fp4_quantization_recipe=None)
+        bf16 = SimpleNamespace(fp8_quantization_recipe=None, fp4_quantization_recipe=None)
+        block.own, block.bf16_eval, block.plain = (
+            te_module(quantized),
+            te_module(bf16),
+            te_module(None),
+        )
+        # Trains in BF16 and only evaluates quantized: recorded without any quantization state
+        # (Transformer Engine's initial, empty quantizers). Its graphs address none, and
+        # handing the empty lists back would take away what an evaluation built.
+        block.bf16_train = te_module(quantized)
+        block.bf16_train._fp8_workspaces = {}
+        block.bf16_train.quantizers = {"scaling_fwd": []}
+        block.bf16_train.fp8_meta = {"other": 1}
+
+        def snapshot(module):
+            return (
+                dict(module._fp8_workspaces),
+                dict(module.quantizers),
+                {key: module.fp8_meta[key] for key in ("recipe", "scaling_fwd")},
+            )
+
+        captured = snapshot(block.own)
+        block.keep_what_the_graphs_address()  # where the capture ends
+        assert [entry[0] for entry in block._state_of_modules_evaluated_otherwise()] == [block.own]
+
+        # An evaluation: another kind of recipe, the cache dropped, the scaling state rebuilt.
+        others = (block.bf16_eval, block.plain, block.bf16_train)
+        for module in (block.own,) + others:
+            module._fp8_workspaces.clear()
+            module._fp8_workspaces["weight"] = object()
+            module.quantizers["scaling_fwd"] = [object()]
+            module.fp8_meta.update(recipe=object(), scaling_fwd=object())
+        untouched = [snapshot(module) for module in others]
+
+        seen = []
+        block._replay_under_quantization_context(lambda: seen.append(snapshot(block.own)))
+        assert seen == [captured]
+        assert block.own.fp8_meta["other"] == 1
+        assert [snapshot(module) for module in others] == untouched
+
+    def test_later_stage_replay_takes_the_pipeline_input_whatever_the_model_passes(self):
+        """A decoder block of a later pipeline stage computes on the activations it received
+        from the previous stage (``input_tensor``), and its eager forward ignores a
+        ``hidden_states`` argument (the models pass their ``decoder_input`` there). The replay
+        feeds the graph the same tensor; a capture gets Transformer Engine's sample, and the
+        post-process block always takes its argument."""
+        block = self._block(cuda_graph_impl="chunk_wise")
+        block.pre_process = False
+        pipeline_input, passed = torch.zeros(4, 1, 8), torch.ones(4, 1, 8)
+        block.input_tensor = pipeline_input
+
+        _, kwargs = block._prepare_pipeline_input_for_chunk_cuda_graph(
+            (), {"hidden_states": passed}, replay=True
+        )
+        assert kwargs["hidden_states"] is pipeline_input and block.input_tensor is pipeline_input
+        args, _ = block._prepare_pipeline_input_for_chunk_cuda_graph((passed,), {}, replay=True)
+        assert args[0] is pipeline_input
+        # Capture: the sample tensor becomes the block's input.
+        args, _ = block._prepare_pipeline_input_for_chunk_cuda_graph((passed,), {})
+        assert args[0] is passed and block.input_tensor is passed
+
+        block.input_tensor = pipeline_input
+        block.is_cuda_graph_postprocess_callable = True
+        args, _ = block._prepare_pipeline_input_for_chunk_cuda_graph((passed,), {}, replay=True)
+        assert args[0] is passed
+        # The stage with the embedding takes what the model computed.
+        block.pre_process, block.is_cuda_graph_postprocess_callable = True, False
+        args, _ = block._prepare_pipeline_input_for_chunk_cuda_graph((passed,), {}, replay=True)
+        assert args[0] is passed
 
 
 class _ChunkCaptureEnv:
@@ -2948,6 +3489,103 @@ class TestChunkGraphRegression:
         masked = _fixed_length_batch(micro_batch_size, seq_length, vocab, 0, padding_mask)
         with pytest.raises(RuntimeError, match="captured without a padding_mask input"):
             _train_step(model, masked)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        "fp8_delayed_scaling, single_grouped_bias",
+        [(False, False), (True, False), (True, True)],
+        ids=["bf16", "fp8-delayed-scaling", "fp8-delayed-scaling-single-grouped-bias-off-in-te"],
+    )
+    def test_grouped_tensor_experts_with_a_per_expert_bias_capture_and_replay(
+        self, chunk_capture, monkeypatch, fp8_delayed_scaling, single_grouped_bias
+    ):
+        """Drop-and-pad MoE with ``moe_use_grouped_tensor`` and a per-expert bias. Grouped-tensor
+        experts move the token counts to the device, and a block capture cannot record a read
+        back from it (the capture raises). Where Transformer Engine runs grouped tensors
+        natively (BF16 on a recent device), the bias takes the counts the dispatch knew on the
+        host; where it does not (FP8 delayed scaling: its fallback reads the split sizes on
+        the host), the experts of the captured model hand it the host list instead. That
+        decision follows the parameters Transformer Engine built: with
+        ``moe_single_grouped_bias`` and without ``NVTE_GROUPED_LINEAR_SINGLE_PARAM`` it builds
+        per-expert biases, and the experts are those of the row before."""
+        from megatron.core.extensions import transformer_engine as te_extension
+        from megatron.core.transformer.moe import experts as experts_module
+        from megatron.core.transformer.moe.moe_utils import MoEAuxLossAutoScaler
+
+        if not getattr(te_extension, "_TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR", False):
+            pytest.skip("This Transformer Engine's GroupedLinear has no grouped-tensor path")
+        precision = {}
+        if fp8_delayed_scaling:
+            from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+            fp8_available, reason = FP8GlobalStateManager.is_fp8_available()
+            if not fp8_available:
+                pytest.skip(f"FP8 not available on this device: {reason}")
+            precision = dict(
+                fp8="hybrid",
+                fp8_recipe="delayed",
+                fp8_amax_history_len=4,
+                fp8_amax_compute_algo="max",
+            )
+        if single_grouped_bias:
+            # Transformer Engine's default: the option is turned off with a warning.
+            monkeypatch.delenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", raising=False)
+            precision["moe_single_grouped_bias"] = True
+        micro_batch_size, seq_length, vocab = 2, 64, 128
+        chunk_capture.setup(micro_batch_size=micro_batch_size)
+        monkeypatch.setattr(MoEAuxLossAutoScaler, "main_loss_backward_scale", None)
+        model, twin = _build_chunk_gpt_model_and_eager_twin(
+            256,
+            4,
+            4,
+            512,
+            seq_length,
+            None,
+            packed=False,
+            vocab=vocab,
+            moe_use_grouped_tensor=True,
+            **_CHUNK_MOE,
+            **precision,
+        )
+        natively = experts_module._te_runs_grouped_tensors_natively(model.config)
+        assert not (fp8_delayed_scaling and natively)
+        for captured, eager in zip(model.decoder.layers, twin.decoder.layers):
+            assert isinstance(captured.mlp.experts, experts_module.TEGroupedMLP)
+            assert captured.mlp.experts.linear_fc2.use_bias
+            assert not getattr(captured.mlp.experts.linear_fc2, "single_grouped_bias", False)
+            # Only a block capture changes what the configuration asks for, and it changes
+            # both sides of the boundary: the form of the counts and Transformer Engine's path.
+            assert captured.mlp.experts._use_grouped_tensor is natively
+            assert captured.mlp.experts.linear_fc1.use_grouped_tensor is natively
+            assert captured.mlp.experts.linear_fc2.use_grouped_tensor is natively
+            assert eager.mlp.experts._use_grouped_tensor is True
+        batches = [
+            _fixed_length_batch(micro_batch_size, seq_length, vocab, seed) for seed in range(2)
+        ]
+
+        if not fp8_delayed_scaling:
+            chunk_capture.capture_and_replay_against_eager(
+                monkeypatch,
+                model,
+                twin,
+                batches,
+                seq_length,
+                micro_batch_size=micro_batch_size,
+                replays_per_step=2,
+            )
+            return
+        # The scales of delayed scaling follow the history of forwards, which the capture's
+        # own passes are part of: no step-by-step comparison with the twin here (the training
+        # run of this configuration is compared end to end). The capture and the replays run.
+        model.zero_grad_buffer = lambda: None
+        for batch in batches:
+            _train_step(model, batch)
+        chunk_capture.capture(model, seq_length, micro_batch_size)
+        replays = _record_graph_replays(monkeypatch)
+        for batch in batches:
+            per_token_loss = _train_step(model, batch)[0]
+            assert torch.isfinite(per_token_loss).all()
+        assert len(replays) >= 2 * len(batches)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_delayed_scaling_updates_fp8_scales_on_replay(self, chunk_capture, monkeypatch):

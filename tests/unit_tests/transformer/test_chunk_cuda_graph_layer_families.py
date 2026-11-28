@@ -395,7 +395,6 @@ def _build_dsa_gpt(cuda_graph_impl, tokens, max_num_seqs=None, **overrides):
     else:
         layout = _packed_config(cuda_graph_impl, tokens, max_num_seqs)
     config = MLATransformerConfig(
-        num_layers=2,
         hidden_size=128,
         num_attention_heads=4,
         q_lora_rank=32,
@@ -411,8 +410,20 @@ def _build_dsa_gpt(cuda_graph_impl, tokens, max_num_seqs=None, **overrides):
         # Fewer keys than a sequence holds: the selection is sparse.
         dsa_indexer_topk=16,
         dsa_indexer_loss_coeff=0.01,
-        **{**_BF16, **layout, **overrides},
+        **{"num_layers": 2, **_BF16, **layout, **overrides},
     )
+    mtp_block_spec = None
+    if config.mtp_num_layers:
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_transformer_layer_with_experimental_attention_variant_spec,
+        )
+        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
+
+        # As the model builder does: the MTP layer follows the decoder's attention pattern.
+        mtp_layer_spec = get_transformer_layer_with_experimental_attention_variant_spec(
+            config=config
+        )[-1]
+        mtp_block_spec = get_gpt_mtp_block_spec(config, mtp_layer_spec, use_transformer_engine=True)
     model_parallel_cuda_manual_seed(42)
     return GPTModel(
         config=config,
@@ -422,6 +433,7 @@ def _build_dsa_gpt(cuda_graph_impl, tokens, max_num_seqs=None, **overrides):
         vocab_size=_VOCAB,
         max_sequence_length=tokens,
         position_embedding_type="rope",
+        mtp_block_spec=mtp_block_spec,
     ).cuda()
 
 
@@ -504,6 +516,103 @@ def test_dsa_fixed_length_context_parallel_capture_replay_matches_eager(monkeypa
                 seq_length=seq_length,
                 micro_batch_size=micro_batch_size,
                 helpers=helpers,
+            )
+
+
+# Three decoder layers and one MTP layer with a top-k of every second layer: layers 1 and 3
+# select their keys, layer 2 reuses layer 1's and the MTP layer (number 4) reuses layer 3's,
+# across the boundary of the decoder block's graph.
+_DSA_TOPK_SHARED_WITH_MTP = dict(num_layers=3, mtp_num_layers=1, dsa_indexer_topk_freq=2)
+
+
+def _assert_the_mtp_layer_reuses_a_decoder_topk(model):
+    from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+
+    decoder = [m for m in model.decoder.modules() if isinstance(m, DSAttention)]
+    mtp = [m for m in model.mtp.modules() if isinstance(m, DSAttention)]
+    assert [(m.layer_number, m.skip_topk) for m in decoder] == [(1, False), (2, True), (3, False)]
+    assert [(m.layer_number, m.skip_topk, m.source_layer) for m in mtp] == [(4, True, 3)]
+
+
+@pytest.mark.launch_on_gb200
+def test_dsa_topk_shared_with_the_mtp_layer_packed_capture_replay_matches_eager(monkeypatch):
+    """DSA top-k sharing from a decoder layer into the MTP layer, packed sequences: the MTP
+    runs in the post-process graph, whose packed-sequence metadata is not the decoder graph's.
+    The decoder block hands the indices its captured forward computed to the post-process
+    capture, so the post-process graph reads the decoder graph's buffer at every replay."""
+    pytest.importorskip("fast_hadamard_transform")
+    tokens, max_num_seqs = 128, 4
+    packings = ([120], [60, 60], [32, 88], [16, 40, 60])
+
+    def make_batches():
+        return [
+            _thd_batch(seqlens, _VOCAB, seed, tokens, max_num_seqs)
+            for seed, seqlens in enumerate(packings)
+        ]
+
+    with _capture_state(micro_batch_size=1) as helpers:
+        model = _build_dsa_gpt("chunk_wise", tokens, max_num_seqs, **_DSA_TOPK_SHARED_WITH_MTP)
+        twin = _build_dsa_gpt("none", tokens, max_num_seqs, **_DSA_TOPK_SHARED_WITH_MTP)
+        _assert_the_mtp_layer_reuses_a_decoder_topk(model)
+        assert model.postprocess_block is not None and model.mtp_process
+        with _indexer_loss_state([model, twin]):
+            batches, reference, tolerance = _capture_replay_and_compare(
+                monkeypatch,
+                model,
+                twin,
+                make_batches,
+                _packed_step,
+                seq_length=tokens,
+                micro_batch_size=1,
+                helpers=helpers,
+            )
+            assert model.decoder._chunk_graph_dsa_topk_shared_layers == (3,)
+            _assert_stale_packing_is_visible(
+                model, _packed_step, batches[1], reference[1], tolerance
+            )
+
+
+@pytest.mark.launch_on_gb200
+def test_dsa_topk_shared_with_the_mtp_layer_fixed_length_capture_replay_matches_eager(monkeypatch):
+    """The same sharing with fixed-length batches: the MTP runs eagerly after the decoder
+    block's replay, and without an attention mask the layers find the shared indices on the
+    config. No replay runs the Python that puts them there, so the block does after every
+    replay; an evaluation forward in between leaves its own indices behind, which the next
+    training step must not read."""
+    pytest.importorskip("fast_hadamard_transform")
+    seq_length, micro_batch_size = 128, 2
+
+    def make_batches():
+        return [_fixed_length_batch(seed, micro_batch_size, seq_length) for seed in range(3)]
+
+    with _capture_state(micro_batch_size) as helpers:
+        model = _build_dsa_gpt("chunk_wise", seq_length, **_DSA_TOPK_SHARED_WITH_MTP)
+        twin = _build_dsa_gpt("none", seq_length, **_DSA_TOPK_SHARED_WITH_MTP)
+        _assert_the_mtp_layer_reuses_a_decoder_topk(model)
+        # The MTP layer, LM head and loss stay eager.
+        assert model.postprocess_block is None and model.mtp_process
+        with _indexer_loss_state([model, twin]):
+            batches, reference, tolerance = _capture_replay_and_compare(
+                monkeypatch,
+                model,
+                twin,
+                make_batches,
+                _fixed_length_step,
+                seq_length=seq_length,
+                micro_batch_size=micro_batch_size,
+                helpers=helpers,
+            )
+            # An evaluation forward (eager, another batch) between two replays.
+            model.eval()
+            with torch.no_grad():
+                evaluated = batches[2]
+                model(evaluated["input_ids"], evaluated["position_ids"], None)
+            model.train()
+            _assert_matches(
+                _fixed_length_step(model, batches[0]),
+                reference[0],
+                tolerance,
+                "replay after an evaluation forward",
             )
 
 
@@ -670,7 +779,107 @@ def test_gated_delta_net_fixed_length_capture_replay_matches_eager(monkeypatch, 
         )
 
 
-def _build_mok_gpt(cuda_graph_impl, seq_length, pg_collection):
+def _build_custom_layer_hybrid(cuda_graph_impl, seq_length, attention_layer):
+    """HybridModel whose stack holds two custom layers (layer configs with a ``layer_type``)
+    that scale every position by a function of its token id and by the rotary table the stack
+    hands them, behind an attention layer or (``attention_layer=False``) on their own."""
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
+    from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig, ExternalGainLayer
+
+    class TokenGainLayer(ExternalGainLayer):
+        """A custom layer whose output depends on the token ids and on the rotary table the
+        stack hands it."""
+
+        def forward(self, hidden_states, *, input_ids=None, rotary_pos_emb=None, **kwargs):
+            assert input_ids is not None and rotary_pos_emb is not None
+            # [batch, tokens] ids against [tokens, batch, hidden] activations.
+            token_scale = 1 + input_ids.transpose(0, 1).unsqueeze(-1).to(hidden_states.dtype) / (
+                2 * _VOCAB
+            )
+            tables = rotary_pos_emb if isinstance(rotary_pos_emb, tuple) else (rotary_pos_emb,)
+            table_scale = 1 + sum(table.float().abs().mean() for table in tables) / 8
+            return hidden_states * self.gain * token_scale * table_scale.to(hidden_states.dtype)
+
+    class TokenGainConfig(ExternalGainConfig):
+        layer_type = TokenGainLayer
+
+    root = TransformerConfig(
+        num_layers=3 if attention_layer else 2,
+        hidden_size=128,
+        num_attention_heads=4,
+        # The batch carries no attention mask (causal attention).
+        create_attention_mask_in_dataloader=False,
+        **{**_BF16, **_graph_config(cuda_graph_impl)},
+    )
+    custom = TokenGainConfig.from_config(root)
+    layers = [custom, custom]
+    if attention_layer:
+        layers.insert(0, AttentionLayerConfig.from_config(root))
+    model_parallel_cuda_manual_seed(42)
+    return HybridModel(
+        config=root,
+        vocab_size=_VOCAB,
+        max_sequence_length=seq_length,
+        hybrid_layer_config_list=layers,
+        position_embedding_type="rope",
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    ).cuda()
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("attention_layer", [True, False], ids=["behind_attention", "alone"])
+def test_custom_hybrid_layers_fixed_length_capture_replay_matches_eager(
+    monkeypatch, attention_layer
+):
+    """Custom layers of a hybrid stack (``hybrid_layer_config_list`` entries with a
+    ``layer_type``) are recorded with the block as they are written. The stack hands them the
+    token ids, which the model passes to the block only for them, and the rotary table: the
+    block graph takes both as inputs, also in a stack without an attention layer of Megatron's
+    own, so a replay scales by the ids of its own batch like eager does."""
+    seq_length, micro_batch_size = 64, 2
+
+    def make_batches():
+        return [_fixed_length_batch(seed, micro_batch_size, seq_length) for seed in range(3)]
+
+    with _capture_state(micro_batch_size) as helpers:
+        model = _build_custom_layer_hybrid("chunk_wise", seq_length, attention_layer)
+        twin = _build_custom_layer_hybrid("none", seq_length, attention_layer)
+        assert model.decoder._has_custom_layers
+        assert model.postprocess_block is None
+        _capture_replay_and_compare(
+            monkeypatch,
+            model,
+            twin,
+            make_batches,
+            _fixed_length_step,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            helpers=helpers,
+        )
+        # The ids are an input of the block graph, as the model hands them.
+        assert model.decoder._chunk_graph_captures_input_ids
+        sample = model.decoder.get_layer_static_inputs(seq_length, micro_batch_size)
+        assert sample["input_ids"].shape == (micro_batch_size, seq_length)
+
+
+def _select_mok_backend(monkeypatch, backend):
+    """Run ``backend`` or skip. The deprecated ``"mok"`` runs the standalone package only where
+    CuTe MoK cannot run, so its tests take that choice away (as the MoK numerics tests do)."""
+    from megatron.core.transformer.moe.megakernel.mok import package
+
+    if backend == "mok":
+        pytest.importorskip("mok.functional")
+        monkeypatch.setattr(package, "cutemok_available", lambda: False)
+    else:
+        pytest.importorskip("cudnn.moe_ep.cutemok")
+        if not package.cutemok_available():
+            pytest.skip("CuTe MoK cannot run here")
+    return package.clear_mok_caches
+
+
+def _build_mok_gpt(cuda_graph_impl, seq_length, pg_collection, backend):
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
     from megatron.core.models.gpt.gpt_model import GPTModel
 
@@ -690,7 +899,7 @@ def _build_mok_gpt(cuda_graph_impl, seq_length, pg_collection):
         gated_linear_unit=True,
         activation_func=F.silu,
         gradient_accumulation_fusion=True,
-        moe_megakernel_backend="mok",
+        moe_megakernel_backend=backend,
         moe_megakernel_backend_config=dict(
             fwd_num_comm_sms=2,
             bwd_num_comm_sms=2,
@@ -727,11 +936,13 @@ def _build_mok_gpt(cuda_graph_impl, seq_length, pg_collection):
 
 
 @pytest.mark.launch_on_gb200
-def test_mok_bf16_fixed_length_capture_replay_matches_eager(monkeypatch):
-    """The MoK megakernel with BF16 expert weights inside a one-layer block graph."""
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
+def test_mok_bf16_fixed_length_capture_replay_matches_eager(monkeypatch, backend):
+    """The MoK megakernel with BF16 expert weights inside a one-layer block graph, with the
+    standalone package and with CuTe MoK."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("MoK requires Blackwell SM100/SM103")
-    functional = pytest.importorskip("mok.functional")
+    clear_mok_caches = _select_mok_backend(monkeypatch, backend)
     if not is_te_min_version("2.14.0"):
         pytest.skip("CUDA graphs with the TE RNG tracker and grouped weights require TE >= 2.14.0")
     from megatron.core.process_groups_config import ProcessGroupCollection
@@ -744,9 +955,11 @@ def test_mok_bf16_fixed_length_capture_replay_matches_eager(monkeypatch):
     try:
         with _capture_state(micro_batch_size, expert_model_parallel_size=1) as helpers:
             groups = ProcessGroupCollection.use_mpu_process_groups()
-            model = _build_mok_gpt("chunk_wise", seq_length, groups)
-            twin = _build_mok_gpt("none", seq_length, groups)
-            assert model.module.decoder.layers[0].mlp.megakernel_experts is not None
+            model = _build_mok_gpt("chunk_wise", seq_length, groups, backend)
+            twin = _build_mok_gpt("none", seq_length, groups, backend)
+            megakernel = model.module.decoder.layers[0].mlp.megakernel_experts
+            assert megakernel is not None
+            assert (megakernel.cutemok is None) == (backend == "mok")
             _capture_replay_and_compare(
                 monkeypatch,
                 model,
@@ -758,7 +971,8 @@ def test_mok_bf16_fixed_length_capture_replay_matches_eager(monkeypatch):
                 helpers=helpers,
             )
     finally:
-        functional.clear_workspace_cache()
+        # After the graphs are gone: a plan must outlive the replays that use it.
+        clear_mok_caches()
 
 
 def _build_fp32_residual_gpt(cuda_graph_impl, seq_length):

@@ -905,7 +905,7 @@ class PagedStashManager:
     def _in_flight_peak(order, paged_vp_stages):
         """The most microbatches a chunk-level pipeline order keeps in flight on the VP stages
         with paged layers. ``order`` names model chunks from 1: ``c`` is a forward of chunk
-        ``c``, ``-c`` its backward (``convert_schedule_table_to_order``)."""
+        ``c``, ``-c`` its backward (``convert_te_cuda_graph_schedule_table_to_order``)."""
         in_flight = peak = 0
         for chunk_id in order:
             if abs(chunk_id) in paged_vp_stages:
@@ -1411,6 +1411,23 @@ def paged_stash_init_chunk_handler(vp_size, vp_stage):
     stash_manager.vp_size = vp_size if vp_size is not None else 1
     stash_manager.current_vp_stage = vp_stage if vp_stage is not None else 0
     stash_manager.update_model_chunk(stash_manager.current_vp_stage)
+
+
+def paged_stash_init_capture_chunk_handler(vp_size, vp_stage):
+    """``paged_stash_init_chunk_handler`` for one capture-time forward of a chunk CUDA graph.
+
+    Transformer Engine runs every slot of a stage once per pass (its eager passes, then the
+    recorded one), so a capture runs more forwards than a step has microbatches, and nothing
+    restarts the microbatch counter in between. A runtime key only has to be unique among the
+    stashes in flight (``stash_paged_tensors`` asserts that its key holds none), so the
+    microbatch field wraps within the three digits a key gives it.
+    """
+    paged_stash_init_chunk_handler(vp_size, vp_stage)
+    stash_manager = PagedStashManager.get_instance()
+    vp_stage_index = stash_manager.current_vp_stage
+    stash_manager.current_microbatch[vp_stage_index] = (
+        stash_manager.current_microbatch[vp_stage_index] - 1
+    ) % 999 + 1
 
 
 @contextmanager

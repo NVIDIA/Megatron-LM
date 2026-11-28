@@ -48,13 +48,16 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer import cuda_graphs
-from megatron.core.transformer.cuda_graphs import TECudaGraphHelper, convert_schedule_table_to_order
+from megatron.core.transformer.cuda_graphs import (
+    TECudaGraphHelper,
+    convert_te_cuda_graph_schedule_table_to_order,
+)
 from megatron.core.transformer.moe.moe_logging import (
     MoEMetricsTracker,
     get_moe_metrics_tracker,
     set_moe_metrics_tracker,
 )
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_attr_wrapped_model
 from tests.unit_tests.test_utilities import Utils
 
@@ -88,11 +91,11 @@ _PACKED = dict(
 _TOLERANCE = 5e-3
 
 
-def _config(cuda_graph_impl, **settings):
+def _config(cuda_graph_impl, config_class=TransformerConfig, **settings):
     """Small BF16 model configuration; ``cuda_graph_impl="none"`` gives the eager twin."""
     if cuda_graph_impl == "none":
         settings = {**settings, "cuda_graph_dynamic_microbatches": False}
-    return TransformerConfig(
+    return config_class(
         **{
             "num_layers": 2,
             "hidden_size": _HIDDEN,
@@ -120,14 +123,17 @@ def _build_chunks(
     stage_flags=None,
     layer_spec=None,
     hybrid_layer_pattern=None,
+    experimental_attention=False,
 ):
     """This rank's model chunks (one per virtual pipeline stage), wrapped like training.
 
-    The chunks are ``GPTModel``s, or ``HybridModel``s of ``hybrid_layer_pattern``.
+    The chunks are ``GPTModel``s, or ``HybridModel``s of ``hybrid_layer_pattern``. With
+    ``experimental_attention`` the layers follow ``config.experimental_attention_variant``, as
+    the model builder builds them (the MTP layer from the last layer's spec).
     ``stage_flags`` overrides ``(pre_process, post_process)`` of the single chunk, which lets a
     rank without pipeline parallelism hold the chunk of a later stage.
     """
-    if layer_spec is None:
+    if layer_spec is None and not experimental_attention:
         layer_spec = get_gpt_layer_with_transformer_engine_spec()
     vp_size = config.virtual_pipeline_model_parallel_size
     # Same weights in every run and in both twins: the model-parallel seed covers the weights
@@ -156,10 +162,25 @@ def _build_chunks(
                     vp_stage=vp_stage,
                 )
             else:
+                mtp_layer_spec = layer_spec
+                if experimental_attention:
+                    from megatron.core.models.gpt import experimental_attention_variant_module_specs
+
+                    specs = experimental_attention_variant_module_specs
+                    layer_spec = (
+                        specs.get_transformer_block_with_experimental_attention_variant_spec(
+                            config, vp_stage=vp_stage
+                        )
+                    )
+                    mtp_layer_spec = (
+                        specs.get_transformer_layer_with_experimental_attention_variant_spec(
+                            config=config
+                        )[-1]
+                    )
                 mtp_block_spec = None
                 if config.mtp_num_layers:
                     mtp_block_spec = get_gpt_mtp_block_spec(
-                        config, layer_spec, use_transformer_engine=True, vp_stage=vp_stage
+                        config, mtp_layer_spec, use_transformer_engine=True, vp_stage=vp_stage
                     )
                 model = GPTModel(
                     config=config,
@@ -188,11 +209,11 @@ def _build_chunks(
     return chunks
 
 
-def _build_graph_and_eager_chunks(settings, **build_kwargs):
+def _build_graph_and_eager_chunks(settings, config_class=TransformerConfig, **build_kwargs):
     """Chunk-wise model chunks and their eager twins (same weights, no CUDA graphs)."""
-    config = _config("chunk_wise", **settings)
+    config = _config("chunk_wise", config_class, **settings)
     graph_chunks = _build_chunks(config, **build_kwargs)
-    eager_chunks = _build_chunks(_config("none", **settings), **build_kwargs)
+    eager_chunks = _build_chunks(_config("none", config_class, **settings), **build_kwargs)
     for graph_chunk, eager_chunk in zip(graph_chunks, eager_chunks):
         eager_chunk.module.load_state_dict(graph_chunk.module.state_dict())
     return config, graph_chunks, eager_chunks
@@ -326,7 +347,7 @@ def _pipeline_order(config, num_microbatches):
     _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
         num_microbatches, num_chunks, group_size, forward_only=False
     )
-    return convert_schedule_table_to_order(
+    return convert_te_cuda_graph_schedule_table_to_order(
         num_warmup_microbatches,
         num_chunks,
         get_schedule_table(num_microbatches, num_chunks, group_size),
@@ -575,6 +596,95 @@ class TestChunkCudaGraphPipeline:
                     RuntimeError, match=f"only contains {num_microbatches} graph slots"
                 ):
                     _forward(models[0], feeds[0][0], microbatch=num_microbatches)
+
+    def test_dsa_topk_shared_with_the_mtp_layer_follows_the_slot_of_its_microbatch(self):
+        """DSA top-k sharing from a decoder layer into the MTP layer, two pipeline stages,
+        packed sequences, a different pack per microbatch. The last stage holds layers 3 and 4
+        and the MTP layer (5); layer 3 selects the keys that layers 4 and 5 reuse. Decoder block
+        and post-process are two graphs per slot: the post-process graph of slot k has to read
+        the indices the decoder graph of slot k wrote. The last stage runs one microbatch at a
+        time, each through the graph pair of its own slot (four slots, a different pack each);
+        a post-process graph that read another slot's indices would compute the MTP layer with
+        the selection of another pack, which the eager twin's results show per microbatch."""
+        pytest.importorskip("fast_hadamard_transform")
+        from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+        from tests.unit_tests.transformer.test_chunk_cuda_graph_layer_families import (
+            _indexer_loss_state,
+        )
+
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+        num_microbatches = len(_PACKS)
+        self._init_num_microbatches(num_microbatches)
+        settings = dict(
+            num_layers=4,
+            pipeline_model_parallel_size=2,
+            pipeline_p2p_fixed_shape=True,
+            mtp_num_layers=1,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=16,
+            qk_pos_emb_head_dim=8,
+            v_head_dim=16,
+            normalization="RMSNorm",
+            add_bias_linear=False,
+            experimental_attention_variant="dsa",
+            dsa_indexer_n_heads=4,
+            dsa_indexer_head_dim=16,
+            # Fewer keys than a pack holds: the selection is sparse.
+            dsa_indexer_topk=16,
+            dsa_indexer_loss_coeff=0.01,
+            # Layers 1 to 3 select their keys; layer 4 and the MTP layer reuse layer 3's.
+            dsa_indexer_topk_freq=4,
+            dsa_indexer_skip_topk_offset=3,
+            calculate_per_token_loss=True,
+            **_PACKED,
+        )
+        with _training_stream():
+            config, models, eager_models = _build_graph_and_eager_chunks(
+                settings, MLATransformerConfig, experimental_attention=True
+            )
+            core = models[0].module
+            last_stage = parallel_state.is_pipeline_last_stage()
+            assert core.mtp_process == last_stage
+            if last_stage:
+                mtp = [m for m in core.mtp.modules() if isinstance(m, DSAttention)]
+                assert [(m.layer_number, m.skip_topk, m.source_layer) for m in mtp] == [
+                    (5, True, 3)
+                ]
+
+            batches = [_packed_microbatch(seqlens, seed) for seed, seqlens in enumerate(_PACKS)]
+            feeds = [
+                [
+                    _packed_feed(models[0], batch, (_TOKENS, 1, _HIDDEN), Utils.rank, 0, microbatch)
+                    for microbatch, batch in enumerate(batches)
+                ]
+            ]
+            order = _pipeline_order(config, num_microbatches)
+            with _indexer_loss_state([core, eager_models[0].module]):
+                reference, _ = _run_pipeline_order(eager_models, feeds, order)
+                warmup, _ = _run_pipeline_order(models, feeds, order)
+                for key, result in warmup.items():
+                    _assert_result_matches(result, reference[key], f"eager warm-up {key}")
+
+                with _captured_graphs(models, config, _TOKENS, 1) as helper:
+                    assert helper.num_microbatches == num_microbatches
+                    assert helper.num_layers_per_chunk == [2 if last_stage else 1]
+                    if last_stage:
+                        assert core.decoder._chunk_graph_dsa_topk_shared_layers == (3,)
+                        assert len(core.decoder._chunk_graph_dsa_topk_of_slots) == num_microbatches
+                    # Twice, and a step with fewer packs in between: every slot is replayed
+                    # again after the other slots ran.
+                    for count in (num_microbatches, 2, num_microbatches):
+                        results, peak = _run_pipeline_order(
+                            models, feeds, _pipeline_order(config, count)
+                        )
+                        assert len(results) == count
+                        # The stage that shares the indices holds one microbatch at a time.
+                        assert peak == (1 if last_stage else 2)
+                        for key, result in results.items():
+                            _assert_result_matches(
+                                result, reference[key], f"replay of {count} microbatches {key}"
+                            )
 
     def test_fixed_length_mrope_slots_keep_their_own_position_table(self):
         """Fixed-length mRoPE on two pipeline stages, position ids differing per microbatch.

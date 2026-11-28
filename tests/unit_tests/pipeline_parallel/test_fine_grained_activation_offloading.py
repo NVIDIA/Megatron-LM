@@ -3186,6 +3186,116 @@ def _block_capture_reference(x, weights):
     return x.grad
 
 
+def _untracked_source(values):
+    """A device tensor whose storage the caching allocator does not own (a DLPack alias, like
+    the views Transformer Engine's bulk_allocate carves out of one buffer): ``record_stream``
+    does nothing for it."""
+    source = torch.from_dlpack(values.clone())
+    assert not source.untyped_storage().resizable()
+    return source
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_block_capture_start_drops_the_sources_an_eager_step_still_holds():
+    """A source an eager step holds until its copy is done does not outlive the capture's start.
+
+    An eager offload keeps a source that ``record_stream`` cannot protect until a later offload
+    hook finds its copy finished. Once the graphs own the offloads no hook runs in Python again
+    (the capture's hooks do not poll, a replay runs none), so a hold that is still there when
+    the capture starts would stay on the device for the run.
+    """
+    Utils.initialize_model_parallel(1, 1)
+    off_interface.reset_instance()
+    device = torch.device("cuda")
+    weights = [torch.randn(64, 64, device=device, requires_grad=True) for _ in range(2)]
+    group_fn = _block_capture_group_fn()
+
+    def decoder(x):
+        return group_fn(group_fn(x, "mlp", weights[0]), "mlp", weights[1])
+
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        _block_capture_warmup(decoder, torch.randn(8, 64, device=device, requires_grad=True))
+
+        expected = torch.arange(1 << 14, dtype=torch.int64, device=device)
+        held = OffloadTensorGroup("fused_group_mlp")
+        held.push_tensor((1, 0), _untracked_source(expected))
+        chunk = _make_warmup_chunk([held])
+        if hasattr(torch.cuda, "_sleep"):
+            # The copy is still pending when the capture starts.
+            with torch.cuda.stream(chunk.d2h_stream):
+                torch.cuda._sleep(200_000_000)
+        chunk.bulk_offload_group(held)
+        assert len(held._unrecorded_sources) == 1
+        assert manager._groups_holding_sources == [held]
+
+        off_interface.enter_block_capture()
+        assert held._unrecorded_sources == []
+        assert manager._groups_holding_sources == []
+        off_interface.exit_block_capture()
+
+        # The capture's start waited for the copy before it let the source go.
+        torch.cuda.synchronize()
+        assert torch.equal(chunk.reload(held._tensors[(1, 0)]).cpu(), expected.cpu())
+    finally:
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_block_capture_keeps_every_offload_source_until_the_capture_stream_joined_its_copy():
+    """Inside a whole-block capture the group itself keeps what it copied out.
+
+    ``record_stream`` is not used there (a block freed with a foreign-stream use is recycled
+    only after the capture), so the group's own reference is all that protects a source until
+    the capture stream has waited for the copy: also a source whose storage the allocator does
+    not own, which eager offloads hold through another list.
+    """
+    Utils.initialize_model_parallel(1, 1)
+    off_interface.reset_instance()
+    device = torch.device("cuda")
+    weights = [torch.randn(64, 64, device=device, requires_grad=True) for _ in range(2)]
+    group_fn = _block_capture_group_fn()
+
+    def decoder(x):
+        return group_fn(group_fn(x, "mlp", weights[0]), "mlp", weights[1])
+
+    try:
+        manager = PipelineOffloadManager.get_instance()
+        _block_capture_warmup(decoder, torch.randn(8, 64, device=device, requires_grad=True))
+        off_interface.enter_block_capture()
+
+        expected = torch.arange(1 << 14, dtype=torch.int64, device=device)
+        untracked = _untracked_source(expected)
+        tracked = expected.clone()
+        group = OffloadTensorGroup("fused_group_mlp")
+        group.push_tensor((1, 0), untracked)
+        group.push_tensor((1, 1), tracked)
+        chunk = _make_warmup_chunk([group])
+        chunk.is_warmup = False
+        chunk.bulk_offload_group(group)
+
+        assert [
+            source is kept
+            for source, kept in zip((untracked, tracked), group._block_capture_sources)
+        ] == [True, True]
+        # Not the eager hold: nothing would ever poll it once the graphs replay.
+        assert group._unrecorded_sources == []
+        assert manager._groups_holding_sources == []
+
+        chunk._block_capture_pending_release.append((group, []))
+        chunk._block_capture_release(keep=0)
+        assert group._block_capture_sources == []
+        off_interface.exit_block_capture()
+
+        torch.cuda.synchronize()
+        for tag in ((1, 0), (1, 1)):
+            assert torch.equal(chunk.reload(group._tensors[tag]).cpu(), expected.cpu())
+    finally:
+        off_interface.reset_instance()
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 def test_block_capture_mode_serves_one_handler_per_capture_forward():
     """Chunk-wise CUDA graphs drive the offload manager in block-capture mode.

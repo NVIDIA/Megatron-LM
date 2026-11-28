@@ -1032,6 +1032,13 @@ class PipelineOffloadManager:
             )
             # The capture may precede the reset() that would normally close the warm-up.
             self.post_warmup_callback()
+        # Sources an eager step still holds until their copies are done (record_stream does
+        # not protect them) are dropped by a later offload hook, and from here on none runs:
+        # the capture's hooks do not poll and a replay runs no Python. Wait for the copies and
+        # drop the sources now, before the capture allocates.
+        for group in self._groups_holding_sources:
+            group.release_offload_sources(wait_stream=torch.cuda.current_stream())
+        self._groups_holding_sources = []
         self._block_capture = True
         self._block_capture_keep_last_group = keep_last_group
         self._block_capture_forward_active = False

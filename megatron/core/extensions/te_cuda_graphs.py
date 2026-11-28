@@ -158,6 +158,8 @@ class TECudaGraphMixin:
     module is redirected: while graphs are being captured it records a graph, and once
     te_cuda_graphs is populated it replays the graph for the current microbatch.
     Eval-mode calls, and calls with any other cuda_graph_impl, run forward() normally.
+    (A subclass that is the callable of another implementation names it in
+    _te_cuda_graph_impl: the whole-block mixin of chunk-wise graphs.)
 
     How to use:
         List this mixin before the module's base class, so its __call__ runs first:

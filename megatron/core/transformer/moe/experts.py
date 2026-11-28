@@ -250,16 +250,93 @@ def _token_counts_on_device(tokens_per_expert, device) -> torch.Tensor:
     host-to-device copy and records a non-blocking one with the address of a temporary host
     buffer.
     """
+    host_tensor = None
     if isinstance(tokens_per_expert, torch.Tensor):
         if tokens_per_expert.is_cuda or torch.device(device).type != "cuda":
             # Nothing to upload: a device tensor, or a host tensor that stays on the host.
             return tokens_per_expert.to(device=device, dtype=torch.int64, non_blocking=True)
+        host_tensor = tokens_per_expert
         counts = tokens_per_expert.tolist()
     else:
         counts = list(tokens_per_expert)
     if counts and all(count == counts[0] for count in counts):
         return torch.full((len(counts),), int(counts[0]), dtype=torch.int64, device=device)
+    if host_tensor is not None and not torch.cuda.is_current_stream_capturing():
+        # Counts that differ per expert, no capture: the upload that does not wait for the
+        # stream, as before.
+        return host_tensor.to(device=device, dtype=torch.int64, non_blocking=True)
     return torch.tensor(counts, dtype=torch.int64, device=device)
+
+
+def _host_token_counts(tokens_per_expert) -> Optional[list]:
+    """The per-expert token counts as a Python list where they are known on the host (a list,
+    or the CPU tensor of a drop-and-pad dispatch), else ``None``: reading device counts would
+    synchronize, which a CUDA graph capture cannot record."""
+    if isinstance(tokens_per_expert, torch.Tensor):
+        return None if tokens_per_expert.is_cuda else tokens_per_expert.tolist()
+    return list(tokens_per_expert)
+
+
+def _te_runs_grouped_tensors_natively(config) -> bool:
+    """Whether Transformer Engine's ``GroupedLinear`` keeps its native grouped-tensor path for
+    the model-wide precision of ``config``.
+
+    Where it does not (FP8 delayed scaling, FP32 parameters, an older cuBLASLt, ...) it falls
+    back to split-quantize, which reads the split sizes on the host.
+    """
+    try:
+        from transformer_engine.pytorch.module.grouped_linear import (
+            is_module_grouped_tensor_path_supported,
+        )
+    except ImportError:
+        # A Transformer Engine without the predicate: keep what the configuration asks for.
+        return True
+    if config.bf16:
+        dtype = torch.bfloat16
+    elif config.fp16:
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+    recipe = None
+    if config.fp8:
+        from megatron.core.fp8_utils import get_fp8_recipe
+
+        recipe = get_fp8_recipe(config)
+    elif config.fp4:
+        from megatron.core.fp4_utils import get_fp4_recipe
+
+        recipe = get_fp4_recipe(config)
+    try:
+        return is_module_grouped_tensor_path_supported(recipe, dtype)
+    except (RuntimeError, AssertionError):
+        # The predicate asks the device (no CUDA device in this process).
+        return True
+
+
+def _block_capture_needs_host_token_counts(
+    config, with_fused_impl: bool, single_grouped_parameters: bool
+) -> bool:
+    """Whether grouped-tensor experts hand Transformer Engine their token counts as a host list
+    instead of a device tensor.
+
+    A whole-block capture cannot record a host read. Where Transformer Engine leaves its native
+    grouped-tensor path it reads the split sizes on the host, and it would get them as a device
+    tensor. The counts of a drop-and-pad dispatch are known on the host, so they stay there, in
+    the form the split-quantize path takes. The decision follows the model-wide precision. Not
+    with ``single_grouped_parameters`` (a single grouped weight or bias as Transformer Engine
+    built the linears, which is not always what the options ask for: they need the native
+    path, and Transformer Engine says so itself), the operation fuser (it moves the counts
+    itself) or paged stash.
+    """
+    return (
+        getattr(config, "cuda_graph_impl", "none") == "chunk_wise"
+        and not with_fused_impl
+        and not config.moe_paged_stash
+        and config.moe_expert_capacity_factor is not None
+        and bool(config.moe_pad_expert_input_to_capacity)
+        and not single_grouped_parameters
+        and not _te_runs_grouped_tensors_natively(config)
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -504,6 +581,21 @@ class TEGroupedMLP(MegatronModule):
             # TE: selects the path inside GroupedLinear.forward, which reads this per-forward.
             self.linear_fc1.use_grouped_tensor = False
             self.linear_fc2.use_grouped_tensor = False
+        if self._use_grouped_tensor and _block_capture_needs_host_token_counts(
+            self.config,
+            self._with_fused_impl,
+            # Read off the linears: Transformer Engine builds per-expert parameters where the
+            # single grouped ones are not enabled in its environment.
+            single_grouped_parameters=any(
+                getattr(linear, flag, False)
+                for linear in (self.linear_fc1, self.linear_fc2)
+                for flag in ("single_grouped_weight", "single_grouped_bias")
+            ),
+        ):
+            # Both sides of the boundary have to agree, as above.
+            self._use_grouped_tensor = False
+            self.linear_fc1.use_grouped_tensor = False
+            self.linear_fc2.use_grouped_tensor = False
         if self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             assert HAVE_TE, "Quantized or TE grouped-tensor GroupedMLP execution requires TE."
             align_size = (
@@ -579,13 +671,17 @@ class TEGroupedMLP(MegatronModule):
                 intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs
             )
 
-        # Eager-only CPU-metadata path. The legacy contract returns List[Tensor[hidden_size]],
-        # and torch.split plus the Python zip below require concrete host token counts. A packed
-        # bias paired with Python counts also uses this compatibility path. Converting a tensor
-        # with .tolist() synchronizes and copies device data to the host, so this path must never
-        # be included in a CUDA graph.
+        # CPU-metadata path. The legacy contract returns List[Tensor[hidden_size]], and
+        # torch.split plus the Python zip below require concrete host token counts. A packed
+        # bias paired with Python counts also uses this compatibility path. Counts that the
+        # forward still had on the host (a drop-and-pad dispatch) travel with the tensor;
+        # converting a device tensor with .tolist() synchronizes and copies device data to the
+        # host, which a CUDA graph capture cannot record.
         if isinstance(tokens_per_expert, torch.Tensor):
-            tokens_per_expert = tokens_per_expert.tolist()
+            host_token_counts = getattr(tokens_per_expert, "host_token_counts", None)
+            tokens_per_expert = (
+                host_token_counts if host_token_counts is not None else tokens_per_expert.tolist()
+            )
 
         shape = intermediate_parallel.shape
         flat_output = intermediate_parallel.view(-1, shape[-1])
@@ -1450,9 +1546,13 @@ class TEGroupedMLP(MegatronModule):
             )
 
         if self._use_grouped_tensor:
+            host_token_counts = _host_token_counts(tokens_per_expert)
             tokens_per_expert = _token_counts_on_device(
                 tokens_per_expert, permuted_local_hidden_states.device
             )
+            if host_token_counts is not None:
+                # A per-expert bias needs the counts as Python ints (_apply_bias).
+                tokens_per_expert.host_token_counts = host_token_counts
         elif isinstance(tokens_per_expert, torch.Tensor):
             tokens_per_expert = tokens_per_expert.tolist()
 

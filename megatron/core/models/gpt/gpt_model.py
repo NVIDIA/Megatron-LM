@@ -399,6 +399,12 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 pg_collection=self.pg_collection,
                 output_dtype=self.logit_dtype,
             )
+            if self.mtp_process and hasattr(self.output_layer, 'is_first_microbatch'):
+                # The LM head also projects every MTP depth: several calls per microbatch add
+                # into the same main_grad. Transformer Engine writes over main_grad when it is
+                # told the microbatch is the first one, so one of those calls would erase what
+                # the others added.
+                self.output_layer.is_repeated_layer = True
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()

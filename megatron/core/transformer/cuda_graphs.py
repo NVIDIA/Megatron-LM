@@ -2323,6 +2323,36 @@ def _te_cuda_graph_layer_is_graphable(layer, config):
     )
 
 
+def _dsa_topk_layers_the_mtp_reuses(model_chunk):
+    """Decoder layers whose DSA top-k indices an MTP layer of ``model_chunk`` reuses.
+
+    With ``dsa_indexer_topk_freq > 1`` a DSA layer reuses the top-k indices of an earlier
+    layer of its model chunk. MTP layers continue the decoder's layer numbering, so the first
+    of them may reuse a decoder layer's indices, across the boundary of the decoder block's
+    graph (``ChunkCudaGraphBlockMixin._keep_dsa_topk_for_layers_outside_this_graph``).
+    """
+    mtp = getattr(model_chunk, 'mtp', None)
+    if mtp is None:
+        return ()
+    reused, computed = set(), set()
+    for module in mtp.modules():
+        if not getattr(module, 'index_share', False):
+            continue
+        if module.skip_topk:
+            reused.add(module.source_layer)
+        else:
+            computed.add(module.layer_number)
+    return tuple(sorted(reused - computed))
+
+
+def _forget_what_earlier_graphs_addressed(callables):
+    """Chunk callables drop the tensors they kept for the graphs of a previous capture (shared
+    DSA top-k indices, cached quantized weights)."""
+    for block in callables:
+        if getattr(block, 'is_cuda_graph_chunk_callable', False):
+            block.forget_what_earlier_graphs_addressed()
+
+
 def _chunk_cuda_graph_block_is_graphable(block, config):
     """Check whether a decoder block registered a chunk-wise TE graph.
 
@@ -2798,7 +2828,7 @@ class TECudaGraphHelper:
         A whole-block capture records the fine-grained activation offloads into the graphs,
         so the offload manager is told when the capture starts and whether it produced graphs.
         A capture that raises is over all the same: later eager forwards must not take the
-        capture path (``GraphableMegatronModule._should_call_te_cudagraph``).
+        capture path (``TECudaGraphMixin._should_call_te_cudagraph``).
         """
         block_offload_capture = (
             self.config.fine_grained_activation_offloading and is_chunk_wise_cuda_graph(self.config)
@@ -2931,6 +2961,9 @@ class TECudaGraphHelper:
                         if not self._decoder_runs_without_autograd():
                             callables.append(chunk_with_decoder.decoder)
                             callables_is_mtp.append(False)
+                            chunk_with_decoder.decoder._chunk_graph_dsa_topk_shared_layers = (
+                                _dsa_topk_layers_the_mtp_reuses(chunk_with_decoder)
+                            )
                         else:
                             # The training forward runs this block under torch.no_grad() and
                             # keeps none of its activations. A graph would record them with a
@@ -2959,6 +2992,12 @@ class TECudaGraphHelper:
                         if eager_reason is None:
                             callables.append(postprocess_block)
                             callables_is_mtp.append(False)
+                            # A plain reference: the decoder is not a child of this block.
+                            object.__setattr__(
+                                postprocess_block,
+                                '_chunk_graph_dsa_topk_source_block',
+                                chunk_with_decoder.decoder,
+                            )
                         else:
                             # The post-process lives on the last pipeline stage.
                             log_on_each_pipeline_stage(
@@ -3322,7 +3361,8 @@ class TECudaGraphHelper:
                     )
 
             if is_chunk_callable:
-                contains_self_attn = any(
+                # A hybrid stack hands the table to its custom layers as well.
+                contains_self_attn = getattr(layer, '_has_custom_layers', False) or any(
                     isinstance(module, TransformerLayer)
                     and not isinstance(module.self_attention, IdentityOp)
                     for module in layer.modules()
@@ -4203,6 +4243,7 @@ class TECudaGraphHelper:
                 # let autograd redirect those stale references to the capturing stream; the
                 # process-global setting stays enabled for the same reason as there.
                 torch.autograd.graph.set_override_stale_capture_stream(True)
+            _forget_what_earlier_graphs_addressed(self.flattened_callables)
             with (
                 self._te_capture_scope(),
                 rng_context,
@@ -4265,6 +4306,10 @@ class TECudaGraphHelper:
             # before exposing the fixed addresses to eager block-level staging.
             self._attach_graph_dynamic_route_arenas(sample_kwargs, route_arenas)
 
+            for block in self.flattened_callables:
+                if getattr(block, 'is_cuda_graph_chunk_callable', False):
+                    block.keep_what_the_graphs_address()
+
             self._graphs_created = True
 
         self._finish_capturing(start_time)
@@ -4301,6 +4346,7 @@ class TECudaGraphHelper:
                 layer.te_cuda_graphs = []
                 layer.te_cuda_graph_manual_hooks = []
                 layer.clear_te_cuda_graph_static_hidden_inputs()
+            _forget_what_earlier_graphs_addressed(layers)
         self._clear_graph_dynamic_route_arenas()
         if is_chunk_wise_cuda_graph(self.config):
             # The chunk graphs were captured into the process-wide shared pool; a later capture

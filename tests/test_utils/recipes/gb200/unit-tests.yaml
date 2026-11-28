@@ -123,6 +123,30 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # Three files of chunk-wise block captures (real captures and replays against eager twins)
+  # run apart from the catch-all bucket, which is close to its 60-minute job limit. The other
+  # GB200-marked chunk-wise tests (paged stash, MoK) stay in the catch-all bucket.
+  - test_case: [tests/unit_tests/transformer/test_chunk_cuda_graph_layer_families.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/test_chunk_cuda_graph_pipeline.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/test_chunk_graph_precision_contexts.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/**/*.py]
     products:
       - environment: [dev]

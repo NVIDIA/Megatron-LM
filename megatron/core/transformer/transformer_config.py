@@ -6020,6 +6020,15 @@ class TransformerConfig(ModelParallelConfig):
                         "cuda_graph_impl='chunk_wise' captures the whole decoder chunk; "
                         "cuda_graph_modules must be empty."
                     )
+                if self.enable_autocast:
+                    # The schedule opens torch.autocast around every forward step. The graphs
+                    # are recorded outside of it, and a replay runs none of the block's Python,
+                    # so the recorded kernels would not be the autocast ones.
+                    raise ValueError(
+                        "cuda_graph_impl='chunk_wise' does not support enable_autocast: the "
+                        "block graphs are recorded outside the torch.autocast of the forward "
+                        "step, which a replay cannot apply."
+                    )
                 if self.gtp_weight_remat_size > 1 or self.expert_gtp_weight_remat_size > 1:
                     # GTP gathers and reduces its weight shards on side streams and reports
                     # gradient readiness from Python. Its CUDA graph integration joins those
@@ -6072,6 +6081,15 @@ class TransformerConfig(ModelParallelConfig):
                         "cuda_graph_impl='chunk_wise' does not support log_moe_overload_factor: "
                         "the token counts are recorded by Python inside the MoE forward and "
                         "backward, which a block replay does not run."
+                    )
+                if self.moe_enable_routing_replay and (self.num_moe_experts or 0) > 1:
+                    # The router records its top-k indices into Python lists and takes the
+                    # indices to replay from Python state, per forward: a block graph would
+                    # record nothing after the capture and replay the capture's routes.
+                    raise ValueError(
+                        "cuda_graph_impl='chunk_wise' does not support moe_enable_routing_replay: "
+                        "the router records and replays its top-k indices through Python state "
+                        "of every forward, which a block replay does not run."
                     )
                 if (
                     self.overlap_dispatch_backward_with_experts_wgrad

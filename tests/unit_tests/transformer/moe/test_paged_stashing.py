@@ -37,6 +37,7 @@ from megatron.core.transformer.moe.paged_stash import (
     check_paged_stash_host_spill,
     check_paged_stash_overflow,
     configure_runtime_schedule,
+    paged_stash_init_capture_chunk_handler,
     paged_stash_init_chunk_handler,
     paged_stash_prepare_for_cuda_graph_capture,
     paged_stash_reset,
@@ -241,6 +242,33 @@ def test_chunk_capture_after_evaluation_restarts_the_runtime_coordinates(monkeyp
     assert (manager.current_layer, manager.current_microbatch) == ([99], [99])
 
 
+def test_chunk_capture_keeps_the_stash_key_of_every_forward_within_its_digits(monkeypatch):
+    """Transformer Engine runs every graph slot of a stage once per pass of a capture (its
+    eager passes, then the recorded one) and nothing restarts the microbatch counter between
+    them, so a stage with 512 slots runs 1024 capture-time forwards. A stash key holds three
+    digits for the microbatch: the capture-time handler wraps the field, which is safe because
+    a key only has to be unique among the stashes in flight."""
+    config = SimpleNamespace(cuda_graph_impl="chunk_wise", moe_paged_stash=True)
+    manager = _make_schedule_manager([1_001_000, -1_001_000])
+    monkeypatch.setattr(PagedStashManager, "STASH_MGR", manager)
+    paged_stash_prepare_for_cuda_graph_capture(config)
+
+    keys = []
+    for _ in range(2 * 512):
+        paged_stash_init_capture_chunk_handler(1, 0)
+        keys.append(manager.get_schedule_layer(1, 1, manager.current_microbatch[0]))
+    # Nothing changes below the limit of the field, and the keys of any 998 forwards in a row
+    # differ.
+    assert keys[:999] == [1_001_000 + microbatch for microbatch in range(1, 1000)]
+    assert keys[999:1001] == [1_001_001, 1_001_002]
+    assert all(len(set(keys[start : start + 998])) == 998 for start in (0, 13, 26))
+    # The training handler, which a step restarts, is the one that would overflow.
+    manager.current_microbatch = [999]
+    paged_stash_init_chunk_handler(1, 0)
+    with pytest.raises(AssertionError, match="Schedule encoding overflow"):
+        manager.get_schedule_layer(1, 1, manager.current_microbatch[0])
+
+
 def test_paged_stash_schedule_supports_distinct_vp_layer_templates():
     manager = _make_schedule_manager(
         [
@@ -383,12 +411,12 @@ def test_chunk_capture_order_counts_the_microbatches_of_the_paged_vp_stages(
     """Two model chunks on the rank (virtual pipeline). An order names the chunks from 1: ``c``
     is a forward of chunk ``c`` and ``-c`` its backward. Only the stages with paged layers hold
     stashed activations, and which of the two they are changes what the order keeps in flight."""
-    from megatron.core.transformer.cuda_graphs import convert_schedule_table_to_order
+    from megatron.core.transformer.cuda_graphs import convert_te_cuda_graph_schedule_table_to_order
 
-    # The example of convert_schedule_table_to_order: 2 pipeline stages, 2 chunks per rank,
-    # 5 microbatches in groups of 3, on the first pipeline rank (5 warm-up forwards).
+    # The example of convert_te_cuda_graph_schedule_table_to_order: 2 pipeline stages, 2 chunks
+    # per rank, 5 microbatches in groups of 3, on the first pipeline rank (5 warm-up forwards).
     schedule_table = list(zip([0, 1, 2, 0, 1, 2, 3, 4, 3, 4], [0, 0, 0, 1, 1, 1, 0, 0, 1, 1]))
-    capture_order = convert_schedule_table_to_order(5, 2, schedule_table)
+    capture_order = convert_te_cuda_graph_schedule_table_to_order(5, 2, schedule_table)
     assert capture_order == [1, 1, 1, 2, 2, 2, -2, 1, -2, 1, -2, 2, -1, 2, -1, -1, -2, -2, -1, -1]
     # The discovery iteration ran one microbatch through both chunks.
     discovery_order = [1, 2, -2, -1]

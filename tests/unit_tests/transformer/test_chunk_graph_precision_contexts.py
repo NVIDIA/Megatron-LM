@@ -471,6 +471,7 @@ class TestChunkGraphPrecisionContexts:
             assert FP8GlobalStateManager.is_fp8_enabled()
         assert not FP8GlobalStateManager.is_fp8_enabled()
 
+    @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not available")
     def test_chunk_replay_runs_under_the_block_fp8_context(self, monkeypatch):
         """Replay enters the graphed callable without running the block forward, so the chunk
         callable itself opens the FP8 autocast that TE's graphed callable reads its amax-reduction
@@ -494,7 +495,7 @@ class TestChunkGraphPrecisionContexts:
 
         monkeypatch.setattr(fp4_utils, "get_fp4_context", recording_fp4_context)
 
-        class GraphedBase(TECudaGraphMixin):
+        class GraphedBase(TECudaGraphMixin, torch.nn.Module):
             """Records the shared replay the block mixin hands over to."""
 
             def _te_cuda_graph_replay(self, *args, **kwargs):
@@ -503,6 +504,7 @@ class TestChunkGraphPrecisionContexts:
 
         class Block(ChunkCudaGraphBlockMixin, GraphedBase):
             def __init__(self, config):
+                torch.nn.Module.__init__(self)
                 self.config = config
                 self.pre_process = True
                 self.te_cuda_graphs = [object()]
@@ -532,6 +534,80 @@ class TestChunkGraphPrecisionContexts:
             "exit",
         ]
         assert replay(fp8=None, fp4=None, pipeline_model_parallel_size=1) == [("replay", 1, ())]
+
+    @pytest.mark.skipif(not (HAVE_TE and torch.cuda.is_available()), reason="TE and CUDA required")
+    def test_chunk_replay_hands_a_module_with_its_own_recipe_that_recipe_back(self, monkeypatch):
+        """Inside an autocast, Transformer Engine's graphed callable writes that autocast's
+        recipe into the metadata of every TE module of the callable. A module that quantizes
+        under a recipe of another kind (it opens its own autocast in its forward, like the MXFP8
+        LM head of an NVFP4 model) would take that for a change of the recipe type on its next
+        eager forward and drop its cached quantized weight, which the graphs write and read.
+        The replay hands such a module its recipe back; a module of the model's kind of recipe
+        keeps what Transformer Engine wrote."""
+        import transformer_engine.pytorch as te
+        from transformer_engine.common import recipe as te_recipe
+
+        # Two recipe classes neither of which derives from the other.
+        other_recipe_class = getattr(te_recipe, "Float8CurrentScaling", None)
+        if other_recipe_class is None:
+            pytest.skip("this Transformer Engine has no second recipe class")
+        model_recipe = other_recipe_class()
+        own_recipe = te_recipe.DelayedScaling()
+
+        @contextmanager
+        def model_context(config, layer_no=-1, is_init=False):
+            yield
+
+        monkeypatch.setattr(fp8_utils, "get_fp8_context", model_context)
+
+        class GraphedBase(TECudaGraphMixin, torch.nn.Module):
+            def _te_cuda_graph_replay(self, *args, **kwargs):
+                # What Transformer Engine's graphed callable does inside an autocast.
+                for module in self.children():
+                    module.fp8_meta["recipe"] = model_recipe
+                return "output"
+
+        class Block(ChunkCudaGraphBlockMixin, GraphedBase):
+            def __init__(self):
+                torch.nn.Module.__init__(self)
+                self.config = SimpleNamespace(
+                    cuda_graph_impl="chunk_wise",
+                    sequence_parallel=False,
+                    pipeline_model_parallel_size=1,
+                    fp8="hybrid",
+                )
+                self.pre_process = True
+                self.te_cuda_graphs = [object()]
+                self.current_microbatch = 0
+                self.of_the_model_kind = te.Linear(4, 4)
+                self.of_its_own_kind = te.Linear(4, 4)
+                self.never_quantized = te.Linear(4, 4)
+
+        block = Block()
+        block.of_the_model_kind.fp8_meta["recipe"] = other_recipe_class()
+        block.of_its_own_kind.fp8_meta["recipe"] = own_recipe
+        assert block.never_quantized.fp8_meta.get("recipe") is None
+        hidden_states = torch.ones(2, 1, 4)
+        for _ in range(2):
+            assert block._te_cuda_graph_replay(hidden_states) == "output"
+            assert block.of_its_own_kind.fp8_meta["recipe"] is own_recipe
+            assert block.of_the_model_kind.fp8_meta["recipe"] is model_recipe
+            assert block.never_quantized.fp8_meta["recipe"] is model_recipe
+        # Read off the first replay, once.
+        assert [module for module, _ in block._te_modules_with_their_own_recipe] == [
+            block.of_its_own_kind
+        ]
+
+        # Without a model-wide recipe the replay opens no autocast and nothing is written.
+        unquantized = Block()
+        unquantized.config.fp8 = None
+        unquantized.of_its_own_kind.fp8_meta["recipe"] = own_recipe
+        monkeypatch.setattr(
+            GraphedBase, "_te_cuda_graph_replay", lambda self, *args, **kwargs: "output"
+        )
+        assert unquantized._te_cuda_graph_replay(hidden_states) == "output"
+        assert unquantized._te_modules_with_their_own_recipe == []
+        assert unquantized.of_its_own_kind.fp8_meta["recipe"] is own_recipe
 
     def test_layer_quantization_context_dispatch_under_chunk_graphs(self, monkeypatch):
         """``get_layer_quantization_context`` mirrors ``get_layer_fp8_context`` for NVFP4: under
@@ -1002,6 +1078,15 @@ class TestNvfp4ChunkGraphEndToEnd:
             _BF16,
             _MXFP8,
         ),
+        # The LM head of an NVFP4 model under its own MXFP8 autocast, inside the post-process
+        # that is captured under the model's NVFP4 one.
+        "nvfp4-output-proj": (
+            _NVFP4_FIRST_LAST_BF16,
+            dict(fp8_output_proj=True),
+            _NVFP4,
+            _NVFP4,
+            _NVFP4,
+        ),
     }
 
     @pytest.mark.parametrize(
@@ -1014,6 +1099,7 @@ class TestNvfp4ChunkGraphEndToEnd:
             ("hybrid", None, "nvfp4-mtp-bf16"),
             ("gpt", None, "mxfp8-mtp-bf16"),
             ("gpt", None, "mxfp8-output-proj-mtp-bf16"),
+            ("gpt", None, "nvfp4-output-proj"),
         ],
     )
     def test_thd_mtp_capture_and_replay_keep_the_eager_layer_precision(
@@ -1027,15 +1113,17 @@ class TestNvfp4ChunkGraphEndToEnd:
         boundary layer); with full recompute both stacks take their per-layer context in
         ``recompute.checkpointed_forward``. ``mtp-bf16``: ``keep_mtp_in_bf16`` keeps every MTP
         module in BF16, also next to an MXFP8 LM head (``output-proj``, GPTModel only), for
-        which the post-process is captured under the MXFP8 autocast. The eager reference is the
-        same model before the capture."""
+        which the post-process is captured under the MXFP8 autocast. ``nvfp4-output-proj``: the
+        MXFP8 LM head of an NVFP4 model, which opens its own autocast inside the post-process
+        captured under the NVFP4 one. The eager reference is the same model before the
+        capture."""
         from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
         from tests.unit_tests.transformer.test_thd_cuda_graph import _thd_batch, _train_step
 
         quantization, overrides, quantized, mtp_precision, callable_precision = (
             self._THD_PRECISIONS[precision]
         )
-        if quantized == _MXFP8:
+        if quantized == _MXFP8 or overrides.get("fp8_output_proj"):
             _skip_unless_mxfp8_is_available()
         num_layers, micro_batch_size = 4, 1
         _init_two_microbatches(micro_batch_size)
@@ -1096,6 +1184,120 @@ class TestNvfp4ChunkGraphEndToEnd:
                 assert _relative_error(grads[name], ref_grads[name]) <= 1e-2, (name, index)
         # No decoder or MTP module ran its forward after the capture: both callables replayed.
         recorder.check(["eager", "warmup", "capture"], expected, recompute)
+
+    def test_evaluation_between_replays_leaves_the_mxfp8_lm_head_of_an_nvfp4_model_intact(
+        self, capture_cleanups
+    ):
+        """NVFP4 model with the MXFP8 LM head (``fp8_output_proj``). The head quantizes under
+        its own MXFP8 autocast; the post-process that holds it is replayed under the model's
+        NVFP4 one, and Transformer Engine's graphed callable writes that recipe into the head's
+        metadata on every replay. Evaluation runs the eager post-process: a head that found the
+        NVFP4 recipe there would take its own MXFP8 one for a change of the recipe type, warn
+        and drop its cached quantized weight, the tensor the captured graphs write and read.
+        The replay hands the head its recipe back, so an evaluation pass between training steps
+        changes nothing."""
+        import warnings
+
+        from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+        from tests.unit_tests.transformer.test_thd_cuda_graph import _thd_batch, _train_step
+
+        _skip_unless_mxfp8_is_available()
+        micro_batch_size = 1
+        _init_two_microbatches(micro_batch_size)
+        model = _build_quantized_thd_model("gpt", fp8_output_proj=True)
+        model.train()
+        assert model.postprocess_block is not None and model.mtp_process
+        head = model.output_layer
+        batches = [
+            _thd_batch(seqlens, _VOCAB, seed, _SEQ_LENGTH, _CHUNK["thd_max_packed_sequences"])
+            for seed, seqlens in enumerate(([120], [60, 60], [16, 40, 60]))
+        ]
+
+        def train(batch):
+            MTPLossLoggingHelper.clean_loss_in_tracker()
+            per_token_loss, _ = _train_step(model, batch)
+            torch.cuda.synchronize()
+            return per_token_loss
+
+        def evaluate(batch):
+            """The eager post-process, as an evaluation between training iterations runs it:
+            (per-token loss, messages of the warnings it raised)."""
+            model.eval()
+            try:
+                with torch.no_grad(), warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    per_token_loss = model(
+                        input_ids=batch["input_ids"],
+                        position_ids=batch["position_ids"],
+                        attention_mask=None,
+                        labels=batch["labels"],
+                        loss_mask=batch["loss_mask"],
+                        padding_mask=batch["padding_mask"],
+                        packed_seq_params=batch["packed_seq_params"],
+                    )
+                    torch.cuda.synchronize()
+            finally:
+                model.train()
+            return per_token_loss.detach().float().clone(), [str(w.message) for w in caught]
+
+        reference = [train(batch) for batch in batches]
+        evaluation_reference, _ = evaluate(batches[0])
+        assert type(head.fp8_meta["recipe"]).__name__ == _MXFP8
+
+        self._capture(model, micro_batch_size, capture_cleanups)
+        assert len(model.postprocess_block.te_cuda_graphs) > 0
+
+        torch.testing.assert_close(train(batches[2]), reference[2], rtol=1e-3, atol=1e-3)
+        # The replay ran under the NVFP4 autocast and the head still holds its own recipe.
+        assert type(head.fp8_meta["recipe"]).__name__ == _MXFP8
+        assert [
+            module for module, _ in model.postprocess_block._te_modules_with_their_own_recipe
+        ] == [head]
+        cached_weights = dict(head._fp8_workspaces)
+
+        per_token_loss, messages = evaluate(batches[0])
+        assert not [message for message in messages if "Recipe type changed" in message], messages
+        torch.testing.assert_close(per_token_loss, evaluation_reference, rtol=1e-3, atol=1e-3)
+        # The head kept the quantized weight the graphs were captured with.
+        assert head._fp8_workspaces.keys() == cached_weights.keys()
+        assert all(head._fp8_workspaces[name] is cached_weights[name] for name in cached_weights)
+
+        for index in (0, 1, 2):
+            torch.testing.assert_close(
+                train(batches[index]), reference[index], rtol=1e-3, atol=1e-3
+            )
+            assert type(head.fp8_meta["recipe"]).__name__ == _MXFP8
+        per_token_loss, messages = evaluate(batches[1])
+        assert not [message for message in messages if "Recipe type changed" in message], messages
+
+
+@pytest.mark.launch_on_gb200  # MXFP8 needs Blackwell
+@pytest.mark.skipif(not (HAVE_TE and torch.cuda.is_available()), reason="TE and CUDA required")
+def test_mxfp8_lm_head_shared_with_mtp_always_accumulates_its_weight_gradient():
+    """With MTP the LM head projects the main hidden states and every MTP depth: several calls
+    per microbatch on one weight. Transformer Engine writes over ``main_grad`` when a call is
+    flagged as the first microbatch of a step, so a flagged call would erase what the other
+    calls of that microbatch added. The model marks such a head as a repeated layer, which
+    keeps the flag from Transformer Engine: every call accumulates."""
+    from megatron.core.extensions.transformer_engine import _resolve_is_first_microbatch
+    from tests.unit_tests.test_utilities import Utils
+
+    _skip_unless_mxfp8_is_available()
+    Utils.destroy_model_parallel()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    try:
+        model = _build_quantized_thd_model("gpt", _MXFP8_FIRST_LAST_BF16, fp8_output_proj=True)
+        head = model.output_layer
+        assert model.mtp_process and type(head).__name__ == "TELMHeadColumnParallelLinear"
+        assert head.is_repeated_layer
+        model.set_is_first_microbatch()
+        assert head.is_first_microbatch
+        assert _resolve_is_first_microbatch(head) is None
+        # A layer that is called once per microbatch still hands the flag over.
+        decoder_linear = model.decoder.layers[1].mlp.linear_fc1
+        assert _resolve_is_first_microbatch(decoder_linear) is True
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @contextmanager
@@ -1173,6 +1375,76 @@ def _build_recipe_fp8_gpt_model(cuda_graph_impl):
     return model.bfloat16().cuda()
 
 
+def _build_evaluation_recipe_gpt_model(cuda_graph_impl, trains_in_fp8):
+    """Fixed-length 4-layer GPTModel whose MLP linears evaluate under a per-module recipe of
+    another kind than the one they train with (``evaluation_recipe`` of a precision config).
+
+    ``trains_in_fp8``: the model trains in per-tensor FP8, the MLP linears with it, and they
+    evaluate in blockwise FP8. Otherwise the model trains in BF16 and the MLP linears evaluate
+    in per-tensor FP8. Every build holds the same weights."""
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+    from megatron.core.models.gpt.gpt_model import GPTModel
+    from megatron.core.quantization.quant_config import RecipeConfig
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.enums import AttnBackend
+
+    model_parallel_cuda_manual_seed(123)
+    torch.manual_seed(123)
+    if trains_in_fp8:
+        model_wide = dict(fp8="hybrid", fp8_recipe="tensorwise")
+        # Trains under the model's recipe; the evaluation recipe replaces it.
+        training_recipe = {
+            "fp8_quantization_recipe": "tensorwise",
+            "override_quantized_autocast": False,
+        }
+        evaluation_recipe = {"fp8_quantization_recipe": "blockwise"}
+    else:
+        model_wide = {}
+        training_recipe = {}
+        evaluation_recipe = {
+            "fp8_quantization_recipe": "tensorwise",
+            "override_nonquantized_autocast": True,
+        }
+    quant_recipe = RecipeConfig.from_config_dict(
+        {
+            "matchers": {
+                "mlp": {
+                    "type": "glob",
+                    "enabled": True,
+                    "pattern": "*mlp.linear_fc*",
+                    "config": "evaluates_otherwise",
+                }
+            },
+            "configs": {
+                "evaluates_otherwise": {
+                    "transformer_engine_config_type": "TEQuantizationParams",
+                    "training_recipe": training_recipe,
+                    "evaluation_recipe": evaluation_recipe,
+                }
+            },
+        }
+    )
+    config = _config(
+        hidden_size=256,
+        params_dtype=torch.bfloat16,
+        attention_backend=AttnBackend.unfused,  # like the other fixed-length chunk-graph tests
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        cuda_graph_impl=cuda_graph_impl,
+        cuda_graph_modules=[],
+        use_te_rng_tracker=True,
+        quant_recipe=quant_recipe,
+        **model_wide,
+    )
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+        vocab_size=_VOCAB,
+        max_sequence_length=_SEQ_LENGTH,
+    )
+    return model.bfloat16().cuda()
+
+
 @pytest.mark.launch_on_gb200
 class TestQuantRecipeWeightsUnderChunkGraphs:
     """Linears quantized only through a per-module ``quant_recipe`` (``--te-precision-config-file``
@@ -1186,6 +1458,10 @@ class TestQuantRecipeWeightsUnderChunkGraphs:
     cached quantized weights and no quantization: every replay computed with the weights of the
     last eager step. ``_resolve_is_first_microbatch`` therefore withholds the flag from such a
     capture, and TE records the quantization itself.
+
+    The evaluation-recipe test at the end also covers linears of a model that does train under
+    a model-wide FP8 recipe (its capture turns TE's weight caching on) and evaluate under a
+    per-module one.
     """
 
     @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not available")
@@ -1229,8 +1505,8 @@ class TestQuantRecipeWeightsUnderChunkGraphs:
 
     @pytest.fixture
     def capture_cleanups(self):
-        """``TestNvfp4ChunkGraphEndToEnd.capture_cleanups`` for any device with FP8, in the
-        state of a process in which no capture turned on TE's weight caching."""
+        """``TestNvfp4ChunkGraphEndToEnd.capture_cleanups`` for any device with FP8; the test
+        starts in the state of a process in which no capture turned on TE's weight caching."""
         import transformer_engine as te
         from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
 
@@ -1325,3 +1601,125 @@ class TestQuantRecipeWeightsUnderChunkGraphs:
             logits, grads = step(graph_model)
             torch.testing.assert_close(logits, updated_logits, rtol=1e-2, atol=1e-2)
             assert _relative_error(grads, updated_grads) <= 1e-2, microbatch
+
+    @pytest.mark.skipif(not (HAVE_TE and torch.cuda.is_available()), reason="TE and CUDA required")
+    @pytest.mark.parametrize(
+        "trains_in_fp8", [True, False], ids=["trains-in-fp8", "trains-in-bf16"]
+    )
+    def test_evaluation_under_another_kind_of_recipe_between_replays(
+        self, capture_cleanups, trains_in_fp8
+    ):
+        """Linears with an ``evaluation_recipe`` of another kind than the recipe they train
+        with, against an eager twin: replays, an evaluation, a weight update, replays of both
+        microbatches of a step, twice.
+
+        At an evaluation Transformer Engine finds another kind of recipe on such a module,
+        drops its cached quantized weight and rebuilds its quantizers; in eager the next
+        training forward does the same the other way round. The graphs of a model that trains
+        in FP8 write and read the cached weights of the capture, so the block keeps them and
+        hands each module the state of the capture back before every replay. A module that
+        trains in BF16 was recorded without quantization state: nothing is handed back, and
+        its second evaluation finds the quantizers its first one built."""
+        import transformer_engine as te
+
+        from megatron.core.transformer import cuda_graphs
+
+        if trains_in_fp8 and not hasattr(te.common.recipe, "Float8BlockScaling"):
+            pytest.skip("This Transformer Engine has no blockwise FP8 recipe")
+        if trains_in_fp8:
+            from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+            # Older releases have no such query: the evaluation then says so itself.
+            available = getattr(FP8GlobalStateManager, "is_fp8_block_scaling_available", None)
+            block_scaling_available, reason = available() if available else (True, "")
+            if not block_scaling_available:
+                pytest.skip(f"Blockwise FP8 not available on this device: {reason}")
+        evaluation_recipe = "Float8BlockScaling" if trains_in_fp8 else "Float8CurrentScaling"
+
+        micro_batch_size = 2
+        _init_two_microbatches(micro_batch_size)
+        tokens = torch.arange(_SEQ_LENGTH, device="cuda").repeat(micro_batch_size, 1)
+        # Causal mask (True: masked), the layout the block's static capture input has.
+        attention_mask = (
+            ~torch.tril(torch.ones((_SEQ_LENGTH, _SEQ_LENGTH), dtype=torch.bool, device="cuda"))
+        ).tile(micro_batch_size, 1, 1, 1)
+
+        def build(cuda_graph_impl):
+            model = _build_evaluation_recipe_gpt_model(cuda_graph_impl, trains_in_fp8)
+            model.train()
+            linears = {
+                name: module
+                for name, module in model.named_modules()
+                if getattr(module, "te_quant_params", None) is not None
+            }
+            assert sorted(linears) == [
+                f"decoder.layers.{layer}.mlp.linear_fc{fc}" for layer in range(4) for fc in (1, 2)
+            ]
+            return model, list(linears.values())
+
+        def step(model):
+            return _fixed_length_step(model, tokens, attention_mask)
+
+        def evaluate(model):
+            model.eval()
+            # As forward_step does for the first microbatch of an evaluation forward: the
+            # linears quantize the current weights instead of reusing what the last
+            # evaluation cached.
+            model.set_is_first_microbatch()
+            try:
+                with torch.no_grad():
+                    logits = model(
+                        input_ids=tokens, position_ids=tokens, attention_mask=attention_mask
+                    )
+                    return logits.float().clone()
+            finally:
+                model.train()
+
+        def assert_matches_eager(what):
+            expected_logits, expected_grads = step(eager_model)
+            logits, grads = step(graph_model)
+            torch.testing.assert_close(logits, expected_logits, rtol=1e-2, atol=1e-2, msg=what)
+            assert _relative_error(grads, expected_grads) <= 1e-2, what
+            return expected_logits
+
+        eager_model, eager_linears = build("none")
+        graph_model, graph_linears = build("chunk_wise")
+        # Eager before the capture, like the reference.
+        assert_matches_eager("before the capture")
+        assert all(linear.fp8 for linear in eager_linears + graph_linears) == trains_in_fp8
+
+        TestNvfp4ChunkGraphEndToEnd._capture(graph_model, micro_batch_size, capture_cleanups)
+        # The cached quantized weights the graphs write and read (none in a BF16 model).
+        caches = [dict(linear._fp8_workspaces) for linear in graph_linears]
+        assert all(bool(cache) == trains_in_fp8 for cache in caches)
+
+        def has_the_caches_of_the_capture(linear, cache):
+            now = linear._fp8_workspaces
+            return now.keys() == cache.keys() and all(now[name] is cache[name] for name in cache)
+
+        previous_logits = assert_matches_eager("first replay")
+        for factor in (-2.0, -0.5):
+            torch.testing.assert_close(
+                evaluate(graph_model), evaluate(eager_model), rtol=1e-2, atol=1e-2
+            )
+            # The evaluation left its own kind of recipe on the linears and, in the FP8 model,
+            # took the cached weights of the capture away from them.
+            for linear, cache in zip(graph_linears, caches):
+                assert type(linear.fp8_meta["recipe"]).__name__ == evaluation_recipe
+                assert not (trains_in_fp8 and has_the_caches_of_the_capture(linear, cache))
+            # What an optimizer step does; the sign flip keeps the final layer norm from
+            # hiding the update.
+            with torch.no_grad():
+                for linear in eager_linears + graph_linears:
+                    linear.weight.mul_(factor)
+            # Every microbatch of the step computes with the updated weights, like eager.
+            for microbatch in (0, 1):
+                cuda_graphs.set_current_microbatch(graph_model, microbatch)
+                logits = assert_matches_eager(f"after the update by {factor}, {microbatch}")
+                # The FP8 model's linears hold the cached weights of the capture again. In
+                # the BF16 model the graphs address none, and what the evaluation built stays
+                # for the next evaluation.
+                if trains_in_fp8:
+                    assert all(map(has_the_caches_of_the_capture, graph_linears, caches))
+            assert _relative_error(logits, previous_logits) > 5e-2
+            previous_logits = logits

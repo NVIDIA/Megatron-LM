@@ -6984,7 +6984,9 @@ class TestZigzagPackedRoll:
         """Chunk CUDA graphs capture the roll with static ``cu_seqlens`` buffers whose values
         change per replay (repeated final boundaries pad the slot count). The boundary exchange
         and the scatter must therefore have data-independent shapes, and the captured graph must
-        reproduce the eager roll of every packing that fits the static slots."""
+        reproduce the eager roll of every packing that fits the static slots. The eager roll
+        checks the alignment of the document lengths on the host; the recorded pass cannot
+        read values, so it carries the check as a device-side assert that every replay runs."""
         if Utils.world_size % cp != 0:
             pytest.skip(f"world size {Utils.world_size} is not a multiple of cp={cp}")
         from megatron.core.transformer.multi_token_prediction import (
@@ -7021,19 +7023,33 @@ class TestZigzagPackedRoll:
             def roll(x, cu):
                 return _roll_tensor_packed_seq_zigzag_cp(x, -1, -1, cu, cp_group)
 
-            references = [roll(local, cu_seqlens(packing)) for packing in packings]
+            device_asserts = []
+            assert_async = torch._assert_async
 
-            static_x = local.clone()
-            static_cu = cu_seqlens(packings[0]).clone()
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                for _ in range(2):
-                    roll(static_x, static_cu)
-            torch.cuda.current_stream().wait_stream(side)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                static_out = roll(static_x, static_cu)
+            def recording_assert_async(condition, *message):
+                device_asserts.append(message)
+                return assert_async(condition, *message)
+
+            torch._assert_async = recording_assert_async
+            try:
+                references = [roll(local, cu_seqlens(packing)) for packing in packings]
+
+                static_x = local.clone()
+                static_cu = cu_seqlens(packings[0]).clone()
+                side = torch.cuda.Stream()
+                side.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(side):
+                    for _ in range(2):
+                        roll(static_x, static_cu)
+                torch.cuda.current_stream().wait_stream(side)
+                recorded_eagerly = list(device_asserts)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    static_out = roll(static_x, static_cu)
+            finally:
+                torch._assert_async = assert_async
+            alignment = [m for m in device_asserts if m and "twice the CP size" in m[0]]
+            recorded_eagerly = [m for m in recorded_eagerly if m and "twice the CP size" in m[0]]
             replayed = []
             for packing in packings:
                 static_cu.copy_(cu_seqlens(packing))
@@ -7047,6 +7063,8 @@ class TestZigzagPackedRoll:
             del graph, static_out
             for packing, reference, output in zip(packings, references, replayed):
                 assert torch.equal(output, reference), packing
+            # The eager rolls checked on the host; the recorded one put its check on the device.
+            assert recorded_eagerly == [] and len(alignment) == 1
         finally:
             Utils.destroy_model_parallel()
 

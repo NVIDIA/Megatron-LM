@@ -3579,6 +3579,39 @@ def is_hybrid_ep_available():
     return HAVE_HYBRIDEP
 
 
+def test_dsa_topk_layers_the_mtp_reuses():
+    """The decoder layers whose DSA top-k indices an MTP layer of the same model chunk reuses:
+    the sources of the MTP's sharing layers that the MTP does not compute itself."""
+    from megatron.core.transformer.cuda_graphs import _dsa_topk_layers_the_mtp_reuses
+
+    def attention(layer_number, source_layer=None, index_share=True):
+        module = torch.nn.Identity()
+        module.index_share = index_share
+        module.layer_number = layer_number
+        module.skip_topk = source_layer is not None
+        module.source_layer = source_layer if source_layer is not None else layer_number
+        return module
+
+    def chunk(*mtp_layers):
+        model_chunk = torch.nn.Module()
+        model_chunk.mtp = torch.nn.Sequential(*mtp_layers, torch.nn.Linear(2, 2))
+        return model_chunk
+
+    # Layer 4 reuses decoder layer 3.
+    assert _dsa_topk_layers_the_mtp_reuses(chunk(attention(4, source_layer=3))) == (3,)
+    # Layer 4 selects its own keys and layer 5 reuses those: nothing crosses the boundary.
+    assert _dsa_topk_layers_the_mtp_reuses(chunk(attention(4), attention(5, source_layer=4))) == ()
+    # Two MTP layers reusing two decoder layers.
+    reused = _dsa_topk_layers_the_mtp_reuses(
+        chunk(attention(5, source_layer=3), attention(6, source_layer=2))
+    )
+    assert reused == (2, 3)
+    # No sharing (dsa_indexer_topk_freq == 1), no DSA layer, no MTP.
+    assert _dsa_topk_layers_the_mtp_reuses(chunk(attention(4, index_share=False))) == ()
+    assert _dsa_topk_layers_the_mtp_reuses(chunk()) == ()
+    assert _dsa_topk_layers_the_mtp_reuses(torch.nn.Module()) == ()
+
+
 class TestChunkWiseCudaGraphs:
     """Chunk-wise TE CUDA graphs (cuda_graph_impl='chunk_wise'): config validation and callable
     selection."""
@@ -3661,6 +3694,18 @@ class TestChunkWiseCudaGraphs:
                 },
                 "does not support log_moe_overload_factor",
             ),
+            # A context the schedule opens around the forward step, outside the recorded block.
+            ({'enable_autocast': True}, "does not support enable_autocast"),
+            # Routes the router records into, and replays from, Python state of every forward.
+            (
+                {
+                    'moe_enable_routing_replay': True,
+                    'num_moe_experts': 4,
+                    'moe_expert_capacity_factor': 1.0,
+                    'moe_pad_expert_input_to_capacity': True,
+                },
+                "does not support moe_enable_routing_replay",
+            ),
             # A router whose iteration count the host decides from the values of each batch.
             (
                 {
@@ -3714,6 +3759,8 @@ class TestChunkWiseCudaGraphs:
             "delay_wgrad_compute",
             "overlap_dispatch_backward_with_experts_wgrad",
             "log_moe_overload_factor",
+            "enable_autocast",
+            "moe_enable_routing_replay",
             "sinkhorn_routing",
             "gtp_weight_shards",
             "packed_without_dynamic_microbatches",
@@ -4252,8 +4299,9 @@ class TestChunkWiseCudaGraphs:
         helper.flattened_callables = list(callables)
         helper.num_layers_per_chunk = [len(callables)]
         helper._get_sample_arguments = lambda order, chunk_id_list=None: ([()] * len(callables), [])
+        # The helper imports make_graphed_callables from Transformer Engine at call time.
         monkeypatch.setattr(
-            cuda_graphs_module, "make_graphed_callables", fake_make_graphed_callables
+            "transformer_engine.pytorch.graph.make_graphed_callables", fake_make_graphed_callables
         )
         monkeypatch.setattr(cuda_graphs_module, "get_num_microbatches", lambda: 1)
         monkeypatch.setattr(cuda_graphs_module, "log_on_each_pipeline_stage", lambda **kwargs: None)
@@ -4319,8 +4367,7 @@ class TestChunkWiseCudaGraphs:
         helper = self._capture_input_helper(monkeypatch, [object()], **config_overrides)
         if not te_takes_pool:
             monkeypatch.setattr(
-                cuda_graphs_module,
-                "make_graphed_callables",
+                "transformer_engine.pytorch.graph.make_graphed_callables",
                 lambda modules, sample_args, **kwargs: None,
             )
 
@@ -4362,8 +4409,9 @@ class TestChunkWiseCudaGraphs:
                 raise RuntimeError("capture failed")
             return ()
 
+        # The helper imports make_graphed_callables from Transformer Engine at call time.
         monkeypatch.setattr(
-            cuda_graphs_module, "make_graphed_callables", fake_make_graphed_callables
+            "transformer_engine.pytorch.graph.make_graphed_callables", fake_make_graphed_callables
         )
 
         if capture_fails:
@@ -4413,8 +4461,9 @@ class TestChunkWiseCudaGraphs:
                 raise RuntimeError("capture failed")
             return ()
 
+        # The helper imports make_graphed_callables from Transformer Engine at call time.
         monkeypatch.setattr(
-            cuda_graphs_module, "make_graphed_callables", fake_make_graphed_callables
+            "transformer_engine.pytorch.graph.make_graphed_callables", fake_make_graphed_callables
         )
 
         if capture_fails:
@@ -4449,7 +4498,8 @@ class TestChunkWiseCudaGraphs:
         helper._start_capturing = start_capturing
         if failure == "sample_inputs":
             helper._get_cuda_graph_input_data = refuse_sample_inputs
-        monkeypatch.setattr(cuda_graphs_module, "make_graphed_callables", fail_capture)
+        # create_cudagraphs() imports make_graphed_callables from Transformer Engine at call time.
+        monkeypatch.setattr("transformer_engine.pytorch.graph.make_graphed_callables", fail_capture)
 
         try:
             with pytest.raises((ValueError, RuntimeError), match="captured|capture failed"):
@@ -4840,7 +4890,10 @@ class TestChunkWiseCudaGraphs:
         for name, value in (("curr_iteration", 0), ("cuda_graph", None), ("result", None)):
             monkeypatch.setattr(OptimizerCudaGraphWrapper, name, value)
 
-        te_make_graphed_callables = cuda_graphs_module.make_graphed_callables
+        # The helper imports make_graphed_callables from Transformer Engine at call time.
+        import transformer_engine.pytorch.graph as te_graph
+
+        te_make_graphed_callables = te_graph.make_graphed_callables
         captures, helpers = [], []
 
         @functools.wraps(te_make_graphed_callables)
@@ -4848,9 +4901,7 @@ class TestChunkWiseCudaGraphs:
             captures.append((kwargs.get('pool'), torch.cuda.graphs.graph.default_capture_stream))
             return te_make_graphed_callables(*args, **kwargs)
 
-        monkeypatch.setattr(
-            cuda_graphs_module, "make_graphed_callables", recording_make_graphed_callables
-        )
+        monkeypatch.setattr(te_graph, "make_graphed_callables", recording_make_graphed_callables)
         # Model construction and the eager steps run on a non-default stream, like training.
         training_stream = torch.cuda.Stream()
         training_stream.wait_stream(torch.cuda.current_stream())
@@ -4933,7 +4984,10 @@ class TestChunkWiseCudaGraphs:
             assert OptimizerCudaGraphWrapper.cuda_graph is not None
 
             ((pool, capture_stream),) = captures
-            if 'pool' in inspect.signature(cuda_graphs_module.make_graphed_callables).parameters:
+            from transformer_engine.pytorch.graph import make_graphed_callables
+
+            # The recording stand-in wraps Transformer Engine's function, signature included.
+            if 'pool' in inspect.signature(make_graphed_callables).parameters:
                 assert pool is not None
                 # Still the handle the optimizer-step graph was captured into afterwards.
                 assert pool is full_cuda_graph._shared_graph_pool

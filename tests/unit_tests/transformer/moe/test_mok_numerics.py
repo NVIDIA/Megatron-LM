@@ -410,9 +410,10 @@ def _requantize_routed_experts(backend, amax_reduction_group):
 
 
 @pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("backend", ["mok", "cutemok"])
 @pytest.mark.parametrize("single_grouped_weight", [False, True], ids=["split", "single-grouped"])
 def test_real_mok_mxfp8_chunk_wise_replay_follows_requantized_experts(
-    monkeypatch, single_grouped_weight
+    monkeypatch, single_grouped_weight, backend
 ):
     """A one-layer MoK MXFP8 block graph must replay with the scales of the latest update.
 
@@ -428,7 +429,17 @@ def test_real_mok_mxfp8_chunk_wise_replay_follows_requantized_experts(
         (10, 3),
     ):
         pytest.skip("MoK requires Blackwell SM100/SM103")
-    functional = pytest.importorskip("mok.functional")
+    from megatron.core.transformer.moe.megakernel.mok import package
+    from megatron.core.transformer.moe.megakernel.mok.package import clear_mok_caches
+
+    if backend == "mok":
+        pytest.importorskip("mok.functional")
+        # Deprecated "mok" runs the standalone package only where CuTe MoK cannot run.
+        monkeypatch.setattr(package, "cutemok_available", lambda: False)
+    else:
+        pytest.importorskip("cudnn.moe_ep.cutemok")
+        if not package.cutemok_available():
+            pytest.skip("CuTe MoK cannot run here")
     pytest.importorskip("transformer_engine.pytorch")
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -493,7 +504,7 @@ def test_real_mok_mxfp8_chunk_wise_replay_follows_requantized_experts(
             gated_linear_unit=True,
             activation_func=F.silu,
             gradient_accumulation_fusion=True,
-            moe_megakernel_backend="mok",
+            moe_megakernel_backend=backend,
             moe_megakernel_backend_config=dict(
                 fwd_num_comm_sms=2,
                 bwd_num_comm_sms=2,
@@ -593,7 +604,8 @@ def test_real_mok_mxfp8_chunk_wise_replay_follows_requantized_experts(
             cuda_graphs.te_set_capture_end()
         if helper is not None and helper.graphs_created():
             helper.delete_cuda_graphs()
-        functional.clear_workspace_cache()
+        # After the graphs are gone: a plan must outlive the replays that use it.
+        clear_mok_caches()
         destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
         torch.set_rng_state(cpu_rng_state)
