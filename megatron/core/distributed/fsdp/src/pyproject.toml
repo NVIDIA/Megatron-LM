@@ -18,7 +18,7 @@ readme = { file = "README.md", content-type = "text/markdown" }
 name = "megatron-fsdp"
 dynamic = ["version", "readme"]
 description = "**Megatron-FSDP** is an NVIDIA-developed PyTorch extension that provides a high-performance implementation of Fully Sharded Data Parallelism (FSDP)"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = { text = "Apache 2.0" }
 dependencies = ["torch", "einops", "packaging"]
 authors = [{ name = "NVIDIA", email = "nemo-toolkit@nvidia.com" }]
@@ -46,8 +46,7 @@ classifiers = [
     "Natural Language :: English",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Image Recognition",
     "Topic :: Scientific/Engineering :: Mathematics",
