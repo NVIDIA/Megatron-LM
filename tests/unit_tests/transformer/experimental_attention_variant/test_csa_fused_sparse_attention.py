@@ -914,3 +914,129 @@ def test_real_fused_sbhd_forward_backward_matches_native_reference(num_heads):
     torch.testing.assert_close(
         sink_fused.grad.float(), sink_native.grad.float(), rtol=5e-2, atol=5e-2
     )
+
+
+def test_csa_fwd_prefers_flash_mla_over_cudnn_fallback(monkeypatch):
+    seen = {}
+
+    def fake_flash(q, kv_3d, indices_3d, _scale, **_kwargs):
+        seen["flash_called"] = True
+        seen["kv_ndim"] = kv_3d.ndim
+        seen["indices_ndim"] = indices_3d.ndim
+        out = torch.zeros((q.shape[0], q.shape[1], 512), dtype=q.dtype)
+        lse = torch.zeros((q.shape[0], q.shape[1]), dtype=torch.float32)
+        return out, torch.empty(0), lse
+
+    cudnn_fwd = MagicMock(side_effect=AssertionError("cuDNN fallback must not run when FlashMLA is present"))
+    monkeypatch.setattr(fused_csa, "_flash_mla_sparse_fwd", fake_flash)
+    monkeypatch.setattr(fused_csa, "_DSA", SimpleNamespace(sparse_attention_forward_wrapper=cudnn_fwd))
+    monkeypatch.setattr(fused_csa, "_get_head_padding", lambda _heads: 64)
+    monkeypatch.setattr(fused_csa, "_get_topk_alignment", lambda: 64)
+
+    q = torch.randn(3, 32, 576, dtype=torch.bfloat16)
+    kv = torch.randn(8, 576, dtype=torch.bfloat16)
+    indices = torch.zeros(3, 16, dtype=torch.int32)
+    out, lse, lse_indexer = fused_csa._csa_fwd_flash_mla(q, kv, indices, 0.125)
+
+    assert seen == {"flash_called": True, "kv_ndim": 3, "indices_ndim": 3}
+    assert out.shape == (3, 32, 512)
+    assert lse.shape == (3, 32)
+    assert lse_indexer is None
+    cudnn_fwd.assert_not_called()
+
+
+@pytest.mark.parametrize("topk,indexer_topk", [(16, 0), (512, 512), (1024, 512)])
+def test_csa_fwd_falls_back_to_cudnn_dsa_on_sm100_without_flash_mla(
+    monkeypatch, topk, indexer_topk
+):
+    seen = {}
+
+    class FakeDSA:
+        @staticmethod
+        def sparse_attention_forward_wrapper(q, kv, topk_idxs, **kwargs):
+            seen["q_shape"] = tuple(q.shape)
+            seen["kv_ndim"] = kv.ndim
+            seen["topk_shape"] = tuple(topk_idxs.shape)
+            seen["topk_idxs"] = topk_idxs.detach().clone()
+            seen["sink"] = kwargs["attn_sink"].detach().clone()
+            seen["indexer_topk"] = kwargs["indexer_topk"]
+            seen["scale"] = kwargs["softmax_scale"]
+            rows, heads, _ = q.shape
+            out = torch.arange(rows * heads * 512, dtype=q.dtype).reshape(rows, heads, 512)
+            lse = torch.arange(rows * heads, dtype=torch.float32).reshape(rows, heads)
+            lse_idx = lse + 100.0 if kwargs["indexer_topk"] > 0 else None
+            return {"out": out, "max_logits": torch.empty(0), "lse": lse, "lse_indexer": lse_idx}
+
+    def raise_no_flash():
+        raise ImportError("FlashMLA is not installed")
+
+    monkeypatch.setattr(fused_csa, "_flash_mla_sparse_fwd", None)
+    monkeypatch.setattr(fused_csa, "_ensure_flash_mla", raise_no_flash)
+    monkeypatch.setattr(fused_csa, "_DSA", FakeDSA)
+    monkeypatch.setattr(fused_csa, "_get_head_padding", lambda _heads: 64)
+    monkeypatch.setattr(fused_csa, "_get_topk_alignment", lambda: 64)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_args: (10, 0))
+
+    q = torch.randn(2, 32, 576, dtype=torch.bfloat16)
+    kv = torch.randn(6, 576, dtype=torch.bfloat16)
+    indices = torch.zeros(2, topk, dtype=torch.int32)
+    sink = torch.linspace(-0.5, 0.5, 32)
+    out, lse, lse_indexer = fused_csa._csa_fwd_flash_mla(
+        q, kv, indices, 0.25, d_v=512, attn_sink=sink, indexer_topk=indexer_topk
+    )
+
+    expected_topk = ((topk + 63) // 64) * 64
+    assert seen["q_shape"] == (2, 64, 576)
+    assert seen["kv_ndim"] == 2
+    assert seen["topk_shape"] == (2, expected_topk)
+    assert torch.all(seen["topk_idxs"][:, topk:] == -1)
+    assert torch.equal(seen["sink"][:32], sink)
+    assert torch.all(seen["sink"][32:] == float("-inf"))
+    assert seen["indexer_topk"] == indexer_topk
+    assert seen["scale"] == 0.25
+    assert out.shape == (2, 32, 512)
+    assert out.is_contiguous()
+    assert lse.shape == (2, 32)
+    if indexer_topk == 0:
+        assert lse_indexer is None
+    elif indexer_topk >= topk:
+        # indexer_topk == TopK triggers the lse.clone() snapshot fallback.
+        assert torch.equal(lse_indexer, lse)
+        assert lse_indexer is not lse
+    else:
+        assert torch.equal(lse_indexer, lse + 100.0)
+
+
+def test_csa_fwd_does_not_use_cudnn_fallback_on_sm90_or_unsupported_shape(monkeypatch):
+    cudnn_fwd = MagicMock(side_effect=AssertionError("unsupported cuDNN fallback should not be called"))
+
+    def raise_no_flash():
+        raise ImportError("FlashMLA is not installed")
+
+    monkeypatch.setattr(fused_csa, "_flash_mla_sparse_fwd", None)
+    monkeypatch.setattr(fused_csa, "_ensure_flash_mla", raise_no_flash)
+    monkeypatch.setattr(fused_csa, "_DSA", SimpleNamespace(sparse_attention_forward_wrapper=cudnn_fwd))
+    monkeypatch.setattr(fused_csa, "_get_topk_alignment", lambda: 64)
+
+    q_sm90 = torch.randn(2, 32, 576, dtype=torch.bfloat16)
+    kv_sm90 = torch.randn(4, 576, dtype=torch.bfloat16)
+    indices = torch.zeros(2, 64, dtype=torch.int32)
+
+    monkeypatch.setattr(fused_csa, "_get_head_padding", lambda _heads: 64)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_args: (9, 0))
+    with pytest.raises(ImportError, match="FlashMLA is not installed"):
+        fused_csa._csa_fwd_flash_mla(q_sm90, kv_sm90, indices, 0.25)
+
+    # On SM100, (padded_H=128, D=576) is not supported by cuDNN DSA forward.
+    q_h128 = torch.randn(2, 128, 576, dtype=torch.bfloat16)
+    monkeypatch.setattr(fused_csa, "_get_head_padding", lambda _heads: 128)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_args: (10, 0))
+    with pytest.raises(ImportError, match="cuDNN DSA forward fallback requires SM100"):
+        fused_csa._csa_fwd_flash_mla(q_h128, kv_sm90, indices, 0.25)
+
+    # Unsupported d_v != 512 on SM100 also declines fallback.
+    monkeypatch.setattr(fused_csa, "_get_head_padding", lambda _heads: 64)
+    with pytest.raises(ImportError, match="d_v=256"):
+        fused_csa._csa_fwd_flash_mla(q_sm90, kv_sm90, indices, 0.25, d_v=256)
+
+    cudnn_fwd.assert_not_called()

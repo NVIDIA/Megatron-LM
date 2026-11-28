@@ -48,6 +48,14 @@ _DSA = None
 
 _CSA_TEACHER_LSE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 
+# Variants supported by cuDNN Frontend's SM100 sparse-attention forward kernel
+# (`cudnn.DSA.sparse_attention_forward_wrapper`): (num_heads, head_dim) -> supported indexer_topk.
+_CUDNN_DSA_FWD_SUPPORTED_VARIANTS = {
+    (64, 512): (0, 512, 1024, 2048),
+    (64, 576): (0, 512, 1024, 2048),
+    (128, 512): (0, 512, 1024),
+}
+
 
 def _ensure_flash_mla():
     """Lazily import the FlashMLA sparse-forward kernel.
@@ -87,6 +95,43 @@ def _get_topk_alignment() -> int:
     return 128
 
 
+def _try_ensure_dsa_namespace() -> bool:
+    """Populate ``_DSA`` when cudnn-frontend is available without raising on ImportError."""
+    if _DSA is not None:
+        return True
+    try:
+        _ensure_dsa_namespace()
+    except ImportError:
+        return False
+    return True
+
+
+def _can_use_cudnn_dsa_fwd(
+    q: Tensor,
+    kv: Tensor,
+    padded_num_heads: int,
+    d_v: int,
+    indexer_topk: int,
+) -> bool:
+    """Return whether SM100 ``cudnn.DSA.sparse_attention_forward_wrapper`` supports these inputs."""
+    if d_v != 512 or q.dtype not in (torch.float16, torch.bfloat16) or kv.dtype != q.dtype:
+        return False
+    if getattr(_DSA, "sparse_attention_forward_wrapper", None) is None:
+        return False
+    supported_topk = _CUDNN_DSA_FWD_SUPPORTED_VARIANTS.get((padded_num_heads, q.shape[-1]))
+    if supported_topk is None or indexer_topk not in supported_topk:
+        return False
+    try:
+        sm = (
+            torch.cuda.get_device_capability(q.device)
+            if q.is_cuda
+            else torch.cuda.get_device_capability()
+        )
+    except (AssertionError, RuntimeError):
+        return False
+    return sm[0] == 10
+
+
 def _csa_fwd_flash_mla(
     q: Tensor,
     kv: Tensor,
@@ -97,15 +142,25 @@ def _csa_fwd_flash_mla(
     topk_length: Optional[Tensor] = None,
     indexer_topk: int = 0,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
-    """DSA-shaped adapter around :func:`flash_mla.flash_mla_sparse_fwd`.
+    """DSA-shaped adapter around ``flash_mla_sparse_fwd`` with SM100 cuDNN DSA fallback.
 
-    Accepts flat (unbatched) tensors with global indices; pads ``TopK`` to
-    the GPU-specific alignment; returns ``(out, lse, lse_indexer)``.
+    Prefers :func:`flash_mla.flash_mla_sparse_fwd` when available; when FlashMLA is not
+    installed on an SM100 GPU with a supported geometry, falls back to
+    ``cudnn.DSA.sparse_attention_forward_wrapper``. Accepts flat (unbatched) tensors with
+    global indices, pads ``TopK`` and local query heads, and returns ``(out, lse, lse_indexer)``.
     """
     assert not (
         indexer_topk > 0 and topk_length is not None
     ), "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
-    _ensure_flash_mla()
+    use_cudnn_fwd = False
+    flash_err: Optional[ImportError] = None
+    try:
+        _ensure_flash_mla()
+    except ImportError as exc:
+        if not _try_ensure_dsa_namespace():
+            raise
+        use_cudnn_fwd = True
+        flash_err = exc
 
     _total_S_q, actual_num_heads, _D = q.shape
     TopK = topk_idxs.shape[-1]
@@ -115,10 +170,17 @@ def _csa_fwd_flash_mla(
         pad_width = TopK_padded - TopK
         topk_idxs = torch.nn.functional.pad(topk_idxs, (0, pad_width), value=-1)
 
-    kv_3d = kv.unsqueeze(1)  # (total_S_kv, 1, D)  h_kv=1
-    indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
-
     padded_num_heads = _get_head_padding(actual_num_heads)
+    if use_cudnn_fwd and not _can_use_cudnn_dsa_fwd(
+        q, kv, padded_num_heads, d_v, indexer_topk
+    ):
+        raise ImportError(
+            f"{flash_err} cuDNN DSA forward fallback requires SM100, fp16/bf16 Q/KV, "
+            f"d_v=512, and a supported (H, D, indexer_topk) variant; got "
+            f"(padded_H={padded_num_heads}, D={_D}, d_v={d_v}, "
+            f"indexer_topk={indexer_topk}, dtype={q.dtype})."
+        ) from flash_err
+
     if padded_num_heads != actual_num_heads:
         q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
         q_padded[:, :actual_num_heads, :] = q
@@ -129,22 +191,43 @@ def _csa_fwd_flash_mla(
             attn_sink_padded[:actual_num_heads] = attn_sink
             attn_sink = attn_sink_padded
 
-    with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
-        res = _flash_mla_sparse_fwd(
-            q,
-            kv_3d,
-            indices,
-            softmax_scale,
-            d_v=d_v,
-            attn_sink=attn_sink,
-            topk_length=topk_length,
-            indexer_topk=indexer_topk,
-        )
-        if indexer_topk > 0:
-            out, _max_logits, lse, lse_indexer = res
-        else:
-            out, _max_logits, lse = res
-            lse_indexer = None
+    if use_cudnn_fwd:
+        with torch.cuda.nvtx.range("cudnn_dsa_sparse_fwd"):
+            res = _DSA.sparse_attention_forward_wrapper(
+                q,
+                kv,
+                topk_idxs,
+                attn_sink=attn_sink,
+                topk_length=topk_length,
+                softmax_scale=softmax_scale,
+                indexer_topk=indexer_topk,
+            )
+            if isinstance(res, dict):
+                out, lse, lse_indexer = res["out"], res["lse"], res.get("lse_indexer")
+            elif len(res) == 4:
+                out, _max_logits, lse, lse_indexer = res
+            else:
+                out, _max_logits, lse = res
+                lse_indexer = None
+    else:
+        kv_3d = kv.unsqueeze(1)  # (total_S_kv, 1, D)  h_kv=1
+        indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
+        with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
+            res = _flash_mla_sparse_fwd(
+                q,
+                kv_3d,
+                indices,
+                softmax_scale,
+                d_v=d_v,
+                attn_sink=attn_sink,
+                topk_length=topk_length,
+                indexer_topk=indexer_topk,
+            )
+            if indexer_topk > 0:
+                out, _max_logits, lse, lse_indexer = res
+            else:
+                out, _max_logits, lse = res
+                lse_indexer = None
 
     if padded_num_heads != actual_num_heads:
         # Reconstruction uses the same strides for saved output and its private destination.
