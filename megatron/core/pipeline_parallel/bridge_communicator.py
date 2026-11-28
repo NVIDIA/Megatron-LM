@@ -643,9 +643,6 @@ class BridgeCommunicator:
 
         Note: Gradient receivers are activation 'SENDERS'
 
-        Args:
-            tensor_shape: Expected gradient tensor shape
-
         Returns:
             The received gradient tensor, or None when backward is disabled.
         """

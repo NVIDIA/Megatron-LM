@@ -162,9 +162,9 @@ class Scheduler:
         request pool and add waiting request into active pool.
 
         Args:
-            result (typing.OrderedDict[int, InferenceRequest], optional): The result returned
-                by the engine. A dictionary with keys as the request ids, and values as the
-                requests. Defaults to None.
+            result_dict (typing.OrderedDict[int, InferenceRequest], optional): The result
+                returned by the engine. A dictionary with keys as the request ids, and
+                values as the requests. Defaults to None.
         """
         for result_request_id in list(result_dict.keys()):
             active_request = self.active_request_pool[result_request_id]
