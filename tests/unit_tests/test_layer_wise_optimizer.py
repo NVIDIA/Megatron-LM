@@ -116,6 +116,7 @@ class MuonExcludedMatrixModel(nn.Module):
         self.scalar = nn.Linear(10, 8)
         self.muon = nn.Linear(8, 5)
         self.scalar.weight.use_muon = False
+        self.scalar.weight.is_word_embedding_parameter = True
 
     def forward(self, x):
         return self.muon(F.relu(self.scalar(x)))
@@ -144,6 +145,7 @@ class TestLayerWiseOptimizer:
         use_layer_wise=True,
         copy_from=None,
         use_param_layout=False,
+        embedding_min_norm=None,
     ):
         """Create model, DDP wrapper, and optimizer.
 
@@ -195,6 +197,7 @@ class TestLayerWiseOptimizer:
             bf16=True,
             use_distributed_optimizer=False,
             clip_grad=clip_grad,
+            embedding_min_norm=embedding_min_norm,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=use_layer_wise,
         )
@@ -379,10 +382,13 @@ class TestLayerWiseOptimizer:
                             f"Parameter {name} differs between rank 0 and rank {i}. {str(e)}"
                         ) from None
 
-    def test_explicit_muon_exclusion_updates_with_param_layout(self):
+    @pytest.mark.parametrize("embedding_min_norm", [None, 2.0])
+    def test_explicit_muon_exclusion_updates_with_param_layout(self, embedding_min_norm):
         """An excluded 2D matrix is updated and synchronized by the scalar DistOpt."""
         model, optimizer, pg_collection = self.create_model_and_optimizer(
-            model_class=MuonExcludedMatrixModel, use_param_layout=True
+            model_class=MuonExcludedMatrixModel,
+            use_param_layout=True,
+            embedding_min_norm=embedding_min_norm,
         )
         excluded_weight = model.module.scalar.weight
         initial_weight = excluded_weight.detach().clone()
@@ -393,6 +399,11 @@ class TestLayerWiseOptimizer:
 
         assert update_successful
         assert not torch.equal(excluded_weight, initial_weight)
+        if embedding_min_norm is not None:
+            row_norms = excluded_weight.float().norm(dim=1)
+            torch.testing.assert_close(
+                row_norms, torch.full_like(row_norms, 4.0), rtol=0.004, atol=0
+            )
 
         dp_size = get_pg_size(pg_collection.dp_cp)
         gathered = [torch.empty_like(excluded_weight) for _ in range(dp_size)]

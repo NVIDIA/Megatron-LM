@@ -9,6 +9,7 @@ from typing import Callable, Optional, Tuple, Union
 import torch
 
 from ..utils import is_te_min_version
+from .param_norm_constraints import EmbeddingMinNorm
 
 logger = logging.getLogger(__name__)
 
@@ -454,10 +455,8 @@ class OptimizerConfig:
     def validate(self) -> None:
         """Check optimizer-local settings without modifying the config."""
 
-        if self.embedding_min_norm is not None and (
-            not math.isfinite(self.embedding_min_norm) or self.embedding_min_norm <= 0.0
-        ):
-            raise ValueError("embedding_min_norm must be a finite positive value")
+        if self.embedding_min_norm is not None:
+            EmbeddingMinNorm.validate_threshold(self.embedding_min_norm)
 
         if self.embedding_min_norm is not None and self.optimizer_cuda_graph:
             raise ValueError("embedding_min_norm is not supported with optimizer_cuda_graph")
