@@ -132,12 +132,12 @@ rank into one pinned buffer:
 
 Fine-grained offloading is compatible with CUDA graphs. When CUDA graph is enabled, the following constraints apply:
 
-> **Scope:** The event-boundary integration described in this section is specific to Transformer Engine's per-callable capture (`cuda_graph_impl=transformer_engine`). It does not change MCore's `local` or `full_iteration` CUDA graph runners.
+> **Scope:** The event-boundary integration described in this section is specific to Transformer Engine's per-callable capture (`cuda_graph_impl=transformer_engine`). It does not change MCore's `local` or `full_iteration` CUDA graph runners, and it does not apply to chunk-wise graphs (`cuda_graph_impl=chunk_wise`), which capture the offloads into the whole-block graphs (no `cuda_graph_modules` scope, `attn_norm` and `mlp_norm` can be offloaded); see the chunk-wise section of [cuda_graph.md](cuda_graph.md), which also describes `--fine-grained-offloading-graph-keep-last-group`.
 
 - `attn_norm` and `mlp_norm` **cannot** be offloaded (they cross CUDA graph boundaries).
 - Use an explicit scope containing each captured offloaded region: `attn` for attention-side offload, and add `moe_router` for the recommended partial-MoE delayed-expert setup.
 - Empty `cuda_graph_modules` (TE whole-layer capture) is not yet integrated with the offload event boundary and emits a warning; use explicit partial scopes.
-- `cuda_graph_impl` must be `transformer_engine`.
+- `cuda_graph_impl` must be `transformer_engine` for this per-callable integration.
 - Requires `torch >= 2.9.0` and `transformer_engine >= 2.14.0`.
 
 ```bash

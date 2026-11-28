@@ -9,13 +9,13 @@
 
 # CUDA Graph
 
-CUDA Graphs reduce kernel-launch overhead by recording GPU operations once and replaying the recording on subsequent iterations. Megatron-LM provides three CUDA graph implementations controlled by `--cuda-graph-impl`.
+CUDA Graphs reduce kernel-launch overhead by recording GPU operations once and replaying the recording on subsequent iterations. Megatron-LM provides four CUDA graph implementations controlled by `--cuda-graph-impl`.
 
 For implementation background and design details, see NVIDIA's
 [Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/latest/torch-cuda-graph/te-megatron-cuda-graphs.html).
 That article is a useful conceptual reference, but some examples there still use older flags such as
 `--enable-cuda-graph` or `--cuda-graph-scope full_iteration`; in this repository, prefer
-`--cuda-graph-impl local|transformer_engine|full_iteration` as documented below.
+`--cuda-graph-impl local|transformer_engine|chunk_wise|full_iteration` as documented below.
 
 ## Overview
 
@@ -23,7 +23,7 @@ CUDA graph behavior is set by three orthogonal flags:
 
 | Flag | Values | Purpose |
 |---|---|---|
-| `--cuda-graph-impl` | `none` / `local` / `transformer_engine` / `full_iteration` | Which capture backend or strategy to use |
+| `--cuda-graph-impl` | `none` / `local` / `transformer_engine` / `chunk_wise` / `full_iteration` | Which capture backend or strategy to use |
 | `--cuda-graph-modules` | `attn` / `mlp` / `moe` / `moe_router` / `moe_preprocess` / `mamba` | Per-layer **training** capture coverage; multi-valued and only meaningful for `local` and `transformer_engine` |
 | `--inference-cuda-graph-scope` | `none` / `layer` / `block` | Granularity of CUDA graphs during **inference**; only `local` supports non-`none` values |
 
@@ -34,6 +34,7 @@ Supported combinations:
 | `none` | — | off | off |
 | `local` | MCore `CudaGraphManager` | per-layer, controlled by `--cuda-graph-modules` | `layer` (default) or `block`, controlled by `--inference-cuda-graph-scope` |
 | `transformer_engine` | TE `make_graphed_callables()` | per-layer, controlled by `--cuda-graph-modules` | not supported (`none` only) |
+| `chunk_wise` | TE `make_graphed_callables()` | one forward/backward graph pair per PP/VPP model chunk and microbatch slot (plus one for the post-process of the last stage with packed sequences); `--cuda-graph-modules` must be empty | not supported (`none` only) |
 | `full_iteration` | MCore `FullCudaGraphWrapper` | one graph per training iteration; `--cuda-graph-modules` must be empty | not supported (`none` only) |
 
 ---
@@ -171,6 +172,306 @@ per-layer workspaces.
 
 ---
 
+## Chunk-wise CUDA Graph (`--cuda-graph-impl chunk_wise`)
+
+`--cuda-graph-impl chunk_wise` keeps Transformer Engine's `make_graphed_callables()` but hands it the
+whole decoder block of every PP/VPP model chunk instead of the individual layers: one forward graph
+and one backward graph per decoder block and microbatch slot. Activation recompute (including
+`--recompute-granularity full`), MoE dispatch/combine and the hyper-connection residual streams are
+recorded inside the graph, so a training step launches one graph per chunk and pass instead of one
+per layer. `--cuda-graph-modules` must be empty and inference CUDA graphs are not supported.
+
+With packed sequences (`--sequence-packing-scheduler`) the post-process of the last pipeline stage
+(MTP block, LM head and loss) is captured as a second callable of that chunk, in the same schedule
+order, so it shares the graph memory pool with the decoder graphs. The post-process stays eager
+(it runs after the decoder replay) for fixed-length batches, when the stage owns no decoder layer
+or its decoder block is not captured (`--freeze-base-model-for-mtp` and `--freeze-all-layers` run
+the decoder without autograd, so it stays eager; frozen parameters alone do not: a decoder that is
+frozen while another part of the model trains is captured as usual),
+and when Python has to see the logits of every microbatch: forward hooks on the LM head (logits
+savers, distillation captures) or, for `GPTModel`, `--config-logger-dir` (its post-process dumps
+the inputs and logits of every forward). A call that conditions the post-process on
+anything but the captured tensors (no labels or no loss mask; with MTP on the stage, no token ids,
+position ids or padding mask; an MTP input mask, precomputed MTP embeddings, a per-call
+`runtime_gather_output`, an output processor, extra MTP block arguments, a sequence length offset,
+a disabled MTP loss or a context-parallel layout plan) takes the eager post-process as well.
+When the post-process of a packed run is never captured (the stage or model reasons above), a
+warning on its pipeline stage names the reason; a single call that takes the eager post-process
+does so without a message. Every microbatch of a training step has to take the same
+post-process (`pretrain_gpt.py` and `pretrain_hybrid.py` pass the same arguments for every
+microbatch): replays and eager post-process calls mixed within one step are not supported,
+because a replay runs none of the Python that tracks the step's first microbatch for the
+weight gradient accumulation and the quantized weight cache.
+
+### Usage
+
+```bash
+--cuda-graph-impl chunk_wise \
+--cuda-graph-warmup-steps 2 \
+# packed sequences: static shapes and a capture bound on the packed microbatch count
+--micro-batch-size 1 --max-seqlen-per-dp-cp-rank <W> --pad-packed-seq-alignment max \
+--thd-max-packed-sequences <N> --cuda-graph-dynamic-microbatches \
+# packed sequences with PP > 1: the padded inter-stage shape is static, skip the P2P shape exchange
+--pipeline-p2p-fixed-shape \
+# optional: optimizer step in the same graph memory pool (optimizer state must stay on the GPU)
+--optimizer-cuda-graph
+```
+
+With `--optimizer-cuda-graph` the optimizer step graph is captured into the pool of the block graphs
+when `cuda_graph_use_single_mempool` is on (the default) and the installed Transformer Engine's
+`make_graphed_callables()` takes a `pool` argument; otherwise both keep their own pools. The
+optimizer's first step always runs eagerly, so its state exists before the graph is captured.
+
+### Requirements
+
+- Transformer Engine: the mode is developed and tested with Transformer Engine 2.20 development
+  builds. The capture passes Transformer Engine the options its version offers (shared graph
+  pool, buffer reuse between slots, parameter gradients without a copy), so older releases may
+  capture, but they are not tested; paged stash needs TE >= 2.19, which the configuration
+  enforces.
+- MoE layers need static token shapes: drop-padding MoE (`--moe-expert-capacity-factor` with
+  `--moe-pad-expert-input-to-capacity` and the `alltoall` or `flex` token dispatcher; the
+  `allgather` dispatcher reads the token counts on the host), the HybridEP flex dispatcher with
+  `--moe-expert-rank-capacity-factor`, or a MoE megakernel backend. HybridEP's runtime padding
+  (`--moe-hybridep-pad-variable-tokens`) is turned off: every rank holds the same static token count.
+  With `--moe-use-grouped-tensor` and drop-padding, the experts hand Transformer Engine their
+  token counts as a host list where its native grouped-tensor path cannot run the model-wide
+  precision (FP8 delayed scaling, FP32 parameters): its fallback reads them on the host, which a
+  capture cannot record from a device tensor. Not covered: the operation fuser's variant of that
+  fallback (`--use-transformer-engine-op-fuser`, which moves the counts itself), experts built
+  with a single grouped weight or bias (Transformer Engine requires its native path for them and
+  says so) and paged stash (it requires grouped-tensor execution).
+  MoK's MXFP8 mode records its expert scale re-swizzle inside the captured block, so every replay
+  picks up the scales of the latest parameter update.
+- Packed sequences need `--micro-batch-size 1`, `--cuda-graph-dynamic-microbatches`, an explicit
+  window `--max-seqlen-per-dp-cp-rank` (the static token count per rank that every pack is padded
+  to: a multiple of 2, or of 32 with MXFP8, times the TP size with sequence parallelism),
+  `--pad-packed-seq-alignment max` (or the value of the window) and a bound on the sequences per
+  pack (`--thd-max-packed-sequences`). With pipeline parallelism every microbatch in flight owns
+  a graph slot, and their number is derived from the global batch size: the dataset has to yield
+  one sequence per item (`--use-varlen-dataset`, or mock `--sft` data). The training CLI rejects
+  real `--sft` data and `--dataloader-inter-document-masking` there, whose items hold several
+  sequences, and a step that still needs more slots than were captured raises. Packed data paths without the packing scheduler (`--sft`,
+  `--dataloader-inter-document-masking`) are not captured: the training CLI rejects them with
+  `chunk_wise`, and in a custom training loop a block graph captured from fixed-length batches
+  raises when it receives packed sequence parameters. A tensor keyword the block was not captured
+  with (`extra_block_kwargs`, or an attention mask with `create_attention_mask_in_dataloader` off)
+  is not a graph input and has no effect on a replay, as with the per-layer graphs.
+- With fixed-length batches the graph slots follow the step: one slot without pipeline
+  parallelism, one per microbatch of the step with it. `--cuda-graph-dynamic-microbatches` only
+  applies to packed sequences and is turned off (with a warning) otherwise.
+- With pipeline parallelism the graph slots are sized when the graphs are captured. With
+  fixed-length batches a `--step-batch-size-schedule` transition to a larger batch needs a
+  relaunch: with `--save` set the training loop saves a checkpoint and exits at the transition;
+  without it the first step at the new size stops on the slot check. With packed sequences the
+  capture refuses a schedule that still has a larger batch ahead: capture after the schedule has
+  reached its maximum (relaunch from a checkpoint past the last transition).
+- Fixed-length batches that carry a padding mask (for example `--varlen-sbhd-validation`) need
+  `--cuda-graph-warmup-steps >= 1` when the block has MoE layers or custom layers: the capture
+  reserves the mask input only if the block received a mask during the eager warm-up, and a mask
+  that reaches a graph captured without one raises.
+- Custom layers of a hybrid stack (`hybrid_layer_config_list` entries with a `layer_type`) are
+  recorded with the block as they are written. A replay runs none of their Python, so they must
+  not read tensor values on the host, keep Python state per microbatch or rely on hooks. The
+  token ids the stack hands them are an input of the block graph, exactly as the model hands
+  them, on the stages the model gives ids to, which also needs `--cuda-graph-warmup-steps >= 1`:
+  ids that reach a graph captured without them raise. The rotary table is an input as well.
+  The packed-sequence metadata a custom layer receives inside the graph is rebuilt from the
+  graph's inputs: it carries `qkv_format`, the four `cu_seqlens_*` tensors, `max_seqlen_q/kv`
+  (`--max-seqlen-per-dp-cp-rank` times the CP size), `cp_partition_mode` from the config and
+  `pad_between_seqs=True`, and none of the per-pack attributes a data pipeline sets on top
+  (`seq_idx`, `total_tokens`, `cp_group`, a prebuilt CP route, `tokens_per_sample`).
+  With fixed-length batches and the dataloader's attention mask (the default;
+  `--no-create-attention-mask-in-dataloader` turns it off), a stage that receives no batch
+  (neither the first nor the last) cannot replay a stack with custom layers: the mask it was
+  captured with is missing there and has no stand-in for a custom layer. A packed block graph
+  hands its layers, custom ones included, no attention mask.
+- Not supported with `chunk_wise`: `enable_autocast` (the graphs are recorded outside the
+  `torch.autocast` the schedule opens around a forward step), `--overlap-moe-expert-parallel-comm`,
+  `--delay-wgrad-compute`,
+  `--overlap-dispatch-backward-with-experts-wgrad`, sinkhorn routing
+  (`--moe-router-load-balancing-type sinkhorn`: its normalisation loop ends on a host-side read),
+  GTP weight rematerialization (`--tensor-parallel-num-weight-shards` or
+  `--expert-tensor-parallel-num-weight-shards` above the tensor-parallel size: its CUDA graph
+  integration covers the `local` and `full_iteration` graphs), Megatron-FSDP and Torch FSDP2
+  (they gather the parameters of a layer in its forward hooks, which a block replay does not
+  run; use `full_iteration` graphs with FSDP),
+  dynamic context parallelism (the captured
+  block records the context-parallel communicator of the capture sample), and hybrid stacks that
+  convert between context-parallel layouts across their layers. Features that support no
+  Transformer Engine captured graph are refused here as well: attention residuals
+  (`--enable-attention-residuals`), wide residual streams, and MoE layers with
+  `--mlp-chunks-for-training` above 1.
+- Not supported together with packed sequences: `--position-embedding-type mrope` (the packing
+  scheduler carries `[1, tokens]` position ids while mRoPE needs the `[3, batch, seq]` layout),
+  GDN / KDA / GDP layers (selected by `--experimental-attention-variant`, by the `G` / `K` symbols of
+  a hybrid layer pattern, or by a layer spec that puts the gated delta product mixer into its Mamba
+  layers: the FLA kernels derive their chunk indices on the host from the `cu_seqlens` values and
+  cache them per tensor, so a captured block graph would replay the pack layout of the capture
+  sample) and Mamba layers with chunkwise context parallelism (their CP metadata is built on the
+  host per pack). mRoPE is rejected by the training CLI (a model built directly raises when its
+  block is first captured), the GDN / KDA variants and pattern symbols when the configuration
+  is built, the other two when the block is first captured. These restrictions apply to packed
+  sequences only.
+- With packed sequences `--defer-embedding-wgrad-compute` is turned off: the LM head is part of the
+  captured post-process, so its weight gradient is computed inside the graph. So is
+  `--mtp-loss-early-backward`: the backward of the MTP heads is part of the post-process backward
+  graph. With fixed-length batches both keep working (the post-process is eager); the LM head
+  then keeps a copy of the decoder output of every microbatch until the deferred weight gradient
+  is computed, because the block graph reuses its output buffer.
+- A replay runs no Python inside the captured blocks. Forward tensor metrics that observe them
+  (residual and router sources; logits sources too with packed sequences) are rejected at the first
+  training step; `--log-moe-overload-factor`, whose token counts are recorded by Python inside the
+  MoE forward and backward, and MoE routing replay (`--moe-enable-routing-replay`), whose routes
+  are recorded into and replayed from Python state of every forward, are rejected when the
+  configuration is built; and forward or backward
+  hooks on modules inside a captured block do not fire at replay, so the hook-based dumps
+  (`--save-activations-interval`, `--save-tokens-per-expert-interval`, `--save-dgrads-interval`,
+  the MoE routing trace of `--moe-routing-trace-path`) only cover what still runs eagerly; the
+  routing trace also records the eager passes Transformer Engine runs on the capture's sample
+  inputs before it records the graphs.
+
+### Precision and position embeddings
+
+A graph replay runs under the block-wide FP8 autocast the eager block forward opens (the replay does
+not run the forward), so delayed scaling keeps reducing its amax and updating its scales, and the FP8
+weight cache keeps following `is_first_microbatch`. NVFP4 is captured like FP8. A module that
+quantizes under a recipe of its own inside a captured callable (the MXFP8 LM head of an NVFP4
+model, `--fp8-output-proj` with `--fp4-format`) keeps that recipe: Transformer Engine writes the
+replay's recipe into every module of the callable, and the replay hands such a module its own
+back, so an eager pass between training steps (evaluation) does not reset its cached weight.
+(A module whose `evaluation_recipe` is a quantized recipe of another kind than the one it trains
+with changes its recipe type at every evaluation: Transformer Engine then drops its cached
+weight, and in eager mode the next training forward quantizes a new one. The block graphs were
+recorded with the first one: the block keeps it, and the scaling state recorded with it, for as
+long as its graphs exist and hands them back to the module before every replay.)
+Modules that are
+quantized only through a per-module recipe (`--te-precision-config-file`, no model-wide FP8 / FP4
+mode) have no replay-driven weight cache: the graph re-quantizes their weights in every microbatch,
+where eager does it once per step.
+`--first-last-layers-bf16` layers opt out of the block-wide capture autocast and MTP layers opt in
+(`get_layer_fp8_context`, `get_layer_fp4_context`); a post-process without quantized modules (no MTP on
+the stage or `--keep-mtp-in-bf16`, and no MXFP8 output projection) is captured and replayed without an
+autocast, like its eager counterpart. A captured callable replays under one autocast: with FP8
+delayed scaling and a captured post-process (packed sequences), the scales of the MTP layers are
+therefore reduced once per microbatch, where the eager MTP reduces them after every MTP depth. With
+the default amax history of one step and separate MTP layers the scales are the same; a longer
+`--fp8-amax-history-len`, or `--mtp-use-repeated-layer` with several MTP depths, follows a different
+cadence than eager. With `--fp32-residual-connection` the block's hidden-state input is captured in
+float32, the dtype the embedding and the pipeline deliver, so the residual stream is not rounded at a
+block boundary.
+
+`--position-embedding-type rope`, `yarn` and (fixed-length) `mrope`, or MLA's own rotary handling,
+can be captured: the block's sample inputs carry a rotary table of the runtime shape, which the
+runtime table overwrites at replay.
+
+MTP hidden-state mixing (`--mtp-hsm`) is captured with the post-process of a packed run. Its roll of
+the older hidden states depends on whether the data path hands one tensor as both the query and the
+padded boundaries of a pack; the captured post-process rebuilds the packed metadata the way the
+eager warm-up steps received it, so it needs `--cuda-graph-warmup-steps >= 1`.
+
+### Activation recompute
+
+The re-entrant checkpoint sites (full recompute, the MTP block, `mlp` / `moe` / `shared_experts`, the
+GDN / GDN2 / KDA core `gdn` and `core_attn`) use Transformer Engine's checkpoint for every precision
+whenever `cuda_graph_impl` is
+`chunk_wise`, including the eager warm-up iterations: Megatron's `tensor_parallel.checkpoint` runs the
+function without a checkpoint node while a graph is warmed up or captured and would silently keep the
+activations resident. Recompute built on `CheckpointWithoutOutput` (`layernorm`, `moe_act`,
+`mla_up_proj`, `gdn_norm_out`, `mhc`) keeps its own hook mechanism, which registers the recompute
+inside the capture as is.
+
+A recompute inside the captured block cannot reproduce a random draw of the forward: it runs
+inside the backward graph, where the RNG state cannot be rewound. Full recompute therefore requires
+`hidden_dropout=0`, `attention_dropout=0` and no router input jitter; selective recompute requires
+`attention_dropout=0` for `core_attn`, `hidden_dropout=0` for `mlp` / `moe` and no router input
+jitter for `moe`; hyper-connection (`mhc`) recompute requires both dropouts to be 0.
+`--moe-router-force-load-balancing` and `--moe-router-force-biased` are not rejected, but their
+random router logits are drawn again when the router is recomputed (full recompute, or selective
+recompute of `moe`), so that combination is for throughput measurements only, not for numerical
+comparisons (the code warns).
+`--distribute-saved-activations` does not shard the input of a block's first checkpoint, which is the
+graph's static input buffer.
+
+### Fine-grained activation offloading
+
+`--fine-grained-activation-offloading` runs in a whole-block capture mode: the D2H/H2D copies are
+captured into each slot's graphs, with host buffers no other slot reuses and no cross-slot prefetch,
+so any number of live slots can replay. The pinned host memory of a rank is therefore the offloaded
+bytes of one microbatch (the Activation Offload Summary) times the captured slots of its stage, held
+for as long as the graphs live, where eager reuses a pool sized by the microbatches in flight. The
+capture logs the total per rank at INFO level (`--logging-level 20`; with
+`--fine-grained-offloading-buffer-size-gib`, the range of the fixed buffer it reserved) and,
+without a fixed buffer, returns the eager warm-up's pool first. Size host memory, or the fixed buffer, by that rule. The captured callables' static inputs (the block's
+`hidden_states`, which the first layer's `attn_norm` commit would otherwise free) are kept out of
+the offload release, and the group hooks are no-ops outside a capture-time forward, so a full
+activation recompute captured into the backward graph neither offloads nor reloads (a fully
+recomputed block saves no activations to offload in the first place, so offloading only pays for
+layers that are not recomputed). With pipeline parallelism the combination is limited by the eager
+offload schedule, which the warm-up iterations run: it works with two pipeline stages when at least
+one layer of every stage is kept out of the recompute (`--recompute-method block` with
+`--recompute-num-layers` below the stage's layer count). With every layer of a stage recomputed
+(uniform full recompute, or the block method over all layers), or with three or more pipeline
+stages, that schedule stops on a chunk-mismatch assertion, with or without CUDA graphs.
+Because a slot's graphs are self-contained, the copies that eager
+overlaps with the *next* microbatch (the last groups' D2H at the end of a forward, the first group's
+reload at the start of a backward) cannot be hidden the same way, so the copies cost more step time
+than in eager. `--fine-grained-offloading-graph-keep-last-group` keeps the last group of every
+offload module resident per slot to avoid the synchronous reload at the price of part of the memory
+saving (DSv4 proxy, five offload modules, chunk graphs without offload as the reference: 2.35 s/step
+and -5.3 GB without the flag, 1.55 s/step and -1.7 GB with it). Without packed sequences the
+post-process (MTP, LM head, loss) runs eagerly after the decoder replay and keeps its activations on
+the GPU: the captured graphs own every offload of the step. Every slot inherits the offload policy
+recorded during the eager warm-up (which groups stay resident, including the groups kept for
+`delta_offload_bytes_across_pp_ranks`), so that budget applies per live slot rather than once per
+schedule. It needs `--cuda-graph-warmup-steps >= 1`; deleting the graphs returns the offload to the
+eager policy and releases the pinned host buffers of the deleted slots (a fixed pinned buffer,
+`--fine-grained-offloading-buffer-size-gib`, keeps the range the capture reserved for its
+lifetime, so eager offloads after a deletion use the remaining tail).
+
+### Paged stash and DSA
+
+`--moe-paged-stash` works in a runtime-keyed mode: each MoE layer stashes its own activations after
+its forward and reloads them right before its own backward (no cross-layer prefetch; GPU pages only
+by default), at any pipeline size, so the captured graphs do not depend on the recorded pipeline
+order; it needs TE >= 2.19 and `--cuda-graph-warmup-steps >= 2`. The page buffers are sized from the
+first iteration; when that iteration ran fewer microbatches than the stage keeps in flight in the
+order the graphs are captured for (packed sequences, a first step with fewer packs than the stage
+holds), the capture raises the recorded sizes by the ratio of the microbatches in flight and
+allocates the buffers again. A MoE layer that is recomputed in
+the backward (full recompute, or selective recompute of `moe`) is stashed only when another MoE layer
+of the same recompute segment follows it; the last one of a segment is consumed by that backward at
+once and stays in place, as in the eager schedule. Only stashed layers count towards the size of the
+page buffers. With one MoE layer per segment and every MoE layer recomputed, the flag therefore has
+no effect: no page buffers are allocated and a warning says so. As at larger pipeline sizes, a stash
+that overflows its page buffers after the capture stops the run (raise
+`--moe-paged-stash-buffer-size-factor-cuda`), and so does a rank whose routed tokens exceed
+`--moe-expert-rank-capacity-factor`: a captured graph cannot repeat the step without the budget as
+the eager schedule does. The budget check covers the MoE layers the schedule tracks, in eager runs
+as well: those directly in the decoder and MTP layer lists, not the ones behind a hybrid stack's
+hyper-connection wrappers or inside a hybrid MTP stack. Without pipeline parallelism the stash saves what the capacity factor pads:
+in a 16-layer MXFP8 MoE proxy (8 experts, top-4, 4096 tokens per rank, PP=1) it lowered the peak
+allocation by 9 % at a capacity factor of 2.0 and by 0.3 % at 1.25, at the same step time.
+
+`--dsa-cp-balance-indexer` with `--sequence-packing-scheduler dp_balanced` works in its graph-dynamic
+mode: the per-pack route pair becomes two static inputs of the block graph (refreshed per replay
+like `cu_seqlens`).
+
+`--hca-aligned-backward` keeps its contract under graphs: the aligned backward needs one padded
+sequence per pack. A block capture decides from its sample (one full-length sequence) and
+records a device-side check, so a replayed pack with other boundaries stops the run; leave the
+flag off for packs whose boundaries change.
+
+DSA top-k sharing (`--dsa-indexer-topk-freq` above 1) may cross the boundary of the decoder
+block's graph: MTP layers continue the decoder's layer numbering, so the first of them can reuse
+the top-k indices of a decoder layer of its stage. The decoder block keeps the index tensors of
+each slot's graph and hands them to the post-process graph at capture and, after every replay, to
+the layers that run eagerly (the MTP of fixed-length batches). This keeps one index tensor
+(`[batch, tokens, dsa_indexer_topk]`) per reused layer and captured slot on the stage that owns
+the MTP.
+
+---
+
 ## Full-Iteration Training CUDA Graph (`--cuda-graph-impl full_iteration`)
 
 Captures the entire training iteration (excluding optimizer) as a single CUDA graph. The same
@@ -211,7 +512,7 @@ This implementation does not create inference CUDA graphs. For inference, use
 
 ### Dense Model Training
 
-All three implementations work for dense models:
+All four implementations work for dense models:
 
 ```bash
 # Per-layer (local)
@@ -221,6 +522,9 @@ All three implementations work for dense models:
 # Per-layer (TE)
 --cuda-graph-impl transformer_engine
 # equivalent: --cuda-graph-impl transformer_engine --cuda-graph-modules attn mlp
+
+# Whole decoder block per pipeline stage (TE)
+--cuda-graph-impl chunk_wise
 
 # Full-iteration
 --cuda-graph-impl full_iteration
@@ -257,6 +561,8 @@ models as well:
   capture. Setting it to 0 is not recommended: some operations rely on the first few iterations
   for lazy initialization or autotuning, and capturing too early may produce incorrect or
   suboptimal graphs.
+- With `--optimizer-cuda-graph` the optimizer's first step always runs eagerly (it allocates the
+  optimizer state): the step graph is captured at iteration `max(--cuda-graph-warmup-steps, 1)`.
 - Inference CUDA graphs (serving or RL rollout) currently require
   `--cuda-graph-impl local`. Use `--inference-cuda-graph-scope layer|block` with
   `local`; all other implementations must set `--inference-cuda-graph-scope none`,

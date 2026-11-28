@@ -30,6 +30,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.transformer.chunk_cuda_graph import (
+    ChunkCudaGraphPostProcessBlock,
+    build_postprocess_block,
+)
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType, ModelType
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.module import GraphableMegatronModule
@@ -52,6 +56,49 @@ from megatron.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class GPTPostProcessBlock(ChunkCudaGraphPostProcessBlock):
+    """``GPTModel._postprocess`` (MTP block, LM head, loss) as a chunk CUDA graph callable."""
+
+    def eager_only_reason(self):
+        """Also stay eager for the config logger, which dumps the logits of every forward."""
+        if has_config_logger_enabled(self.config):
+            return "config_logger_dir dumps the inputs and logits of every forward"
+        return super().eager_only_reason()
+
+    def forward(
+        self,
+        hidden_states,
+        input_ids=None,
+        position_ids=None,
+        labels=None,
+        loss_mask=None,
+        attention_mask=None,
+        packed_seq_params=None,
+        padding_mask=None,
+        rotary_pos_emb=None,
+        rotary_pos_cos=None,
+        rotary_pos_sin=None,
+        mhc_multistream=None,
+    ):
+        """Run the owner's training post-process on the (static) graph inputs."""
+        owner = self._owner
+        return owner._postprocess(
+            hidden_states=hidden_states,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            labels=labels,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            mtp_in_postprocess=owner.mtp_process,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            packed_seq_params=packed_seq_params,
+            mhc_multistream=mhc_multistream,
+        )
 
 
 class GPTModel(LanguageModule, GraphableMegatronModule):
@@ -352,6 +399,12 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 pg_collection=self.pg_collection,
                 output_dtype=self.logit_dtype,
             )
+            if self.mtp_process and hasattr(self.output_layer, 'is_first_microbatch'):
+                # The LM head also projects every MTP depth: several calls per microbatch add
+                # into the same main_grad. Transformer Engine writes over main_grad when it is
+                # told the microbatch is the first one, so one of those calls would erase what
+                # the others added.
+                self.output_layer.is_repeated_layer = True
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
@@ -364,6 +417,10 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+
+        # Chunk CUDA graphs of packed-sequence (THD) runs also capture the post-process of the
+        # last pipeline stage.
+        self.postprocess_block = build_postprocess_block(self, GPTPostProcessBlock)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -745,6 +802,18 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 **decoder_extra_block_kwargs,
             )
 
+        # Chunk-wise CUDA graphs with fine-grained offloading: the eager warm-up marks on the
+        # microbatch's offload template where the decoder's groups end and where the forward's
+        # groups end (a backward-time recompute appends its groups after that), so each captured
+        # callable's keep-last policy covers its own range only. No-ops once the capture starts.
+        mark_offload_group_ends = (
+            getattr(self.config, "cuda_graph_impl", "none") == "chunk_wise"
+            and getattr(self.config, "fine_grained_activation_offloading", False)
+            and self.training
+        )
+        if mark_offload_group_ends:
+            off_interface.mark_decoder_groups_end()
+
         # When mHC + MTP, the decoder returns (contracted, multi-stream); when
         # AttnRes + MTP, it returns (aggregated, depth-source tuple). MTP needs
         # the extra stream; lm_head needs the first element. mHC and AttnRes are
@@ -761,7 +830,64 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         else:
             hidden_states = decoder_output
 
-        return self._postprocess(
+        postprocess_block = getattr(self, 'postprocess_block', None)
+        if (
+            postprocess_block is not None
+            and self.training
+            and labels is not None
+            and output_processor is None
+            and not InferenceMode.is_active()
+            # The captured post-process takes the tensors below only; a call that conditions
+            # the MTP, the MTP layers or the LM head on anything else runs the eager one.
+            and mtp_input_mask is None
+            and runtime_gather_output is None
+            and not extra_block_kwargs
+            and sequence_len_offset is None
+            # The config logger dumps decoder_input, which the block does not take.
+            and not has_config_logger_enabled(self.config)
+            # A graph cannot be replayed without a tensor it was captured with.
+            and postprocess_block.receives_every_captured_input(
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                padding_mask=padding_mask,
+            )
+        ):
+            # Captured into / replayed from the chunk CUDA graphs.
+            output = postprocess_block(
+                hidden_states,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                mhc_multistream=mhc_multistream,
+            )
+            if mark_offload_group_ends:
+                off_interface.mark_forward_groups_end()
+            return output
+
+        if (
+            self.post_process
+            and self.training
+            and getattr(self.config, "cuda_graph_impl", "none") == "chunk_wise"
+            and getattr(self.config, "defer_embedding_wgrad_compute", False)
+        ):
+            # The eager LM head keeps its input of every microbatch until the schedule computes
+            # the deferred weight gradient at the end of the step. A replayed decoder block
+            # returns a static output buffer of its graph, which Transformer Engine lends to
+            # later graphs once the block's backward has run: give the LM head its own tensor.
+            # Only the stage that owns the LM head keeps anything.
+            hidden_states = hidden_states.clone()
+
+        output = self._postprocess(
             hidden_states=hidden_states,
             input_ids=input_ids,
             position_ids=position_ids,
@@ -786,6 +912,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             output_processor=output_processor,
             output_processor_context=output_processor_context,
         )
+        if mark_offload_group_ends:
+            off_interface.mark_forward_groups_end()
+        return output
 
     def _postprocess(
         self,

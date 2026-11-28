@@ -934,6 +934,52 @@ def test_router_gating_linear_replays(router_dtype, with_bias):
     )
 
 
+@pytest.mark.parametrize("scale_layout", ["rowwise", "columnwise"])
+def test_mok_mxfp8_scale_refresh_replays_in_a_cuda_graph(scale_layout):
+    """A graph that records MOK's MXFP8 scale refresh converts the live TE scales at each replay.
+
+    ``MoKMegakernel.quantized_routed_weights`` records the re-swizzle into every captured block:
+    a device-side ``copy_`` from Transformer Engine's logical E8M0 scales into the cached
+    tcgen05-layout buffer the megakernel descriptors address. After an optimizer update rewrote
+    the logical scales in place, a replay has to leave that buffer bit-identical to the eager
+    conversion, at the captured address.
+    """
+    from megatron.core.transformer.moe.megakernel.mok.weights import _swizzle_mxfp8_scale
+
+    seeded()
+    num_experts, rows, columns = 4, 256, 384
+    if scale_layout == "rowwise":
+        # TE rowwise scales: [E, M, K / 32].
+        storage = torch.randint(
+            0, 256, (num_experts, rows, columns // 32), device="cuda", dtype=torch.uint8
+        )
+        logical, shape = storage, dict(rows=rows, columns=columns)
+    else:
+        # TE columnwise scales [E, M / 32, K], consumed as the strided transpose [E, K, M / 32].
+        storage = torch.randint(
+            0, 256, (num_experts, rows // 32, columns), device="cuda", dtype=torch.uint8
+        )
+        logical, shape = storage.transpose(-2, -1), dict(rows=columns, columns=rows)
+
+    # The first (eager) conversion allocates the cached buffer; later ones refresh it in place.
+    cached = _swizzle_mxfp8_scale(logical, **shape)
+    address = cached.data_ptr()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        refreshed = _swizzle_mxfp8_scale(logical, out=cached, **shape)
+    assert refreshed is cached
+
+    for update in range(3):
+        before = cached.clone()
+        storage.copy_(torch.randint(0, 256, storage.shape, device="cuda", dtype=torch.uint8))
+        expected = _swizzle_mxfp8_scale(logical, **shape)
+        assert not bytes_equal(before, expected), "the update must change the scales"
+        for replay in range(2):
+            graph.replay()
+            assert bytes_equal(cached, expected), f"{scale_layout} {update=} {replay=}"
+        assert cached.data_ptr() == address
+
+
 # --- modules --------------------------------------------------------------------------------
 
 

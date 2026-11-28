@@ -6949,7 +6949,7 @@ def train(
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
     # Initialize CUDA Graphs helper.
-    if cfg.model.transformer.cuda_graph_impl == "transformer_engine":
+    if cfg.model.transformer.cuda_graph_impl in ("transformer_engine", "chunk_wise"):
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
@@ -6958,6 +6958,7 @@ def train(
             optimizers=[optimizer],
             pg_collection=model_pg_collection,
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
+            forward_only=bool(getattr(args, "freeze_all_layers", False)),
         )
 
     # OTel: everything above in train() (the preamble: weight-hash check, sniff
@@ -7100,7 +7101,7 @@ def train(
         # graph capture (create_cudagraphs) is a notable one-time cost worth its
         # own span, distinct from the megatron.train.iteration spans around it.
         if (
-            cfg.model.transformer.cuda_graph_impl == "transformer_engine"
+            cfg.model.transformer.cuda_graph_impl in ("transformer_engine", "chunk_wise")
             and not cuda_graph_helper.capture_finished()
             and iteration - start_iteration == cfg.model.transformer.cuda_graph_warmup_steps
         ):
@@ -7114,6 +7115,13 @@ def train(
                     args, optimizer
                 ):
                     disable_forward_pre_hook(model, param_sync=False)
+                if getattr(config, "mtp_num_layers", None):
+                    # A chunk-wise capture of the post-process records whether the MTP
+                    # acceptance statistics are collected. train_step() sets that policy before
+                    # every forward; with no warm-up step the capture comes first.
+                    MTPLossLoggingHelper.configure_acceptance_collection(
+                        enabled=bool(cfg.logger.tensorboard_dir or cfg.logger.wandb_project)
+                    )
                 cuda_graph_helper.create_cudagraphs()
                 if cfg.model.transformer.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(
                     args, optimizer
@@ -7282,7 +7290,7 @@ def train(
                     pre_hook_enabled = True
                     # Set the manual hooks here since it's not set right after the capturing.
                     if (
-                        cfg.model.transformer.cuda_graph_impl == "transformer_engine"
+                        cfg.model.transformer.cuda_graph_impl in ("transformer_engine", "chunk_wise")
                         and cfg.model.transformer.cuda_graph_warmup_steps == 0
                     ):
                         assert (
@@ -7544,7 +7552,10 @@ def train(
         )
 
     # Destroy CUDA Graphs.
-    if cfg.model.transformer.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+    if (
+        cfg.model.transformer.cuda_graph_impl in ("transformer_engine", "chunk_wise")
+        and cuda_graph_helper.graphs_created()
+    ):
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph

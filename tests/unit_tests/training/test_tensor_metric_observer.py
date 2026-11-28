@@ -869,3 +869,58 @@ def test_forward_metrics_reject_full_iteration_cuda_graphs():
             model=[model], iteration=0, pg_collection=_pg_collection()
         ):
             pass
+
+
+@pytest.mark.parametrize(
+    ("source_kind", "sequence_packing_scheduler", "rejected"),
+    [
+        # Residual and router observations sit inside the captured decoder block.
+        ("residual_accumulator", None, True),
+        ("router_logits", None, True),
+        # The post-process is captured with packed sequences and eager without them.
+        ("output_logits", "dp_balanced", True),
+        ("mtp_logits", "dp_balanced", True),
+        ("output_logits", None, False),
+        ("mtp_logits", None, False),
+    ],
+)
+def test_forward_metrics_reject_blocks_captured_by_chunk_wise_cuda_graphs(
+    source_kind, sequence_packing_scheduler, rejected
+):
+    """A chunk-wise replay runs no Python inside the captured blocks, so their observation
+    sites would never notify the observer."""
+    model = _forward_model(cuda_graph_impl="chunk_wise")
+    model.config.sequence_packing_scheduler = sequence_packing_scheduler
+    source_kinds = frozenset({source_kind})
+
+    if rejected:
+        with pytest.raises(NotImplementedError, match="chunk-wise CUDA graphs"):
+            observer_mod._validate_forward_observation_model([model], source_kinds)
+    else:
+        observer_mod._validate_forward_observation_model([model], source_kinds)
+
+
+def test_forward_metrics_on_chunk_wise_blocks_are_rejected_at_the_first_step():
+    """The refusal comes with the first training step, not when the metric first comes due:
+    by then the graphs are captured and the run may be thousands of steps in."""
+    model = _forward_model(cuda_graph_impl="chunk_wise")
+    model.config.sequence_packing_scheduler = "dp_balanced"
+    observer = build_tensor_metric_observer(
+        ["global-output-logits-l2:1000"], result_sink=lambda *args: None
+    )
+    with pytest.raises(NotImplementedError, match="chunk-wise CUDA graphs"):
+        with observer.observe_forward_backward(
+            model=[model], iteration=0, pg_collection=_pg_collection()
+        ):
+            pass
+
+    # Sources that stay observable (fixed-length batches keep the post-process eager) and
+    # optimizer metrics pass, also on later steps.
+    model.config.sequence_packing_scheduler = None
+    for metrics in (["global-output-logits-l2:1000"], ["layer-param-l2:1000"]):
+        observer = build_tensor_metric_observer(metrics, result_sink=lambda *args: None)
+        for iteration in (0, 1):
+            with observer.observe_forward_backward(
+                model=[model], iteration=iteration, pg_collection=_pg_collection()
+            ):
+                pass

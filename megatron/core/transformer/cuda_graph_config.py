@@ -19,6 +19,7 @@ ALLOWED_INFERENCE_SCOPES: dict[str, Set[InferenceCudaGraphScope]] = {
     "local": {InferenceCudaGraphScope.layer, InferenceCudaGraphScope.block},
     "transformer_engine": {InferenceCudaGraphScope.none},
     "full_iteration": {InferenceCudaGraphScope.none},
+    "chunk_wise": {InferenceCudaGraphScope.none},
 }
 
 
@@ -39,11 +40,37 @@ def validate_moe_cuda_graph_support(config) -> None:
         config.num_moe_experts is None
         or config.num_moe_experts <= 1
         or not is_whole_moe_cuda_graph_scope(config.cuda_graph_modules)
-        or (
-            config.moe_expert_capacity_factor is not None
-            and config.moe_pad_expert_input_to_capacity
-        )
     ):
+        return
+
+    if config.moe_expert_capacity_factor is not None and config.moe_pad_expert_input_to_capacity:
+        # Drop-padding MoE: every expert holds the same static token count. The all-gather
+        # dispatcher still copies the per-expert counts to the host in every forward, which a
+        # chunk-wise capture of the whole MoE cannot record (a megakernel backend dispatches
+        # by itself).
+        assert (
+            getattr(config, "cuda_graph_impl", "none") != "chunk_wise"
+            or config.moe_megakernel_backend is not None
+            or config.moe_token_dispatcher_type != "allgather"
+        ), (
+            "chunk-wise CUDA graphs with drop-padding MoE need moe_token_dispatcher_type "
+            "'alltoall' or 'flex': the allgather dispatcher reads the per-expert token counts "
+            "on the host in every forward."
+        )
+        return
+
+    if getattr(config, "cuda_graph_impl", "none") == "chunk_wise":
+        # The whole decoder block is captured, so the MoE only needs static shapes: a rank
+        # capacity with the sync-free HybridEP dispatcher, or a megakernel backend.
+        assert config.moe_megakernel_backend is not None or (
+            config.moe_token_dispatcher_type == "flex"
+            and config.moe_flex_dispatcher_backend == "hybridep"
+            and config.moe_expert_rank_capacity_factor is not None
+        ), (
+            "chunk-wise CUDA graphs with MoE need static token shapes: use drop-padding MoE "
+            "(moe_expert_capacity_factor + moe_pad_expert_input_to_capacity), the HybridEP "
+            "flex dispatcher with moe_expert_rank_capacity_factor, or a MoE megakernel backend."
+        )
         return
 
     assert (
@@ -95,7 +122,7 @@ def cuda_graph_captures_attention(config) -> bool:
     """Return whether the normalized training graph scope includes attention."""
     impl = getattr(config, "cuda_graph_impl", "none")
     modules = getattr(config, "cuda_graph_modules", None)
-    return impl == "full_iteration" or (
+    return impl in ("full_iteration", "chunk_wise") or (
         impl in ("local", "transformer_engine") and (not modules or CudaGraphModule.attn in modules)
     )
 

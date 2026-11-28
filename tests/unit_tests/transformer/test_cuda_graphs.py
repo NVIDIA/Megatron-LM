@@ -1,11 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import functools
 import gc
 import inspect
 import logging
+import math
 import os
 import sys
-from contextlib import nullcontext
+import warnings
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -49,6 +52,7 @@ from megatron.core.transformer.cuda_graphs import (
     CudaGraphManager,
     TECudaGraphHelper,
     VisionTECudaGraphHelper,
+    _chunk_cuda_graph_block_is_graphable,
     _CudagraphGlobalRecord,
     _CudagraphReplayNode,
     _CudaGraphRunner,
@@ -552,6 +556,89 @@ class TestCudaGraphConfigAndArguments:
         assert dsa_tracker['avg_group'] is avg_group
         assert dsa_tracker['agreed_size'] == 2
 
+    @pytest.mark.parametrize("cuda_graph_impl", ["transformer_engine", "chunk_wise"])
+    def test_te_reset_after_capture_cleans_what_a_captured_block_accumulates(
+        self, monkeypatch, cuda_graph_impl
+    ):
+        """TE's warm-up passes run the callables on the constant sample inputs. A chunk-wise
+        block includes the post-process, which adds to the MTP loss tracker, and the MoE
+        dispatch, where one route for every token can overflow a rank capacity and latch the
+        dispatcher's over-budget flag. Both are cleared after the capture: the tracker tensors in
+        place (the graphs write to them), the flag on every dispatcher of every model chunk.
+        Per-layer graphs capture neither and leave both alone."""
+        from importlib import import_module
+
+        from megatron.core.transformer.moe import moe_logging
+        from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+
+        finalize_model_grads_module = import_module(
+            "megatron.core.distributed.finalize_model_grads"
+        )
+
+        class FakeDispatcher:
+            resets = 0
+
+            def reset_over_budget(self):
+                self.resets += 1
+
+        class FakeModelChunk:
+            def __init__(self, token_dispatchers):
+                self._modules = [
+                    SimpleNamespace(),
+                    *(SimpleNamespace(token_dispatcher=d) for d in token_dispatchers),
+                    # Dispatchers without an over-budget flag (all-gather, plain all-to-all).
+                    SimpleNamespace(token_dispatcher=object()),
+                ]
+
+            @staticmethod
+            def zero_grad_buffer():
+                pass
+
+            def modules(self):
+                return iter(self._modules)
+
+        dispatchers = [FakeDispatcher() for _ in range(3)]
+        loss_sums = torch.tensor([3.0, 5.0])
+        num_tokens = torch.tensor([7.0, 11.0])
+        acceptance_counts = torch.ones(2, 2)
+        reduce_group = object()
+        mtp_tracker = {
+            "loss_sums": loss_sums,
+            "num_tokens": num_tokens,
+            "acceptance_counts": acceptance_counts,
+            "reduce_group": reduce_group,
+        }
+        monkeypatch.setattr(MTPLossLoggingHelper, "tracker", mtp_tracker)
+        monkeypatch.setattr(DSAIndexerLossLoggingHelper, "tracker", {})
+        monkeypatch.setattr(
+            moe_logging, "get_moe_metrics_tracker", lambda: SimpleNamespace(clear=lambda: None)
+        )
+        monkeypatch.setattr(
+            finalize_model_grads_module, "reset_model_temporary_tensors", lambda config, model: None
+        )
+
+        helper = object.__new__(TECudaGraphHelper)
+        helper.model = [FakeModelChunk(dispatchers[:2]), FakeModelChunk(dispatchers[2:])]
+        helper.optimizers = []
+        helper.config = SimpleNamespace(cuda_graph_impl=cuda_graph_impl)
+
+        helper._reset_after_capture()
+
+        is_chunk = cuda_graph_impl == "chunk_wise"
+        assert mtp_tracker["loss_sums"] is loss_sums
+        assert mtp_tracker["num_tokens"] is num_tokens
+        assert mtp_tracker["acceptance_counts"] is acceptance_counts
+        assert mtp_tracker["reduce_group"] is reduce_group
+        if is_chunk:
+            assert torch.count_nonzero(loss_sums) == 0
+            assert torch.count_nonzero(num_tokens) == 0
+            assert torch.count_nonzero(acceptance_counts) == 0
+        else:
+            assert torch.equal(loss_sums, torch.tensor([3.0, 5.0]))
+            assert torch.equal(num_tokens, torch.tensor([7.0, 11.0]))
+            assert torch.equal(acceptance_counts, torch.ones(2, 2))
+        assert [dispatcher.resets for dispatcher in dispatchers] == [int(is_chunk)] * 3
+
     def test_te_capture_requires_initialized_dsa_tracker(self, monkeypatch):
         """A custom TE caller cannot lazily allocate tracker storage during capture."""
         helper = object.__new__(TECudaGraphHelper)
@@ -786,6 +873,27 @@ class TestCudaGraphConfigAndArguments:
                 cuda_graph_modules=cuda_graph_modules, cuda_graph_warmup_steps=2
             )
 
+    def test_chunk_wise_paged_stash_allows_dynamic_microbatches(self, monkeypatch):
+        """Chunk graphs key the stash by the runtime (vp, layer, microbatch) coordinates, so
+        the microbatch count may vary; the other whole-MoE paged-stash requirements hold."""
+        chunk_wise = dict(cuda_graph_impl="chunk_wise", cuda_graph_modules=[])
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+        # Packed sequences, whose pack count varies from step to step.
+        packed = dict(
+            sequence_packing_scheduler="dp_balanced",
+            cuda_graph_dynamic_microbatches=True,
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=128,
+            thd_max_packed_sequences=8,
+        )
+        cfg = _te_whole_moe_paged_stash_config(**chunk_wise, **packed, cuda_graph_warmup_steps=2)
+        assert cfg.cuda_graph_dynamic_microbatches
+        with pytest.raises(AssertionError, match="require at least 2 cuda_graph_warmup_steps"):
+            _te_whole_moe_paged_stash_config(**chunk_wise, cuda_graph_warmup_steps=1)
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: False)
+        with pytest.raises(ValueError, match=r"Transformer Engine >= 2\.19\.0"):
+            _te_whole_moe_paged_stash_config(**chunk_wise, cuda_graph_warmup_steps=2)
+
     def test_te_moe_router_paged_stash_still_allows_dynamic_microbatches(self):
         cfg = _te_whole_moe_paged_stash_config(
             cuda_graph_modules=[CudaGraphModule.moe_router], cuda_graph_dynamic_microbatches=True
@@ -812,6 +920,103 @@ class TestCudaGraphConfigAndArguments:
                 use_transformer_engine_op_fuser=True,
             )
             validate_moe_cuda_graph_support(cfg)
+
+    @pytest.mark.parametrize(
+        ("moe", "supported"),
+        [
+            (dict(moe_megakernel_backend="mok"), True),
+            (dict(moe_expert_capacity_factor=1.0, moe_pad_expert_input_to_capacity=True), True),
+            (
+                dict(
+                    moe_token_dispatcher_type="flex",
+                    moe_flex_dispatcher_backend="hybridep",
+                    moe_expert_rank_capacity_factor=1.2,
+                ),
+                True,
+            ),
+            (dict(num_moe_experts=None), True),
+            (dict(), False),
+            (dict(moe_expert_capacity_factor=1.0), False),
+            (dict(moe_token_dispatcher_type="flex", moe_flex_dispatcher_backend="hybridep"), False),
+            (
+                dict(
+                    moe_token_dispatcher_type="flex",
+                    moe_flex_dispatcher_backend="ncclep",
+                    moe_expert_rank_capacity_factor=1.2,
+                ),
+                False,
+            ),
+        ],
+        ids=[
+            "megakernel",
+            "drop-padding",
+            "hybridep-rank-capacity",
+            "dense",
+            "dropless-alltoall",
+            "token-drop-without-padding",
+            "hybridep-without-rank-capacity",
+            "ncclep-rank-capacity",
+        ],
+    )
+    def test_chunk_wise_moe_graph_needs_static_token_shapes(self, moe, supported):
+        """A chunk-wise graph holds the whole MoE: any dispatch with static token shapes can be
+        captured (no paged stash or op fuser requirement, unlike a per-layer whole-MoE graph)."""
+        config = SimpleNamespace(
+            cuda_graph_impl="chunk_wise",
+            cuda_graph_modules=[],
+            num_moe_experts=4,
+            moe_expert_capacity_factor=None,
+            moe_pad_expert_input_to_capacity=False,
+            moe_megakernel_backend=None,
+            moe_token_dispatcher_type="alltoall",
+            moe_flex_dispatcher_backend="deepep",
+            moe_expert_rank_capacity_factor=None,
+            moe_paged_stash=False,
+            use_transformer_engine_op_fuser=False,
+        )
+        for name, value in moe.items():
+            setattr(config, name, value)
+
+        if supported:
+            validate_moe_cuda_graph_support(config)
+        else:
+            with pytest.raises(
+                AssertionError, match="chunk-wise CUDA graphs with MoE need static token shapes"
+            ):
+                validate_moe_cuda_graph_support(config)
+
+    @pytest.mark.parametrize(
+        "cuda_graph_impl, megakernel_backend, supported",
+        [
+            ("chunk_wise", None, False),
+            ("chunk_wise", "mok", True),
+            ("transformer_engine", None, True),
+        ],
+        ids=["chunk-wise", "chunk-wise-megakernel", "per-layer"],
+    )
+    def test_chunk_wise_drop_padding_moe_needs_a_dispatcher_without_host_reads(
+        self, cuda_graph_impl, megakernel_backend, supported
+    ):
+        """Drop-padding gives every expert a static token count, but the allgather dispatcher
+        still copies the counts to the host in every forward: a chunk-wise capture of the whole
+        MoE stops there. alltoall and flex have a static path."""
+        config = SimpleNamespace(
+            cuda_graph_impl=cuda_graph_impl,
+            cuda_graph_modules=[],
+            num_moe_experts=4,
+            moe_expert_capacity_factor=1.0,
+            moe_pad_expert_input_to_capacity=True,
+            moe_megakernel_backend=megakernel_backend,
+            moe_token_dispatcher_type="allgather",
+        )
+        if supported:
+            validate_moe_cuda_graph_support(config)
+        else:
+            with pytest.raises(AssertionError, match="need moe_token_dispatcher_type 'alltoall'"):
+                validate_moe_cuda_graph_support(config)
+        for dispatcher in ("alltoall", "flex"):
+            config.moe_token_dispatcher_type = dispatcher
+            validate_moe_cuda_graph_support(config)
 
     def test_full_iteration_impl_requires_empty_scope(self):
         with pytest.raises(
@@ -871,6 +1076,153 @@ class TestCudaGraphConfigAndArguments:
                 cuda_graph_modules='full_iteration_inference',
                 inference_cuda_graph_scope='layer',
             )
+
+    def test_chunk_wise_cli_accepts_yarn_and_fixed_length_mrope_rotary(self, monkeypatch):
+        """The chunk capture materializes yarn and fixed-length mRoPE tables, so the CLI accepts
+        them; only mRoPE with the packing scheduler (no [3, batch, seq] position ids) fails
+        before the model is built."""
+        # There is no --mrope-section CLI flag; mrope_section is set on args like the
+        # Qwen-VL trainers do.
+        for position_embedding_type in ('rope', 'yarn', 'mrope'):
+            args, _, _ = _validated_cuda_graph_cli_args(
+                monkeypatch,
+                [
+                    '--cuda-graph-impl',
+                    'chunk_wise',
+                    '--position-embedding-type',
+                    position_embedding_type,
+                ],
+                mrope_section=[8, 4, 4],
+            )
+            assert args.cuda_graph_impl == 'chunk_wise'
+        with pytest.raises(ValueError, match="mrope together with packed \\(THD\\) sequences"):
+            _validated_cuda_graph_cli_args(
+                monkeypatch,
+                [
+                    '--cuda-graph-impl',
+                    'chunk_wise',
+                    '--position-embedding-type',
+                    'mrope',
+                    '--sequence-packing-scheduler',
+                    'dp_balanced',
+                    '--calculate-per-token-loss',
+                    '--pad-packed-seq-alignment',
+                    'max',
+                    '--max-seqlen-per-dp-cp-rank',
+                    '128',
+                ],
+                mrope_section=[8, 4, 4],
+            )
+
+    def test_chunk_wise_cli_requires_one_sample_per_packed_microbatch(self, monkeypatch):
+        """The graph helper asserts this after the model is built and the checkpoint is
+        loaded; the CLI fails first."""
+        packed_chunk_wise = [
+            '--cuda-graph-impl',
+            'chunk_wise',
+            '--cuda-graph-dynamic-microbatches',
+            '--sequence-packing-scheduler',
+            'dp_balanced',
+            '--calculate-per-token-loss',
+            '--pad-packed-seq-alignment',
+            'max',
+            '--max-seqlen-per-dp-cp-rank',
+            '128',
+            '--thd-max-packed-sequences',
+            '4',
+        ]
+        args, _, _ = _validated_cuda_graph_cli_args(monkeypatch, packed_chunk_wise)
+        assert args.cuda_graph_impl == 'chunk_wise'
+        with pytest.raises(ValueError, match="requires --micro-batch-size 1"):
+            _validated_cuda_graph_cli_args(monkeypatch, packed_chunk_wise, micro_batch_size=2)
+        # Fixed-length chunk graphs take any micro batch size.
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-impl', 'chunk_wise'], micro_batch_size=2
+        )
+        assert args.micro_batch_size == 2
+
+    def test_chunk_wise_cli_requires_one_sequence_per_item_for_pipeline_slots(self, monkeypatch):
+        """With pipeline parallelism every in-flight microbatch owns a graph slot, and their
+        number is derived from the global batch size: an --sft item, a pack of conversations
+        that the scheduler takes apart, could need more slots than the capture made."""
+        packed_chunk_wise = [
+            '--cuda-graph-impl',
+            'chunk_wise',
+            '--cuda-graph-dynamic-microbatches',
+            '--sequence-packing-scheduler',
+            'dp_balanced',
+            '--calculate-per-token-loss',
+            '--pad-packed-seq-alignment',
+            'max',
+            '--max-seqlen-per-dp-cp-rank',
+            '128',
+            '--thd-max-packed-sequences',
+            '4',
+            '--pipeline-p2p-fixed-shape',
+        ]
+        two_stages = dict(pipeline_model_parallel_size=2, world_size=2)
+        real_sft = dict(sft=True, data_path=['conversations.jsonl'])
+        for refused in (real_sft, dict(dataloader_inter_document_masking=True)):
+            with pytest.raises(ValueError, match="needs one sequence per dataset item"):
+                _validated_cuda_graph_cli_args(
+                    monkeypatch, packed_chunk_wise, **refused, **two_stages
+                )
+        # Mock --sft data (asked for, or built because no data source is declared) has one
+        # sequence per item; one pipeline stage has one slot.
+        for accepted in (
+            dict(sft=True, mock_data=True, **two_stages),
+            dict(sft=True, **two_stages),
+            real_sft,
+        ):
+            args, _, _ = _validated_cuda_graph_cli_args(monkeypatch, packed_chunk_wise, **accepted)
+            assert args.cuda_graph_impl == 'chunk_wise' and args.sft
+
+    @pytest.mark.parametrize("fsdp", ["use_megatron_fsdp", "use_torch_fsdp2"])
+    def test_chunk_wise_cli_rejects_fsdp(self, monkeypatch, fsdp):
+        """FSDP gathers the parameters of a layer in its forward hooks. A block replay runs
+        none of the hooks inside the block (the capture already fails: Megatron-FSDP sees the
+        blocks called outside the model forward), so the combination is refused up front."""
+        with pytest.raises(ValueError, match="does not support Megatron-FSDP or Torch FSDP2"):
+            _validated_cuda_graph_cli_args(
+                monkeypatch, ['--cuda-graph-impl', 'chunk_wise'], **{fsdp: True}
+            )
+
+    @pytest.mark.parametrize("data_path", ["sft", "dataloader_inter_document_masking"])
+    def test_chunk_wise_cli_rejects_packed_data_paths_without_the_packing_scheduler(
+        self, monkeypatch, data_path
+    ):
+        """Those paths hand the block packed sequence parameters although its graphs are
+        captured for fixed-length batches; the replay would raise after the whole capture."""
+        with pytest.raises(ValueError, match="only with --sequence-packing-scheduler"):
+            _validated_cuda_graph_cli_args(
+                monkeypatch, ['--cuda-graph-impl', 'chunk_wise'], **{data_path: True}
+            )
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-impl', 'transformer_engine'], **{data_path: True}
+        )
+        assert args.cuda_graph_impl == 'transformer_engine'
+
+    @pytest.mark.parametrize(
+        ("cuda_graph_impl", "expected"), [("chunk_wise", True), ("local", False)]
+    )
+    def test_te_rng_tracker_follows_te_captured_graphs_in_cli_and_run_config(
+        self, monkeypatch, cuda_graph_impl, expected
+    ):
+        """Transformer Engine captures the chunk-wise graphs whatever transformer_impl builds
+        the layers, so both configuration paths turn its RNG tracker on for them."""
+        from megatron.training.config.common_config import RNGConfig
+
+        args, _, _ = _validated_cuda_graph_cli_args(
+            monkeypatch, ['--cuda-graph-impl', cuda_graph_impl, '--transformer-impl', 'local']
+        )
+        assert args.te_rng_tracker is expected
+
+        transformer = _base_cuda_graph_config(transformer_impl="local")
+        transformer.cuda_graph_impl = cuda_graph_impl
+        rng = RNGConfig()
+        rng.finalize_model_config(transformer)
+        assert rng.te_rng_tracker is expected
+        assert transformer.use_te_rng_tracker is expected
 
     def test_enable_cuda_graph_flag_migrates_to_local_impl(self, monkeypatch):
         args, _, print_messages = _validated_cuda_graph_cli_args(
@@ -1945,6 +2297,7 @@ class TestHybridTECudaGraphDiscovery:
             layers.append(layer)
 
         rotary_pos_emb = torch.ones(8, 1, 1, 2)
+        rotary_calls = []
 
         class RotaryEmbedding:
             @staticmethod
@@ -1954,20 +2307,66 @@ class TestHybridTECudaGraphDiscovery:
             @staticmethod
             def __call__(_seq_length, offset=0, packed_seq=False, cp_group=None):
                 # Mirror RotaryEmbedding.forward so unexpected keywords still fail.
-                del offset, packed_seq, cp_group
+                del offset, cp_group
+                rotary_calls.append({'seq_length': _seq_length, 'packed_seq': packed_seq})
                 return rotary_pos_emb
+
+        class YarnRotaryEmbedding(RotaryEmbedding):
+            @staticmethod
+            def __call__(_seq_length, offset=0, packed_seq=False, cp_group=None):
+                # Mirror YarnRotaryEmbedding.forward: returns (emb, mscale).
+                del offset, cp_group
+                rotary_calls.append({'seq_length': _seq_length, 'packed_seq': packed_seq})
+                return rotary_pos_emb, 1.0
+
+        class MultimodalRotaryEmbedding:
+            # No get_rotary_seq_len, like the real module.
+            @staticmethod
+            def __call__(
+                position_ids, mrope_section, cp_group=None, return_raw_freqs=False, packed_seq=False
+            ):
+                # Mirror MultimodalRotaryEmbedding.forward: position_ids [3, bs, seq] ->
+                # [seq, bs, 1, dim] materialized embeddings.
+                del cp_group
+                assert position_ids.dim() == 3 and position_ids.shape[0] == 3
+                rotary_calls.append(
+                    {
+                        'position_ids_shape': tuple(position_ids.shape),
+                        'position_ids_dtype': position_ids.dtype,
+                        'mrope_section': mrope_section,
+                        'return_raw_freqs': return_raw_freqs,
+                        'packed_seq': packed_seq,
+                    }
+                )
+                return torch.ones(position_ids.shape[2], position_ids.shape[1], 1, 2)
+
+        if position_embedding_type == 'yarn':
+            rotary_module = YarnRotaryEmbedding()
+        elif position_embedding_type == 'mrope':
+            rotary_module = MultimodalRotaryEmbedding()
+        else:
+            rotary_module = RotaryEmbedding()
 
         chunk = SimpleNamespace(
             decoder=SimpleNamespace(layers=layers),
             position_embedding_type=position_embedding_type,
-            rotary_pos_emb=RotaryEmbedding(),
+            rotary_pos_emb=rotary_module,
+            mrope_section=[1, 0, 0],
+            _fused_mrope_available=False,
         )
         helper = object.__new__(TECudaGraphHelper)
         helper.config = SimpleNamespace(
             multi_latent_attention=multi_latent_attention,
             cuda_graph_modules=cuda_graph_modules,
             context_parallel_size=context_parallel_size,
+            sequence_parallel=False,
+            tensor_model_parallel_size=1,
+            apply_rope_fusion=False,
+            rotary_interleaved=False,
+            fused_single_qkv_rope=False,
+            sequence_packing_scheduler="dp_balanced" if is_thd else None,
         )
+        helper._rotary_calls = rotary_calls
         helper.seq_length = 8
         helper.micro_batch_size = 1
         helper.num_model_chunks = 1
@@ -2086,6 +2485,115 @@ class TestHybridTECudaGraphDiscovery:
             if position_embedding_type == 'mrope':
                 assert 'affecting GPTModel.' in records[0][1]
                 assert 'GPTModel and HybridModel' not in records[0][1]
+
+    @staticmethod
+    def _make_chunk_callable(helper):
+        """Make the helper's single callable the chunk decoder itself (a whole-block
+        callable)."""
+        chunk = helper.chunks_with_decoder[0]
+        decoder = helper.flattened_callables[0]
+        decoder.layers = [decoder]
+        chunk.decoder = decoder
+
+    @pytest.mark.parametrize(
+        ('position_embedding_type', 'is_thd'),
+        [('rope', False), ('rope', True), ('yarn', False), ('yarn', True), ('mrope', False)],
+    )
+    def test_chunk_callable_materializes_rotary_table(
+        self, monkeypatch, position_embedding_type, is_thd
+    ):
+        """A chunk callable is the whole training forward and TE flattens only the captured
+        keyword tensors, so its sample must carry a runtime-shaped rotary table for rope, yarn
+        and (fixed-length) mRoPE; none of them is a per-layer sample-contract warning."""
+        records = []
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            'log_on_each_pipeline_stage',
+            lambda **kwargs: records.append((kwargs['level'], kwargs['msg'])),
+        )
+        helper, rotary_pos_emb = self._rotary_sample_helper(
+            monkeypatch,
+            layer_kind='transformer',
+            position_embedding_type=position_embedding_type,
+            cuda_graph_modules=[],
+            is_thd=is_thd,
+        )
+        self._make_chunk_callable(helper)
+
+        _sample_args, sample_kwargs = helper._get_sample_arguments([1, -1])
+
+        assert records == []
+        table = sample_kwargs[0]['rotary_pos_emb']
+        assert isinstance(table, torch.Tensor)
+        # [seq, batch, 1, dim]: seq = 8 tokens, batch = 1 (hidden_states [8, 1, 8]).
+        assert table.shape == (8, 1, 1, 2)
+        assert table.dtype == torch.float32
+        assert len(helper._rotary_calls) == 1
+        call = helper._rotary_calls[0]
+        # THD block callables capture the full packed table, not the per-CP-rank slice.
+        assert call['packed_seq'] is is_thd
+        if position_embedding_type == 'mrope':
+            # Built from a [3, batch, seq] int64 position_ids sample with the model's
+            # mrope_section, mirroring GPTModel._preprocess.
+            assert call['position_ids_shape'] == (3, 1, 8)
+            assert call['position_ids_dtype'] == torch.long
+            assert call['mrope_section'] == [1, 0, 0]
+            assert call['return_raw_freqs'] is False
+        else:
+            assert table is rotary_pos_emb
+            assert call['seq_length'] == 8
+
+    @pytest.mark.parametrize('position_embedding_type', ['rope', 'yarn', 'mrope'])
+    def test_chunk_callable_rotary_table_per_in_flight_slot(
+        self, monkeypatch, position_embedding_type
+    ):
+        """Two microbatches in flight (forward, forward, backward, backward) are two graph
+        slots. The rope / yarn tables are constants, so the slots share one sample tensor. An
+        mRoPE table follows each microbatch's position_ids and the rotation's backward reads it
+        again, so every slot gets its own static buffer: the second microbatch's forward replay
+        would overwrite a shared one before the first microbatch's backward ran."""
+        helper, rotary_pos_emb = self._rotary_sample_helper(
+            monkeypatch,
+            layer_kind='transformer',
+            position_embedding_type=position_embedding_type,
+            cuda_graph_modules=[],
+        )
+        self._make_chunk_callable(helper)
+        helper.num_microbatches = 2
+
+        _sample_args, sample_kwargs = helper._get_sample_arguments([1, 1, -1, -1])
+
+        first, second = (kwargs['rotary_pos_emb'] for kwargs in sample_kwargs)
+        if position_embedding_type == 'mrope':
+            assert first is not second
+            assert len(helper._rotary_calls) == 2
+        else:
+            assert first is second is rotary_pos_emb
+            assert len(helper._rotary_calls) == 1
+
+    def test_chunk_callable_rejects_mrope_with_packed_sequences(self, monkeypatch):
+        """The packing scheduler provides [1, tokens] position ids, so no runtime mRoPE table
+        exists for a THD chunk callable to copy into the sample: refuse instead of replaying
+        attention without RoPE."""
+        records = []
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            'log_on_each_pipeline_stage',
+            lambda **kwargs: records.append((kwargs['level'], kwargs['msg'])),
+        )
+        helper, _rotary_pos_emb = self._rotary_sample_helper(
+            monkeypatch,
+            layer_kind='transformer',
+            position_embedding_type='mrope',
+            cuda_graph_modules=[],
+            is_thd=True,
+        )
+        self._make_chunk_callable(helper)
+
+        with pytest.raises(ValueError, match="'mrope' together with packed \\(THD\\) sequences"):
+            helper._get_sample_arguments([1, -1])
+        assert records == []
+        assert helper._rotary_calls == []
 
     def test_rotary_sample_contract_warning_is_deduplicated_for_yarn_thd_cp2(self, monkeypatch):
         records = []
@@ -3069,6 +3577,1433 @@ def is_hybrid_ep_available():
     from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
 
     return HAVE_HYBRIDEP
+
+
+def test_dsa_topk_layers_the_mtp_reuses():
+    """The decoder layers whose DSA top-k indices an MTP layer of the same model chunk reuses:
+    the sources of the MTP's sharing layers that the MTP does not compute itself."""
+    from megatron.core.transformer.cuda_graphs import _dsa_topk_layers_the_mtp_reuses
+
+    def attention(layer_number, source_layer=None, index_share=True):
+        module = torch.nn.Identity()
+        module.index_share = index_share
+        module.layer_number = layer_number
+        module.skip_topk = source_layer is not None
+        module.source_layer = source_layer if source_layer is not None else layer_number
+        return module
+
+    def chunk(*mtp_layers):
+        model_chunk = torch.nn.Module()
+        model_chunk.mtp = torch.nn.Sequential(*mtp_layers, torch.nn.Linear(2, 2))
+        return model_chunk
+
+    # Layer 4 reuses decoder layer 3.
+    assert _dsa_topk_layers_the_mtp_reuses(chunk(attention(4, source_layer=3))) == (3,)
+    # Layer 4 selects its own keys and layer 5 reuses those: nothing crosses the boundary.
+    assert _dsa_topk_layers_the_mtp_reuses(chunk(attention(4), attention(5, source_layer=4))) == ()
+    # Two MTP layers reusing two decoder layers.
+    reused = _dsa_topk_layers_the_mtp_reuses(
+        chunk(attention(5, source_layer=3), attention(6, source_layer=2))
+    )
+    assert reused == (2, 3)
+    # No sharing (dsa_indexer_topk_freq == 1), no DSA layer, no MTP.
+    assert _dsa_topk_layers_the_mtp_reuses(chunk(attention(4, index_share=False))) == ()
+    assert _dsa_topk_layers_the_mtp_reuses(chunk()) == ()
+    assert _dsa_topk_layers_the_mtp_reuses(torch.nn.Module()) == ()
+
+
+class TestChunkWiseCudaGraphs:
+    """Chunk-wise TE CUDA graphs (cuda_graph_impl='chunk_wise'): config validation and callable
+    selection."""
+
+    _PACKED = dict(
+        sequence_packing_scheduler="dp_balanced",
+        cuda_graph_dynamic_microbatches=True,
+        pad_packed_seq_alignment="max",
+        max_seqlen_per_dp_cp_rank=128,
+        thd_max_packed_sequences=8,
+    )
+    _NO_DROPOUT = dict(hidden_dropout=0.0, attention_dropout=0.0)
+    _FULL_RECOMPUTE = dict(
+        recompute_granularity='full', recompute_method='uniform', recompute_num_layers=1
+    )
+    _MHC_RECOMPUTE = dict(
+        enable_hyper_connections=True,
+        recompute_granularity='selective',
+        recompute_modules=['mhc'],
+        mhc_recompute_layer_num=2,
+    )
+    _DROP_PADDING_MOE = dict(
+        num_moe_experts=4,
+        moe_token_dispatcher_type="alltoall",
+        moe_expert_capacity_factor=1.0,
+        moe_pad_expert_input_to_capacity=True,
+    )
+
+    def test_chunk_config_accepts_full_recompute(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            recompute_granularity='full',
+            recompute_method='uniform',
+            recompute_num_layers=1,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        assert cfg.cuda_graph_impl == 'chunk_wise'
+
+    def test_chunk_config_accepts_fine_grained_activation_offloading(self):
+        cfg = _base_cuda_graph_config(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            fine_grained_activation_offloading=True,
+            offload_modules=['core_attn', 'attn_proj'],
+        )
+        assert cfg.cuda_graph_impl == 'chunk_wise'
+        assert cfg.fine_grained_activation_offloading
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            ({'cuda_graph_modules': [CudaGraphModule.attn]}, "cuda_graph_modules must be empty"),
+            (
+                {'overlap_moe_expert_parallel_comm': True},
+                "incompatible with overlap_moe_expert_parallel_comm and delay_wgrad_compute",
+            ),
+            (
+                {'delay_wgrad_compute': True},
+                "incompatible with overlap_moe_expert_parallel_comm and delay_wgrad_compute",
+            ),
+            # The third delayed-weight-gradient option: caught here, not by the capture.
+            (
+                {
+                    'overlap_dispatch_backward_with_experts_wgrad': True,
+                    'num_moe_experts': 4,
+                    'moe_expert_capacity_factor': 1.0,
+                    'moe_pad_expert_input_to_capacity': True,
+                },
+                "incompatible with overlap_dispatch_backward_with_experts_wgrad",
+            ),
+            # A host-side tracker that only the Python of the MoE forward / backward fills.
+            (
+                {
+                    'log_moe_overload_factor': True,
+                    'num_moe_experts': 4,
+                    'moe_expert_capacity_factor': 1.0,
+                    'moe_pad_expert_input_to_capacity': True,
+                },
+                "does not support log_moe_overload_factor",
+            ),
+            # A context the schedule opens around the forward step, outside the recorded block.
+            ({'enable_autocast': True}, "does not support enable_autocast"),
+            # Routes the router records into, and replays from, Python state of every forward.
+            (
+                {
+                    'moe_enable_routing_replay': True,
+                    'num_moe_experts': 4,
+                    'moe_expert_capacity_factor': 1.0,
+                    'moe_pad_expert_input_to_capacity': True,
+                },
+                "does not support moe_enable_routing_replay",
+            ),
+            # A router whose iteration count the host decides from the values of each batch.
+            (
+                {
+                    'num_moe_experts': 4,
+                    'moe_router_load_balancing_type': 'sinkhorn',
+                    'moe_router_topk': 1,
+                },
+                "does not support sinkhorn routing",
+            ),
+            # Weight shards gathered on side streams that only the local and the
+            # full-iteration graph runners join.
+            (
+                {'tensor_model_parallel_size': 2, 'tensor_parallel_num_weight_shards': 4},
+                "does not support GTP weight rematerialization",
+            ),
+            (
+                {**_PACKED, 'cuda_graph_dynamic_microbatches': False},
+                "chunk CUDA graphs require cuda_graph_dynamic_microbatches",
+            ),
+            # Each source of randomness a captured full recompute cannot reproduce.
+            (
+                {**_FULL_RECOMPUTE, 'hidden_dropout': 0.1, 'attention_dropout': 0.0},
+                "full activation recompute requires hidden_dropout=0",
+            ),
+            (
+                {**_FULL_RECOMPUTE, 'hidden_dropout': 0.0, 'attention_dropout': 0.1},
+                "full activation recompute requires hidden_dropout=0",
+            ),
+            (
+                {**_FULL_RECOMPUTE, **_NO_DROPOUT, 'moe_input_jitter_eps': 1e-2},
+                "full activation recompute requires hidden_dropout=0",
+            ),
+            # mHC recompute is captured with the block, like under full-iteration graphs.
+            (
+                {**_MHC_RECOMPUTE, 'hidden_dropout': 0.1, 'attention_dropout': 0.0},
+                "mHC recompute with cuda_graph_impl='full_iteration' or chunk-wise",
+            ),
+            (
+                {**_MHC_RECOMPUTE, 'hidden_dropout': 0.0, 'attention_dropout': 0.1},
+                "mHC recompute with cuda_graph_impl='full_iteration' or chunk-wise",
+            ),
+            # The attention-only split is a per-layer capture.
+            (
+                {**_MHC_RECOMPUTE, **_NO_DROPOUT, 'mhc_recompute_attn_cuda_graph_split': True},
+                "mhc_recompute_attn_cuda_graph_split requires cuda_graph_impl='transformer_engine'",
+            ),
+        ],
+        ids=[
+            "cuda_graph_modules",
+            "overlap_moe_expert_parallel_comm",
+            "delay_wgrad_compute",
+            "overlap_dispatch_backward_with_experts_wgrad",
+            "log_moe_overload_factor",
+            "enable_autocast",
+            "moe_enable_routing_replay",
+            "sinkhorn_routing",
+            "gtp_weight_shards",
+            "packed_without_dynamic_microbatches",
+            "full_recompute_hidden_dropout",
+            "full_recompute_attention_dropout",
+            "full_recompute_moe_input_jitter",
+            "mhc_recompute_hidden_dropout",
+            "mhc_recompute_attention_dropout",
+            "mhc_recompute_attention_split",
+        ],
+    )
+    def test_chunk_config_rejections(self, overrides, match):
+        overrides = {'cuda_graph_modules': [], **overrides}
+        with pytest.raises(ValueError, match=match):
+            _base_cuda_graph_config(cuda_graph_impl='chunk_wise', **overrides)
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            (
+                {'recompute_modules': ['core_attn'], 'attention_dropout': 0.1},
+                "attention dropout is not supported with graphed attention recomputation",
+            ),
+            (
+                {'recompute_modules': ['mlp'], 'hidden_dropout': 0.1},
+                "hidden dropout is not supported with graphed MLP/MoE recomputation",
+            ),
+            (
+                {'recompute_modules': ['moe'], **_DROP_PADDING_MOE, 'hidden_dropout': 0.1},
+                "hidden dropout is not supported with graphed MLP/MoE recomputation",
+            ),
+            (
+                {'recompute_modules': ['moe'], **_DROP_PADDING_MOE, 'moe_input_jitter_eps': 1e-2},
+                "moe_input_jitter_eps is not supported with graphed moe recomputation",
+            ),
+        ],
+        ids=["core_attn_dropout", "mlp_dropout", "moe_dropout", "moe_input_jitter"],
+    )
+    def test_chunk_config_rejects_randomness_in_a_captured_selective_recompute(
+        self, overrides, match
+    ):
+        """A block graph records the recompute with the forward: a dropout mask or a router
+        jitter drawn again in the recomputed forward would differ from the first one. These
+        refusals are the per-layer graphs' (a whole layer in scope); a chunk captures it too."""
+        settings = {**self._NO_DROPOUT, 'recompute_granularity': 'selective', **overrides}
+        with pytest.raises(AssertionError, match=match):
+            _base_cuda_graph_config(cuda_graph_impl='chunk_wise', cuda_graph_modules=[], **settings)
+
+    def test_chunk_config_takes_fixed_length_slots_from_the_step(self):
+        """Fixed-length batches: one slot per microbatch of the step, captured in the order
+        the schedule runs them. Dynamic slots (the topology floor of the schedule, captured in
+        the order of that larger count) are for packed sequences."""
+        with pytest.warns(UserWarning, match="cuda_graph_dynamic_microbatches only applies"):
+            fixed_length = _base_cuda_graph_config(
+                cuda_graph_impl='chunk_wise',
+                cuda_graph_modules=[],
+                cuda_graph_dynamic_microbatches=True,
+            )
+        assert fixed_length.cuda_graph_dynamic_microbatches is False
+        packed = _base_cuda_graph_config(
+            cuda_graph_impl='chunk_wise', cuda_graph_modules=[], **self._PACKED
+        )
+        assert packed.cuda_graph_dynamic_microbatches is True
+
+    def test_chunk_config_accepts_mhc_recompute_without_dropout(self):
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            **self._MHC_RECOMPUTE,
+            **self._NO_DROPOUT,
+        )
+        assert config.cuda_graph_impl == 'chunk_wise'
+
+    @pytest.mark.parametrize("cuda_graph_impl", ["chunk_wise", "transformer_engine"])
+    def test_attention_split_flag_without_mhc_recompute_only_warns(self, cuda_graph_impl):
+        """Without mHC recompute the split flag has no effect under any implementation."""
+        with pytest.warns(UserWarning, match="mhc_recompute_attn_cuda_graph_split has no effect"):
+            config = _base_cuda_graph_config(
+                cuda_graph_impl=cuda_graph_impl,
+                cuda_graph_modules=[],
+                mhc_recompute_attn_cuda_graph_split=True,
+            )
+        assert config.mhc_recompute_attn_cuda_graph_split
+
+    def test_chunk_config_rejects_dynamic_context_parallel(self, monkeypatch):
+        """The captured block records the context-parallel communicator of the capture sample.
+        Dynamic CP reaches graph validation only as packed DSA, where a per-layer graph that
+        keeps attention eager is accepted with a warning."""
+        from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+        monkeypatch.setattr(
+            transformer_config_module, "_validate_dsa_kernel_backend_dependencies", lambda _: None
+        )
+        monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _version: True)
+        dynamic_cp_dsa = dict(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=16,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            add_bias_linear=False,
+            q_lora_rank=64,
+            kv_lora_rank=64,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            v_head_dim=64,
+            rope_type='rope',
+            rotary_base=10000,
+            rotary_percent=1.0,
+            dsa_indexer_n_heads=8,
+            dsa_indexer_head_dim=64,
+            dsa_indexer_topk=32,
+            experimental_attention_variant="dsa",
+            dsa_kernel_backend="cudnn",
+            sequence_packing_scheduler="default_dynamic_cp",
+            dynamic_context_parallel=True,
+            max_seqlen_per_dp_cp_rank=128,
+            pad_packed_seq_alignment="max",
+            thd_max_packed_sequences=4,
+            context_parallel_size=2,
+            cp_comm_type="allgather",
+            calculate_per_token_loss=True,
+        )
+        with pytest.warns(UserWarning, match="packed DSA with context parallelism"):
+            MLATransformerConfig(
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=[CudaGraphModule.mlp],
+                **dynamic_cp_dsa,
+            )
+        with pytest.raises(ValueError, match="does not support dynamic_context_parallel"):
+            MLATransformerConfig(
+                cuda_graph_impl="chunk_wise",
+                cuda_graph_modules=[],
+                cuda_graph_dynamic_microbatches=True,
+                **dynamic_cp_dsa,
+            )
+
+    @pytest.mark.parametrize(
+        ("overrides", "warns"),
+        [
+            ({**_FULL_RECOMPUTE, 'moe_router_force_load_balancing': True}, True),
+            (
+                {
+                    'recompute_granularity': 'selective',
+                    'recompute_modules': ['moe'],
+                    'moe_router_force_load_balancing': True,
+                },
+                True,
+            ),
+            (
+                {
+                    'recompute_granularity': 'selective',
+                    'recompute_modules': ['core_attn'],
+                    'moe_router_force_load_balancing': True,
+                },
+                False,
+            ),
+            ({'moe_router_force_load_balancing': True}, False),
+            (_FULL_RECOMPUTE, False),
+            ({**_FULL_RECOMPUTE, 'moe_router_force_biased': 0.5}, True),
+        ],
+        ids=[
+            "full_recompute",
+            "selective_moe_recompute",
+            "selective_core_attn_recompute",
+            "no_recompute",
+            "full_recompute_without_force_load_balancing",
+            "full_recompute_with_forced_bias",
+        ],
+    )
+    def test_chunk_config_warns_when_recompute_redraws_forced_router_logits(self, overrides, warns):
+        """moe_router_force_load_balancing and moe_router_force_biased draw random router
+        logits; a recompute of the router (full recompute, or selective recompute of 'moe')
+        draws them again."""
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _base_cuda_graph_config(
+                cuda_graph_impl='chunk_wise',
+                cuda_graph_modules=[],
+                **self._NO_DROPOUT,
+                **self._DROP_PADDING_MOE,
+                **overrides,
+            )
+        redraw_warnings = [
+            warning
+            for warning in caught
+            if "random router logits are drawn again in the recompute" in str(warning.message)
+        ]
+        assert len(redraw_warnings) == int(warns)
+
+    def test_chunk_config_computes_the_lm_head_wgrad_in_a_captured_post_process(self):
+        """With packed sequences the LM head is part of the captured post-process, so its
+        weight gradient cannot be deferred to the schedule: the option is turned off with a
+        warning. Fixed-length chunk graphs keep the LM head eager and the option untouched."""
+        deferred = dict(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
+            gradient_accumulation_fusion=True,
+            defer_embedding_wgrad_compute=True,
+        )
+        with pytest.warns(UserWarning, match="defer_embedding_wgrad_compute is disabled"):
+            packed = _base_cuda_graph_config(
+                **deferred, **self._PACKED, pipeline_p2p_fixed_shape=True
+            )
+        assert packed.defer_embedding_wgrad_compute is False
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fixed_length = _base_cuda_graph_config(**deferred)
+        assert fixed_length.defer_embedding_wgrad_compute is True
+        assert not [w for w in caught if "defer_embedding_wgrad_compute" in str(w.message)]
+
+    def test_chunk_config_records_the_mtp_backward_in_a_captured_post_process(self):
+        """With packed sequences the MTP loss is part of the captured post-process: its
+        backward is recorded in the backward graph, so the early backward (which the eager
+        warm-up steps would run and a replay would not) is turned off with a warning.
+        Fixed-length chunk graphs keep the MTP eager and the option untouched."""
+        early = dict(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            mtp_num_layers=1,
+            mtp_loss_early_backward=True,
+        )
+        with pytest.warns(UserWarning, match="mtp_loss_early_backward is disabled"):
+            packed = _base_cuda_graph_config(**early, **self._PACKED)
+        assert packed.mtp_loss_early_backward is False
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            fixed_length = _base_cuda_graph_config(**early)
+        assert fixed_length.mtp_loss_early_backward is True
+        assert not [w for w in caught if "mtp_loss_early_backward" in str(w.message)]
+
+    @pytest.mark.parametrize("variant", ["gdn", "kda"])
+    def test_chunk_config_rejects_gated_delta_net_with_packed_sequences(self, variant):
+        """FLA builds the GDN / KDA chunk indices on the host from the cu_seqlens values and
+        caches them per tensor, so a captured block graph would replay the capture sample's pack
+        layout for every microbatch. Fixed-length chunk graphs with the same layers, and the
+        per-layer TE graphs of the same packed configuration, are unaffected."""
+        gated_delta_net = dict(
+            experimental_attention_variant=variant,
+            linear_attention_freq=1,
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_num_key_heads=4,
+            linear_num_value_heads=4,
+        )
+        packed = self._PACKED
+        match = "does not support packed-sequence .* GDN / KDA"
+        with pytest.raises(ValueError, match=match):
+            _base_cuda_graph_config(
+                cuda_graph_impl='chunk_wise', cuda_graph_modules=[], **gated_delta_net, **packed
+            )
+        # Also with context parallelism, where the message has to win over the generic
+        # THD CP layout-conversion rejection of attention-capturing graphs.
+        with pytest.raises(ValueError, match=match):
+            _base_cuda_graph_config(
+                cuda_graph_impl='chunk_wise',
+                cuda_graph_modules=[],
+                context_parallel_size=2,
+                cp_partition_mode="contiguous",
+                **gated_delta_net,
+                **packed,
+            )
+        fixed_length = _base_cuda_graph_config(
+            cuda_graph_impl='chunk_wise', cuda_graph_modules=[], **gated_delta_net
+        )
+        assert fixed_length.cuda_graph_impl == 'chunk_wise'
+        per_layer = _base_cuda_graph_config(
+            cuda_graph_impl='transformer_engine', cuda_graph_modules=[], **gated_delta_net, **packed
+        )
+        assert per_layer.cuda_graph_impl == 'transformer_engine'
+
+    @pytest.mark.parametrize("pattern", ["G-*-", "*-K-", "*-/G-"])
+    def test_chunk_config_rejects_hybrid_gated_delta_net_layers_with_packed_sequences(
+        self, pattern
+    ):
+        """A hybrid stack selects GDN / KDA layers per pattern symbol and leaves
+        experimental_attention_variant unset: the same rejection must key on the pattern (and
+        the captured block re-checks its layers, _check_packed_layers_are_capturable)."""
+        packed = self._PACKED
+        with pytest.raises(ValueError, match="does not support packed-sequence .* GDN / KDA"):
+            _base_cuda_graph_config(
+                cuda_graph_impl='chunk_wise',
+                cuda_graph_modules=[],
+                is_hybrid_model=True,
+                hybrid_layer_pattern=pattern,
+                **packed,
+            )
+        fixed_length = _base_cuda_graph_config(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            is_hybrid_model=True,
+            hybrid_layer_pattern=pattern,
+        )
+        assert fixed_length.cuda_graph_impl == 'chunk_wise'
+        attention_only = _base_cuda_graph_config(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            is_hybrid_model=True,
+            hybrid_layer_pattern="*-/*-",
+            **packed,
+        )
+        assert attention_only.cuda_graph_impl == 'chunk_wise'
+
+    @pytest.mark.parametrize("layer_family", ["gated_delta_net", "gated_delta_product"])
+    def test_captured_block_rejects_gated_delta_net_layers_with_packed_sequences(
+        self, layer_family
+    ):
+        """The block-level check sees the layers themselves, whatever selected them: a GDN /
+        KDA layer of a hybrid pattern, or the gated delta product mixer a layer spec puts
+        into a Mamba-symbol layer (no config field names it)."""
+        from megatron.core.ssm.gated_delta_net.common import _GDNBase
+        from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+        from megatron.core.transformer.chunk_cuda_graph import ChunkCudaGraphBlockMixin
+
+        layer_class = _GDNBase if layer_family == "gated_delta_net" else GatedDeltaProductMixer
+
+        class Block(ChunkCudaGraphBlockMixin, torch.nn.Module):
+            config = SimpleNamespace(cuda_graph_impl="none")
+
+        block = Block()
+        block.attention = torch.nn.Identity()
+        block._check_packed_layers_are_capturable()
+        block.linear_attention = layer_class.__new__(layer_class)
+        torch.nn.Module.__init__(block.linear_attention)
+        with pytest.raises(ValueError, match="does not support packed-sequence .* GDN / KDA"):
+            block._check_packed_layers_are_capturable()
+
+    _STATIC_HYBRIDEP = dict(
+        num_moe_experts=4,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_expert_rank_capacity_factor=1.2,
+        # A HybridEP rank capacity needs the op fuser (or grouped tensors).
+        use_transformer_engine_op_fuser=True,
+    )
+
+    @pytest.mark.parametrize(
+        "moe",
+        [
+            # Dropless all-to-all: token counts per expert vary with the routing.
+            dict(num_moe_experts=4, moe_token_dispatcher_type="alltoall"),
+            # HybridEP without a rank capacity.
+            dict(
+                num_moe_experts=4,
+                moe_token_dispatcher_type="flex",
+                moe_flex_dispatcher_backend="hybridep",
+            ),
+        ],
+    )
+    def test_chunk_config_requires_static_moe_token_shapes(self, moe):
+        """The captured block includes the MoE dispatch. The requirement is checked when the
+        config is built, not only when the graphs are captured after the warm-up steps."""
+        with pytest.raises(AssertionError, match="need static token shapes"):
+            _base_cuda_graph_config(cuda_graph_impl='chunk_wise', cuda_graph_modules=[], **moe)
+        # The same MoE without graphs is fine.
+        _base_cuda_graph_config(cuda_graph_impl='none', **moe)
+
+    @pytest.mark.parametrize(
+        "moe",
+        [
+            _STATIC_HYBRIDEP,
+            dict(
+                num_moe_experts=4,
+                moe_token_dispatcher_type="alltoall",
+                moe_expert_capacity_factor=1.0,
+                moe_pad_expert_input_to_capacity=True,
+            ),
+        ],
+    )
+    def test_chunk_config_accepts_static_moe_token_shapes(self, moe):
+        config = _base_cuda_graph_config(cuda_graph_impl='chunk_wise', cuda_graph_modules=[], **moe)
+        assert config.cuda_graph_impl == 'chunk_wise'
+
+    def test_chunk_config_turns_off_hybridep_runtime_padding(self):
+        """Every dispatcher rank holds the same static token count under chunk graphs, and
+        HybridEP's runtime padding (an all-reduce plus a host read per MoE layer) cannot be
+        captured: packed chunk graphs do not need the flag, and a set flag is turned off."""
+        packed = self._PACKED
+        config = _base_cuda_graph_config(
+            cuda_graph_impl='chunk_wise', cuda_graph_modules=[], **self._STATIC_HYBRIDEP, **packed
+        )
+        assert config.moe_hybridep_pad_variable_tokens is False
+        with pytest.warns(UserWarning, match="moe_hybridep_pad_variable_tokens"):
+            config = _base_cuda_graph_config(
+                cuda_graph_impl='chunk_wise',
+                cuda_graph_modules=[],
+                moe_hybridep_pad_variable_tokens=True,
+                **self._STATIC_HYBRIDEP,
+                **packed,
+            )
+        assert config.moe_hybridep_pad_variable_tokens is False
+        assert config.moe_hybridep_pad_uneven_dispatch_inputs is False
+        # Eager packed HybridEP still needs the runtime padding.
+        eager_packed = dict(sequence_packing_scheduler="dp_balanced", max_seqlen_per_dp_cp_rank=128)
+        with pytest.raises(ValueError, match="moe_hybridep_pad_variable_tokens=True"):
+            _base_cuda_graph_config(cuda_graph_impl='none', **self._STATIC_HYBRIDEP, **eager_packed)
+
+    def test_chunk_config_has_no_inference_graph_scope(self):
+        config = _base_cuda_graph_config(cuda_graph_impl='chunk_wise', cuda_graph_modules=[])
+        assert config.inference_cuda_graph_scope == InferenceCudaGraphScope.none
+        with pytest.raises(AssertionError, match="Invalid inference CUDA graph scope"):
+            _base_cuda_graph_config(
+                cuda_graph_impl='chunk_wise',
+                cuda_graph_modules=[],
+                inference_cuda_graph_scope=InferenceCudaGraphScope.layer,
+            )
+
+    @pytest.mark.parametrize(
+        ("cuda_graph_impl", "cuda_graph_modules", "expected"),
+        [
+            ("chunk_wise", [], True),
+            ("transformer_engine", [CudaGraphModule.attn], True),
+            ("transformer_engine", [CudaGraphModule.mlp], False),
+            ("full_iteration", [], False),
+            ("none", [], False),
+        ],
+    )
+    def test_graph_dynamic_dsa_pack_routing_follows_te_graphs_that_capture_attention(
+        self, cuda_graph_impl, cuda_graph_modules, expected
+    ):
+        """The balanced DSA indexer routes varying packs through fixed-capacity graph inputs
+        under per-layer TE graphs that capture attention and under chunk-wise graphs."""
+        config = SimpleNamespace(
+            dsa_cp_balance_indexer=True,
+            cuda_graph_impl=cuda_graph_impl,
+            cuda_graph_modules=cuda_graph_modules,
+            sequence_packing_scheduler="dp_balanced",
+        )
+        derived = TransformerConfig.dsa_cp_balance_indexer_graph_dynamic_packs.fget(config)
+        assert derived is expected
+
+    def test_chunk_uses_outer_block_callable(self):
+        config = SimpleNamespace(cuda_graph_impl='chunk_wise')
+        for block_type in (TransformerBlock, HybridStack):
+            block = object.__new__(block_type)
+            object.__setattr__(block, 'config', config)
+            assert isinstance(block, GraphableMegatronModule)
+            assert _chunk_cuda_graph_block_is_graphable(block, config)
+            assert not block._should_call_local_cudagraph()
+            # Under per-layer TE graphs the layers are the callables, never their block.
+            per_layer = SimpleNamespace(cuda_graph_impl='transformer_engine', cuda_graph_modules=[])
+            object.__setattr__(block, 'config', per_layer)
+            assert not _te_cuda_graph_layer_is_graphable(block, per_layer)
+            assert not _chunk_cuda_graph_block_is_graphable(block, per_layer)
+            assert not block._should_call_te_cudagraph()
+        layer = object.__new__(TransformerLayer)
+        object.__setattr__(layer, 'config', config)
+        assert not _chunk_cuda_graph_block_is_graphable(layer, config)
+        assert not _te_cuda_graph_layer_is_graphable(layer, config)
+
+    def test_chunk_config_warns_when_packed_pp_keeps_the_p2p_shape_exchange(self):
+        """Packing pads every microbatch to max_seqlen_per_dp_cp_rank, so the pipeline P2P shape
+        is static; without pipeline_p2p_fixed_shape every P2P still exchanges shapes (a host
+        synchronization)."""
+        packed_pp = dict(
+            cuda_graph_impl='chunk_wise',
+            cuda_graph_modules=[],
+            cuda_graph_dynamic_microbatches=True,
+            sequence_packing_scheduler="dp_balanced",
+            pad_packed_seq_alignment="max",
+            max_seqlen_per_dp_cp_rank=128,
+            thd_max_packed_sequences=8,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.bfloat16,
+        )
+        with pytest.warns(UserWarning, match="pipeline_p2p_fixed_shape=True"):
+            _base_cuda_graph_config(**packed_pp)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            _base_cuda_graph_config(**packed_pp, pipeline_p2p_fixed_shape=True)
+            _base_cuda_graph_config(**{**packed_pp, "pipeline_model_parallel_size": 1})
+        assert not [w for w in caught if "pipeline_p2p_fixed_shape" in str(w.message)]
+
+    def test_te_capture_runs_on_the_shared_capture_stream_for_pool_sharing(self, monkeypatch):
+        """The chunk graphs and the optimizer-step graph share one memory pool, whose free blocks
+        are keyed by the allocating stream: TE's capture (torch.cuda.graph without a stream) must
+        therefore run on get_shared_capture_stream(). The context redirects torch's default
+        capture stream for the capture only (other graphs of the process keep theirs, also when
+        the capture raises); the full-iteration path keeps passing the stream explicitly."""
+        from megatron.core import full_cuda_graph
+
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        monkeypatch.setattr(full_cuda_graph, "_shared_capture_stream", None)
+        previous_stream = torch.cuda.Stream()
+        monkeypatch.setattr(torch.cuda.graphs.graph, "default_capture_stream", previous_stream)
+        with pytest.raises(RuntimeError, match="capture failed"):
+            with full_cuda_graph.capture_te_graphs_on_shared_stream():
+                shared_stream = full_cuda_graph.get_shared_capture_stream()
+                assert shared_stream is not previous_stream
+                assert torch.cuda.graphs.graph.default_capture_stream is shared_stream
+                # What TE's make_graphed_callables builds: a graph context without a stream.
+                assert torch.cuda.graph(torch.cuda.CUDAGraph()).capture_stream is shared_stream
+                raise RuntimeError("capture failed")
+        assert torch.cuda.graphs.graph.default_capture_stream is previous_stream
+
+    @staticmethod
+    def _capture_input_helper(monkeypatch, callables, **config_overrides):
+        """A PP=1 helper whose _get_cuda_graph_input_data() runs without a model: the tests read
+        the keyword arguments it builds for Transformer Engine's make_graphed_callables."""
+
+        def fake_make_graphed_callables(modules, sample_args, pool=None, **kwargs):
+            raise AssertionError("only the keyword arguments are under test")
+
+        config = SimpleNamespace(
+            cuda_graph_impl="chunk_wise",
+            cuda_graph_modules=[],
+            cuda_graph_warmup_steps=1,
+            cuda_graph_use_single_mempool=True,
+            cuda_graph_retain_backward_graph=False,
+            microbatch_group_size_per_vp_stage=1,
+            overlap_moe_expert_parallel_comm=False,
+            delay_wgrad_compute=False,
+            fine_grained_activation_offloading=False,
+            fp8=None,
+            fp4=None,
+        )
+        for name, value in config_overrides.items():
+            setattr(config, name, value)
+        pp_group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = config
+        helper.pp_group = pp_group
+        helper.p2p_communicator = SimpleNamespace(
+            pp_group=pp_group, virtual_pipeline_model_parallel_size=None
+        )
+        helper.pg_collection = None
+        helper.tp_group = helper.dp_cp_group = None
+        helper.num_model_chunks = 1
+        helper.flattened_callables = list(callables)
+        helper.num_layers_per_chunk = [len(callables)]
+        helper._get_sample_arguments = lambda order, chunk_id_list=None: ([()] * len(callables), [])
+        # The helper imports make_graphed_callables from Transformer Engine at call time.
+        monkeypatch.setattr(
+            "transformer_engine.pytorch.graph.make_graphed_callables", fake_make_graphed_callables
+        )
+        monkeypatch.setattr(cuda_graphs_module, "get_num_microbatches", lambda: 1)
+        monkeypatch.setattr(cuda_graphs_module, "log_on_each_pipeline_stage", lambda **kwargs: None)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda *args: 0)
+        return helper
+
+    @staticmethod
+    def _create_cudagraphs_helper(capture_kwargs, **config_overrides):
+        """A helper whose create_cudagraphs() reaches make_graphed_callables with stand-in
+        sample inputs (the caller replaces make_graphed_callables)."""
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = _base_cuda_graph_config(
+            cuda_graph_impl='chunk_wise', cuda_graph_modules=[], **config_overrides
+        )
+        helper.model = []
+        helper.flattened_callables = [torch.nn.Identity()]
+        helper.callables_per_chunk = []
+        helper.num_microbatches = 1
+        helper._captures_dsa_metric_writes = False
+        helper._start_capturing = lambda: 0.0
+        helper._finish_capturing = lambda _start_time: None
+        helper._get_cuda_graph_input_data = lambda: ([()], {'_order': [1, -1], **capture_kwargs})
+        helper._validate_mhc_static_hidden_inputs = lambda _sample_args: None
+        helper._uses_mhc_direct_write_arena = lambda: False
+        return helper
+
+    @pytest.mark.parametrize(
+        ("config_overrides", "te_takes_pool", "shares_pool"),
+        [
+            (dict(), True, True),
+            (dict(cuda_graph_warmup_steps=0), True, True),
+            (dict(cuda_graph_use_single_mempool=False), True, False),
+            (dict(), False, False),
+            (dict(cuda_graph_impl="transformer_engine"), True, False),
+        ],
+        ids=[
+            "shared",
+            "no_eager_warmup_step",
+            "single_mempool_off",
+            "te_without_pool_argument",
+            "per_layer_graphs",
+        ],
+    )
+    def test_chunk_capture_shares_the_graph_pool_with_the_optimizer_graph(
+        self, monkeypatch, config_overrides, te_takes_pool, shares_pool
+    ):
+        """The chunk graphs share one pool with the optimizer-step graph, which reuses the
+        blocks they leave idle, whenever cuda_graph_use_single_mempool is on and Transformer
+        Engine takes a pool: also without an eager warm-up step, because the optimizer's first
+        step (which allocates its state) is never the captured one. A capture round never
+        reuses the handle of an earlier round, whose graphs may be gone."""
+        from megatron.core import full_cuda_graph
+
+        handles = []
+
+        def new_pool_handle():
+            handles.append(object())
+            return handles[-1]
+
+        earlier_round = object()
+        monkeypatch.setattr(torch.cuda, "graph_pool_handle", new_pool_handle)
+        monkeypatch.setattr(full_cuda_graph, "_shared_graph_pool", earlier_round)
+        helper = self._capture_input_helper(monkeypatch, [object()], **config_overrides)
+        if not te_takes_pool:
+            monkeypatch.setattr(
+                "transformer_engine.pytorch.graph.make_graphed_callables",
+                lambda modules, sample_args, **kwargs: None,
+            )
+
+        _, kwargs = helper._get_cuda_graph_input_data()
+
+        if not shares_pool:
+            assert 'pool' not in kwargs
+            assert handles == []
+            assert full_cuda_graph._shared_graph_pool is earlier_round
+            return
+        assert kwargs['pool'] is not earlier_round
+        assert kwargs['pool'] is handles[0]
+        # The optimizer-step graph asks for the same handle.
+        assert full_cuda_graph.get_graph_pool(True) is kwargs['pool']
+        # The next round, also when these graphs were never deleted, gets its own.
+        _, next_round_kwargs = helper._get_cuda_graph_input_data()
+        assert next_round_kwargs['pool'] is handles[1]
+        assert full_cuda_graph.get_graph_pool(True) is handles[1]
+
+    @pytest.mark.parametrize("shares_pool", [True, False])
+    @pytest.mark.parametrize("capture_fails", [False, True])
+    def test_chunk_capture_runs_on_the_shared_stream_only_for_a_shared_pool(
+        self, monkeypatch, shares_pool, capture_fails
+    ):
+        """create_cudagraphs points torch's default capture stream at the shared capture stream
+        exactly while make_graphed_callables captures into the shared pool, and puts the
+        previous stream back, also when the capture raises."""
+        from megatron.core import full_cuda_graph
+
+        shared_stream, previous_stream, pool = object(), object(), object()
+        monkeypatch.setattr(full_cuda_graph, "_shared_capture_stream", shared_stream)
+        monkeypatch.setattr(torch.cuda.graphs.graph, "default_capture_stream", previous_stream)
+        helper = self._create_cudagraphs_helper({'pool': pool} if shares_pool else {})
+        seen = []
+
+        def fake_make_graphed_callables(modules, sample_args, **kwargs):
+            seen.append((torch.cuda.graphs.graph.default_capture_stream, kwargs.get('pool')))
+            if capture_fails:
+                raise RuntimeError("capture failed")
+            return ()
+
+        # The helper imports make_graphed_callables from Transformer Engine at call time.
+        monkeypatch.setattr(
+            "transformer_engine.pytorch.graph.make_graphed_callables", fake_make_graphed_callables
+        )
+
+        if capture_fails:
+            with pytest.raises(RuntimeError, match="capture failed"):
+                helper.create_cudagraphs()
+        else:
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+
+        if shares_pool:
+            assert seen == [(shared_stream, pool)]
+        else:
+            assert seen == [(previous_stream, None)]
+        assert torch.cuda.graphs.graph.default_capture_stream is previous_stream
+
+    @pytest.mark.parametrize("offloading", [True, False])
+    @pytest.mark.parametrize("capture_fails", [False, True])
+    def test_chunk_capture_tells_the_offload_manager_whether_the_graphs_exist(
+        self, monkeypatch, offloading, capture_fails
+    ):
+        """After a successful capture the graphs carry the offloads and the manager stops
+        serving eager forwards; a capture that raised must leave the eager policy in charge."""
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+
+        calls = []
+        monkeypatch.setattr(
+            off_interface,
+            "enter_block_capture",
+            staticmethod(lambda keep_last_group=False: calls.append(("enter", keep_last_group))),
+        )
+        monkeypatch.setattr(
+            off_interface,
+            "exit_block_capture",
+            staticmethod(lambda captured=True: calls.append(("exit", captured))),
+        )
+        offload = (
+            dict(fine_grained_activation_offloading=True, offload_modules=['core_attn'])
+            if offloading
+            else {}
+        )
+        helper = self._create_cudagraphs_helper({}, **offload)
+
+        def fake_make_graphed_callables(modules, sample_args, **kwargs):
+            if capture_fails:
+                raise RuntimeError("capture failed")
+            return ()
+
+        # The helper imports make_graphed_callables from Transformer Engine at call time.
+        monkeypatch.setattr(
+            "transformer_engine.pytorch.graph.make_graphed_callables", fake_make_graphed_callables
+        )
+
+        if capture_fails:
+            with pytest.raises(RuntimeError, match="capture failed"):
+                helper.create_cudagraphs()
+        else:
+            helper.create_cudagraphs()
+
+        if offloading:
+            keep_last_group = helper.config.fine_grained_offloading_graph_keep_last_group
+            assert calls == [("enter", keep_last_group), ("exit", not capture_fails)]
+        else:
+            assert calls == []
+
+    @pytest.mark.parametrize("failure", ["sample_inputs", "capture"])
+    def test_capture_that_raises_ends_the_capture_state(self, monkeypatch, failure):
+        """A capture that is refused while its sample inputs are built (a block that cannot be
+        captured), or that raises in Transformer Engine, is over: later eager forwards must not
+        take the capture path."""
+        helper = self._create_cudagraphs_helper({})
+
+        def start_capturing():
+            cuda_graphs_module._set_capture_start()
+            return 0.0
+
+        def refuse_sample_inputs():
+            raise ValueError("cannot be captured")
+
+        def fail_capture(modules, sample_args, **kwargs):
+            raise RuntimeError("capture failed")
+
+        helper._start_capturing = start_capturing
+        if failure == "sample_inputs":
+            helper._get_cuda_graph_input_data = refuse_sample_inputs
+        # create_cudagraphs() imports make_graphed_callables from Transformer Engine at call time.
+        monkeypatch.setattr("transformer_engine.pytorch.graph.make_graphed_callables", fail_capture)
+
+        try:
+            with pytest.raises((ValueError, RuntimeError), match="captured|capture failed"):
+                helper.create_cudagraphs()
+            assert not cuda_graphs_module.is_graph_capturing()
+        finally:
+            cuda_graphs_module._set_capture_end()
+
+    @pytest.mark.parametrize("cuda_graph_impl", ["chunk_wise", "transformer_engine"])
+    def test_delete_cuda_graphs_releases_what_the_chunk_graphs_held(
+        self, monkeypatch, cuda_graph_impl
+    ):
+        """Deleting the chunk graphs forgets the shared pool handle (a later round must not
+        capture into the pool of destroyed graphs) and hands the offloads back to the eager
+        forwards. Per-layer graphs own neither."""
+        from megatron.core import full_cuda_graph
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            FineGrainedActivationOffloadingInterface as off_interface,
+        )
+
+        released = []
+        monkeypatch.setattr(
+            off_interface, "release_block_capture", staticmethod(lambda: released.append(True))
+        )
+        pool = object()
+        monkeypatch.setattr(full_cuda_graph, "_shared_graph_pool", pool)
+        monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+        monkeypatch.setattr(cuda_graphs_module, "log_on_each_pipeline_stage", lambda **kwargs: None)
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda *args: 0)
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = SimpleNamespace(
+            cuda_graph_impl=cuda_graph_impl, fine_grained_activation_offloading=True
+        )
+        helper.callables_per_chunk = []
+        helper.chunks_with_decoder = []
+        helper.tp_group = helper.dp_cp_group = None
+        helper._graphs_created = True
+
+        helper.delete_cuda_graphs()
+
+        assert not helper.graphs_created()
+        if cuda_graph_impl == "chunk_wise":
+            assert full_cuda_graph._shared_graph_pool is None
+            assert released == [True]
+        else:
+            assert full_cuda_graph._shared_graph_pool is pool
+            assert released == []
+
+    def test_only_the_gpt_post_process_stays_eager_for_the_config_logger(self):
+        """GPTModel dumps the inputs and logits of every forward from its post-process;
+        HybridModel dumps nothing per forward, so its post-process is still captured."""
+        from megatron.core.models.hybrid.hybrid_model import HybridPostProcessBlock
+
+        config = SimpleNamespace(cuda_graph_impl='chunk_wise', config_logger_dir="/config/logger")
+        hybrid_block = HybridPostProcessBlock.__new__(HybridPostProcessBlock)
+        torch.nn.Module.__init__(hybrid_block)
+        hybrid_block.config = config
+        hybrid_block.output_layer = torch.nn.Linear(2, 2)
+
+        assert hybrid_block.eager_only_reason() is None
+        assert "config_logger_dir" in self._postprocess_block(config).eager_only_reason()
+
+    @staticmethod
+    def _postprocess_block(config, *, mtp_process=False):
+        """A post-process chunk callable with only the state its capture predicates read."""
+        from megatron.core.models.gpt.gpt_model import GPTPostProcessBlock
+
+        block = GPTPostProcessBlock.__new__(GPTPostProcessBlock)
+        torch.nn.Module.__init__(block)
+        block.config = config
+        block.output_layer = torch.nn.Linear(2, 2)
+        object.__setattr__(block, '_owner', SimpleNamespace(mtp_process=mtp_process))
+        return block
+
+    @pytest.mark.parametrize(
+        ("scenario", "eager_reason"),
+        [
+            ("capturable", None),
+            ("lm_head_forward_hook", "forward hooks are registered on the output layer"),
+            ("config_logger", "config_logger_dir dumps the inputs and logits of every forward"),
+            ("no_decoder_layer", "its pipeline stage owns no decoder layer"),
+        ],
+        ids=["capturable", "lm_head_forward_hook", "config_logger", "no_decoder_layer"],
+    )
+    def test_chunk_discovery_keeps_a_post_process_python_must_observe_eager(
+        self, monkeypatch, scenario, eager_reason
+    ):
+        """A replay runs no Python: forward hooks on the LM head (logits savers, distillation
+        captures) and the config logger's per-forward dump need the eager post-process, and a
+        stage without decoder layers has no decoder graph for it to follow. The post-process is
+        then not a callable and the reason is logged."""
+        config = SimpleNamespace(
+            cuda_graph_impl='chunk_wise',
+            config_logger_dir="/config/logger" if scenario == "config_logger" else "",
+        )
+        decoder = TransformerBlock.__new__(TransformerBlock)
+        torch.nn.Module.__init__(decoder)
+        decoder.config = config
+        decoder.layers = torch.nn.ModuleList(
+            [] if scenario == "no_decoder_layer" else [torch.nn.Identity(), torch.nn.Identity()]
+        )
+        postprocess_block = self._postprocess_block(config)
+        if scenario == "lm_head_forward_hook":
+            postprocess_block.output_layer.register_forward_hook(lambda *_args: None)
+        model_chunk = SimpleNamespace(decoder=decoder, postprocess_block=postprocess_block)
+        # The post-process lives on the last pipeline stage, so the reason is logged there
+        # (log_on_each_pipeline_stage), not on global rank 0 only.
+        records = []
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            "log_on_each_pipeline_stage",
+            lambda **kwargs: (
+                records.append((kwargs["level"], kwargs["msg"]))
+                if kwargs["level"] >= logging.WARNING
+                else None
+            ),
+        )
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            "log_single_rank",
+            lambda *args, **kwargs: pytest.fail("the eager reason must reach every stage"),
+        )
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda *args: 0)
+        helper = object.__new__(TECudaGraphHelper)
+        helper.model = [model_chunk]
+        helper.config = config
+        helper.tp_group = helper.dp_cp_group = None
+
+        helper._discover_layers()
+
+        if eager_reason is None:
+            assert helper.callables_per_chunk == [[decoder, postprocess_block]]
+            assert helper.flattened_callables == [decoder, postprocess_block]
+            assert helper.callables_per_chunk_is_mtp == [[False, False]]
+            assert records == []
+            return
+        if scenario == "no_decoder_layer":
+            assert helper.callables_per_chunk == [[]]
+            assert helper.flattened_callables == []
+            assert helper.chunks_with_decoder == [None]
+        else:
+            assert helper.callables_per_chunk == [[decoder]]
+            assert helper.flattened_callables == [decoder]
+            assert helper.chunks_with_decoder == [model_chunk]
+        assert len(records) == 1
+        level, message = records[0]
+        assert level == logging.WARNING
+        assert "runs eagerly because " + eager_reason in message
+
+    @pytest.mark.parametrize(
+        "scenario", ["freeze_base_model_for_mtp", "forward_only", "frozen_parameters_only"]
+    )
+    def test_chunk_discovery_keeps_a_decoder_that_runs_without_autograd_eager(
+        self, monkeypatch, scenario
+    ):
+        """``freeze_base_model_for_mtp`` (the model wraps the decoder call) and
+        ``freeze_all_layers`` (the training loop runs the step without autograd and builds the
+        helper with ``forward_only``) run the decoder under torch.no_grad() and keep none of
+        its activations. A block graph would record them, with a backward nothing replays, so
+        the block and the post-process that follows it stay eager. Frozen parameters alone do
+        not decide: a pipeline stage that holds only frozen layers still passes gradients to
+        whatever trains upstream of it, and is captured."""
+        config = SimpleNamespace(
+            cuda_graph_impl='chunk_wise',
+            config_logger_dir="",
+            freeze_base_model_for_mtp=scenario == "freeze_base_model_for_mtp",
+        )
+        decoder = TransformerBlock.__new__(TransformerBlock)
+        torch.nn.Module.__init__(decoder)
+        decoder.config = config
+        decoder.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)])
+        model_chunk = torch.nn.Module()
+        model_chunk.decoder = decoder
+        model_chunk.postprocess_block = postprocess_block = self._postprocess_block(config)
+        if scenario == "frozen_parameters_only":
+            model_chunk.requires_grad_(False)
+        messages = []
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            "log_on_each_pipeline_stage",
+            lambda **kwargs: (
+                messages.append(kwargs["msg"]) if kwargs["level"] >= logging.WARNING else None
+            ),
+        )
+        monkeypatch.setattr(torch.distributed, "get_rank", lambda *args: 0)
+        helper = object.__new__(TECudaGraphHelper)
+        helper.model = [model_chunk]
+        helper.config = config
+        helper.forward_only = scenario == "forward_only"
+        helper.tp_group = helper.dp_cp_group = None
+
+        helper._discover_layers()
+
+        if scenario == "frozen_parameters_only":
+            assert helper.flattened_callables == [decoder, postprocess_block]
+            assert messages == []
+            return
+        assert helper.flattened_callables == []
+        assert len(messages) == 2
+        assert "the decoder block runs eagerly because the training forward runs it without" in (
+            messages[0]
+        )
+        assert "runs eagerly because the decoder block of its stage is not captured" in messages[1]
+
+    @pytest.mark.parametrize(
+        ("postprocess_config", "mtp_process", "postprocess_quantized"),
+        [
+            (dict(mtp_num_layers=1, keep_mtp_in_bf16=False), True, True),
+            (dict(mtp_num_layers=1, keep_mtp_in_bf16=True), True, False),
+            (dict(mtp_num_layers=1, keep_mtp_in_bf16=False), False, False),
+            (dict(mtp_num_layers=None, keep_mtp_in_bf16=False), False, False),
+            (dict(mtp_num_layers=1, keep_mtp_in_bf16=True, fp8_output_proj=True), True, True),
+        ],
+        ids=[
+            "quantized_mtp",
+            "mtp_kept_in_bf16",
+            "mtp_on_another_stage",
+            "no_mtp",
+            "mxfp8_output_projection",
+        ],
+    )
+    def test_chunk_capture_autocast_follows_the_quantized_modules_of_each_callable(
+        self, monkeypatch, postprocess_config, mtp_process, postprocess_quantized
+    ):
+        """The capture opens Transformer Engine's FP8 autocast per callable. The decoder block
+        always holds quantized modules; the post-process block only with MTP layers that are
+        not kept in BF16 or with the MXFP8 output projection, exactly as its eager forward."""
+        from megatron.core.transformer.chunk_cuda_graph import ChunkCudaGraphBlockMixin
+
+        class DecoderBlock(ChunkCudaGraphBlockMixin, torch.nn.Module):
+            config = SimpleNamespace(cuda_graph_impl="none")
+
+        fp8_config = dict(fp8="hybrid", fp8_recipe="mxfp8", fp8_output_proj=False)
+        fp8_config.update(postprocess_config)
+        postprocess_block = self._postprocess_block(
+            SimpleNamespace(**fp8_config), mtp_process=mtp_process
+        )
+        helper = self._capture_input_helper(
+            monkeypatch, [DecoderBlock(), postprocess_block], **fp8_config
+        )
+        monkeypatch.setattr("megatron.core.fp8_utils.get_fp8_recipe", lambda config: "recipe")
+
+        _, kwargs = helper._get_cuda_graph_input_data()
+
+        assert kwargs['fp8_enabled'] == (True, postprocess_quantized)
+        assert kwargs['fp8_recipe'] == "recipe"
+
+    @pytest.mark.parametrize(
+        ("capacity_field", "tail_padding_policy", "real_documents_per_pack"),
+        [
+            ("cuda_graph_thd_max_packed_sequences", "extend_last", 3),
+            ("cuda_graph_thd_max_packed_sequences", "append_dummy_seq", 3),
+            ("thd_max_packed_sequences", "extend_last", 4),
+            ("thd_max_packed_sequences", "append_dummy_seq", 3),
+        ],
+    )
+    def test_thd_capture_slot_bound_covers_what_the_packing_scheduler_produces(
+        self, monkeypatch, capacity_field, tail_padding_policy, real_documents_per_pack
+    ):
+        """The packed-microbatch bound of the capture (one of the three terms the slot count is
+        the maximum of) against the packs the scheduler really makes. The dp_balanced
+        scheduler caps the real documents per pack below the static THD capacity:
+        cuda_graph_thd_max_packed_sequences includes the dummy padding document whenever
+        padding is enabled, thd_max_packed_sequences only under the append_dummy_seq tail
+        policy. The bound has to be derived from the cap the scheduler really applies."""
+        from megatron.core.datasets import data_schedule
+
+        global_batch_size, seq_length, capacity = 48, 8, 4
+        config = SimpleNamespace(
+            sequence_packing_scheduler="dp_balanced",
+            max_seqlen_per_dp_cp_rank=8 * seq_length,
+            pad_packed_seq_alignment="max",
+            thd_tail_padding_policy=tail_padding_policy,
+            thd_max_packed_sequences=None,
+            cuda_graph_thd_max_packed_sequences=None,
+            virtual_pipeline_model_parallel_size=None,
+            microbatch_group_size_per_vp_stage=None,
+        )
+        setattr(config, capacity_field, capacity)
+
+        def group():
+            return SimpleNamespace(size=lambda: 1)
+
+        # The scheduler exactly as wrap_data_iterator configures it for this config.
+        schedulers = []
+
+        class RecordingScheduler(data_schedule.DpBalancedScheduler):
+            def run(self, *args, **kwargs):
+                schedulers.append(self)
+                return None, 0, 0, 0
+
+        monkeypatch.setitem(
+            data_schedule.scheduler_map,
+            data_schedule.PackingSchedulerEnum.DP_BALANCED,
+            RecordingScheduler,
+        )
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+        data_schedule.wrap_data_iterator(
+            None,
+            config,
+            1,
+            SimpleNamespace(
+                dp_cp_gtp_remat=None,
+                dp_cp=group(),
+                dp_gtp_remat=None,
+                dp=group(),
+                tp=group(),
+                pp=group(),
+                dynamic_cp=None,
+            ),
+        )
+        (scheduler,) = schedulers
+        assert scheduler.max_num_seqs == real_documents_per_pack
+        # A step of short documents: only the document cap limits a pack.
+        packs = scheduler.get_groups_and_subsamples(
+            [(sample_id, 1) for sample_id in range(global_batch_size)]
+        )
+        assert len(packs) == math.ceil(global_batch_size / real_documents_per_pack)
+
+        helper = object.__new__(TECudaGraphHelper)
+        helper.config = config
+        helper.dp_group = group()
+        helper.dp_cp_group = group()
+        helper.micro_batch_size = 1
+        helper.seq_length = seq_length
+        helper.thd_sequence_length_upper_bound = None
+
+        bound, mode = helper._get_thd_varlen_max_num_microbatches(global_batch_size, 1)
+
+        assert mode == "thd_varlen_upper_bound"
+        # Short documents are the worst case for the pack count, so the bound is exact here.
+        assert bound == len(packs)
+
+    @staticmethod
+    def _fixed_length_gpt(cuda_graph_impl, **config_overrides):
+        """A small fixed-length GPT; under chunk_wise its decoder block is the graph callable
+        and the LM head and loss stay eager."""
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            create_attention_mask_in_dataloader=False,
+            use_te_rng_tracker=True,
+            cuda_graph_impl=cuda_graph_impl,
+            cuda_graph_modules=[],
+            **config_overrides,
+        )
+        model_parallel_cuda_manual_seed(123)
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=128,
+            max_sequence_length=32,
+            position_embedding_type="rope",
+        ).cuda()
+        model.train()
+        # The capture resets gradient buffers through the DDP wrapper; the test owns the grads.
+        model.zero_grad_buffer = lambda: None
+        return model
+
+    @staticmethod
+    @contextmanager
+    def _real_capture(monkeypatch, micro_batch_size):
+        """Process state for a real chunk capture on the training stream; yields the
+        ``(pool, default capture stream)`` every make_graphed_callables call saw, the capture
+        stream that was the default before, and a list of helpers to delete on exit."""
+        from megatron.core import full_cuda_graph
+        from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        init_num_microbatches_calculator(
+            rank=0,
+            rampup_batch_size=None,
+            global_batch_size=micro_batch_size,
+            micro_batch_size=micro_batch_size,
+            data_parallel_size=1,
+        )
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        previous_stream = torch.cuda.Stream()
+        monkeypatch.setattr(torch.cuda.graphs.graph, "default_capture_stream", previous_stream)
+        monkeypatch.setattr(full_cuda_graph, "_shared_graph_pool", None)
+        monkeypatch.setattr(full_cuda_graph, "_shared_capture_stream", None)
+        for name, value in (("curr_iteration", 0), ("cuda_graph", None), ("result", None)):
+            monkeypatch.setattr(OptimizerCudaGraphWrapper, name, value)
+
+        # The helper imports make_graphed_callables from Transformer Engine at call time.
+        import transformer_engine.pytorch.graph as te_graph
+
+        te_make_graphed_callables = te_graph.make_graphed_callables
+        captures, helpers = [], []
+
+        @functools.wraps(te_make_graphed_callables)
+        def recording_make_graphed_callables(*args, **kwargs):
+            captures.append((kwargs.get('pool'), torch.cuda.graphs.graph.default_capture_stream))
+            return te_make_graphed_callables(*args, **kwargs)
+
+        monkeypatch.setattr(te_graph, "make_graphed_callables", recording_make_graphed_callables)
+        # Model construction and the eager steps run on a non-default stream, like training.
+        training_stream = torch.cuda.Stream()
+        training_stream.wait_stream(torch.cuda.current_stream())
+        try:
+            with torch.cuda.stream(training_stream):
+                yield captures, previous_stream, helpers
+        finally:
+            torch.cuda.synchronize()
+            for helper in helpers:
+                if helper.graphs_created():
+                    helper.delete_cuda_graphs()
+            torch.cuda.current_stream().wait_stream(training_stream)
+            destroy_num_microbatches_calculator()
+            Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _forward_backward(model, step, micro_batch_size=2, seq_length=32):
+        """One training forward and backward on the batch of ``step``."""
+        generator = torch.Generator(device="cuda").manual_seed(step)
+        tokens = torch.randint(
+            0, 128, (micro_batch_size, seq_length + 1), device="cuda", generator=generator
+        )
+        position_ids = torch.arange(seq_length, device="cuda").repeat(micro_batch_size, 1)
+        for param in model.parameters():
+            # Leaf-grad buffers at fixed addresses: an optimizer-step graph reads them.
+            if param.grad is None:
+                param.grad = torch.zeros_like(param)
+            else:
+                param.grad.zero_()
+        loss = model(tokens[:, :-1], position_ids, None, labels=tokens[:, 1:])
+        loss.float().mean().backward()
+
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("warmup_steps", [0, 1])
+    def test_chunk_and_optimizer_graphs_share_a_pool_and_match_eager_training(
+        self, monkeypatch, warmup_steps
+    ):
+        """The chunk graphs and the optimizer-step graph are captured into the shared pool on
+        the shared capture stream, so the optimizer step reuses the blocks the chunk graphs
+        leave idle. Only its transient tensors may live there: every replay of a chunk graph
+        overwrites those blocks. The optimizer state is allocated by the first optimizer step,
+        which runs eagerly also without a warm-up step (the chunk graphs are then captured
+        before any optimizer step). Several optimizer steps match an eager twin."""
+        from megatron.core import full_cuda_graph
+        from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+
+        num_steps, micro_batch_size, seq_length = 5, 2, 32
+        with self._real_capture(monkeypatch, micro_batch_size) as (captures, previous, helpers):
+            model = self._fixed_length_gpt('chunk_wise', cuda_graph_warmup_steps=warmup_steps)
+            eager = self._fixed_length_gpt('none')
+            eager.load_state_dict(model.state_dict())
+            initial = {name: param.detach().clone() for name, param in eager.named_parameters()}
+
+            eager_optimizer = torch.optim.Adam(eager.parameters(), lr=1e-2, capturable=True)
+            for step in range(num_steps):
+                self._forward_backward(eager, step)
+                eager_optimizer.step()
+
+            optimizer = torch.optim.Adam(model.parameters(), lr=1e-2, capturable=True)
+            optimizer_step = OptimizerCudaGraphWrapper(
+                optimizer.step,
+                cuda_graph_warmup_steps=warmup_steps,
+                use_single_mempool=model.config.cuda_graph_use_single_mempool,
+            )
+            helper = TECudaGraphHelper(
+                model=[model],
+                config=model.config,
+                seq_length=seq_length,
+                micro_batch_size=micro_batch_size,
+            )
+            helpers.append(helper)
+            for step in range(num_steps):
+                if step == warmup_steps:
+                    helper.create_cudagraphs()
+                    assert len(model.decoder.te_cuda_graphs) == 1
+                self._forward_backward(model, step)
+                optimizer_step()
+            torch.cuda.synchronize()
+            assert OptimizerCudaGraphWrapper.cuda_graph is not None
+
+            ((pool, capture_stream),) = captures
+            from transformer_engine.pytorch.graph import make_graphed_callables
+
+            # The recording stand-in wraps Transformer Engine's function, signature included.
+            if 'pool' in inspect.signature(make_graphed_callables).parameters:
+                assert pool is not None
+                # Still the handle the optimizer-step graph was captured into afterwards.
+                assert pool is full_cuda_graph._shared_graph_pool
+                assert capture_stream is full_cuda_graph.get_shared_capture_stream()
+            assert torch.cuda.graphs.graph.default_capture_stream is previous
+
+            # Relative L2 error of the parameters against the size of the eager update.
+            update_sq, error_sq = 0.0, 0.0
+            for (name, param), reference in zip(model.named_parameters(), eager.parameters()):
+                update_sq += (reference.float() - initial[name].float()).square().sum().item()
+                error_sq += (param.float() - reference.float()).square().sum().item()
+            assert update_sq > 0
+            assert error_sq <= 1e-2 * update_sq, (error_sq, update_sq)
+
+            helper.delete_cuda_graphs()
+            assert full_cuda_graph._shared_graph_pool is None
 
 
 class TestPartialCudaGraph:

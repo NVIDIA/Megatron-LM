@@ -5,7 +5,7 @@ from typing import List, Optional, Set, Tuple, Union
 from torch import Tensor
 
 from megatron.core.context_parallel import ContextParallelLayoutState, CPLayout
-from megatron.core.fp4_utils import get_fp4_context
+from megatron.core.fp4_utils import get_fp4_context, get_layer_quantization_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.hybrid.layers import utils as hybrid_layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -13,7 +13,7 @@ from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.utils import precision_aware_checkpoint
+from megatron.core.transformer.utils import precision_aware_checkpoint, use_te_checkpoint
 from megatron.core.utils import make_viewless_tensor
 
 
@@ -149,6 +149,14 @@ def checkpointed_forward(
                         )
                     else:
                         inner_quantization_context = nullcontext()
+                    if getattr(self.config, "cuda_graph_impl", "none") == "chunk_wise":
+                        # BF16 boundary layers opt out of the block-wide capture autocast
+                        # and MTP layers opt in.
+                        inner_quantization_context = get_layer_quantization_context(
+                            self.config,
+                            layer.layer_number - 1,
+                            is_mtp_layer=getattr(self, "is_mtp_layer", False),
+                        )
                 else:
                     inner_quantization_context = nullcontext()
 
@@ -273,12 +281,19 @@ def checkpointed_forward(
             input_ids,
         )
         if use_checkpoint:
+            # The first checkpoint's input is the block's own input. Under chunk-wise CUDA
+            # graphs that is the graph's static input buffer, refreshed in place at every
+            # replay: sharding it (a .data swap) would detach the buffer the captured forward
+            # reads, and the buffer stays allocated for the slot anyway.
+            distribute_saved_activations = self.config.distribute_saved_activations and not (
+                start == 0 and getattr(self.config, "cuda_graph_impl", "none") == "chunk_wise"
+            )
             hidden_states, context = precision_aware_checkpoint(
                 cf,
                 self.config,
                 self.pg_collection.tp,
                 *args,
-                distribute_saved_activations=self.config.distribute_saved_activations,
+                distribute_saved_activations=distribute_saved_activations,
             )
         else:
             # Note: original block-branch no-checkpoint path omitted padding_mask
@@ -308,9 +323,10 @@ def checkpointed_forward(
         # gradient computation for the re-entrant autograd engine, so under
         # FP8/FP4 we skip checkpointing while hidden_states.requires_grad
         # is False (these slots get pushed past the recompute window).
+        # (The same engine is the backend under chunk-wise CUDA graphs.)
         recompute_skip_num_layers = 0
         for layer_idx in range(self.num_layers_per_pipeline_rank):
-            if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
+            if use_te_checkpoint(self.config) and not hidden_states.requires_grad:
                 recompute_skip_num_layers += 1
             use_checkpoint = (
                 layer_idx >= recompute_skip_num_layers

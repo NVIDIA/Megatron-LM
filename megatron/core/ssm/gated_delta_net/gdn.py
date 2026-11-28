@@ -46,6 +46,7 @@ from megatron.core.ssm.ops.gdp import (
 )
 from megatron.core.ssm.ssm_inference import SSMDynamicInferenceMixin
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import use_te_checkpoint
 from megatron.core.utils import (
     deprecate_inference_params,
     get_pg_size,
@@ -807,7 +808,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
 
             # Quantized recompute must restore TE's FP8/FP4 state, matching the
             # selective MLP and MoE recompute paths.
-            if self.config.fp8 or self.config.fp4:
+            if use_te_checkpoint(self.config):
                 # Import here to avoid a circular dependency.
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 

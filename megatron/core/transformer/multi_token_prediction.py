@@ -19,7 +19,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import get_fp8_context, get_fp8_disabled_context
 from megatron.core.fusions.fused_mtp_prefix import mtp_e2e_prefix_objective
 from megatron.core.fusions.fused_mtp_tv import vocab_parallel_tv_distance
 from megatron.core.inference.utils import InferenceMode
@@ -254,8 +254,9 @@ class ContiguousPackedSeqRollPlan:
             fallback when no prefetched halo is supplied. None on the last CP rank.
         send_rank: Global rank of the previous contiguous CP shard, used by the P2P
             fallback. None on the first CP rank.
-        has_sequences: Whether de-duplicated cumulative sequence lengths describe at
-            least one physical packed sequence.
+        has_sequences: Whether the cumulative sequence lengths describe at least one
+            interval, possibly of zero length. It follows from the metadata shape alone,
+            so it is the same for every pack a CUDA graph replays.
         right_halo_valid_count: Number of successor rows after the local final row
             that remain in the same physical packed sequence. This device scalar
             sanitizes an arbitrary small halo width without rebuilding packed
@@ -397,13 +398,12 @@ def _build_contiguous_packed_seq_roll_plan(
     global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
 
     cu = cu_seqlens.to(device=tensor.device, dtype=torch.long)
-    if cu.numel() > 1:
-        # Static packed metadata can repeat its final boundary to pad the number
-        # of cu_seqlens entries. Remove duplicates before assigning positions to
-        # packed intervals so every retained interval has a nonzero length.
-        nonduplicate_boundaries = torch.ones(cu.numel(), device=cu.device, dtype=torch.bool)
-        nonduplicate_boundaries[1:] = cu[1:] != cu[:-1]
-        cu = cu[nonduplicate_boundaries]
+    # Static packed metadata can repeat its final boundary to pad the number of cu_seqlens
+    # entries (zero-length intervals). They are harmless below: ``bucketize(right=True)``
+    # returns the first boundary strictly greater than a position, so a repeated boundary never
+    # becomes the end of a live position, and ``cu[-1]`` is unchanged. They are deliberately not
+    # compacted with a boolean mask: that indexing is data-dependent (host synchronization) and
+    # cannot be captured when the post-process runs inside a CUDA graph.
 
     has_sequences = cu.numel() > 1
     if local_seq_len == 0 or not has_sequences:
@@ -1031,6 +1031,10 @@ def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group
     Each physical document length must be divisible by ``2 * cp_size`` so every rank owns
     two equal chunks. All documents share one batched boundary exchange. Slots after the
     final physical boundary roll as a separate segment whose last slot takes fill_value.
+
+    The exchange carries one row per ``cu_seqlens`` interval, empty intervals included, and
+    the indices are computed on the device, so no shape depends on the boundary values: a CUDA
+    graph that captured the roll replays it for other packs with the same number of entries.
     """
     cp_size = cp_group.size()
     sequence_dim = dims if dims >= 0 else tensor.dim() + dims
@@ -1042,22 +1046,32 @@ def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group
     aligned = (torch.diff(physical_cu_seqlens) % (2 * cp_size) == 0).all()
     local_boundaries = torch.div(physical_cu_seqlens, cp_size, rounding_mode='floor').long()
     local_lengths = torch.diff(local_boundaries)
-    # Exchange one boundary vector per neighbour for all nonempty documents.
+    # Exchange one boundary vector per neighbour for all documents.
     # RL packing may repeat the final boundary in fixed-size metadata.
-    nonempty = torch.nonzero(local_lengths > 0).flatten()
-    # nonzero already waits for CUDA, so validate on the host before indexing or communication.
-    if not bool(aligned):
+    nonempty = local_lengths > 0
+    # Validate on the host before indexing or communication. A CUDA graph capture cannot wait
+    # for the device (is_available() first: a CUDA-less torch build raises from the capture
+    # query), so the recorded pass checks on the device instead: every replay then validates
+    # the boundaries it was handed.
+    capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    if capturing:
+        torch._assert_async(  # pylint: disable=protected-access
+            aligned, "Packed document lengths must be divisible by twice the CP size"
+        )
+    elif not bool(aligned):
         raise ValueError("Packed document lengths must be divisible by twice the CP size")
     if nonempty.numel() == 0:
         return rolled_tensor
-    local_starts = local_boundaries[:-1].index_select(0, nonempty)
-    local_ends = local_boundaries[1:].index_select(0, nonempty)
-    chunk_lengths = local_lengths.index_select(0, nonempty) // 2
+    last_slot = tensor.size(sequence_dim) - 1
+    local_starts = local_boundaries[:-1]
+    local_ends = local_boundaries[1:]
+    chunk_lengths = local_lengths // 2
     second_starts = local_starts + chunk_lengths
     first_ends = second_starts - 1
     second_ends = local_ends - 1
-    first_boundary = tensor.index_select(sequence_dim, local_starts)
-    second_boundary = tensor.index_select(sequence_dim, second_starts)
+    # An empty document may start one past the last slot; the row it sends is a placeholder.
+    first_boundary = tensor.index_select(sequence_dim, local_starts.clamp(max=last_slot))
+    second_boundary = tensor.index_select(sequence_dim, second_starts.clamp(max=last_slot))
     first_received, second_received = _exchange_cp_roll_boundaries(
         first_boundary, second_boundary, cp_group
     )
@@ -1065,8 +1079,21 @@ def _roll_tensor_packed_seq_zigzag_cp(tensor, shifts, dims, cu_seqlens, cp_group
         # Rank 0 holds every document's global end; the shared exchange zero-fills it.
         second_received.fill_(fill_value)
 
-    rolled_tensor.index_copy_(sequence_dim, first_ends, first_received)
-    rolled_tensor.index_copy_(sequence_dim, second_ends, second_received)
+    # Empty documents write their placeholder rows to the last slot, which then takes its own
+    # value: the end of the document that reaches it, or fill_value when none does.
+    rolled_tensor.index_copy_(
+        sequence_dim, torch.where(nonempty, first_ends, last_slot), first_received
+    )
+    rolled_tensor.index_copy_(
+        sequence_dim, torch.where(nonempty, second_ends, last_slot), second_received
+    )
+    reaches_last_slot = nonempty & (second_ends == last_slot)
+    last_value = second_received.index_select(
+        sequence_dim, reaches_last_slot.to(torch.uint8).argmax().reshape(1)
+    )
+    rolled_tensor.narrow(sequence_dim, last_slot, 1).copy_(
+        torch.where(reaches_last_slot.any(), last_value, torch.full_like(last_value, fill_value))
+    )
     return rolled_tensor
 
 
@@ -1384,7 +1411,10 @@ def _packed_seq_params_for_local_hsm_roll(
             get_pg_rank(cp_group) * cp_local_length + get_pg_rank(tp_group) * local_seq_length
         )
         valid_ends = physical[:-1] + (cu_seqlens[1:] - cu_seqlens[:-1])
-        boundaries = torch.cat([physical, valid_ends]).sort().values.unique_consecutive()
+        # Repeated boundaries are kept: they delimit empty intervals, which the local roll
+        # skips, and the entry count then follows from the metadata shape alone, so a CUDA
+        # graph can replay the translation with other boundary values.
+        boundaries = torch.cat([physical, valid_ends]).sort().values
         shard_local = boundaries.clamp(window_start, window_start + local_seq_length) - window_start
         return replace(
             packed_seq_params,
@@ -2202,6 +2232,16 @@ class MTPLossAutoScaler(torch.autograd.Function):
         """
         (mtp_loss,) = ctx.saved_tensors
         mtp_loss_backward_scale = MTPLossAutoScaler.main_loss_backward_scale
+        if (
+            torch.is_tensor(mtp_loss_backward_scale)
+            and mtp_loss_backward_scale.device != mtp_loss.device
+        ):
+            # A scale on another device (the CPU default) is read on the host, so a CUDA graph
+            # recording this backward would keep its value as a constant. Move it to the loss
+            # device on first use, which is the eager warm-up pass that precedes a capture: the
+            # graph then reads the tensor that set_loss_scale updates in place.
+            mtp_loss_backward_scale = mtp_loss_backward_scale.to(mtp_loss.device)
+            MTPLossAutoScaler.main_loss_backward_scale = mtp_loss_backward_scale
         scaled_mtp_loss_grad = torch.ones_like(mtp_loss) * mtp_loss_backward_scale
         return grad_output, scaled_mtp_loss_grad
 
@@ -2213,7 +2253,20 @@ class MTPLossAutoScaler(torch.autograd.Function):
             scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in
                                   matches the scale of the main_loss.
         """
-        MTPLossAutoScaler.main_loss_backward_scale = scale
+        # Keep one persistent device tensor and update it in place: a CUDA graph that captured
+        # the MTP loss backward holds this tensor's address, so binding a new tensor would leave
+        # the replayed backward reading the old one. A one-element scale of another shape or
+        # dtype (0-dim vs. [1]) is the same value and is written into the existing tensor too.
+        current = MTPLossAutoScaler.main_loss_backward_scale
+        if (
+            torch.is_tensor(current)
+            and current.device == scale.device
+            and current.numel() == 1
+            and scale.numel() == 1
+        ):
+            current.copy_(scale.detach().reshape(current.shape))
+        else:
+            MTPLossAutoScaler.main_loss_backward_scale = scale.detach().clone()
 
 
 def _process_mtp_e2e_tv_loss(
@@ -2847,6 +2900,9 @@ class MultiTokenPredictionLayer(MegatronModule):
     # with ``__new__`` and a minimal config namespace) take the plain MTP forward path;
     # ``__init__`` overrides it from ``config.enable_attention_residuals``.
     attn_res_enabled: bool = False
+    # The model's config when ``keep_mtp_in_bf16`` holds this layer out of its FP8 / FP4
+    # quantization, else None; see ``_get_bf16_context``.
+    quantized_model_config: Optional[TransformerConfig] = None
 
     def __init__(
         self,
@@ -2869,11 +2925,14 @@ class MultiTokenPredictionLayer(MegatronModule):
                 to select hash-routed MoE layers in the nested HybridStack.
             name (str | None): module instance name passed top-down from its paranet module
         """
+        model_config = config
         if config.keep_mtp_in_bf16:
             config = deepcopy(config)
             config.fp4 = None
             config.fp8 = None
         super().__init__(config=config)
+        if config.keep_mtp_in_bf16 and (model_config.fp8 or model_config.fp4):
+            self.quantized_model_config = model_config
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
                 raise ValueError(
@@ -3116,6 +3175,21 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         self.offload_context = nullcontext()
 
+    def _get_bf16_context(self) -> AbstractContextManager:
+        """Context of a layer that runs without FP8 / FP4 quantization.
+
+        The layer opens no quantization context of its own, so it runs in whatever state
+        encloses it. A chunk-wise CUDA graph records the post-process block under the model's
+        FP8 / FP4 autocast when the block holds a quantized module (the MXFP8 output
+        projection), so a layer that ``keep_mtp_in_bf16`` holds out of a quantized model
+        disables quantization explicitly there. Everywhere else nothing encloses the layer and
+        this is ``nullcontext``.
+        """
+        model_config = self.quantized_model_config
+        if model_config is None or getattr(model_config, "cuda_graph_impl", "none") != "chunk_wise":
+            return nullcontext()
+        return get_fp8_disabled_context(model_config)
+
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained MTP execution."""
         if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
@@ -3353,8 +3427,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             quantization_context = get_fp4_context(self.config)
             transformer_layer_quantization_context = get_fp4_context(self.config)
         else:
-            quantization_context = nullcontext()
-            transformer_layer_quantization_context = nullcontext()
+            quantization_context = self._get_bf16_context()
+            transformer_layer_quantization_context = self._get_bf16_context()
 
         with rng_context:
             with quantization_context:
@@ -3526,7 +3600,8 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         * Non-tensor objects are captured by the ``custom_forward`` closure; only tensor / ``None``
           arguments flow positionally through the underlying checkpoint primitive.
-        * Quantized recipes (fp8, fp4) route through ``te_checkpoint``;
+        * Quantized recipes (fp8, fp4) and every precision with
+          ``cuda_graph_impl="chunk_wise"`` route through ``te_checkpoint``;
           everything else uses ``tensor_parallel.checkpoint``.
         * Only ``fp8 + delayed scaling`` needs an outer quantization
           context entered before ``te_checkpoint``; see the

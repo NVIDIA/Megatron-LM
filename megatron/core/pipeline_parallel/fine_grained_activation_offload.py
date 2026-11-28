@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 from torch.autograd.graph import saved_tensors_hooks
 
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.tensor_parallel.random import is_checkpoint_without_output_tensor
 
 # CPU offload implementation for pipeline parallelism
@@ -461,8 +462,12 @@ class OffloadTensorPool:
         self._stats['current_in_use'] = 0
         debug_rank("OffloadTensorPool: Reset complete")
 
-    def clear(self):
-        """Clear cached tensors; fixed storage stays alive for captured graph reuse."""
+    def clear(self, empty_cuda_cache: bool = True):
+        """Clear cached tensors; fixed storage stays alive for captured graph reuse.
+
+        ``empty_cuda_cache=False`` only drops the host tensors: their pinned blocks go back to
+        PyTorch's host allocator, where the next pinned allocations of those sizes find them.
+        """
         if self._fixed_buffer is not None:
             # Even an idle buffer can be referenced by a captured graph. Keep its
             # backing allocation and external events for the pool's lifetime.
@@ -478,7 +483,7 @@ class OffloadTensorPool:
         self._stats['current_in_use'] = 0
 
         # Trigger GPU cache cleanup
-        if torch.cuda.is_available():
+        if empty_cuda_cache and torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         debug_rank("OffloadTensorPool: Clear complete")
@@ -510,6 +515,9 @@ class OffloadTensorGroup:
         # Warmup-only bookkeeping for redundant copies within this group.
         self.duplicate_storage_tensor_count = 0
         self.duplicate_storage_bytes = 0
+        # Whole-block capture: the device tensors this group copied out, kept until the main
+        # stream joined the copies and released their blocks.
+        self._block_capture_sources = []
         # Offloaded sources whose memory record_stream cannot protect (see
         # ChunkOffloadHandler.bulk_offload_group). The first offload hook of any chunk after their
         # D2H copies have finished drops them; the group's reload drops whatever is left.
@@ -617,6 +625,29 @@ class PipelineOffloadManager:
         self._is_warmup = True
         # Whether eligible group commits should be queued until explicitly flushed.
         self.defer_group_commits = False
+        # Whole-block (chunk-wise TE CUDA graph) capture mode, see enter_block_capture().
+        self._block_capture = False
+        self._block_capture_keep_last_group = False
+        self._block_capture_live_chunks = []
+        # vpp_rank -> group index where the decoder chunk's groups end (the post-process
+        # callable's groups follow them in the warm-up template).
+        self._block_capture_decoder_end = {}
+        # vpp_rank -> group index where the eager model-chunk forward's groups end (the groups
+        # a backward-time recompute adds to the warm-up template follow them).
+        self._block_capture_forward_end = {}
+        # True between begin_block_capture_chunk and end_block_capture_chunk, i.e. while a
+        # capture-time forward runs. Off, the group hooks are no-ops: they then run from a
+        # backward-time recompute (TE's re-entrant checkpoint inside the backward capture),
+        # which must neither offload nor reload.
+        self._block_capture_forward_active = False
+        # untyped_storage().data_ptr() of the captured callables' static inputs (the block's
+        # hidden_states sample args). Transformer Engine keeps these storages alive for the
+        # slot and refreshes them at replay, so an offload must never resize_(0) them.
+        self.block_static_storages = set()
+        # Set when the block capture is over: the captured graphs own every offload of the
+        # step, and an eager caller that follows a replay (the fixed-length post-process)
+        # must not bind itself to the warm-up handlers.
+        self._block_graphs_captured = False
         # Cache OffloadChunkHandler objects for each virtual pipeline stage and each forward pass.
         self._cached_chunks_forward = []
         # Cache OffloadChunkHandler objects for each virtual pipeline stage and each backward pass.
@@ -977,11 +1008,294 @@ class PipelineOffloadManager:
         cur_chunk.vpp_rank = cur_vpp_rank
         self._cached_chunks_forward.append(cur_chunk)
 
+    def enter_block_capture(self, keep_last_group=False):
+        """Serve a whole-block (chunk-wise) TE CUDA graph capture.
+
+        ``keep_last_group``: keep the last group of every name resident per slot (see
+        ``_block_capture_keep_last_groups``; ``fine_grained_offloading_graph_keep_last_group``).
+
+        With chunk-wise graphs the offload hooks run only inside the captured block, so
+        nothing drives this manager at replay and every slot's graphs must be self-contained:
+        each capture-time model-chunk forward gets its own handler cloned from the warm-up
+        policy (``begin_block_capture_chunk``) with host buffers no other slot reuses (fresh
+        pinned tensors, or with ``fine_grained_offloading_buffer_size_gib`` a range of the fixed
+        pinned buffer reserved for the capture), a backward reloads only its own groups (no
+        cross-slot prefetch), and the reload waits are recorded inside the backward graph.
+        Handlers created while a stream is capturing are kept alive because the captured copies
+        address their host buffers.
+        """
+        if self._is_warmup:
+            assert self._cached_chunks_forward, (
+                "Chunk-wise CUDA graphs with fine-grained activation offloading need at "
+                "least one eager warm-up iteration (cuda_graph_warmup_steps >= 1) to record the "
+                "offload policy before capture."
+            )
+            # The capture may precede the reset() that would normally close the warm-up.
+            self.post_warmup_callback()
+        # Sources an eager step still holds until their copies are done (record_stream does
+        # not protect them) are dropped by a later offload hook, and from here on none runs:
+        # the capture's hooks do not poll and a replay runs no Python. Wait for the copies and
+        # drop the sources now, before the capture allocates.
+        for group in self._groups_holding_sources:
+            group.release_offload_sources(wait_stream=torch.cuda.current_stream())
+        self._groups_holding_sources = []
+        self._block_capture = True
+        self._block_capture_keep_last_group = keep_last_group
+        self._block_capture_forward_active = False
+        self.block_static_storages = set()
+        # A fresh capture starts from the warm-up marks, never from a previous capture's ends.
+        self._block_capture_decoder_end = {}
+        self._block_capture_forward_end = {}
+        # The eager warm-up marked where the decoder's groups and the model-chunk forward's
+        # groups end on each stage's template (mark_decoder_groups_end /
+        # mark_forward_groups_end), so the first capture-time forward of a stage already knows
+        # the range keep_last_group applies to; a capture-time forward refreshes it.
+        for template in self._cached_chunks_forward:
+            vpp_rank = getattr(template, 'vpp_rank', 0)
+            if vpp_rank not in self._block_capture_decoder_end:
+                if template._decoder_group_end is not None:
+                    self._block_capture_decoder_end[vpp_rank] = template._decoder_group_end
+            if vpp_rank not in self._block_capture_forward_end:
+                if template._forward_group_end is not None:
+                    self._block_capture_forward_end[vpp_rank] = template._forward_group_end
+        # The eager warm-up filled the shared host pool, and nothing takes from it while graphs
+        # own the offloads: every captured slot addresses pinned buffers of its own. Hand the
+        # pool's tensors back before the capture allocates those buffers (same shapes, so the
+        # host allocator serves them from the returned blocks) instead of holding both for the
+        # run. An eager step after a failed or released capture refills the pool on demand; the
+        # fixed pinned buffer is shared with the capture and stays (clear() leaves it alone).
+        self._cpu_tensor_pool.clear(empty_cuda_cache=False)
+
+    def exit_block_capture(self, captured=True):
+        """Leave the whole-block capture mode.
+
+        After a successful capture (``captured``) the graphs carry every offload and reload of
+        the step; code that still runs eagerly after a replay (the post-process of fixed-length
+        chunk graphs) gets no handler. A capture that raised leaves the eager policy in charge.
+        """
+        self._block_capture = False
+        self._block_capture_forward_active = False
+        self.block_static_storages = set()
+        self._block_graphs_captured = captured
+        if not captured:
+            self._block_capture_live_chunks = []
+            # Transformer Engine disables the offload around its warm-up pass and skips the
+            # re-enabling hook when that pass raises.
+            self.enable_offload()
+        else:
+            # Every slot keeps host buffers of its own for as long as the graphs live, so the
+            # pinned total grows with the captured slots, not with the microbatches in flight.
+            host_buffers = [
+                host_buffer
+                for handler in self._block_capture_live_chunks
+                for host_buffer in handler._block_capture_host_buffers
+            ]
+            if host_buffers:
+                pinned_bytes = sum(
+                    buffer.numel() * buffer.element_size() for buffer in host_buffers
+                )
+                logger.info(
+                    "Activation offloading: rank %d pinned %.2f GiB of host memory in %d "
+                    "buffers for the offloads of %d captured block forwards.",
+                    safe_get_rank(),
+                    pinned_bytes / 2**30,
+                    len(host_buffers),
+                    len(self._block_capture_live_chunks),
+                )
+            elif self._cpu_tensor_pool.uses_fixed_buffer:
+                # With a fixed pinned buffer the capture reserves a range of it instead.
+                reserved_bytes = self._cpu_tensor_pool.get_pool_status()["fixed_buffer"][
+                    "graph_reserved_bytes"
+                ]
+                if reserved_bytes:
+                    logger.info(
+                        "Activation offloading: rank %d reserved %.2f GiB of the fixed pinned "
+                        "buffer for the offloads of %d captured block forwards.",
+                        safe_get_rank(),
+                        reserved_bytes / 2**30,
+                        len(self._block_capture_live_chunks),
+                    )
+        self._cur_forward_chunk = None
+        self._cur_backward_chunk = None
+
+    def release_block_capture(self):
+        """Forget the captured block graphs once they are deleted: eager forwards get their
+        offload handlers again and the pinned host buffers of the deleted slots are released
+        (a fixed pinned buffer keeps the range the capture reserved for its lifetime)."""
+        self._block_graphs_captured = False
+        self._block_capture_live_chunks = []
+
+    def mark_decoder_groups_end(self):
+        """Record, on the warm-up template, where the decoder chunk's groups end.
+
+        Called when a decoder chunk's eager forward returns; the groups the post-process (MTP,
+        LM head) or a backward-time recompute adds to the same template afterwards are not the
+        decoder's. ``begin_block_capture_chunk`` reads it through ``enter_block_capture`` for the
+        first capture-time forward of a stage, before any ``end_block_capture_chunk`` recorded
+        the decoder's end from a capture-time forward.
+        """
+        if self._block_capture or self._block_graphs_captured:
+            return
+        handler = self._cur_forward_chunk
+        if handler is None or not handler.is_warmup or handler._decoder_group_end is not None:
+            return
+        handler._decoder_group_end = handler._offloaded_group_index
+
+    def mark_forward_groups_end(self):
+        """Record, on the warm-up template, where the eager model-chunk forward's groups end.
+
+        Called when the model chunk's eager forward returns (after the post-process on the last
+        stage); the groups a backward-time recompute adds to the same template afterwards belong
+        to no captured forward. The post-process callable's handler (``continue_current``) keeps
+        its last groups within ``[decoder end, forward end)``.
+        """
+        if self._block_capture or self._block_graphs_captured:
+            return
+        handler = self._cur_forward_chunk
+        if handler is None or not handler.is_warmup or handler._forward_group_end is not None:
+            return
+        handler._forward_group_end = handler._offloaded_group_index
+
+    def register_block_static_input(self, tensor):
+        """Protect a captured callable's static input storage from the offload release."""
+        if not self._block_capture or tensor is None or tensor.numel() == 0:
+            # An empty tensor has no storage of its own (data_ptr 0 would match every
+            # released storage).
+            return
+        try:
+            self.block_static_storages.add(tensor.untyped_storage().data_ptr())
+        except (AttributeError, NotImplementedError, RuntimeError):
+            # Storage-less wrappers (fake / functional tensors) are never released.
+            return
+
+    def is_block_static_storage(self, tensor):
+        """Whether ``tensor`` shares the storage of a captured callable's static input."""
+        if not self._block_capture or not self.block_static_storages:
+            return False
+        try:
+            return tensor.untyped_storage().data_ptr() in self.block_static_storages
+        except (AttributeError, NotImplementedError, RuntimeError):
+            return False
+
+    def begin_block_capture_chunk(self, vp_stage, continue_current=False):
+        """Open the handler of one capture-time model-chunk forward (see enter_block_capture).
+
+        ``continue_current`` is set by the post-process callable (MTP, LM head, loss): it extends
+        the decoder forward of the same slot, so its handler is cloned from the same template
+        and resumes at the decoder's last group, the post-process groups coming after the
+        decoder's exactly like in the eager forward that recorded the template. It is a handler
+        of its own, not the decoder's: Transformer Engine captures the two callables as separate
+        graphs, and a graph may neither prefetch the other graph's groups nor wait on events
+        recorded in the other capture.
+        """
+        if not self._block_capture:
+            return
+        # The group hooks serve this forward; a backward-time recompute (after
+        # end_block_capture_chunk) gets no handler.
+        self._block_capture_forward_active = True
+        if not self.do_offload:
+            # Transformer Engine's capture warm-up runs with offloading disabled
+            # (pre_warmup_hook): serve no handler rather than a stale one.
+            self._cur_forward_chunk = None
+            return
+        vpp_rank = 0 if vp_stage is None else vp_stage
+        resume_index = 0
+        if continue_current:
+            resume_index = self._block_capture_decoder_end.get(vpp_rank)
+            assert resume_index is not None, (
+                "The post-process callable was captured before a decoder chunk of virtual "
+                f"pipeline stage {vpp_rank}."
+            )
+        template = next(
+            (c for c in self._cached_chunks_forward if getattr(c, 'vpp_rank', 0) == vpp_rank), None
+        )
+        assert (
+            template is not None
+        ), f"no warm-up offload handler recorded for virtual pipeline stage {vpp_rank}"
+        handler = ChunkOffloadHandler(
+            template.min_offloaded_tensor_size,
+            self._cpu_tensor_pool,
+            max_inflight_offloads=template._max_inflight_offloads,
+        )
+        handler.is_warmup = False
+        handler.vpp_rank = vpp_rank
+        handler._max_group_size = template._max_group_size
+        for group in template.offload_groups:
+            clone = OffloadTensorGroup(group._name)
+            clone.offload = group.offload
+            # A margin group takes no reload slot (bulk_offload), so a prefetch step is not
+            # spent on a resident group.
+            clone.is_offload_margin = group.is_offload_margin
+            clone.use_cpu_pool = False  # no shape-keyed pool: its buffers recycle across slots
+            clone.total_offload_bytes = group.total_offload_bytes
+            clone.total_tensor_count = group.total_tensor_count
+            handler.offload_groups.append(clone)
+        handler._offloaded_group_index = resume_index
+        if self._block_capture_keep_last_group:
+            # The decoder keeps the last groups of its own range, the post-process those of the
+            # rest of the eager forward: neither owns the backward-time recompute groups that
+            # the warm-up appended after the forward returned.
+            end = (
+                self._block_capture_forward_end.get(vpp_rank)
+                if continue_current
+                else self._block_capture_decoder_end.get(vpp_rank)
+            )
+            self._block_capture_keep_last_groups(handler, resume_index, end)
+        if torch.cuda.is_current_stream_capturing():
+            self._block_capture_live_chunks.append(handler)
+        self._cur_forward_chunk = handler
+
+    @staticmethod
+    def _block_capture_keep_last_groups(handler, start, end):
+        """Keep the last group of every name in ``offload_groups[start:end]`` on the GPU.
+
+        A slot's backward graph cannot be prefetched by the previous slot's backward (there is no
+        cross-slot prefetch inside self-contained graphs), so the first group it consumes would be
+        reloaded synchronously; the eager policy keeps the schedule's last groups resident for
+        the same reason. ``end`` is None until the decoder's group range of this virtual stage is
+        known (recorded after its first capture-time forward).
+        """
+        groups = handler.offload_groups[start:end]
+        seen = set()
+        for group in reversed(groups):
+            if group._name not in seen:
+                seen.add(group._name)
+                group.offload = False
+                # Resident like the eager policy's margin groups: no reload slot, so the backward's
+                # LIFO prefetch steps are spent on offloaded groups only.
+                group.is_offload_margin = True
+
+    def end_block_capture_chunk(self, record_decoder_end=True):
+        """Close a capture-time forward: release the pending offloaded blocks (the forward graph
+        has joined the D2H stream) and, for a decoder forward, remember where its groups end."""
+        if not self._block_capture:
+            return
+        self._block_capture_forward_active = False
+        handler = self._cur_forward_chunk
+        if handler is None:
+            return
+        handler._block_capture_release(keep=0)
+        if record_decoder_end:
+            self._block_capture_decoder_end[handler.vpp_rank] = handler._offloaded_group_index
+        else:
+            # A post-process forward ends where the model chunk's forward ends.
+            self._block_capture_forward_end[handler.vpp_rank] = handler._offloaded_group_index
+
     def pop_forward_chunk(self, name=None):
         """Get the next forward pass chunk handler."""
         debug_rank(f"pop_forward_chunk {self._cur_forward_chunk}")
+        if self._block_capture:
+            # One handler per capture-time model-chunk forward (begin_block_capture_chunk);
+            # none for a backward-time recompute (end_block_capture_chunk has run), whose
+            # hooks would otherwise offload or reload inside the backward graph.
+            return self._cur_forward_chunk if self._block_capture_forward_active else None
         if not self.do_offload:
             return self._cur_forward_chunk
+        if self._block_graphs_captured:
+            # Eager post-process after a chunk graph replay: its groups stay on the GPU, as
+            # eager keeps the schedule's last groups resident; binding them to the warm-up
+            # handlers would offload them without a prefetch (and mismatch the chunks under VPP).
+            return None
         while not self._is_warmup and (
             self._cur_forward_chunk is None or self._cur_forward_chunk.finish_all_groups(name)
         ):
@@ -995,6 +1309,10 @@ class PipelineOffloadManager:
 
     def cur_forward_chunk(self):
         """Get the current forward pass chunk handler."""
+        if self._block_capture and not self._block_capture_forward_active:
+            # Backward-time recompute inside a whole-block capture: no handler (see
+            # pop_forward_chunk), so group commits and the saved-tensor hooks are no-ops.
+            return None
         return self._cur_forward_chunk
 
     def cur_backward_chunk(self):
@@ -1011,7 +1329,8 @@ class PipelineOffloadManager:
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
         debug_rank("----__enter__")
-        if self._cur_forward_chunk is None or not self.cur_forward_chunk().do_offload:
+        cur_forward_chunk = self.cur_forward_chunk()
+        if cur_forward_chunk is None or not cur_forward_chunk.do_offload:
             return
         from megatron.core.extensions.transformer_engine import cpu_offload
 
@@ -1025,7 +1344,8 @@ class PipelineOffloadManager:
     def __exit__(self, *args: Any):
         """Exit context manager and restore original tensor saving behavior."""
         debug_rank("----__exit__")
-        if self._cur_forward_chunk is None or not self.cur_forward_chunk().do_offload:
+        cur_forward_chunk = self.cur_forward_chunk()
+        if cur_forward_chunk is None or not cur_forward_chunk.do_offload:
             return
         from megatron.core.extensions.transformer_engine import cpu_offload
 
@@ -1101,6 +1421,10 @@ class ChunkOffloadHandler:
             cpu_backup = torch.empty(
                 src_tensor.shape, dtype=src_tensor.dtype, device="cpu", pin_memory=pin_memory
             )
+            if PipelineOffloadManager.get_instance()._block_capture:
+                # Captured D2H/H2D copies address this buffer for as long as the graphs live;
+                # a freed pinned block would be handed to a later allocation.
+                self._block_capture_host_buffers.append(cpu_backup)
 
         cpu_backup.copy_(src_tensor, non_blocking=pin_memory)
         state = (src_tensor.device, cpu_backup, use_cpu_pool, view_meta)
@@ -1182,6 +1506,20 @@ class ChunkOffloadHandler:
         self._max_inflight_offloads = max_inflight_offloads
         # group_name -> FIFO of offload events for that name (same cap for every name).
         self._offload_pending_by_name: Dict[str, deque] = defaultdict(deque)
+        # Whole-block capture bookkeeping (PipelineOffloadManager.enter_block_capture): the
+        # host buffers the captured copies address and the indices of the offload_groups the
+        # backward already reloaded.
+        self._block_capture_host_buffers = []
+        self._block_capture_consumed = set()
+        # (group, forced-release tensors) whose GPU blocks wait for their D2H copies to be
+        # joined by the main stream before they are released (in-graph recycling).
+        self._block_capture_pending_release = []
+        # Warm-up template only: group index where the decoder chunk's groups end
+        # (PipelineOffloadManager.mark_decoder_groups_end), None until marked.
+        self._decoder_group_end = None
+        # Warm-up template only: group index where the eager model-chunk forward's groups end
+        # (PipelineOffloadManager.mark_forward_groups_end), None until marked.
+        self._forward_group_end = None
 
     def reset(self):
         """Reset the chunk offload handler."""
@@ -1285,6 +1623,12 @@ class ChunkOffloadHandler:
             return False
         if getattr(tensor, "_do_not_offload", False):
             return False
+        # Whole-block capture: a captured callable's static input (the block's hidden_states
+        # sample arg, shared by the first layer's input / residual) is kept alive by TE for the
+        # slot and refreshed at replay; releasing it would leave the graph a 0-byte input, and
+        # copying it out and back is useless.
+        if PipelineOffloadManager.get_instance().is_block_static_storage(tensor):
+            return False
         return True
 
     def bulk_offload_group(self, group_to_offload):
@@ -1292,6 +1636,8 @@ class ChunkOffloadHandler:
         debug_rank("------bulk_offload_group")
         nvtx_msg = "activation offloading " + group_to_offload._name
         nvtx_range_push(nvtx_msg)
+        block_capture = PipelineOffloadManager.get_instance()._block_capture
+        sources = []
         with torch.cuda.stream(self.d2h_stream):
             if self.is_warmup:
                 self._collect_offload_info(group_to_offload)
@@ -1302,16 +1648,26 @@ class ChunkOffloadHandler:
                         use_cpu_pool=group_to_offload.use_cpu_pool,
                         stream=self.d2h_stream,
                     )
-                    # record_stream on the view marks the shared storage
-                    # allocation, so this also covers base-storage offloads.
-                    tensor_on_device.record_stream(self.d2h_stream)
-                    if not _allocator_tracks_storage(tensor_on_device):
-                        # record_stream was a no-op: once the last reference is dropped, the
-                        # producer's stream may reuse the memory before this copy reads it.
-                        group_to_offload.hold_offload_source(tensor_on_device)
+                    if block_capture:
+                        # Inside a capture a block freed with a foreign-stream use is only
+                        # recycled after the capture ends. Keep the source alive instead and
+                        # free it on the main stream once that stream has joined the copy
+                        # (_block_capture_release), so the forward graph reuses the memory.
+                        # That hold covers every source, also one record_stream cannot protect.
+                        sources.append(tensor_on_device)
+                    else:
+                        # record_stream on the view marks the shared storage
+                        # allocation, so this also covers base-storage offloads.
+                        tensor_on_device.record_stream(self.d2h_stream)
+                        if not _allocator_tracks_storage(tensor_on_device):
+                            # record_stream was a no-op: once the last reference is dropped, the
+                            # producer's stream may reuse the memory before this copy reads it.
+                            group_to_offload.hold_offload_source(tensor_on_device)
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
-        if group_to_offload._unrecorded_sources and not (
+        if block_capture:
+            group_to_offload._block_capture_sources = sources
+        elif group_to_offload._unrecorded_sources and not (
             is_graph_capturing() or torch.cuda.is_current_stream_capturing()
         ):
             # A hold made during capture is dropped by the reload in the backward capture; its
@@ -1470,6 +1826,9 @@ class ChunkOffloadHandler:
         if not group.offload:
             return False
 
+        if PipelineOffloadManager.get_instance()._block_capture:
+            # Whole-block capture: no cross-slot lookahead, the policy decides alone.
+            return True
         # Check if next backward chunk is this chunk (for last pipeline stage)
         next_backward_chunk = PipelineOffloadManager.get_instance().front_backward_chunk(
             group._name
@@ -1497,8 +1856,14 @@ class ChunkOffloadHandler:
             self._groups_to_reload.append(group_to_offload)
         if self.should_bulk_offload(group_to_offload):
             self.bulk_offload_group(group_to_offload)
+            if PipelineOffloadManager.get_instance()._block_capture:
+                self._block_capture_pending_release.append(
+                    (group_to_offload, list(forced_released_tensors))
+                )
+                lag = 1 if self._max_inflight_offloads is None else self._max_inflight_offloads
+                self._block_capture_release(keep=lag)
             # Manually release tensors not auto-freed by torch GC
-            if len(forced_released_tensors) > 0:
+            elif len(forced_released_tensors) > 0:
                 cur_stream = torch.cuda.current_stream()
                 for release_tensor in forced_released_tensors:
                     if self.tensor_need_offloading_checker(release_tensor):
@@ -1507,6 +1872,23 @@ class ChunkOffloadHandler:
                         release_tensor.untyped_storage().resize_(0)
         # A group commit is consumed even when policy keeps its tensors on GPU.
         self._groups_to_offload.remove(group_to_offload)
+
+    def _block_capture_release(self, keep=0):
+        """Free the GPU blocks of offloaded groups older than the ``keep`` most recent ones.
+
+        The main (capture) stream first waits on the group's D2H event, so the dependency is part
+        of the graph and the freed blocks can be handed to later allocations of the same forward
+        graph. ``keep`` groups stay pending so their copies overlap the following layers.
+        """
+        while len(self._block_capture_pending_release) > keep:
+            group, forced = self._block_capture_pending_release.pop(0)
+            torch.cuda.current_stream().wait_event(group._offload_event)
+            for release_tensor in forced:
+                # The checker also keeps the callable's static input storage (a layer input
+                # shared with TE's hidden_states sample arg) intact.
+                if self.tensor_need_offloading_checker(release_tensor):
+                    release_tensor.untyped_storage().resize_(0)
+            group._block_capture_sources = []
 
     def _drain_offload_pending(self, group_name: str) -> None:
         """For ``group_name``, have the main stream wait on older D2H events
@@ -1541,8 +1923,9 @@ class ChunkOffloadHandler:
         if len(self._groups_to_reload) > 0:
             # Reload the next layer group
             self.bulk_reload_group()
-        else:
-            # Pre-load the last layer of the next backward chunk to hide latency
+        elif not PipelineOffloadManager.get_instance()._block_capture:
+            # Pre-load the last layer of the next backward chunk to hide latency. Not inside a
+            # whole-block capture: a slot's graphs must not depend on another slot's buffers.
             next_backward_chunk = PipelineOffloadManager.get_instance().front_backward_chunk()
             # Don't pre-reload the last layer if the next backward chunk hasn't finished fprop yet.
             if (
@@ -1551,6 +1934,34 @@ class ChunkOffloadHandler:
                 == next_backward_chunk._max_group_size
             ):
                 next_backward_chunk.pre_reload_last_layer()
+
+    def _block_capture_group_for_backward(self, name):
+        """Group whose tensors the running commit-backward of ``name`` is about to consume.
+
+        Groups of one name are consumed in the reverse of their forward order (layers unwind
+        backwards), so it is the latest not yet consumed group of that name among the groups this
+        handler's forward visited. Groups of different names may interleave differently in
+        backward than in forward, which is why the lookup is per name rather than a single cursor.
+        """
+        for index in range(self._offloaded_group_index - 1, -1, -1):
+            if index in self._block_capture_consumed:
+                continue
+            if self.offload_groups[index]._name == name:
+                self._block_capture_consumed.add(index)
+                return self.offload_groups[index]
+        return None
+
+    def _block_capture_reload_group(self, group):
+        """Reload ``group`` now (block capture: the consumer follows immediately).
+
+        Same as ``bulk_reload_group`` but for a group that is not necessarily the most recently
+        offloaded one: the backward of a layer may consume its groups in another order than the
+        forward committed them.
+        """
+        self._groups_to_reload.remove(group)
+        self._groups_to_reload.append(group)
+        self.h2d_stream.wait_stream(torch.cuda.current_stream())
+        self.bulk_reload_group()
 
     def on_group_commit_backward(self, name):
         """
@@ -1561,6 +1972,18 @@ class ChunkOffloadHandler:
             return
         debug_rank("--on_group_commit_backward")
         self._release_copied_offload_sources()
+        if PipelineOffloadManager.get_instance()._block_capture:
+            # Whole-block capture: the autograd context names this handler and the cursor names
+            # the group. Reload it now if no in-graph prefetch covered it, and record its wait
+            # inside the backward graph (the reload is part of the graph).
+            PipelineOffloadManager.get_instance()._cur_backward_chunk = self
+            group = self._block_capture_group_for_backward(name)
+            if group is not None and group in self._groups_to_reload:
+                self._block_capture_reload_group(group)
+            if group is not None and group in self._reloading_group:
+                group.wait_reload_event(torch.cuda.current_stream())
+                self._reloading_group.remove(group)
+            return
         cur_backward_chunk = PipelineOffloadManager.get_instance().cur_backward_chunk()
         # Switch to this chunk if it's not already current
         if cur_backward_chunk is not self:
@@ -1722,6 +2145,12 @@ def fine_grained_offloading_group_offload(
     cur_forward_chunk = PipelineOffloadManager.get_instance().cur_forward_chunk()
     if cur_forward_chunk is None:
         return tensor
+    if not torch.is_grad_enabled():
+        # The no-grad forward of an activation checkpoint saves nothing, so nothing is copied
+        # out: the group's inputs still belong to the checkpoint, which recomputes from them in
+        # the backward pass. Read here, at the call site: autograd runs every Function.forward
+        # (and with it on_group_commit_forward) with grad mode off.
+        forced_released_tensors = []
     return FineGrainedOffloadingGroupCommitFunction.apply(
         tensor, cur_forward_chunk, name, forced_released_tensors, delay_offload
     )
@@ -1764,6 +2193,29 @@ def fine_grained_offloading_group_start(tensor, name=None):
     if cur_forward_chunk is None:
         return tensor
     return FineGrainedOffloadingGroupStartFunction.apply(tensor, cur_forward_chunk, name)
+
+
+class FineGrainedOffloadingBlockBackwardStartFunction(torch.autograd.Function):
+    """Identity op at a whole-block callable's output: fork the H2D stream when its backward
+    graph starts, so the tail join in ``backward_record`` never depends on uncaptured work.
+    A backward may reload nothing: a resident slot (every group kept on the GPU by the policy),
+    or a fully recomputed block, whose forward ran under TE's checkpoint without saving group
+    tensors and whose backward-time recompute runs the group hooks as no-ops (the manager
+    serves no handler once ``end_block_capture_chunk`` closed the capture-time forward)."""
+
+    @staticmethod
+    def forward(ctx, tensor) -> torch.Tensor:
+        # pylint: disable=missing-function-docstring
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # pylint: disable=missing-function-docstring
+        if torch.cuda.is_current_stream_capturing():
+            PipelineOffloadManager.get_instance().h2d_stream.wait_stream(
+                torch.cuda.current_stream()
+            )
+        return (grad_output,)
 
 
 class FineGrainedActivationOffloadingInterface:
@@ -1851,3 +2303,64 @@ class FineGrainedActivationOffloadingInterface:
     def enable_offload():
         """Enable the offload."""
         PipelineOffloadManager.get_instance().enable_offload()
+
+    @staticmethod
+    def enter_block_capture(keep_last_group=False):
+        """Enter the whole-block (chunk-wise) TE CUDA graph capture mode."""
+        PipelineOffloadManager.get_instance().enter_block_capture(keep_last_group=keep_last_group)
+
+    @staticmethod
+    def exit_block_capture(captured=True):
+        """Leave the whole-block TE CUDA graph capture mode."""
+        PipelineOffloadManager.get_instance().exit_block_capture(captured=captured)
+
+    @staticmethod
+    def release_block_capture():
+        """Forget the captured block graphs after they were deleted."""
+        PipelineOffloadManager.get_instance().release_block_capture()
+
+    @staticmethod
+    def block_capture_forward_start():
+        """Fork the D2H stream into a whole-block capture at the forward's start, so the join in
+        ``forward_record`` is valid even when no group offloads anything (a fork is free)."""
+        if torch.cuda.is_current_stream_capturing():
+            PipelineOffloadManager.get_instance().d2h_stream.wait_stream(
+                torch.cuda.current_stream()
+            )
+
+    @staticmethod
+    def block_capture_backward_start(output):
+        """Attach the H2D-stream fork to the whole-block callable's primary output."""
+        if isinstance(output, tuple):
+            return (FineGrainedOffloadingBlockBackwardStartFunction.apply(output[0]), *output[1:])
+        if isinstance(output, list):
+            return [FineGrainedOffloadingBlockBackwardStartFunction.apply(output[0]), *output[1:]]
+        return FineGrainedOffloadingBlockBackwardStartFunction.apply(output)
+
+    @staticmethod
+    def begin_block_capture_chunk(vp_stage, continue_current=False):
+        """Open the offload handler of one capture-time model-chunk forward."""
+        PipelineOffloadManager.get_instance().begin_block_capture_chunk(
+            vp_stage, continue_current=continue_current
+        )
+
+    @staticmethod
+    def end_block_capture_chunk(record_decoder_end=True):
+        """Close a capture-time forward: release pending blocks; a decoder records its group end."""
+        PipelineOffloadManager.get_instance().end_block_capture_chunk(record_decoder_end)
+
+    @staticmethod
+    def register_block_static_input(tensor):
+        """Keep a captured callable's static input storage out of the offload release."""
+        PipelineOffloadManager.get_instance().register_block_static_input(tensor)
+
+    @staticmethod
+    def mark_decoder_groups_end():
+        """Mark, on the warm-up template, where the decoder chunk's groups end (eager only)."""
+        PipelineOffloadManager.get_instance().mark_decoder_groups_end()
+
+    @staticmethod
+    def mark_forward_groups_end():
+        """Mark, on the warm-up template, where the model-chunk forward's groups end (eager
+        only)."""
+        PipelineOffloadManager.get_instance().mark_forward_groups_end()

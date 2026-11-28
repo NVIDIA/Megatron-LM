@@ -30,6 +30,10 @@ from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_observation import observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.chunk_cuda_graph import (
+    ChunkCudaGraphPostProcessBlock,
+    build_postprocess_block,
+)
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyModule
 from megatron.core.transformer.module import GraphableMegatronModule
@@ -115,6 +119,60 @@ def _validate_hash_moe_pipeline_placement(
             "Currently, all hash MoE layers must be in the same pipeline/virtual-pipeline "
             "stage as the embedding because only that stage owns input_ids. This "
             f"non-embedding stage contains hash MoE layer(s) {local_hash_layer_numbers}."
+        )
+
+
+class HybridPostProcessBlock(ChunkCudaGraphPostProcessBlock):
+    """``HybridModel`` post-process (MTP block, LM head, loss) as a chunk CUDA graph callable."""
+
+    def eager_only_reason(self):
+        """Also stay eager where every pack arrives with a context-parallel layout plan.
+
+        With context parallelism and ``linear_cp_layout`` different from
+        ``attention_cp_layout`` the data pipeline builds the contiguous / zigzag route of every
+        pack, and the MTP consumes it on the host. The model then calls the eager post-process
+        for every microbatch: a captured one would never be replayed.
+        """
+        config = self.config
+        # getattr: unit tests build the block on stand-in configs.
+        if getattr(config, "context_parallel_size", 1) > 1 and getattr(
+            config, "linear_cp_layout", None
+        ) != getattr(config, "attention_cp_layout", None):
+            return (
+                "linear_cp_layout differs from attention_cp_layout, so every pack carries a "
+                "context-parallel layout plan that the MTP reads on the host"
+            )
+        return super().eager_only_reason()
+
+    def forward(
+        self,
+        hidden_states,
+        mhc_multistream=None,
+        input_ids=None,
+        position_ids=None,
+        labels=None,
+        loss_mask=None,
+        attention_mask=None,
+        packed_seq_params=None,
+        padding_mask=None,
+        rotary_pos_emb=None,
+    ):
+        """Run the owner's training post-process on the (static) graph inputs."""
+        return self._owner._postprocess_after_decoder(
+            hidden_states=hidden_states,
+            mhc_multistream=mhc_multistream,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            inference_context=None,
+            inference_params=None,
+            runtime_gather_output=None,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            in_inference_mode=False,
         )
 
 
@@ -659,6 +717,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
+        # Chunk CUDA graphs of packed-sequence (THD) runs also capture the post-process of the
+        # last pipeline stage.
+        self.postprocess_block = build_postprocess_block(self, HybridPostProcessBlock)
+
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 
@@ -1002,6 +1064,18 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
             )
+        # Chunk-wise CUDA graphs with fine-grained offloading: the eager warm-up marks on the
+        # microbatch's offload template where the decoder's groups end and where the forward's
+        # groups end (a backward-time recompute appends its groups after that), so each captured
+        # callable's keep-last policy covers its own range only. No-ops once the capture starts.
+        mark_offload_group_ends = (
+            getattr(self.config, "cuda_graph_impl", "none") == "chunk_wise"
+            and getattr(self.config, "fine_grained_activation_offloading", False)
+            and self.training
+        )
+        if mark_offload_group_ends:
+            off_interface.mark_decoder_groups_end()
+
         # With MTP the outer HybridStack may return one auxiliary value: mHC's
         # pre-contraction multi-stream tensor or AttnRes's complete trunk source
         # tuple. The modes are mutually exclusive, so disambiguate by config.
@@ -1015,6 +1089,113 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         else:
             hidden_states = decoder_output
 
+        postprocess_block = getattr(self, 'postprocess_block', None)
+        if (
+            postprocess_block is not None
+            and self.training
+            and labels is not None
+            and not in_inference_mode
+            # The captured post-process takes the decoder's layout and tensors only: no CP
+            # layout conversion plan, no precomputed MTP embeddings, no MTP conditioning mask,
+            # no per-call logits gathering, MTP on.
+            and compute_mtp_loss
+            and (cp_batch is None or cp_batch.thd_plan is None)
+            and mtp_input_mask is None
+            and not use_precomputed_mtp_embeddings
+            and runtime_gather_output is None
+            and output_processor is None
+            # A graph cannot be replayed without a tensor it was captured with.
+            and postprocess_block.receives_every_captured_input(
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                padding_mask=padding_mask,
+            )
+        ):
+            # Captured into / replayed from the chunk CUDA graphs.
+            output = postprocess_block(
+                hidden_states,
+                mhc_multistream=mhc_multistream,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                attention_mask=attention_mask,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                rotary_pos_emb=rotary_pos_emb,
+            )
+            if mark_offload_group_ends:
+                off_interface.mark_forward_groups_end()
+            return output
+
+        # Through the class: forward also runs on duck-typed stand-ins of the model.
+        output = HybridModel._postprocess_after_decoder(
+            self,
+            hidden_states=hidden_states,
+            mhc_multistream=mhc_multistream,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            inference_context=inference_context,
+            inference_params=inference_params,
+            runtime_gather_output=runtime_gather_output,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            in_inference_mode=in_inference_mode,
+            decoder_input=decoder_input,
+            use_precomputed_mtp_embeddings=use_precomputed_mtp_embeddings,
+            mtp_input_mask=mtp_input_mask,
+            compute_mtp_loss=compute_mtp_loss,
+            cp_batch=cp_batch,
+            packed_seq_params_by_layout=packed_seq_params_by_layout,
+            cp_layout_plan=cp_layout_plan,
+            output_processor=output_processor,
+            output_processor_context=output_processor_context,
+            attn_res_sources=attn_res_sources,
+        )
+        if mark_offload_group_ends:
+            off_interface.mark_forward_groups_end()
+        return output
+
+    def _postprocess_after_decoder(
+        self,
+        *,
+        hidden_states,
+        mhc_multistream,
+        input_ids,
+        position_ids,
+        attention_mask,
+        labels,
+        loss_mask,
+        inference_context,
+        inference_params,
+        runtime_gather_output,
+        packed_seq_params,
+        padding_mask,
+        rotary_pos_emb,
+        in_inference_mode,
+        decoder_input=None,
+        use_precomputed_mtp_embeddings=False,
+        mtp_input_mask=None,
+        compute_mtp_loss=True,
+        cp_batch=None,
+        packed_seq_params_by_layout=None,
+        cp_layout_plan=None,
+        output_processor=None,
+        output_processor_context=None,
+        attn_res_sources=None,
+    ):
+        """MTP block, LM head and loss: everything that follows the decoder.
+
+        Shared by ``forward`` and the chunk CUDA graph post-process block
+        (``HybridPostProcessBlock``).
+        """
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()

@@ -28,7 +28,10 @@ class OptimizerCudaGraphWrapper:
         assert len(kwargs) == 0, 'optimizer.step() does not accept keyword args'
 
         curr_iteration = self.curr_iter()
-        if curr_iteration == self.cuda_graph_warmup_steps:
+        # An optimizer allocates and zero-initializes its state on its first step. Captured,
+        # that initialization is part of the graph and runs again at every replay (the moments
+        # and the step count would restart at each step), so the first step always runs eagerly.
+        if curr_iteration == max(self.cuda_graph_warmup_steps, 1):
             logger.info(f'Capture CUDA graph for optimizer!!!')
             torch.distributed.barrier()
             assert OptimizerCudaGraphWrapper.cuda_graph is None

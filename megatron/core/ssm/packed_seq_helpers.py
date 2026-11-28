@@ -45,9 +45,9 @@ def build_packed_seq_idx(packed_seq_params: PackedSeqParams, total_tokens: int) 
     the helper is agnostic to TP/SP/CP shapes upstream.
     """
     cu_seqlens = get_cu_seqlens(packed_seq_params)
-    total_tokens_tensor = torch.tensor(
-        [total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
-    )
+    # A device-side fill rather than a host tensor upload: this runs inside a chunk-wise CUDA
+    # graph capture, where ``packed_seq_params`` is rebuilt from the graph's static cu_seqlens.
+    total_tokens_tensor = cu_seqlens.new_full((1,), total_tokens)
     cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
     seq_lengths = cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]
     seq_idx = torch.repeat_interleave(

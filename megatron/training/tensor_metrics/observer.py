@@ -274,6 +274,7 @@ class TrainingTensorMetricObserver:
         self._module_names: dict[int, str] | None = None
         self._module_names_key: tuple[int, ...] | None = None
         self._forward_observation_active = False
+        self._checked_chunk_wise_sources = False
         self._prepared_forward_values: dict[int, list[MetricTensor]] | None = None
         self._prepared_forward_iteration: int | None = None
 
@@ -294,6 +295,20 @@ class TrainingTensorMetricObserver:
         """
         if iteration is None:
             raise ValueError("Configured tensor metrics require a training iteration.")
+        if not self._checked_chunk_wise_sources:
+            # A chunk-wise CUDA graph replays whole blocks without their Python. A metric that
+            # observes one is refused at the first training step, not at the first iteration it
+            # comes due (which is after the capture, possibly thousands of steps later).
+            self._checked_chunk_wise_sources = True
+            _validate_chunk_wise_forward_observation(
+                model,
+                frozenset().union(
+                    *(
+                        scheduled.metric.source_kinds & _FORWARD_SOURCE_KINDS
+                        for scheduled in self.scheduled_metrics
+                    )
+                ),
+            )
         due_metrics = self._due_metrics(iteration)
         forward_metrics = tuple(
             scheduled
@@ -554,10 +569,33 @@ def _forward_rank_relations(
     )
 
 
+def _validate_chunk_wise_forward_observation(
+    model: Sequence[torch.nn.Module], source_kinds: frozenset[str]
+) -> None:
+    """Reject forward sources inside the blocks a chunk-wise CUDA graph captures.
+
+    A replay runs no Python inside the captured decoder block, nor inside the post-process
+    captured with packed sequences; only an eager post-process still notifies its observations.
+    """
+    if not source_kinds:
+        return
+    for model_chunk in model:
+        config = getattr(unwrap_model(model_chunk), "config", None)
+        if getattr(config, "cuda_graph_impl", "none") != "chunk_wise":
+            continue
+        post_process_is_captured = getattr(config, "sequence_packing_scheduler", None) is not None
+        if post_process_is_captured or not source_kinds <= {"output_logits", "mtp_logits"}:
+            raise NotImplementedError(
+                "Forward tensor metrics do not yet support the blocks captured by "
+                "chunk-wise CUDA graphs."
+            )
+
+
 def _validate_forward_observation_model(
     model: Sequence[torch.nn.Module], source_kinds: frozenset[str]
 ) -> None:
     """Reject graph modes that cannot produce reliable Python observation notifications."""
+    _validate_chunk_wise_forward_observation(model, source_kinds)
     for model_chunk in model:
         config = getattr(unwrap_model(model_chunk), "config", None)
         cuda_graph_impl = getattr(config, "cuda_graph_impl", "none")

@@ -1039,6 +1039,20 @@ def validate_args(args, defaults={}):
         "parameters sharded. Use DDP or --use-distributed-optimizer instead."
     )
 
+    if getattr(args, "cuda_graph_impl", "none") == "chunk_wise" and (
+        args.use_megatron_fsdp or args.use_torch_fsdp2
+    ):
+        # FSDP gathers and releases the parameters of a layer in its forward hooks (and
+        # Megatron-FSDP v2 checks the order in which the modules are called). A block graph
+        # replay runs none of the hooks inside the block, and the capture calls the blocks
+        # outside the model forward.
+        raise ValueError(
+            "--cuda-graph-impl chunk_wise does not support Megatron-FSDP or Torch FSDP2: FSDP "
+            "gathers the parameters of a layer in its forward hooks, which a whole-block graph "
+            "replay does not run. Use --cuda-graph-impl full_iteration with FSDP, or the "
+            "distributed optimizer with chunk_wise."
+        )
+
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), 'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
         assert args.ckpt_format in (
@@ -2260,17 +2274,85 @@ def validate_args(args, defaults={}):
     if args.cuda_graph_impl != "none":
         if (
             "transformer_engine" in (args.transformer_impl, args.cuda_graph_impl)
-            and not args.te_rng_tracker
-        ):
+            or args.cuda_graph_impl == "chunk_wise"
+        ) and not args.te_rng_tracker:
             args.te_rng_tracker = True
             warn_rank_0("te_rng_tracker is not enabled, enabling it for CUDA graphs.", args.rank)
-        if args.cuda_graph_impl == "transformer_engine":
+        if args.cuda_graph_impl in ("transformer_engine", "chunk_wise"):
             assert (
                 "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
                 or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
             ), (
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
+            )
+        if (
+            args.cuda_graph_impl == "chunk_wise"
+            and args.sequence_packing_scheduler is not None
+            and args.micro_batch_size != 1
+        ):
+            # The graph helper is built after the model and the checkpoint load; fail early.
+            raise ValueError(
+                "--cuda-graph-impl chunk_wise with packed (THD) sequences "
+                "(--sequence-packing-scheduler) requires --micro-batch-size 1."
+            )
+        if (
+            args.cuda_graph_impl == "chunk_wise"
+            and args.sequence_packing_scheduler is None
+            and (args.sft or getattr(args, "dataloader_inter_document_masking", False))
+        ):
+            # These data paths pack sequences without the packing scheduler, so the block
+            # graphs are captured for fixed-length batches and the first replay raises.
+            raise ValueError(
+                "--cuda-graph-impl chunk_wise captures packed (THD) sequences only with "
+                "--sequence-packing-scheduler; --sft and --dataloader-inter-document-masking "
+                "pack sequences without it."
+            )
+        if (
+            args.cuda_graph_impl == "chunk_wise"
+            and args.sequence_packing_scheduler is not None
+            and args.pipeline_model_parallel_size > 1
+        ):
+            # With pipeline parallelism every in-flight microbatch owns a graph slot, and the
+            # capture bounds the packed microbatch count from the global batch size, i.e. with
+            # one sequence per dataset item. A real --sft item is itself a pack of
+            # conversations and a --dataloader-inter-document-masking sample holds several
+            # documents; the scheduler takes both apart, so a step can need more slots than
+            # were captured (the replay raises then). Mock --sft data (--mock-data, or no data
+            # source at all) has one sequence per item.
+            declares_data = any(
+                getattr(args, name, None)
+                for name in (
+                    "data_path",
+                    "train_data_path",
+                    "data_args_path",
+                    "per_split_data_args_path",
+                )
+            )
+            real_sft = args.sft and not args.mock_data and declares_data
+            if real_sft or getattr(args, "dataloader_inter_document_masking", False):
+                raise ValueError(
+                    "--cuda-graph-impl chunk_wise with pipeline parallelism and "
+                    "--sequence-packing-scheduler needs one sequence per dataset item "
+                    "(--use-varlen-dataset, or mock --sft data): a real --sft item and a "
+                    "--dataloader-inter-document-masking sample hold several sequences, while "
+                    "the number of graph slots is derived from the global batch size."
+                )
+        if (
+            args.cuda_graph_impl == "chunk_wise"
+            and args.position_embedding_type == "mrope"
+            and not args.multi_latent_attention
+            and args.sequence_packing_scheduler is not None
+        ):
+            # The packing scheduler carries position_ids as one [1, tokens] row, but mRoPE
+            # needs [3, batch, seq] position ids, so the chunk capture has no runtime-shaped
+            # mRoPE table to carry (the block capture itself raises later); fail before the
+            # model is built. Yarn and fixed-length mRoPE tables are materialized at capture.
+            raise ValueError(
+                "--cuda-graph-impl chunk_wise does not support --position-embedding-type mrope "
+                "together with packed (THD) sequences (--sequence-packing-scheduler): the "
+                "packing scheduler provides [1, tokens] position ids while mRoPE needs "
+                "[3, batch, seq]. Use fixed-length batches or disable chunk-wise CUDA graphs."
             )
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
@@ -2428,7 +2510,8 @@ def _add_inference_args(parser):
         '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
         '"mamba": captures the mamba layer. '
         'An empty list means capturing the whole Transformer layer. '
-        'This field is meaningless when --cuda-graph-impl=full_iteration and must be empty. '
+        'This field is meaningless when --cuda-graph-impl=full_iteration or chunk_wise and must '
+        'be empty. '
         'Backward compatibility: "full" is deprecated but kept for backward compatibility; '
         'it is transformed to an empty list in validate_args. The deprecated values '
         '"full_iteration" and "full_iteration_inference" are also accepted and migrated '

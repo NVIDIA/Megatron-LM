@@ -539,16 +539,52 @@ def _get_should_context_be_quantized_params(
         )
 
 
+def _is_te_graph_capture_without_weight_cache_flag(config) -> bool:
+    """Whether TE is capturing a chunk-wise CUDA graph (its warm-up passes included) that
+    nothing tells which microbatch it replays.
+
+    A replay runs none of the module's Python: the graph keeps whatever ``is_first_microbatch``
+    selected while it was captured. With a model-wide FP8 / FP4 recipe the capture turns on
+    TE's weight caching (``fp8_weight_caching`` in ``TECudaGraphHelper``): TE then ignores the
+    Python flag, records the weight quantization behind a GPU flag and sets that flag from
+    every replay. A model whose modules are quantized only through ``quant_recipe`` gets no such
+    flag. The ``False`` its earlier eager passes left behind would make the capture record a
+    read of the cached quantized weights and no quantization, so every replay would compute
+    with the weights the last eager first microbatch quantized, whatever the optimizer did
+    since.
+    """
+    # Per-layer Transformer Engine graphs (cuda_graph_impl="transformer_engine") take the same
+    # route to the same staleness; this keeps their behaviour as it is.
+    if getattr(config, 'cuda_graph_impl', 'none') != 'chunk_wise':
+        return False
+    # Lazy import: cuda_graphs imports this module at import time (through transformer_config
+    # and the megatron.core.tensor_parallel package), so a module-level import is circular.
+    from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+    if not is_graph_capturing():
+        return False
+    # TE 2.15 moved the flag onto quantization_state and had no getter for a few releases.
+    get_flag = getattr(FP8GlobalStateManager, 'get_skip_fp8_weight_update_tensor', None)
+    if get_flag is not None:
+        return get_flag() is None
+    return FP8GlobalStateManager.quantization_state.skip_fp8_weight_update_tensor is None
+
+
 def _resolve_is_first_microbatch(module) -> Optional[bool]:
     """The value to pass TE, or ``None`` meaning "no opinion, just accumulate".
 
     A ``True`` tells TE the gradient is fresh, so backward writes over ``main_grad`` instead of
     adding into it. Pass the flag on only when it can be trusted.
+
+    ``None`` also keeps TE from caching the quantized weights: it quantizes them in every
+    forward. A CUDA graph captured without TE's weight-cache flag needs exactly that, so that
+    each replay quantizes the weights the optimizer last wrote.
     """
     if (
         module.disable_parameter_transpose_cache
         or not is_first_microbatch_tracked(module.config)
         or getattr(module, 'is_repeated_layer', False)
+        or _is_te_graph_capture_without_weight_cache_flag(module.config)
     ):
         return None
     return module.is_first_microbatch
@@ -1711,7 +1747,10 @@ class TERMSNormDuplicatedLinear(te.pytorch.LayerNormLinear):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Apply RMSNorm followed by the duplicated linear projection."""
         _is_first_microbatch = (
-            None if self.disable_parameter_transpose_cache else self.is_first_microbatch
+            None
+            if self.disable_parameter_transpose_cache
+            or _is_te_graph_capture_without_weight_cache_flag(self.config)
+            else self.is_first_microbatch
         )
         quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
         with quant_context:
@@ -2729,6 +2768,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             # TE 2.9.0 introduces return_max_logit for qk-clip getting the max attention logits
             extra_kwargs["return_max_logit"] = True
             self.current_max_attn_logits = None
+            # A chunk-wise (whole-block) CUDA graph replay runs none of this module's Python:
+            # the statistic then has to live in a tensor the captured forward updates in place.
+            self._accumulate_max_attn_logits_in_place = (
+                getattr(config, "cuda_graph_impl", "none") == "chunk_wise"
+            )
 
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
@@ -2786,6 +2830,33 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                     TEDotProductAttention.cp_stream,
                     self.cp_comm_type,
                 )
+
+    @property
+    def current_max_attn_logits(self):
+        """Largest attention logit per head since the last reset; ``None`` when there is none.
+
+        Eager forwards rebind this value, and the QK-clip consumers reset it by assigning
+        ``None``. A chunk-wise CUDA graph replay runs no Python, so with
+        ``cuda_graph_impl="chunk_wise"`` the forward keeps the statistic in one persistent
+        tensor that it updates in place (an operation every replay repeats); this property
+        then returns that tensor and a reset refills it with ``-inf``, which the consumers
+        treat like a value below every threshold.
+        """
+        accumulator = self.__dict__.get("_max_attn_logits_accumulator")
+        if accumulator is not None:
+            return accumulator
+        return self.__dict__.get("_current_max_attn_logits")
+
+    @current_max_attn_logits.setter
+    def current_max_attn_logits(self, value):
+        accumulator = self.__dict__.get("_max_attn_logits_accumulator")
+        if accumulator is None:
+            self.__dict__["_current_max_attn_logits"] = value
+        elif value is None:
+            accumulator.fill_(float("-inf"))
+        else:
+            # The graphs address the accumulator: keep the tensor, take the values.
+            accumulator.copy_(value)
 
     def forward(
         self,
@@ -2905,7 +2976,15 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 batch_max_attention_logits = batch_max_attention_logits.detach()
 
                 # Update QK_Clip balancing eta
-                if self.current_max_attn_logits is None:
+                if self._accumulate_max_attn_logits_in_place:
+                    accumulator = self.__dict__.get("_max_attn_logits_accumulator")
+                    if accumulator is None:
+                        # Created by an eager pass: the warm-up steps, or the eager passes
+                        # make_graphed_callables() runs before it captures.
+                        accumulator = torch.full_like(batch_max_attention_logits, float("-inf"))
+                        self.__dict__["_max_attn_logits_accumulator"] = accumulator
+                    accumulator.copy_(torch.maximum(accumulator, batch_max_attention_logits))
+                elif self.current_max_attn_logits is None:
                     self.current_max_attn_logits = batch_max_attention_logits
                 else:
                     self.current_max_attn_logits = torch.max(

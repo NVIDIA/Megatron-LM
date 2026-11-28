@@ -18,8 +18,8 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
-from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp4_utils import get_fp4_context, get_layer_fp4_context
+from megatron.core.fp8_utils import get_fp8_context, get_layer_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -46,12 +46,13 @@ from megatron.core.transformer.attention_residual import (
     AttnResStageSources,
     attn_res_final_num_sources,
 )
+from megatron.core.transformer.chunk_cuda_graph import ChunkCudaGraphBlockMixin
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
 )
-from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.module import GraphableMegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.residual_recompute import (
     build_recompute_block_end_plan,
     build_residual_stream_recompute_plan,
@@ -106,7 +107,7 @@ class HybridStackSubmodules:
     mtp_stack_submodules: "HybridStackSubmodules | None" = None
 
 
-class HybridStack(MegatronModule):
+class HybridStack(ChunkCudaGraphBlockMixin, GraphableMegatronModule):
     """
     Constructor for the HybridStack class.
 
@@ -140,6 +141,11 @@ class HybridStack(MegatronModule):
         hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
             to select hash-routed MoE layers.
     """
+
+    def create_mcore_cudagraph_manager(self, config):
+        """The stack is graphed as a whole only through Transformer Engine (chunk-wise graphs);
+        the local CUDA graph implementation keeps graphing its layers."""
+        return None
 
     def __init__(
         self,
@@ -195,6 +201,9 @@ class HybridStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        # Only the decoder stack is a chunk CUDA graph callable. An MTP stack runs inside the
+        # post-process callable's capture and must not re-enter the chunk-capture adapter.
+        self.is_cuda_graph_chunk_callable = not is_mtp_layer
         self.mtp_layer_number = mtp_layer_number
         self.pp_layer_offset = pp_layer_offset
         self.vp_stage = vp_stage
@@ -896,12 +905,16 @@ class HybridStack(MegatronModule):
         if use_inner_fp8_context:
 
             def get_inner_quant_context(config, layer_number):
-                return get_fp8_context(config, layer_number)
+                # Under chunk graphs, BF16 boundary layers opt out of the block-wide FP8 context
+                # and MTP layers (numbered from 1 in their own stack) opt in explicitly.
+                return get_layer_fp8_context(config, layer_number, is_mtp_layer=self.is_mtp_layer)
 
         elif use_fp4_context:
 
             def get_inner_quant_context(config, layer_number):
-                return get_fp4_context(config, layer_number)
+                # Same under NVFP4: BF16 boundary layers opt out of the block-wide capture
+                # autocast, MTP layers open the NVFP4 context themselves.
+                return get_layer_fp4_context(config, layer_number, is_mtp_layer=self.is_mtp_layer)
 
         else:
 

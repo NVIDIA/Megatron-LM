@@ -604,6 +604,61 @@ def is_layer_window_attention(
     )
 
 
+def use_te_checkpoint(config: 'TransformerConfig') -> bool:
+    """Whether activation checkpointing goes through Transformer Engine's ``checkpoint``.
+
+    Quantized (FP8/FP4) recompute of the MLP / MoE / MTP regions uses TE's checkpoint
+    (``precision_aware_checkpoint``). Chunk-wise Transformer Engine CUDA graphs
+    (``cuda_graph_impl == "chunk_wise"``) use it for every precision: the captured block contains
+    the checkpointed forward and its recompute as one unit, whereas ``tensor_parallel.checkpoint``
+    runs the function without a checkpoint node while a graph is warmed up or captured, which
+    would keep every activation of the block alive inside the graph.
+
+    TE's checkpoint does not skip graph warm-up / capture and restores graph-safe RNG states from
+    live handles (no rewind), so paths that must work with per-layer graphs and dropout keep
+    Megatron's ``tensor_parallel.checkpoint`` outside chunk-wise graphs; see
+    ``use_te_checkpoint_for_core_attention``.
+    """
+    if config.fp8 or config.fp4:
+        return True
+    return getattr(config, "cuda_graph_impl", "none") == "chunk_wise"
+
+
+def use_te_checkpoint_for_core_attention(config: 'TransformerConfig') -> bool:
+    """Whether the selective core-attention recompute goes through TE's ``checkpoint``.
+
+    Only under chunk-wise CUDA graphs, where the recompute has to be captured with the block.
+    Everywhere else the core attention keeps ``tensor_parallel.checkpoint`` for every precision:
+    it records and re-enters the FP8/FP4 autocast of the forward, it skips itself while a
+    per-layer graph is warmed up or captured (TE's checkpoint would raise in the local warm-up's
+    ``torch.autograd.grad`` and capture a second recompute), and it clones the graph-safe RNG
+    states before the recompute so attention dropout draws the forward's mask again (TE's
+    checkpoint restores from live generator handles, a no-op with ``te_rng_tracker``).
+    """
+    return getattr(config, "cuda_graph_impl", "none") == "chunk_wise"
+
+
+def core_attention_checkpoint(
+    function: Callable[..., Any],
+    config: 'TransformerConfig',
+    tp_group: Optional[torch.distributed.ProcessGroup],
+    /,
+    *args: Any,
+) -> Any:
+    """Checkpoint the core attention with the implementation chunk-wise graphs need.
+
+    See ``use_te_checkpoint_for_core_attention``; ``distribute_saved_activations`` is always
+    False here, as it was for the core attention before.
+    """
+    if use_te_checkpoint_for_core_attention(config):
+        from megatron.core.extensions.transformer_engine import te_checkpoint
+
+        return te_checkpoint(
+            function, False, tensor_parallel.random.get_cuda_rng_tracker, tp_group, *args
+        )
+    return tensor_parallel.checkpoint(function, False, *args)
+
+
 def precision_aware_checkpoint(
     function: Callable[..., Any],
     config: 'TransformerConfig',
@@ -616,12 +671,14 @@ def precision_aware_checkpoint(
     """Activation-checkpoint ``function`` with the implementation its precision requires.
 
     FP8 and FP4 recompute must go through Transformer Engine's checkpoint, because FP4 is
-    also implemented with TE's ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``). Other
-    precisions use ``tensor_parallel.checkpoint``.
+    also implemented with TE's ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``); so does
+    every precision inside chunk-wise CUDA graphs (see ``use_te_checkpoint``). Other
+    configurations use ``tensor_parallel.checkpoint``.
 
     Args:
         function: Callable to checkpoint.
-        config: Transformer config whose ``fp8`` and ``fp4`` fields select the implementation.
+        config: Transformer config whose ``fp8``, ``fp4`` and ``cuda_graph_impl`` fields select
+            the implementation.
         tp_group: Tensor-parallel group for Transformer Engine's checkpoint.
         *args: Positional arguments for ``function``.
         distribute_saved_activations: Passed through to the checkpoint implementation.
@@ -630,7 +687,7 @@ def precision_aware_checkpoint(
     Returns:
         The output of ``function``.
     """
-    if config.fp8 or config.fp4:
+    if use_te_checkpoint(config):
         # Imported lazily to avoid a circular import.
         from megatron.core.extensions.transformer_engine import te_checkpoint
 

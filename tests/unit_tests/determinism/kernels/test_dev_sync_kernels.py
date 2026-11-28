@@ -104,6 +104,96 @@ def test_mtp_packed_cp1_roll_replays():
     assert_replays_bit_exact(roll, (value,), contention=True, what="MTP packed CP1 roll")
 
 
+def test_mtp_packed_cp1_roll_replays_in_a_cuda_graph_across_packings():
+    """Chunk CUDA graphs capture the packed roll with static ``cu_seqlens`` buffers, separate
+    ones for the logical and the physical boundaries, whose values change per replay while
+    repeated final boundaries keep the entry count. The CP1 roll fills one end index per
+    boundary (the fill is idempotent, so repeated boundaries are harmless) and masks every slot
+    whose successor lies past its document's valid tokens, all with shapes that follow from the
+    metadata shape. The recorded roll must therefore reproduce every pack that fits the static
+    capacity."""
+    from megatron.core.packed_seq_params import PackedSeqParams
+    from megatron.core.transformer.multi_token_prediction import roll_tensor
+
+    capacity, slots = 16, 4
+
+    def boundaries(documents, logical_tail):
+        # ``documents``: (valid length, physical length) per document. Logical boundaries are
+        # the compact cumulative valid lengths; a dummy sequence pads the tokens to the
+        # capacity (with or without logical tokens) and the final boundary repeats.
+        logical, physical = [0], [0]
+        for valid_length, physical_length in documents:
+            logical.append(logical[-1] + valid_length)
+            physical.append(physical[-1] + physical_length)
+        tail = capacity - physical[-1]
+        if tail:
+            logical.append(logical[-1] + (tail if logical_tail else 0))
+            physical.append(capacity)
+        logical += [logical[-1]] * (slots + 1 - len(logical))
+        physical += [physical[-1]] * (slots + 1 - len(physical))
+        return logical, physical
+
+    def expected_roll(value, logical, physical):
+        # A slot takes its right neighbour while that neighbour is a valid token of the same
+        # document; every other slot of the pack takes the fill value.
+        expected = torch.zeros_like(value)
+        for index, (start, end) in enumerate(zip(physical[:-1], physical[1:])):
+            valid_end = start + logical[index + 1] - logical[index]
+            assert valid_end <= end
+            if valid_end > start:
+                expected[start : valid_end - 1] = value[start + 1 : valid_end]
+        return expected
+
+    def roll(x, logical, physical):
+        packed = PackedSeqParams(
+            cu_seqlens_q=logical,
+            cu_seqlens_kv=logical,
+            cu_seqlens_q_padded=physical,
+            cu_seqlens_kv_padded=physical,
+            qkv_format="thd",
+        )
+        return roll_tensor(x, packed_seq_params=packed, return_sum=False)[0]
+
+    def device_boundaries(boundaries):
+        return torch.tensor(boundaries, dtype=torch.int32, device="cuda")
+
+    packings = (
+        [(5, 8), (8, 8)],  # the first document is padded, the pack fills the capacity
+        [(16, 16)],
+        [(3, 4), (2, 4), (4, 4), (1, 4)],  # every slot holds a document
+        [(6, 8), (2, 2)],  # dummy tail and one repeated boundary
+        [(3, 4), (0, 0), (5, 8)],  # an empty document between two others
+        [],  # only the dummy tail
+    )
+    value = torch.arange(1, capacity + 1, dtype=torch.float32, device="cuda")
+    logical, physical = boundaries(packings[0], True)
+    assert logical != physical
+    reference = [2, 3, 4, 5, 0, 0, 0, 0, 10, 11, 12, 13, 14, 15, 16, 0]
+    assert expected_roll(value, logical, physical).tolist() == reference
+
+    static_logical, static_physical = device_boundaries(logical), device_boundaries(physical)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            roll(value, static_logical, static_physical)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_out = roll(value, static_logical, static_physical)
+    for documents in packings:
+        for logical_tail in (True, False):
+            logical, physical = boundaries(documents, logical_tail)
+            expected = expected_roll(value, logical, physical)
+            eager = roll(value, device_boundaries(logical), device_boundaries(physical))
+            assert torch.equal(eager, expected), (logical, physical)
+            static_logical.copy_(device_boundaries(logical))
+            static_physical.copy_(device_boundaries(physical))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(static_out, expected), (logical, physical)
+
+
 @pytest.mark.parametrize("impl", ["eager", "fla"])
 def test_mtp_attn_res_final_head_replays(impl):
     """Replay the AttnRes output head an MTP depth applies over the trunk depth-source tuple.

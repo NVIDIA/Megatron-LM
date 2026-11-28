@@ -697,6 +697,11 @@ class OptimizerConfig:
                 "`--use-precision-aware-optimizer`, as the hybrid device optimizer reuses the "
                 "code path of this flag."
             )
+            # The optimizer step graph replays fixed device addresses; offloaded optimizer
+            # state moves between host and device between steps and cannot be captured.
+            assert (
+                not self.optimizer_cuda_graph
+            ), "optimizer_cuda_graph requires the optimizer state to stay resident on the GPU."
 
         # Chunked optimizer state offload. finalize_optimizer_config() resolves the deprecated
         # offload_optimizer_states alias into chunked_optimizer_state_offload, so accept either

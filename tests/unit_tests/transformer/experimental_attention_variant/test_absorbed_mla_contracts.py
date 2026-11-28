@@ -42,7 +42,9 @@ def test_checkpointed_attention_forward_captures_metadata(monkeypatch):
         {
             "attn_mask_type": AttnMaskType.causal,
             "core_attention": CoreAttention(),
-            "pg_collection": SimpleNamespace(cp=object()),
+            "pg_collection": SimpleNamespace(cp=object(), tp=object()),
+            # core_attention_checkpoint(): tensor_parallel.checkpoint outside chunk-wise graphs.
+            "config": SimpleNamespace(cuda_graph_impl="none"),
         },
     )()
 

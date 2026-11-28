@@ -36,6 +36,7 @@ from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
+    use_te_checkpoint,
 )
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
@@ -560,7 +561,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 )
                 return self.forward_post_core_attn(norm_out)
 
-            if self.config.fp8 or self.config.fp4:
+            if use_te_checkpoint(self.config):
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 return te_checkpoint(

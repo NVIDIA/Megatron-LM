@@ -5,6 +5,7 @@
 import gc
 import logging
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import contextmanager
 from typing import Optional
 
 import torch
@@ -39,6 +40,27 @@ def get_shared_capture_stream():
     return _shared_capture_stream
 
 
+@contextmanager
+def capture_te_graphs_on_shared_stream():
+    """Run Transformer Engine's graph captures inside this context on the shared capture stream.
+
+    ``torch.cuda.graph`` (and therefore TE's ``make_graphed_callables``, which does not take a
+    stream) captures on its class-level ``default_capture_stream``. The caching allocator keys a
+    pool's free blocks by the stream that allocated them, so for the chunk-wise graphs to share
+    one pool with the optimizer-step graph (``get_shared_graph_pool``) both captures have to run
+    on the same stream. The context points torch's default capture stream at the shared stream
+    and puts the previous one back on exit, so captures of other graphs in the process (and the
+    full-iteration path, which passes the stream explicitly) are unaffected.
+    """
+    graph_cls = torch.cuda.graphs.graph
+    previous_stream = graph_cls.default_capture_stream
+    graph_cls.default_capture_stream = get_shared_capture_stream()
+    try:
+        yield
+    finally:
+        graph_cls.default_capture_stream = previous_stream
+
+
 def get_shared_graph_pool():
     """Return a process-wide handle so all call sites share one graph memory pool.
 
@@ -49,6 +71,26 @@ def get_shared_graph_pool():
     if _shared_graph_pool is None:
         _shared_graph_pool = torch.cuda.graph_pool_handle()
     return _shared_graph_pool
+
+
+def release_shared_graph_pool():
+    """Forget the shared pool handle once the graphs captured into it are destroyed.
+
+    A destroyed graph releases its pool on both the device allocator and the pinned-host
+    allocator (``CUDAGraph::reset``), but PyTorch keeps a pool whose ``use_count`` dropped to
+    zero registered under its id until an ``empty_cache`` of that allocator finds every block
+    of the pool free; a new capture into the same id then fails the allocator's
+    ``use_count > 0`` assert (``CachingHostAllocator.h`` for the host side). The pinned-host
+    pool is not reclaimable in practice: the fine-grained offload capture allocates its host
+    buffers inside the graphs (``_block_capture_host_buffers``), their blocks stay registered
+    even after the manager is reset and ``torch._C._host_emptyCache()`` ran, and nothing in
+    training empties the host cache anyway. So a capture round that follows a deletion gets a
+    fresh handle, as ``delete_cuda_graphs`` does for ``CudaGraphManager.global_mempool``.
+    Graphs still alive in the old pool (e.g. an optimizer-step graph) keep it by their own
+    count.
+    """
+    global _shared_graph_pool
+    _shared_graph_pool = None
 
 
 def get_graph_pool(use_single_mempool):

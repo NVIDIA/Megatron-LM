@@ -14,7 +14,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
-from megatron.core.fp4_utils import get_fp4_context
+from megatron.core.fp4_utils import get_fp4_context, get_layer_quantization_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
@@ -31,6 +31,7 @@ from megatron.core.transformer.attention_residual import (
     AttnResStageSources,
     is_attn_res_block_start,
 )
+from megatron.core.transformer.chunk_cuda_graph import ChunkCudaGraphBlockMixin
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.hyper_connection import (
@@ -281,7 +282,7 @@ def _get_block_submodules(
         raise Exception(f"specialize for {type(spec).__name__}.")
 
 
-class TransformerBlock(GraphableMegatronModule, MegatronModule):
+class TransformerBlock(ChunkCudaGraphBlockMixin, GraphableMegatronModule, MegatronModule):
     """Transformer class."""
 
     def __init__(
@@ -352,6 +353,13 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         )
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+
+    def _get_inner_quantization_context(self, layer):
+        """Return the per-layer quantization context of a chunk-wise CUDA graph block."""
+        # A chunk capture runs the block inside one FP8 / NVFP4 context, so BF16 boundary
+        # layers opt out explicitly instead of inheriting it (get_layer_fp8_context,
+        # get_layer_fp4_context).
+        return get_layer_quantization_context(self.config, layer.layer_number - 1)
 
     def _build_layers(self):
         # Transformer layers.
@@ -968,6 +976,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             )
                         else:
                             inner_quantization_context = nullcontext()
+                        if self.config.cuda_graph_impl == "chunk_wise":
+                            inner_quantization_context = self._get_inner_quantization_context(layer)
                     else:
                         inner_quantization_context = nullcontext()
 

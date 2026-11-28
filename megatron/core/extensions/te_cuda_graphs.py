@@ -158,6 +158,8 @@ class TECudaGraphMixin:
     module is redirected: while graphs are being captured it records a graph, and once
     te_cuda_graphs is populated it replays the graph for the current microbatch.
     Eval-mode calls, and calls with any other cuda_graph_impl, run forward() normally.
+    (A subclass that is the callable of another implementation names it in
+    _te_cuda_graph_impl: the whole-block mixin of chunk-wise graphs.)
 
     How to use:
         List this mixin before the module's base class, so its __call__ runs first:
@@ -195,15 +197,22 @@ class TECudaGraphMixin:
         call's state cannot leak into another.
     """
 
+    # The cuda_graph_impl under which this module is a Transformer Engine graph callable.
+    # Per-layer modules are callables of "transformer_engine"; a whole decoder block
+    # (ChunkCudaGraphBlockMixin) is one of "chunk_wise".
+    _te_cuda_graph_impl = "transformer_engine"
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if self.config.cuda_graph_impl == "transformer_engine":
+        if self.config.cuda_graph_impl == self._te_cuda_graph_impl:
             self.register_te_cuda_graph()
 
     def register_te_cuda_graph(self):
         """Initialize TE graph state without changing this module's parameters."""
-        if self.config.cuda_graph_impl != "transformer_engine":
-            raise ValueError("TE graph registration requires cuda_graph_impl='transformer_engine'")
+        if self.config.cuda_graph_impl != self._te_cuda_graph_impl:
+            raise ValueError(
+                f"TE graph registration requires cuda_graph_impl='{self._te_cuda_graph_impl}'"
+            )
 
         # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
         # the number of microbatches. Multiple CUDA graphs per layer is required to support
@@ -551,7 +560,7 @@ class TECudaGraphMixin:
         """
         Check if we should call the TE cudagraph path.
         """
-        if self.config.cuda_graph_impl != "transformer_engine":
+        if self.config.cuda_graph_impl != self._te_cuda_graph_impl:
             return False
         from megatron.core.transformer.cuda_graphs import is_graph_capturing
 

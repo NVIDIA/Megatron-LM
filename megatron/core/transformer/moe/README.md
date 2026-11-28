@@ -665,7 +665,7 @@ structure selects routed-only MOK in `auto` mode. Activation selection is indepe
 | Parallelism | Expert TP=1; TP>1 requires sequence parallelism and native shared execution; EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
 | Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
 | Recomputation | Whole-MoE activation recompute; shared-expert-only recompute when shared execution is native |
-| CUDA Graph | Full-iteration capture |
+| CUDA Graph | Full-iteration capture; chunk-wise capture (`cuda_graph_impl="chunk_wise"`), BF16 and MXFP8 |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
 
 Wgrad GEMMs accumulate in FP32. The destination `main_grad` dtype selects the reduction-store
@@ -679,7 +679,10 @@ parameter ownership or checkpoint keys; the GDN and attention layers retain thei
 With `reuse_grad_buf_for_mxfp8_param_ag`, MCore completes parameter all-gather, requantizes into
 native TE storage, and clears the staging buffer before MOK runs. Single-grouped MXFP8 parameters
 require this mode in the current MCore buffer implementation. MOK aliases the native payloads
-and refreshes its converted scale buffers once per optimizer iteration. The adapter requires
+and refreshes its converted scale buffers once per optimizer iteration. Under chunk-wise CUDA
+graphs (`cuda_graph_impl="chunk_wise"`) that host-driven refresh would not be replayed, so the
+captured block records the refresh itself and every replay re-converts the scales of the latest
+parameter update. The adapter requires
 both native weight layouts; TE's `post_all_gather_processing` is not an MXFP8 capability check.
 
 Per-layer whole-layer capture is distinct from `cuda_graph_impl=full_iteration`. Supporting
@@ -750,11 +753,12 @@ layout is not detected automatically. In-place FSDP loading and
 `torch_dcp` / `fsdp_dtensor` formats are not supported by this conversion.
 
 ### CUDA Graph
-CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are three implementations:
+CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are four implementations:
 
 1. `--cuda-graph-impl=local`: Captures per-layer cuda graphs using the MCore-internal cuda graph manager.
 2. `--cuda-graph-impl=transformer_engine`: Captures per-layer cuda graphs using the TE `make_graphed_callables()` interface.
 3. `--cuda-graph-impl=full_iteration`: Captures the whole training/evaluation forward-backward iteration as a single cuda graph.
+4. `--cuda-graph-impl=chunk_wise`: Captures the whole decoder block of a pipeline stage per microbatch slot using the TE `make_graphed_callables()` interface. Its MoE requirements (static token shapes) are listed in the Chunk-wise CUDA Graph section of `docs/user-guide/features/cuda_graph.md`.
 
 For inference, CUDA graph scope is controlled separately with
 `--inference-cuda-graph-scope=layer|block` together with

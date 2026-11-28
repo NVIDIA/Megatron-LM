@@ -384,10 +384,16 @@ class MoEAuxLossAutoScaler(torch.autograd.Function):
             scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in
                                   matches the scale of the main_loss.
         """
-        if MoEAuxLossAutoScaler.main_loss_backward_scale is None:
+        current = MoEAuxLossAutoScaler.main_loss_backward_scale
+        if current is None:
             MoEAuxLossAutoScaler.main_loss_backward_scale = scale
+        elif current.numel() == 1 and scale.numel() == 1:
+            # A backward that ran before the first scale was set (the eager passes of a CUDA
+            # graph capture at the first iteration) created the default as a 0-dim tensor, and
+            # a captured backward keeps its address; the training loop's scale has shape [1].
+            current.copy_(scale.detach().reshape(current.shape))
         else:
-            MoEAuxLossAutoScaler.main_loss_backward_scale.copy_(scale)
+            current.copy_(scale)
 
 
 def permute(

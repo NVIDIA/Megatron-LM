@@ -361,6 +361,11 @@ def _validate_nonpacked_cp_uniform_length(
     device: torch.device,
 ) -> None:
     """Validate the uniform-length precondition for non-packed allgather CP."""
+    # is_available() first: a CUDA-less torch build raises from the capture query.
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        # The sample of a CUDA graph capture has the static shape that the eager warm-up
+        # forwards validated; the check uploads a host tensor and reads the result back.
+        return
     expected_skv = sq * cp_size
     if (
         cp_group is not None
@@ -1553,13 +1558,15 @@ def bwd_fused_indexer_loss_naive(
     if calculate_per_token_loss:
         grad_kl_per_row = grad_kl_div
     else:
+        # A device-side fill rather than a host tensor upload: this backward is recorded into
+        # CUDA graphs, where a copy from pageable host memory raises.
         valid_row_count = (
             query_valid_rows.sum().to(
                 dtype=torch.float32, device=attention_scores_normalized.device
             )
             if query_valid_rows is not None
-            else torch.tensor(
-                float(b * sq), dtype=torch.float32, device=attention_scores_normalized.device
+            else torch.full(
+                (), float(b * sq), dtype=torch.float32, device=attention_scores_normalized.device
             )
         ).clamp_min(1.0)
         grad_kl_per_row = grad_kl_div / valid_row_count  # scalar value for each real row
@@ -1845,10 +1852,16 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
             raise TypeError("DSAIndexerLossAutoScaler.set_loss_scale requires a torch.Tensor.")
         scale = scale.detach()
 
-        if DSAIndexerLossAutoScaler.main_loss_backward_scale is None:
+        current = DSAIndexerLossAutoScaler.main_loss_backward_scale
+        if current is None:
             DSAIndexerLossAutoScaler.main_loss_backward_scale = scale
+        elif current.numel() == 1 and scale.numel() == 1:
+            # A backward that ran before the first scale was set (the eager passes of a CUDA
+            # graph capture at the first iteration) created the default as a 0-dim tensor, and
+            # a captured backward keeps its address; the training loop's scale has shape [1].
+            current.copy_(scale.reshape(current.shape))
         else:
-            DSAIndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
+            current.copy_(scale)
 
 
 @dataclass

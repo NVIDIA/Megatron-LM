@@ -11,6 +11,9 @@ from megatron.core.fp8_utils import (
     _get_custom_recipe,
     _get_grouped_quantized_recipe,
     _unwrap_parameter_data,
+    get_fp8_disabled_context,
+    get_layer_fp8_context,
+    is_first_last_bf16_layer,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
@@ -302,3 +305,45 @@ else:
     def get_fp4_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Return nullcontext when Transformer Engine is not available."""
         return nullcontext()
+
+
+def get_layer_fp4_context(config: TransformerConfig, layer_no: int, is_mtp_layer: bool = False):
+    """FP4 counterpart of ``get_layer_fp8_context`` (see its docstring for the mechanism).
+
+    Chunk-wise CUDA graphs capture a whole block under one NVFP4 ``fp8_autocast``, and TE wraps
+    the ``__call__`` of the graphed block *class* in it during warm-up and capture. The
+    ``nullcontext`` that ``get_fp4_context`` returns for a BF16 boundary layer would inherit
+    that autocast and record the layer as NVFP4 GEMMs, while an MTP stack of the same class
+    (captured inside the post-process graph, not a graphed callable itself) runs with
+    quantization disabled and would record its FP4 layers in BF16. Under chunk graphs both
+    kinds of layer therefore state their precision explicitly:
+
+    * a BF16 boundary layer (``first_last_layers_bf16``, ``0 <= layer_no < num_layers``) opts
+      out of the block-wide NVFP4 context;
+    * an MTP layer (``is_mtp_layer``) opens the NVFP4 context itself.
+
+    Outside chunk graphs this is exactly ``get_fp4_context``.
+    """
+    if not config.fp4 or getattr(config, "cuda_graph_impl", "none") != "chunk_wise":
+        return get_fp4_context(config, layer_no)
+    if is_mtp_layer:
+        return get_fp4_context(config)
+    if 0 <= layer_no < config.num_layers and is_first_last_bf16_layer(config, layer_no):
+        return get_fp8_disabled_context(config)
+    return get_fp4_context(config, layer_no)
+
+
+def get_layer_quantization_context(
+    config: TransformerConfig, layer_no: int, is_mtp_layer: bool = False
+):
+    """Precision-agnostic per-layer quantization context of a block's inner loop.
+
+    Dispatches to ``get_layer_fp8_context`` (FP8) or ``get_layer_fp4_context`` (FP4), which
+    are mutually exclusive, and returns ``nullcontext`` without quantization. Outside chunk-wise
+    CUDA graphs both reduce to ``get_fp8_context`` / ``get_fp4_context`` for the layer.
+    """
+    if config.fp8:
+        return get_layer_fp8_context(config, layer_no, is_mtp_layer=is_mtp_layer)
+    if config.fp4:
+        return get_layer_fp4_context(config, layer_no, is_mtp_layer=is_mtp_layer)
+    return nullcontext()
