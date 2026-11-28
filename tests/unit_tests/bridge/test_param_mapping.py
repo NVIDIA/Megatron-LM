@@ -1617,3 +1617,18 @@ class TestFusedExpertMapping:
             f"expert_weight.shape={expert_weight.shape} but expected {expected_shape} "
             f"(TP={tp_size}; AutoMapping is responsible for TP scatter)"
         )
+
+
+@pytest.mark.parametrize("size", [1, 2, 4])
+def test_gated_mapping_converts_actual_interleaved_runtime_layout(mock_distributed_env, size):
+    mock_distributed_env()
+    module = torch.nn.Module()
+    module._glu_interleave_size = size
+    mapping = GatedMLPMapping("mlp.linear_fc1.weight", gate="gate", up="up")
+    gate = torch.arange(24).reshape(8, 3).float()
+    up = gate + 100
+    runtime = mapping.hf_to_megatron({"gate": gate, "up": up}, module)
+    exported = mapping.megatron_to_hf(runtime, module)
+    torch.testing.assert_close(exported["gate"], gate)
+    torch.testing.assert_close(exported["up"], up)
+    assert not torch.equal(runtime[:8], gate)

@@ -34,6 +34,7 @@ from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.dist_checkpointing.dict_utils import dict_list_map_inplace
+from megatron.core.dist_checkpointing.glu import glu_checkpoint_metadata
 from megatron.core.dist_checkpointing.layer_key_aliases import remap_sharded_state_dict_for_load
 from megatron.core.dist_checkpointing.mapping import LocalNonpersistentObject, ShardedObject
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
@@ -686,6 +687,7 @@ def _build_sharded_state_dict_metadata(
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     *,
     ckpt_format: Optional[str] = None,
+    model=None,
 ) -> dict:
     """Builds metadata used for sharded_state_dict versioning.
 
@@ -700,6 +702,7 @@ def _build_sharded_state_dict_metadata(
     Args:
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
         ckpt_format: The format of the operation (default: the run's checkpoint section's)
+        model: Built modules whose actual GLU layout should be recorded, when available.
     """
     cfg = get_run_config()
     checkpoint = cfg.checkpoint
@@ -732,6 +735,17 @@ def _build_sharded_state_dict_metadata(
 
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
+    layout_config = cfg.model if model is None else model
+    if layout_config is not None:
+        metadata.update(
+            glu_checkpoint_metadata(
+                layout_config,
+                optimizer_uses_model_layout=(
+                    not has_distributed_optimizer
+                    or metadata.get('distrib_optim_sharding_type') == 'fully_reshardable'
+                ),
+            )
+        )
     # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
     if dp_cp_group is None:
         dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
@@ -1003,7 +1017,7 @@ def save_checkpoint(
     ):
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(
-                dp_cp_group=dp_cp_group, ckpt_format=save_format
+                dp_cp_group=dp_cp_group, ckpt_format=save_format, model=model
             )
             if hasattr(cfg, "optimizer") and cfg.optimizer.use_distributed_optimizer:
                 print_rank_0(
@@ -1031,8 +1045,20 @@ def save_checkpoint(
                 # Adapter-only checkpoint: keep only the adapter weights (plus router expert bias).
                 state_dict = apply_peft_adapter_filter_to_state_dict(state_dict, adapter_key_filter)
 
-        validate_glu_checkpoint_backend(args, ckpt_format=ckpt_format)
-        state_dict = prepare_glu_checkpoint_for_save(state_dict, args)
+        validate_glu_checkpoint_backend(model, ckpt_format=ckpt_format)
+        if ckpt_type in (CheckpointType.LEGACY, CheckpointType.LOCAL):
+            state_dict['glu_checkpoint_metadata'] = (
+                glu_checkpoint_metadata(model, optimizer_uses_model_layout=False)
+                if ckpt_type == CheckpointType.LEGACY
+                else {
+                    key: value
+                    for key, value in sharded_sd_metadata.items()
+                    if key.startswith('glu_')
+                }
+            )
+        state_dict = prepare_glu_checkpoint_for_save(
+            state_dict, model, use_factories=save_format == 'torch_dist', model=model
+        )
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == 'torch_dist':
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
@@ -3105,7 +3131,7 @@ def load_checkpoint(
 
     def validate_glu_layout(checkpoint_state, is_release):
         validate_glu_checkpoint_backend(
-            args, ckpt_format=ckpt_format, skip_load_to_model_and_opt=skip_load_to_model_and_opt
+            model, ckpt_format=ckpt_format, skip_load_to_model_and_opt=skip_load_to_model_and_opt
         )
         # Whether the checkpoint holds optimizer state follows its saved checkpoint section (the
         # saved arguments only without one), as the optimizer load template below does.
@@ -3121,7 +3147,18 @@ def load_checkpoint(
             and load_optim
             and holds_optimizer
         )
-        validate_glu_optimizer_layout(checkpoint_state, args, loading_optimizer=loading_optimizer)
+        glu_metadata = (
+            dist_checkpointing.load_content_metadata(preloaded_state_dict=checkpoint_state)
+            if ckpt_format == 'torch_dist' and ckpt_type != CheckpointType.LOCAL
+            else checkpoint_state.get('glu_checkpoint_metadata')
+        )
+        validate_glu_optimizer_layout(
+            checkpoint_state,
+            model,
+            loading_optimizer=loading_optimizer,
+            metadata=glu_metadata,
+            source_config=(checkpoint_config or {}).get('model'),
+        )
 
     if state_dict is not None:
         # Check common metadata before DCP can write into model/optimizer storage.
@@ -3505,7 +3542,9 @@ def load_checkpoint(
     if not checkpoint_config_read:
         checkpoint_config = _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
     validate_glu_layout(state_dict, release)
-    state_dict = prepare_glu_checkpoint_for_load(state_dict, args)
+    state_dict = prepare_glu_checkpoint_for_load(
+        state_dict, model, use_factories=ckpt_format == 'torch_dist', model=model
+    )
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))

@@ -402,6 +402,9 @@ class SharedExpertMLP(MLP):
 class FusedSharedExpertMLP(SharedExpertMLP):
     """Shared expert MLP implemented with TE GroupedLinear(num_groups=1) fused ops."""
 
+    def _checkpoint_glu_interleave_size(self) -> int | None:
+        return self.config.moe_shared_expert_glu_interleave_size
+
     def __init__(
         self,
         config: TransformerConfig,

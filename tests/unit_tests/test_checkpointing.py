@@ -1939,7 +1939,7 @@ def test_the_glu_optimizer_guard_follows_the_saved_checkpoint_section(
     class StopAtTheGuard(Exception):
         pass
 
-    def guard(state_dict, run_args, *, loading_optimizer):
+    def guard(state_dict, run_args, *, loading_optimizer, metadata, source_config):
         decisions.append(loading_optimizer)
         raise StopAtTheGuard  # Before any tensor storage is read.
 
