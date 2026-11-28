@@ -1933,11 +1933,17 @@ class TestChunkTokenMetadata:
             assert "packed_seq_params" not in kwargs
 
     def test_packed_chunkwise_cp_linear_layers_are_refused(self):
-        """Their CP metadata is derived on the host from each pack's sequence boundaries."""
-        block = self._block()
+        """Their CP metadata is derived on the host from each pack's sequence boundaries. The
+        stack only runs them chunkwise with more than one context-parallel rank: its flag names
+        the layers that would, whatever the size of the CP group."""
+        block = self._block(context_parallel_size=2)
         block._has_linear_layer_with_chunkwise_cp = True
         with pytest.raises(ValueError, match="chunkwise context parallelism"):
             block.get_layer_static_inputs(seq_length=8, micro_batch_size=1)
+
+        block = self._block(context_parallel_size=1)
+        block._has_linear_layer_with_chunkwise_cp = True
+        assert "cu_seqlens_q" in block.get_layer_static_inputs(seq_length=8, micro_batch_size=1)
 
 
 def _thd_batch(seqlens, vocab, seed, capacity, max_num_seqs):
@@ -2073,7 +2079,7 @@ def _pretrain_hybrid_batch(model, batch):
         "cu_seqlens_padded": packed_seq_params.cu_seqlens_q_padded.unsqueeze(0),
         "max_seqlen": torch.tensor(packed_seq_params.max_seqlen_q, dtype=torch.int32).cuda(),
         "local_cp_size": None,
-        "hybrid_cp_group": None,
+        "dynamic_cp_group": None,
     }
     additional_layouts = set()
     if config.linear_cp_layout != config.attention_cp_layout:
@@ -3435,6 +3441,26 @@ class TestGraphDynamicRouteMetadataArena:
         monkeypatch.setattr(cuda_graphs, "get_attr_wrapped_model", get_wrapped)
         cuda_graphs.set_current_microbatch(object(), 7)
         assert block.current_microbatch == 7
+
+    def test_set_current_microbatch_follows_a_language_model_wrapper(self, monkeypatch):
+        """The graph helper captures the callables of the model a wrapper holds as
+        ``language_model`` (decoder block and post-process block). The wrapper exposes that
+        model's decoder but not its post-process block, which has to follow the microbatch as
+        well, or it would replay slot 0 for every microbatch."""
+        from megatron.core.transformer import cuda_graphs
+
+        block = SimpleNamespace(layers=[], config=SimpleNamespace(cuda_graph_impl="chunk_wise"))
+        postprocess_block = SimpleNamespace()
+        language_model = SimpleNamespace(decoder=block, postprocess_block=postprocess_block)
+        wrapper = SimpleNamespace(decoder=block, language_model=language_model)
+
+        def get_wrapped(_model, attr, **_kwargs):
+            return wrapper if attr == "decoder" else None
+
+        monkeypatch.setattr(cuda_graphs, "get_attr_wrapped_model", get_wrapped)
+        cuda_graphs.set_current_microbatch(object(), 3)
+        assert block.current_microbatch == 3
+        assert postprocess_block.current_microbatch == 3
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")

@@ -1309,6 +1309,152 @@ class TestChunkWiseGraphPagedStash:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
+    def test_pp1_with_every_moe_layer_recomputed_allocates_no_page_buffers(self):
+        """PP=1, two layers, each a recompute segment of its own (full recompute, "uniform").
+
+        Every MoE forward that saves activations then runs inside the backward as the last
+        layer of its segment, which that backward consumes on the spot, so nothing is worth a
+        stash. The flag must then cost nothing: the recomputed activations do not size the
+        page buffers, none is allocated (the manager says so once), and the eager step, the
+        capture and the replayed step reproduce the step that ran before the stash was armed."""
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        config.ENABLE_EXPERIMENTAL = True
+        with self._chunk_graph_run(expert_model_parallel_size=1) as helpers:
+            model = self._build_model(
+                num_layers=2,
+                recompute_granularity="full",
+                recompute_method="uniform",
+                recompute_num_layers=1,
+            )
+            batch = self._get_batch()
+            stash_manager = PagedStashManager.get_instance()
+
+            # Warm-up step 1: schedule and capacity discovery. The only activations saved for
+            # a backward are those of the recompute forwards, which are never stashed.
+            loss = self._forward(model, batch)
+            loss.backward()
+            assert stash_manager.status == 'capture'
+            assert stash_manager.runtime_schedule
+            assert not stash_manager.max_tokens_across_vp_stages, (
+                "activations of a backward-time recompute sized the page buffers: "
+                f"{stash_manager.max_tokens_across_vp_stages}"
+            )
+            reference = self._step_result(model, loss)
+
+            # Warm-up step 2: the stash is armed and has nothing to hold.
+            loss = self._forward(model, batch)
+            assert stash_manager.status == 'captured'
+            assert stash_manager.stash_buffers == {}, "page buffers were allocated for nothing"
+            assert stash_manager._warned_nothing_to_stash
+            loss.backward()
+            self._assert_same_step(self._step_result(model, loss), reference, "eager step")
+
+            self._evaluate(model, batch)
+            helper = TECudaGraphHelper(
+                model=[model], config=model.config, seq_length=self.seq_length, micro_batch_size=1
+            )
+            helpers.append(helper)
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+            assert len(model.decoder.cuda_graphs) > 0
+
+            loss = self._forward(model, batch)
+            loss.backward()
+            torch.cuda.synchronize()
+            assert stash_manager.stash_buffers == {}
+            assert check_paged_stash_overflow().any().item() == 0
+            assert check_paged_stash_host_spill().any().item() == 0
+            self._assert_same_step(self._step_result(model, loss), reference, "replayed step")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    def test_pp1_recompute_segment_stashes_all_but_its_last_layer(self, monkeypatch):
+        """PP=1, two layers in one recompute segment (full recompute, "uniform", two layers).
+
+        The forward saves nothing; the recompute runs both layers inside the backward, which
+        then walks them in reverse. The first layer's activations wait for the second layer's
+        backward, so they are stashed (as the recorded-order schedule of the eager mode does);
+        the second layer's are consumed at once and stay in place. The page buffers are sized
+        for exactly that one layer, and the eager step with stash and the replayed step
+        reproduce the loss and every gradient of the step that stashed nothing."""
+        from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+
+        config.ENABLE_EXPERIMENTAL = True
+        with self._chunk_graph_run(expert_model_parallel_size=1) as helpers:
+            model = self._build_model(
+                num_layers=2,
+                recompute_granularity="full",
+                recompute_method="uniform",
+                recompute_num_layers=2,
+            )
+            batch = self._get_batch()
+            stash_manager = PagedStashManager.get_instance()
+
+            def page_use():
+                torch.cuda.synchronize()
+                return _cuda_page_use(stash_manager)
+
+            # Warm-up step 1: schedule and capacity discovery, nothing is stashed. Record the
+            # tensors each recompute commit holds and those that are counted for the buffers.
+            commits, counted = [], []
+            with monkeypatch.context() as patch:
+                defer = stash_manager.defer_recompute_commit
+                count = stash_manager._count_stash_tokens
+
+                def recording_defer(ctx, schedule_layer):
+                    defer(ctx, schedule_layer)
+                    commits.append(len(stash_manager._deferred_recompute_commit[2]))
+
+                def recording_count(*record):
+                    counted.append(record)
+                    count(*record)
+
+                patch.setattr(stash_manager, "defer_recompute_commit", recording_defer)
+                patch.setattr(stash_manager, "_count_stash_tokens", recording_count)
+                loss = self._forward(model, batch)
+                loss.backward()
+            assert stash_manager.status == 'capture'
+            assert len(commits) == 2 and commits[0] == commits[1] > 0, commits
+            # The buffers are sized for the first layer of the segment only.
+            assert len(counted) == commits[0], (len(counted), commits)
+            assert stash_manager.max_tokens_across_vp_stages
+            reference = self._step_result(model, loss)
+
+            # Warm-up step 2: the eager forward stashes nothing (it saves nothing), the eager
+            # backward stashes the first layer of the segment and releases its pages again.
+            loss = self._forward(model, batch)
+            assert stash_manager.status == 'captured'
+            assert stash_manager.stash_buffers
+            assert page_use() == (0, 0), "the no-grad forward of a checkpoint stashed"
+            loss.backward()
+            allocated, held = page_use()
+            assert allocated > 0, "the recompute segment's first layer was not stashed"
+            assert held == 0, f"the backward left {held} stash pages unreleased"
+            self._assert_same_step(
+                self._step_result(model, loss), reference, "eager step with stash"
+            )
+
+            self._evaluate(model, batch)
+            helper = TECudaGraphHelper(
+                model=[model], config=model.config, seq_length=self.seq_length, micro_batch_size=1
+            )
+            helpers.append(helper)
+            helper.create_cudagraphs()
+            assert helper.graphs_created()
+
+            # Replayed step: the stash and the reload of the first layer are part of the
+            # backward graph.
+            loss = self._forward(model, batch)
+            assert page_use() == (0, 0)
+            loss.backward()
+            assert page_use() == (allocated, 0), "the backward graph moved other pages than eager"
+            assert check_paged_stash_overflow().any().item() == 0
+            assert check_paged_stash_host_spill().any().item() == 0
+            self._assert_same_step(self._step_result(model, loss), reference, "replayed step")
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
     def test_capture_on_constant_samples_leaves_no_over_budget_flag(self):
         """Transformer Engine warms every block up on constant sample inputs before it records
         the graphs. All tokens then take one route, so the rank that hosts the chosen expert

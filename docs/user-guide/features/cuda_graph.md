@@ -292,9 +292,12 @@ so any number of live slots can replay. The captured callables' static inputs (t
 the offload release, and the group hooks are no-ops outside a capture-time forward, so a full
 activation recompute captured into the backward graph neither offloads nor reloads (a fully
 recomputed block saves no activations to offload in the first place, so offloading only pays for
-layers that are not recomputed). With pipeline parallelism use `--recompute-method block` for that
-combination: uniform full recompute with offloading stops on a chunk-mismatch assertion of the eager
-offload schedule, with or without CUDA graphs, and the warm-up iterations run that schedule.
+layers that are not recomputed). With pipeline parallelism the combination is limited by the eager
+offload schedule, which the warm-up iterations run: it works with two pipeline stages when at least
+one layer of every stage is kept out of the recompute (`--recompute-method block` with
+`--recompute-num-layers` below the stage's layer count). With every layer of a stage recomputed
+(uniform full recompute, or the block method over all layers), or with three or more pipeline
+stages, that schedule stops on a chunk-mismatch assertion, with or without CUDA graphs.
 Because a slot's graphs are self-contained, the copies that eager
 overlaps with the *next* microbatch (the last groups' D2H at the end of a forward, the first group's
 reload at the start of a backward) cannot be hidden the same way, so the copies cost more step time
@@ -316,7 +319,18 @@ lifetime, so eager offloads after a deletion use the remaining tail).
 `--moe-paged-stash` works in a runtime-keyed mode: each MoE layer stashes its own activations after
 its forward and reloads them right before its own backward (no cross-layer prefetch; GPU pages only
 by default), at any pipeline size, so the captured graphs do not depend on the recorded pipeline
-order; it needs TE >= 2.19 and `--cuda-graph-warmup-steps >= 2`.
+order; it needs TE >= 2.19 and `--cuda-graph-warmup-steps >= 2`. A MoE layer that is recomputed in
+the backward (full recompute, or selective recompute of `moe`) is stashed only when another MoE layer
+of the same recompute segment follows it; the last one of a segment is consumed by that backward at
+once and stays in place, as in the eager schedule. Only stashed layers count towards the size of the
+page buffers. With one MoE layer per segment and every MoE layer recomputed, the flag therefore has
+no effect: no page buffers are allocated and a warning says so. As at larger pipeline sizes, a stash
+that overflows its page buffers after the capture stops the run (raise
+`--moe-paged-stash-buffer-size-factor-cuda`), and so does a rank whose routed tokens exceed
+`--moe-expert-rank-capacity-factor`: a captured graph cannot repeat the step without the budget as
+the eager schedule does. Without pipeline parallelism the stash saves what the capacity factor pads:
+in a 16-layer MXFP8 MoE proxy (8 experts, top-4, 4096 tokens per rank, PP=1) it lowered the peak
+allocation by 9 % at a capacity factor of 2.0 and by 0.3 % at 1.25, at the same step time.
 
 `--dsa-cp-balance-indexer` with `--sequence-packing-scheduler dp_balanced` works in its graph-dynamic
 mode: the per-pack route pair becomes two static inputs of the block graph (refreshed per replay

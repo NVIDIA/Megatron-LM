@@ -4423,6 +4423,12 @@ def set_current_microbatch(model, microbatch_id):
     except RuntimeError:
         decoder_exists = False
     if decoder_exists and model_with_decoder is not None:
+        if is_chunk_wise_cuda_graph(
+            getattr(model_with_decoder.decoder, 'config', None)
+        ) and hasattr(model_with_decoder, 'language_model'):
+            # A wrapper around the language model (TECudaGraphHelper captures the wrapped
+            # model's callables): its post-process block has to follow the microbatch as well.
+            model_with_decoder = model_with_decoder.language_model
         model_with_decoder.decoder.current_microbatch = microbatch_id
         for layer in model_with_decoder.decoder.layers:
             layer.current_microbatch = microbatch_id

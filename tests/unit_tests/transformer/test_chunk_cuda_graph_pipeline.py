@@ -653,6 +653,83 @@ class TestChunkCudaGraphPipeline:
                     for key, result in results.items():
                         _assert_result_matches(result, reference[key], f"step {step} replay {key}")
 
+    @pytest.mark.parametrize("attention", ["transformer_engine", "megatron"])
+    @pytest.mark.parametrize("attention_mask", ["from_dataloader", "none"])
+    def test_fixed_length_graph_captured_with_the_dataloader_attention_mask(
+        self, attention_mask, attention
+    ):
+        """Fixed-length batches with ``create_attention_mask_in_dataloader`` (the default).
+
+        The block graph takes the dataloader's attention mask as a static input. The training
+        script hands that mask to the first and the last pipeline stage only: a stage in between
+        gets no batch at all and calls its block with ``attention_mask=None``. Both calls must
+        replay, and match the eager model called the same way. Transformer Engine's attention
+        applies its causal mask itself; Megatron's own attention (``fallback_to_eager_attn``)
+        applies a given mask as its only mask, so a replay that passed a mask without the causal
+        part there would let every token attend to its successors."""
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
+        num_microbatches, micro_batch_size, seq_length = 4, 2, 32
+        self._init_num_microbatches(num_microbatches, micro_batch_size)
+        settings = dict(
+            num_layers=4, pipeline_model_parallel_size=2, microbatch_group_size_per_vp_stage=2
+        )
+        build_kwargs = {}
+        if attention == "megatron":
+            settings["fallback_to_eager_attn"] = True
+            build_kwargs["layer_spec"] = get_gpt_layer_with_transformer_engine_spec(
+                fallback_to_eager_attn=True
+            )
+        with _training_stream():
+            config, models, eager_models = _build_graph_and_eager_chunks(settings, **build_kwargs)
+            assert config.create_attention_mask_in_dataloader
+            core = models[0].module
+            hidden_shape = (seq_length, micro_batch_size, _HIDDEN)
+            mask = None
+            if attention_mask == "from_dataloader":
+                # get_ltor_masks_and_position_ids: True above the diagonal.
+                mask = ~torch.tril(
+                    torch.ones((micro_batch_size, 1, seq_length, seq_length), device="cuda")
+                ).bool()
+            feeds = []
+            for microbatch in range(num_microbatches):
+                generator = torch.Generator(device="cpu").manual_seed(microbatch)
+                tokens = torch.randint(
+                    0, _VOCAB, (micro_batch_size, seq_length + 1), generator=generator
+                ).cuda()
+                feeds.append(
+                    dict(
+                        inputs=dict(
+                            input_ids=tokens[:, :-1].contiguous(),
+                            position_ids=torch.arange(seq_length, device="cuda").expand(
+                                micro_batch_size, -1
+                            ),
+                            attention_mask=mask,
+                            labels=tokens[:, 1:].contiguous() if core.post_process else None,
+                        ),
+                        hidden=(
+                            None
+                            if core.pre_process
+                            else _noise(hidden_shape, 0, Utils.rank, microbatch)
+                        ),
+                        output_grad=(
+                            None
+                            if core.post_process
+                            else _noise(hidden_shape, 1, Utils.rank, microbatch)
+                        ),
+                        loss_mask=torch.ones(micro_batch_size, seq_length, device="cuda"),
+                    )
+                )
+            feeds = [feeds]
+            order = _pipeline_order(config, num_microbatches)
+            reference, _ = _run_pipeline_order(eager_models, feeds, order)
+
+            with _captured_graphs(models, config, seq_length, micro_batch_size):
+                assert len(core.decoder.cuda_graphs) == num_microbatches
+                for step in range(2):
+                    results, _ = _run_pipeline_order(models, feeds, order)
+                    for key, result in results.items():
+                        _assert_result_matches(result, reference[key], f"step {step} replay {key}")
+
     @pytest.mark.parametrize("metadata", ["full_length", "sp_sharded", "hybrid"])
     def test_later_stage_token_metadata_under_sequence_parallelism(self, metadata):
         """Packed sequences, TP 2 with sequence parallelism, a chunk without the embedding.

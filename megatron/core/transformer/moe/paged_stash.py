@@ -400,21 +400,21 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
         ctx.runtime_stash = False
 
         # Initiate stash for current layer and reload for next layer
-        if stash_manager.status == 'captured':
-            current_schedule_layer = stash_manager.get_schedule_layer(
-                ctx.vp_stage + 1, ctx.layer_no, ctx.microbatch_no
-            )
+        current_schedule_layer = stash_manager.get_schedule_layer(
+            ctx.vp_stage + 1, ctx.layer_no, ctx.microbatch_no
+        )
+        if stash_manager.runtime_schedule and torch._C._current_graph_task_id() != -1:
+            # Runtime-keyed mode, forward inside a backward pass: an activation checkpoint's
+            # recompute. Whether this layer is worth a stash depends on what follows it, which
+            # only the next commit or this layer's own backward tells (see the manager).
+            stash_manager.defer_recompute_commit(ctx, current_schedule_layer)
+        elif stash_manager.status == 'captured':
             if stash_manager.runtime_schedule:
                 # Runtime-keyed mode (chunk CUDA graphs): every layer stashes its own
                 # activations and reloads them right before its own backward, so the captured
                 # graphs do not depend on the recorded pipeline order, at any pipeline size.
-                # A forward that runs inside a backward pass is an activation checkpoint's
-                # recompute, which that backward consumes at once: its activations stay put.
-                ctx.runtime_stash = torch._C._current_graph_task_id() == -1
-                if ctx.runtime_stash:
-                    ctx.stash_manager.stash_paged_tensors(current_schedule_layer)
-                else:
-                    ctx.stash_manager.remove_paged_tensor_from_stash()
+                ctx.runtime_stash = True
+                ctx.stash_manager.stash_paged_tensors(current_schedule_layer)
             else:
                 next_schedule_layer = ctx.stash_manager._pp_schedule[
                     ctx.stash_manager.current_schedule_index + 1
@@ -444,6 +444,9 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
                         ctx.vp_stage + 1, ctx.layer_no, ctx.microbatch_no
                     )
                 )
+            else:
+                # A recompute commit whose own backward comes first keeps its activations.
+                ctx.stash_manager.keep_recompute_commit_in_place(ctx)
             ctx.stash_manager.update_pp_schedule(
                 -(ctx.vp_stage + 1), -ctx.layer_no, -ctx.microbatch_no
             )
@@ -466,6 +469,10 @@ class PagedStashManager:
     """
 
     STASH_MGR = None
+    # Defaults for instances that did not run __init__ (stand-ins in unit tests).
+    runtime_schedule = False
+    _warned_nothing_to_stash = False
+    _deferred_recompute_commit = None
 
     @classmethod
     def get_instance(cls):
@@ -503,6 +510,12 @@ class PagedStashManager:
         # Runtime-keyed mode: stash/reload keys come from the live (vp, layer, microbatch)
         # counters instead of the recorded pipeline order (chunk CUDA graphs).
         self.runtime_schedule = False
+        self._warned_nothing_to_stash = False
+        # Runtime-keyed mode, backward-time recompute: the commit whose stash is undecided,
+        # as (autograd ctx, schedule layer, its paged tensors), and during schedule discovery
+        # the paged tensors that the commit in progress has saved so far.
+        self._deferred_recompute_commit = None
+        self._recompute_commit_tensors = []
 
         # Track max tokens needed across all vp_stages grouped by dtype and hidden_size
         self.max_tokens_across_vp_stages = None
@@ -559,6 +572,75 @@ class PagedStashManager:
             self.paged_tensors_to_stash.clear()
         else:
             pass
+
+    def defer_recompute_commit(self, ctx, pp_schedule_layer):
+        """Runtime-keyed mode: a MoE layer committed inside a backward-time recompute.
+
+        The recorded-order schedule stashes a layer unless its own backward is the next entry.
+        A recompute forward runs its segment's layers one after the other and the backward then
+        walks them in reverse, so only the last layer of a segment is consumed at once; with
+        one layer per segment that is every layer. The runtime-keyed mode cannot look ahead, so
+        it holds the commit back: the next commit of the same recompute shows that this one is
+        not the last and stashes it (``_settle_recompute_commit``), its own backward shows that
+        it is and leaves its activations in place (``keep_recompute_commit_in_place``).
+        During schedule discovery the same decision selects the tensors that size the buffers.
+        """
+        self._settle_recompute_commit(stash=True)
+        if self.status == 'captured':
+            tensors, self.paged_tensors_to_stash = self.paged_tensors_to_stash, []
+        else:
+            tensors, self._recompute_commit_tensors = self._recompute_commit_tensors, []
+        self._deferred_recompute_commit = (ctx, pp_schedule_layer, tensors)
+
+    def keep_recompute_commit_in_place(self, ctx):
+        """The backward of ``ctx`` runs: if its stash was still undecided, it is not needed."""
+        deferred = self._deferred_recompute_commit
+        if deferred is not None and deferred[0] is ctx:
+            self._settle_recompute_commit(stash=False)
+
+    def _settle_recompute_commit(self, stash):
+        """Decide the held-back recompute commit, if any."""
+        deferred = self._deferred_recompute_commit
+        if deferred is None:
+            return
+        self._deferred_recompute_commit = None
+        ctx, pp_schedule_layer, tensors = deferred
+        if not stash:
+            return
+        if self.status == 'captured':
+            # The queue already holds the saves of the commit that revealed the decision.
+            held, self.paged_tensors_to_stash = self.paged_tensors_to_stash, tensors
+            ctx.runtime_stash = True
+            self.stash_paged_tensors(pp_schedule_layer)
+            self.paged_tensors_to_stash = held
+        elif self.status == 'capture':
+            for paged_tensor in tensors:
+                self._count_stash_tokens(*paged_tensor.stash_size_record)
+                paged_tensor.stash_size_record = None
+
+    def _count_stash_tokens(self, key, actual_num_tokens, avg_num_tokens):
+        """Schedule discovery: add one saved tensor to the live totals that size the buffers.
+
+        ``key`` is ``(dtype, hidden_size)``; ``avg_num_tokens`` is None without the hint.
+        """
+        if key not in self.temp_tokens_across_vp_stages:
+            self.temp_tokens_across_vp_stages[key] = 0
+            self.max_tokens_across_vp_stages[key] = 0
+            self.temp_avg_tokens_across_vp_stages[key] = 0
+            self.max_avg_tokens_across_vp_stages[key] = 0
+
+        self.temp_tokens_across_vp_stages[key] += actual_num_tokens
+        self.max_tokens_across_vp_stages[key] = max(
+            self.max_tokens_across_vp_stages[key], self.temp_tokens_across_vp_stages[key]
+        )
+
+        # Track avg tokens across vp stages (if provided) using the same accumulation model.
+        if avg_num_tokens is not None:
+            self.temp_avg_tokens_across_vp_stages[key] += avg_num_tokens
+            self.max_avg_tokens_across_vp_stages[key] = max(
+                self.max_avg_tokens_across_vp_stages[key],
+                self.temp_avg_tokens_across_vp_stages[key],
+            )
 
     def stash_paged_tensors(self, pp_schedule_layer):
         """Stash the paged tensors."""
@@ -767,6 +849,25 @@ class PagedStashManager:
         assert (
             self.stash_buffers is not None
         ), "Paged stash: captured state but stash_buffers is None after allocation."
+        if (
+            self.runtime_schedule
+            and not self.stash_buffers
+            # {}: this rank saved MoE activations, but none in a commit that is stashed. None: it
+            # has no paged MoE layer at all (e.g. a dense pipeline stage), which needs no remark.
+            and self.max_tokens_across_vp_stages is not None
+            and not self._warned_nothing_to_stash
+        ):
+            self._warned_nothing_to_stash = True
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Paged stash: moe_paged_stash has no effect on this rank. Every MoE layer of its "
+                "pipeline stage is recomputed in the backward as the last MoE layer of its "
+                "recompute segment (full recompute with one MoE layer per segment, or selective "
+                "recompute of 'moe'), so its activations are consumed at once: nothing is "
+                "stashed and no page buffers are allocated here. Other pipeline stages may "
+                "still stash.",
+            )
         for dtype_buffers in self.stash_buffers.values():
             for stash_buffer in dtype_buffers.values():
                 stash_buffer.reset()
@@ -1045,6 +1146,7 @@ class PagedStashManager:
             self.temp_avg_tokens_across_vp_stages = {}
 
         avg_num_tokens = None
+        stash_size_record = None
         if self.status == 'capture':
 
             self.num_tokens = self.num_tokens_tensor.item()
@@ -1054,29 +1156,24 @@ class PagedStashManager:
 
             avg_num_tokens = int(self.avg_num_tokens) if self.avg_num_tokens is not None else None
 
-            if (dtype, hidden_size) not in self.temp_tokens_across_vp_stages:
-                self.temp_tokens_across_vp_stages[dtype, hidden_size] = 0
-                self.max_tokens_across_vp_stages[dtype, hidden_size] = 0
-                self.temp_avg_tokens_across_vp_stages[dtype, hidden_size] = 0
-                self.max_avg_tokens_across_vp_stages[dtype, hidden_size] = 0
-
-            self.temp_tokens_across_vp_stages[dtype, hidden_size] += actual_num_tokens
-            self.max_tokens_across_vp_stages[dtype, hidden_size] = max(
-                self.max_tokens_across_vp_stages[dtype, hidden_size],
-                self.temp_tokens_across_vp_stages[dtype, hidden_size],
+            stash_size_record = (
+                (dtype, hidden_size),
+                actual_num_tokens,
+                (
+                    None
+                    if avg_num_tokens is None
+                    else (
+                        avg_num_tokens
+                        if not columnwise_scale_inv
+                        else avg_num_tokens // SCALE_INV_BLOCK_SIZE
+                    )
+                ),
             )
-
-            # Track avg tokens across vp stages (if provided) using the same accumulation model.
-            if avg_num_tokens is not None:
-                self.temp_avg_tokens_across_vp_stages[dtype, hidden_size] += (
-                    avg_num_tokens
-                    if not columnwise_scale_inv
-                    else avg_num_tokens // SCALE_INV_BLOCK_SIZE
-                )
-                self.max_avg_tokens_across_vp_stages[dtype, hidden_size] = max(
-                    self.max_avg_tokens_across_vp_stages[dtype, hidden_size],
-                    self.temp_avg_tokens_across_vp_stages[dtype, hidden_size],
-                )
+            if not (self.runtime_schedule and torch._C._current_graph_task_id() != -1):
+                self._count_stash_tokens(*stash_size_record)
+                stash_size_record = None
+            # else: a backward-time recompute in the runtime-keyed mode. Its tensors count
+            # only if the commit turns out to be stashed (defer_recompute_commit).
 
             # Since capture stage does not use CUDA graph, we can truncate
             # the saved tensor to actual num_tokens
@@ -1105,6 +1202,11 @@ class PagedStashManager:
             page_size=self.page_size,
         )
 
+        # Not None: schedule discovery has not counted this tensor towards the buffer sizes.
+        paged_tensor.stash_size_record = stash_size_record
+        if stash_size_record is not None:
+            self._recompute_commit_tensors.append(paged_tensor)
+
         if self.status == 'captured':
             self.add_paged_tensor_to_stash(paged_tensor)
         return paged_tensor
@@ -1119,14 +1221,17 @@ class PagedStashManager:
             if self.status == 'capture':
                 num_tokens = saved_state.num_tokens_tensor.item()
                 key = (saved_state.dtype, saved_state.hidden_size)
-                if key in self.temp_tokens_across_vp_stages:
+                # A recompute tensor that was never counted (its commit was not stashed).
+                counted = getattr(saved_state, "stash_size_record", None) is None
+                if counted and key in self.temp_tokens_across_vp_stages:
                     self.temp_tokens_across_vp_stages[key] -= (
                         num_tokens
                         if not columnwise_scale_inv
                         else num_tokens // SCALE_INV_BLOCK_SIZE
                     )
                 if (
-                    saved_state.avg_num_tokens is not None
+                    counted
+                    and saved_state.avg_num_tokens is not None
                     and key in self.temp_avg_tokens_across_vp_stages
                 ):
                     self.temp_avg_tokens_across_vp_stages[key] -= (
@@ -1252,9 +1357,10 @@ def configure_runtime_schedule(stash_manager, enabled, config):
     Chunk-wise TE CUDA graphs capture whole decoder blocks, so a captured backward holds each
     layer's reload (and, with full recompute, its recompute forward) itself. The stash keys are
     then the live (vp, layer, microbatch) coordinates and no cross-layer prefetch is derived from
-    the recorded pipeline order: every layer stashes its own activations in the forward and
-    reloads them before its own backward, so PP=1 and the last pipeline stage take the same path
-    as any other stage. Sets ``runtime_schedule`` on ``stash_manager``.
+    the recorded pipeline order: a layer that saves its activations in the forward stashes them
+    there and reloads them before its own backward, so PP=1 and the last pipeline stage take the
+    same path as any other stage; a layer that is recomputed in the backward follows
+    ``PagedStashManager.defer_recompute_commit``. Sets ``runtime_schedule`` on ``stash_manager``.
     """
     stash_manager.runtime_schedule = bool(
         enabled
@@ -1284,6 +1390,8 @@ def paged_stash_prepare_for_cuda_graph_capture(config):
     # their stash hooks (that iteration's reset sets ``enabled`` for its own pass anyway).
     stash_manager.enabled = True
     configure_runtime_schedule(stash_manager, True, config)
+    stash_manager._deferred_recompute_commit = None
+    stash_manager._recompute_commit_tensors = []
     # Restart the runtime coordinates as well: every evaluation forward advances the microbatch
     # counter, a disabled reset returns before it restarts them, and a stash key holds three
     # digits per field. The first capture-time forward opens them again (update_model_chunk).
@@ -1305,6 +1413,9 @@ def paged_stash_reset(enabled=True, config=None):
     stash_manager = PagedStashManager.get_instance()
     stash_manager.enabled = enabled
     configure_runtime_schedule(stash_manager, enabled, config)
+    # A recompute commit is decided within its own backward; nothing carries over a schedule.
+    stash_manager._deferred_recompute_commit = None
+    stash_manager._recompute_commit_tensors = []
     stash_manager.iteration += 1
     if config is not None:
         stash_manager.page_size = config.moe_paged_stash_page_size

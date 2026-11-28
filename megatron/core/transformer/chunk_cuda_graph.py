@@ -18,6 +18,8 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer.dot_product_attention import DotProductAttention
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import GraphableMegatronModule
 
 
@@ -34,6 +36,10 @@ class ChunkCudaGraphBlockMixin:
     """
 
     is_cuda_graph_chunk_callable = True
+    # Whether the graphs were captured with the dataloader's attention mask as a static input
+    # (get_layer_static_inputs), and the mask a replay passes when the caller has none.
+    _chunk_graph_captures_attention_mask = False
+    _attention_mask_for_a_missing_mask = None
 
     def _chunk_cp_group(self):
         """Explicit CP group of the captured block (the post-process block uses its owner's)."""
@@ -124,6 +130,9 @@ class ChunkCudaGraphBlockMixin:
             )
         if (
             getattr(self, "_has_linear_layer_with_chunkwise_cp", False)
+            # The flag says which layers would run chunkwise; the stack only does so with more
+            # than one context-parallel rank (dynamic CP is not captured, so the size is static).
+            and self.config.context_parallel_size > 1
             and self._is_thd_cuda_graph()
         ):
             raise ValueError(
@@ -190,6 +199,7 @@ class ChunkCudaGraphBlockMixin:
                 (batch, tokens), dtype=torch.bool, device=device
             )
         self._chunk_graph_captures_padding_mask = captures_padding_mask
+        self._chunk_graph_captures_attention_mask = "attention_mask" in static_inputs
         if config.moe_n_hash_layers > 0 and any(
             getattr(module, "is_hash_layer", False) for module in self.modules()
         ):
@@ -469,6 +479,61 @@ class ChunkCudaGraphBlockMixin:
 
         return output
 
+    def _supply_attention_mask_of_a_fixed_length_graph(self, hidden_states, kwargs):
+        """Give a fixed-length graph that was captured with an attention mask one at replay.
+
+        With ``create_attention_mask_in_dataloader`` the fixed-length capture takes the
+        dataloader's attention mask as a static input (``get_layer_static_inputs``). The
+        training script hands that mask to the first and the last pipeline stage only: a stage
+        in between receives no batch, so its block is called with ``attention_mask=None``, and
+        the graphed callable refuses a replay that lacks a captured keyword. Pass the mask that
+        means the same as a missing one to the attention of this block:
+
+        * Transformer Engine's attention applies the mask of its ``attn_mask_type`` itself and
+          ignores a given mask or combines the two, so a mask that masks nothing equals none
+          (what the per-layer replay passes, ``TransformerLayer._get_te_cuda_graph_replay_args``);
+        * Megatron's own ``DotProductAttention`` (``fallback_to_eager_attn``) applies a given
+          mask as its only mask and builds the causal one just for a missing mask, so there
+          the causal mask equals none.
+        """
+        if not self._chunk_graph_captures_attention_mask:
+            return
+        if kwargs.get("attention_mask") is not None:
+            return
+        # hidden_states is [tokens, batch, hidden] in the block's own frame: CP-local and, with
+        # sequence parallelism, TP-local. The mask is [batch, 1, CP-local tokens, tokens].
+        local_seq_length, micro_batch_size = hidden_states.shape[0], hidden_states.shape[1]
+        if self.config.sequence_parallel:
+            local_seq_length *= self.config.tensor_model_parallel_size
+        shape = (
+            micro_batch_size,
+            1,
+            local_seq_length,
+            local_seq_length * self.config.context_parallel_size,
+        )
+        mask = self._attention_mask_for_a_missing_mask
+        if mask is None or mask.shape != shape or mask.device != hidden_states.device:
+            mask = torch.zeros(shape, dtype=torch.bool, device=hidden_states.device)
+            mask_reading_attention = [
+                module for module in self.modules() if isinstance(module, DotProductAttention)
+            ]
+            if mask_reading_attention:
+                if self.config.context_parallel_size > 1 or any(
+                    module.attn_mask_type != AttnMaskType.causal
+                    for module in mask_reading_attention
+                ):
+                    raise ValueError(
+                        "cuda_graph_impl='chunk_wise' captured this block with the dataloader's "
+                        "attention mask, but the block was called without one (a pipeline stage "
+                        "that is neither the first nor the last receives no batch). With "
+                        "fallback_to_eager_attn the missing mask can only be replaced for causal "
+                        "attention without context parallelism: pass the attention mask on "
+                        "every stage or set create_attention_mask_in_dataloader=False."
+                    )
+                mask = ~torch.tril(torch.ones_like(mask))
+            self._attention_mask_for_a_missing_mask = mask
+        kwargs["attention_mask"] = mask
+
     def _te_cuda_graph_replay(self, *args, **kwargs):
         """Replay the graph of microbatch ``current_microbatch``."""
         if self.config.cuda_graph_impl != "chunk_wise":
@@ -476,7 +541,9 @@ class ChunkCudaGraphBlockMixin:
 
         args, kwargs = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
         self._decompose_packed_seq_params_to_kwargs(kwargs)
-        self._align_token_metadata_to_block(args[0] if args else kwargs["hidden_states"], kwargs)
+        hidden_states = args[0] if args else kwargs["hidden_states"]
+        self._align_token_metadata_to_block(hidden_states, kwargs)
+        self._supply_attention_mask_of_a_fixed_length_graph(hidden_states, kwargs)
         # Only tensors are graph inputs; a keyword that is None at runtime was not captured.
         kwargs = {key: value for key, value in kwargs.items() if value is not None}
 
