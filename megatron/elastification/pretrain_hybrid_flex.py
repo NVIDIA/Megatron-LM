@@ -124,6 +124,9 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     Returns:
         HybridModel: The returned model
     """
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
     args = get_args()
     cfg_container = get_run_config()
     if has_nvidia_modelopt:
@@ -173,7 +176,8 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
         position_embedding_type=args.position_embedding_type,
         rotary_percent=args.rotary_percent,
         rotary_base=args.rotary_base,
-        vp_stage=vp_stage
+        vp_stage=vp_stage,
+        pg_collection=pg_collection,
     )
     from megatron.elastification.flextron_utils import (
         inject_flextron_forward_logic,

@@ -6,34 +6,40 @@
 import json
 import os
 import sys
+
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__),
                                              os.path.pardir, os.path.pardir)))
-import torch
-from megatron.training import get_args
-from megatron.training import get_tokenizer
-from megatron.training import print_rank_0
-from megatron.training.checkpointing import load_checkpoint
-from megatron.core import mpu
-from megatron.training.arguments import parse_and_validate_args
-from megatron.training.initialize import initialize_megatron
-from megatron.training import get_model
-from megatron.inference.text_generation import generate_and_post_process
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.core.models.gpt import GPTModel
 from typing import Union
-from megatron.core.transformer.spec_utils import import_module
-from megatron.training.arguments import core_transformer_config_from_args
-from megatron.training.global_vars import get_run_config, set_run_config
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_layer_local_spec
-from megatron.training.argument_utils import inference_cfg_container_from_args
 
-def model_provider(pre_process=True, post_process=True) -> GPTModel:
+import torch
+
+from megatron.core import mpu
+from megatron.core.models.gpt import GPTModel
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+)
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.transformer.spec_utils import import_module
+from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
+from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.initialize import initialize_megatron
+
+
+def model_provider(
+    pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None
+) -> GPTModel:
     """Builds the model.
 
     Args:
         pre_process (bool, optional): Set to true if you need to compute embedings. Defaults to True.
         post_process (bool, optional): Set to true if you need to want to compute output logits/loss. Defaults to True.
-
+        vp_stage: Virtual pipeline stage supplied by get_model.
+        config: Transformer configuration supplied by get_model.
+        pg_collection: Process groups supplied by get_model.
 
     Returns:
         GPTModel: The returned model
@@ -42,7 +48,10 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     cfg_container = get_run_config()
 
     print_rank_0('building GPT model ...')
-    config = core_transformer_config_from_args(args)
+    if config is None:
+        config = core_transformer_config_from_args(args)
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     if args.spec is None:
         if args.transformer_impl == 'local':
@@ -77,7 +86,9 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
         parallel_output=False,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,
-        rotary_percent=args.rotary_percent
+        rotary_percent=args.rotary_percent,
+        vp_stage=vp_stage,
+        pg_collection=pg_collection,
     )
 
     return model
@@ -109,6 +120,8 @@ def add_text_generate_args(parser):
     return parser
 
 def generate_samples_unconditional(model):
+    from megatron.inference.text_generation import generate_and_post_process
+
     args = get_args()
 
     if torch.distributed.get_rank() == 0:
@@ -146,6 +159,8 @@ def generate_samples_unconditional(model):
 
 
 def generate_samples_conditional(model):
+    from megatron.inference.text_generation import generate_and_post_process
+
     args = get_args()
 
     if torch.distributed.get_rank() == 0:

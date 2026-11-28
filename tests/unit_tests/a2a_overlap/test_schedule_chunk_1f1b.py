@@ -12,6 +12,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe import fused_a2a
 from megatron.core.transformer.moe.token_dispatcher import nccl_ep_release_context
@@ -79,6 +80,7 @@ def build_model(config, use_padding_mask=False, use_mtp_input_mask=False, post_p
         pre_process=True,
         post_process=post_process,
         max_sequence_length=max_seq_len,
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     f_schedule_plan = gpt_model.build_schedule_plan(**data)
     return gpt_model, f_schedule_plan, data

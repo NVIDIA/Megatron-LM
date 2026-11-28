@@ -88,6 +88,8 @@ def _build_pg_collection(
     tp_dp_cp_group = grid.create_pg(["tp", "cp", "dp"])
     embd_group_ranks = mpu.default_embedding_ranks(dist.get_process_group_ranks(pp_group))
     embd_group = dist.new_group(ranks=embd_group_ranks)
+    if embd_group == dist.GroupMember.NON_GROUP_MEMBER:
+        embd_group = None
     pos_embd_group_ranks = mpu.default_position_embedding_ranks(
         dist.get_process_group_ranks(pp_group)
     )

@@ -16,6 +16,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel, _cross_entropy_mxfp8_grad_format
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -173,6 +174,7 @@ class TestGPTModelOutputLayerSelection:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert isinstance(model.output_layer, tensor_parallel.ColumnParallelLinear)
         assert not isinstance(model.output_layer, TELMHeadColumnParallelLinear)
@@ -188,6 +190,7 @@ class TestGPTModelOutputLayerSelection:
             vocab_size=100,
             max_sequence_length=4,
             logit_dtype=torch.float32,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert model.output_layer.output_dtype == torch.float32
 
@@ -213,6 +216,7 @@ class TestGPTModelOutputLayerSelection:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=128,
             max_sequence_length=8,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert isinstance(model.output_layer, TELMHeadColumnParallelLinear)
 
@@ -227,6 +231,7 @@ class TestGPTModelOutputLayerSelection:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=128,
             max_sequence_length=8,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert isinstance(model.output_layer, TELMHeadColumnParallelLinear)
 
@@ -412,6 +417,7 @@ class TestCrossEntropyMxfp8Grad:
             vocab_size=256,
             max_sequence_length=seq_len,
             mtp_block_spec=mtp_block_spec,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
 
     @staticmethod
@@ -508,6 +514,7 @@ class TestCrossEntropyMxfp8GradBinding:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=256,
             max_sequence_length=64,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     @pytest.mark.internal
@@ -577,7 +584,11 @@ class TestCrossEntropyMxfp8GradRejectedByOtherModels:
         from megatron.core.models.hybrid.hybrid_model import HybridModel
 
         return HybridModel(
-            config=config, hybrid_stack_spec=None, vocab_size=256, max_sequence_length=64
+            config=config,
+            hybrid_stack_spec=None,
+            vocab_size=256,
+            max_sequence_length=64,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     @staticmethod
@@ -590,6 +601,7 @@ class TestCrossEntropyMxfp8GradRejectedByOtherModels:
             transformer_layer_spec=None,
             vocab_size=256,
             max_sequence_length=64,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     @staticmethod
@@ -603,6 +615,7 @@ class TestCrossEntropyMxfp8GradRejectedByOtherModels:
             transformer_decoder_layer_spec=None,
             vocab_size=256,
             max_sequence_length=64,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     @pytest.mark.parametrize("build", ["_hybrid", "_bert", "_t5"])
