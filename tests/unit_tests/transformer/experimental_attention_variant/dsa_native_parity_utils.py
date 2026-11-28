@@ -568,3 +568,76 @@ def run_absorbed_mla_dsa_parity(
             assert_similarity(real_param.grad, baseline_param.grad, eps=eps, label=baseline_name)
     finally:
         Utils.destroy_model_parallel()
+
+
+def run_fused_dsa_fp8_integration(*, seqlen: int, rope_fp32: bool) -> None:
+    """Build a cuDNN FP8 absorbed-MLA DSA layer and run forward + backward.
+
+    FP8 scoring intentionally diverges from the BF16 native reference, so instead of parity
+    this asserts that (1) FP8 scoring is actually reached through the full-fusion path and
+    (2) the full-fusion forward/backward is numerically healthy, which exercises the
+    ``FusedIndexerSparseAttnFunc`` autograd return arity for the threaded precision.
+    """
+    import dataclasses
+
+    from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+
+    _skip_if_backend_unavailable("cudnn")
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    try:
+        model_parallel_cuda_manual_seed(1234)
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed(1234)
+
+        config = _make_config(
+            use_sparse_loss=False, calculate_per_token_loss=False, dsa_kernel_backend="cudnn"
+        )
+        config = dataclasses.replace(
+            config,
+            dsa_indexer_loss_coeff=0.0,
+            dsa_indexer_scoring_precision="fp8",
+            dsa_indexer_rope_fp32=rope_fp32,
+        )
+        object.__setattr__(config, "attention_backend", AttnBackend.auto)
+        spec = get_dsa_module_spec_for_backend(config=config, backend=TESpecProvider())
+        real_layer = build_module(
+            spec, config=config, layer_number=1, cp_comm_type=None, pg_collection=None
+        ).cuda()
+
+        # Spy on the single scoring choke point to confirm FP8 actually reaches scoring
+        # (rather than silently scoring in BF16 on the full-fusion route).
+        seen_precisions = []
+        original_indexer_forward = dsa_cudnn_kernels._indexer_forward
+
+        def _spy_indexer_forward(*args, scoring_precision="bf16", **kwargs):
+            seen_precisions.append(scoring_precision)
+            return original_indexer_forward(*args, scoring_precision=scoring_precision, **kwargs)
+
+        dsa_cudnn_kernels._indexer_forward = _spy_indexer_forward
+        original_rotate_activation = dsa_module.rotate_activation
+        dsa_module.rotate_activation = _mock_rotate_activation
+        try:
+            attention_mask = torch.triu(
+                torch.full((1, 1, seqlen, seqlen), float("-inf"), device="cuda"), diagonal=1
+            )
+            hidden_states = torch.randn(
+                (seqlen, 1, config.hidden_size),
+                dtype=torch.bfloat16,
+                device="cuda",
+                requires_grad=True,
+            )
+            grad = torch.randn_like(hidden_states)
+            out, _ = real_layer(hidden_states, attention_mask=attention_mask)
+            out.backward(grad)
+        finally:
+            dsa_cudnn_kernels._indexer_forward = original_indexer_forward
+            dsa_module.rotate_activation = original_rotate_activation
+
+        assert (
+            "fp8" in seen_precisions
+        ), f"FP8 scoring was never reached; saw {set(seen_precisions)}"
+        assert torch.isfinite(out).all()
+        assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
+    finally:
+        Utils.destroy_model_parallel()
