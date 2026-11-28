@@ -484,13 +484,29 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
                         "Media types in one message must use the same content-part separator."
                     )
                 separator = separators.pop()
-            msg_copy["content"] = separator.join(chunk for chunk in text_chunks if chunk)
+                msg_copy["content"] = separator.join(chunk for chunk in text_chunks if chunk)
+            elif msg_copy.get("role") == "tool":
+                # vLLM joins the text parts of a tool result with newlines, whatever the
+                # template's content format.
+                msg_copy["content"] = "\n".join(text_chunks)
+            else:
+                msg_copy["content"] = "".join(text_chunks)
         elif isinstance(content, dict):
             msg_copy["content"] = str(content.get("text", ""))
         elif content is None:
             msg_copy["content"] = ""
         elif not isinstance(content, str):
             msg_copy["content"] = str(content)
+
+        # An assistant turn's reasoning may arrive as `reasoning` (vLLM's name) or
+        # `reasoning_content` (its older name, which chat templates read). As vLLM does, take
+        # `reasoning` when both are set, and give the template the turn under both names.
+        if msg_copy.get("role") == "assistant":
+            reasoning = msg_copy.get("reasoning")
+            if reasoning is None:
+                reasoning = msg_copy.get("reasoning_content")
+            if reasoning is not None:
+                msg_copy["reasoning"] = msg_copy["reasoning_content"] = reasoning
 
         tool_calls = msg_copy.get("tool_calls")
         if isinstance(tool_calls, list):
@@ -864,6 +880,14 @@ def apply_parsers(
     return message_text, meta
 
 
+def _strips_content_with_tool_calls(parsers):
+    """Whether a configured tool parser strips the content of a turn with tool calls."""
+    return any(
+        getattr(PARSER_MAPPING.get(name), "strip_content_with_tool_calls", False)
+        for name in parsers or ()
+    )
+
+
 def _chat_tokenizer(tokenizer):
     """Prefer the underlying HF tokenizer for chat-template work."""
     hf_tokenizer = getattr(getattr(tokenizer, "_tokenizer", None), "tokenizer", None)
@@ -1112,7 +1136,10 @@ class _ChatRequestOptions:
 
 
 def _streaming_chat_parsers(parsers, options, n):
-    """One `StreamingChatParser` per choice, or `None` when no parsers are configured."""
+    """One `StreamingChatParser` per choice, or `None` when no parsers are configured.
+
+    With tools requested, whitespace-only content is held back until it is followed by text or
+    the stream ends, and dropped if a tool call follows, as vLLM streams it."""
     if not parsers:
         return None
     marker_prefixes = (
@@ -1144,6 +1171,7 @@ def _streaming_chat_parsers(parsers, options, n):
             parse_streaming_text,
             marker_prefixes=marker_prefixes,
             named_tool_choice=options.is_named_tool_choice,
+            drop_whitespace_before_tool_calls=options.tools_requested,
         )
         for _ in range(n)
     ]
@@ -1227,6 +1255,13 @@ def format_chat_response(batch_results, sampling_params, tokenizer, options, *, 
             # absent final content from an empty assistant message and otherwise
             # continue the episode after a reasoning-only completion.
             content = None
+        elif normalized_tool_calls:
+            # As in vLLM, a tool-call turn has no content when only whitespace surrounds the
+            # calls, whatever the tool parser; tool parsers that opt in also strip it.
+            content = message_text or ""
+            if _strips_content_with_tool_calls(parsers):
+                content = content.strip()
+            content = content if content.strip() else None
         else:
             content = message_text if message_text is not None else ""
 
@@ -1234,6 +1269,9 @@ def format_chat_response(batch_results, sampling_params, tokenizer, options, *, 
         if normalized_tool_calls:
             message["tool_calls"] = normalized_tool_calls
         if "reasoning" in metadata:
+            # `reasoning` is vLLM's field; `reasoning_content` is its older name, kept for
+            # existing clients.
+            message["reasoning"] = metadata["reasoning"]
             message["reasoning_content"] = metadata["reasoning"]
         if options.return_tokenized_data and not payload_offloaded:
             # Wire contract matches vLLM: prompt_token_ids are model-input tokens

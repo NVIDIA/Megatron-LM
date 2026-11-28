@@ -39,6 +39,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
     chat_completions as chat_completions_module,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.chat_completions import (
+    _ChatRequestOptions,
     _coerce_to_token_id_list,
     _expanded_prefix_stitching_metadata,
     _extract_media_url_bytes,
@@ -53,6 +54,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endp
     _sanitize_messages_for_template,
     _sanitize_tools_for_template,
     _serialize_eos_token_ids,
+    _streaming_chat_parsers,
     _suffix_tokens_after_prefix,
     _TemplateRenderer,
     _tokenize_chat_template_sync,
@@ -607,6 +609,77 @@ def test_sanitize_messages_flattens_content_to_a_string(
         assert sanitized["content"] == expected
 
 
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        pytest.param(
+            {"role": "assistant", "content": "a", "reasoning": "why"}, "why", id="reasoning"
+        ),
+        pytest.param(
+            {"role": "assistant", "content": "a", "reasoning_content": "why"},
+            "why",
+            id="reasoning-content",
+        ),
+        pytest.param(
+            {"role": "assistant", "content": "a", "reasoning": "new", "reasoning_content": "old"},
+            "new",
+            id="reasoning-wins",
+        ),
+        pytest.param(
+            {"role": "assistant", "content": "a", "reasoning": None, "reasoning_content": "old"},
+            "old",
+            id="null-reasoning",
+        ),
+        pytest.param(
+            {"role": "assistant", "content": "a", "reasoning": ""}, "", id="empty-reasoning"
+        ),
+        pytest.param({"role": "assistant", "content": "a"}, None, id="no-reasoning"),
+    ],
+)
+def test_sanitize_messages_gives_assistant_reasoning_under_both_names(message, expected):
+    original = copy.deepcopy(message)
+
+    (sanitized,) = _sanitize_messages_for_template([message])
+
+    assert sanitized.get("reasoning") == expected
+    assert sanitized.get("reasoning_content") == expected
+    assert message == original
+
+
+def test_sanitize_messages_leaves_reasoning_of_other_roles_alone():
+    message = {"role": "user", "content": "a", "reasoning": "why"}
+
+    assert _sanitize_messages_for_template([message]) == [message]
+
+
+@pytest.mark.parametrize(
+    "content, expected",
+    [
+        pytest.param(
+            [{"type": "text", "text": "18 C, sunny"}, {"type": "text", "text": "Wind: 12 km/h"}],
+            "18 C, sunny\nWind: 12 km/h",
+            id="text-parts",
+        ),
+        pytest.param(["a", {"type": "text", "text": ""}, {"text": "b"}], "a\n\nb", id="every-part"),
+        pytest.param([{"type": "text", "text": "only"}], "only", id="one-part"),
+        pytest.param([], "", id="no-parts"),
+        pytest.param("as a string", "as a string", id="string"),
+        pytest.param(None, "", id="none"),
+    ],
+)
+def test_sanitize_messages_joins_tool_result_text_parts_with_newlines(content, expected):
+    tool = {"role": "tool", "tool_call_id": "call_1", "content": content}
+    user = {"role": "user", "content": content}
+
+    sanitized_tool, sanitized_user = _sanitize_messages_for_template([tool, user])
+
+    assert sanitized_tool == {**tool, "content": expected}
+    # Other roles keep joining text parts without a separator.
+    assert sanitized_user["content"] == (
+        expected.replace("\n", "") if isinstance(content, list) else expected
+    )
+
+
 def test_sanitize_messages_coerces_tool_call_arguments_to_mappings():
     calls = [
         {"function": {"name": "a", "arguments": '{"x": 1}'}},
@@ -1104,6 +1177,7 @@ def test_redact_token_id_lists_for_logging():
 def _parser(parse_result):
     parser = mock.MagicMock()
     parser.implicit_reasoning_end_markers = ()
+    parser.strip_content_with_tool_calls = False
     # A fresh copy per call: the endpoint normalizes, and may drop, the tool calls in place.
     parser.parse.side_effect = lambda *args, **kwargs: copy.deepcopy(parse_result)
     return parser
@@ -1765,6 +1839,7 @@ _TOOL_PARSE_RESULT = ("parsed", {"tool_calls": _TOOL_CALLS, "reasoning": "thinki
 _TOOL_MESSAGE = {
     "content": "parsed",
     "tool_calls": _NORMALIZED_TOOL_CALLS,
+    "reasoning": "thinking",
     "reasoning_content": "thinking",
 }
 _NAMED_TOOL_CHOICE = {"type": "function", "function": {"name": "f1"}}
@@ -1840,7 +1915,7 @@ _CHAT_LOGPROBS = {
             {},
             {},
             ("answer", {"reasoning": "why"}),
-            {"content": "answer", "reasoning_content": "why"},
+            {"content": "answer", "reasoning": "why", "reasoning_content": "why"},
             "stop",
             None,
             id="reasoning-without-tool-calls",
@@ -1882,12 +1957,32 @@ _CHAT_LOGPROBS = {
             None,
             id="parallel-tool-calls-disabled-keeps-first",
         ),
+        # A tool parser that doesn't strip leaves a tool-call turn's content as written.
+        pytest.param(
+            {"tools": _TOOLS},
+            {},
+            ("\n parsed \n", {"tool_calls": _TOOL_CALLS}),
+            {"content": "\n parsed \n", "tool_calls": _NORMALIZED_TOOL_CALLS},
+            "tool_calls",
+            None,
+            id="tool-calls-keep-raw-content",
+        ),
+        # Whitespace-only content of a tool-call turn is dropped whatever the tool parser.
+        pytest.param(
+            {"tools": _TOOLS},
+            {},
+            ("\n \n", {"tool_calls": _TOOL_CALLS}),
+            {"content": None, "tool_calls": _NORMALIZED_TOOL_CALLS},
+            "tool_calls",
+            None,
+            id="tool-calls-drop-whitespace-only-content",
+        ),
         # Incidental tool-call syntax is ignored when the client opted out of tools.
         pytest.param(
             {"tools": _TOOLS, "tool_choice": "none"},
             {},
             _TOOL_PARSE_RESULT,
-            {"content": "<30><31>", "reasoning_content": "thinking"},
+            {"content": "<30><31>", "reasoning": "thinking", "reasoning_content": "thinking"},
             "stop",
             None,
             id="tool-choice-none-drops-tool-calls",
@@ -2042,6 +2137,29 @@ _LENGTH = {
     "sampling_params": {"num_tokens_to_generate": 1},
 }
 _FINISH_REASONS = {"stop": _STOP, "length": _LENGTH}
+_FINISH_FUNCTION = {"name": "finish", "arguments": '{"message": "done"}'}
+_ONE_CALL = _FINISH_CALL[len("</think>") :]
+# The model's text after its reasoning; its content not streamed (stripped, and null when only
+# whitespace is left, as vLLM reports it) and streamed (whitespace-only content is held back and
+# dropped before a call, as vLLM streams it; streamed text is not stripped); the call count. Only
+# the text before the first call is content; vLLM 0.33 also streams what follows a call.
+_TOOL_CALL_TURNS = {
+    "call-only": (_ONE_CALL, None, "", 1),
+    "newline-before-call": ("\n" + _ONE_CALL, None, "", 1),
+    "whitespace-around-call": (" \n\t" + _ONE_CALL + "\n ", None, "", 1),
+    "text-before-call": ("Checking.\n\n" + _ONE_CALL, "Checking.", "Checking.\n\n", 1),
+    "padded-text-before-call": (
+        "\n  Let me finish.\n" + _ONE_CALL,
+        "Let me finish.",
+        "\n  Let me finish.\n",
+        1,
+    ),
+    "two-calls": ("\n" + _ONE_CALL + "\n" + _ONE_CALL, None, "", 2),
+    "text-before-two-calls": ("OK\n" + _ONE_CALL + "\n" + _ONE_CALL, "OK", "OK\n", 2),
+    # Without a call nothing is stripped, and whitespace is still sent.
+    "whitespace-without-call": ("\n \n", "\n \n", "\n \n", 0),
+    "text-without-call": ("\nDone.\n", "\nDone.\n", "\nDone.\n", 0),
+}
 
 _REAL_PARSER_ROWS = [
     # qwen3-coder-tool normalizes the function name before the argument-schema lookup.
@@ -2051,7 +2169,8 @@ _REAL_PARSER_ROWS = [
             ["qwen3-coder-tool"],
             _EXECUTE_TOOLS,
             _STOP,
-            {"content": "", "tool_calls": _EXECUTE_CALL},
+            # Nothing but the call: the tool parser leaves no content, as vLLM reports it.
+            {"content": None, "tool_calls": _EXECUTE_CALL},
             "tool_calls",
             id=f"tool-name-{label}",
         )
@@ -2080,7 +2199,7 @@ _REAL_PARSER_ROWS = [
             _REASONING_PARSERS,
             _THINKING,
             reply,
-            {"content": None, "reasoning_content": reasoning},
+            {"content": None, "reasoning": reasoning, "reasoning_content": reasoning},
             finish_reason,
             id=f"reasoning-only-{label}-{finish_reason}",
         )
@@ -2107,7 +2226,7 @@ _REAL_PARSER_ROWS = [
         _REASONING_PARSERS,
         _THINKING,
         _LENGTH,
-        {"content": "answer", "reasoning_content": "thinking"},
+        {"content": "answer", "reasoning": "thinking", "reasoning_content": "thinking"},
         "length",
         id="reasoning-then-answer",
     ),
@@ -2117,8 +2236,10 @@ _REAL_PARSER_ROWS = [
             _REASONING_PARSERS,
             {**_THINKING, **_FINISH_TOOLS},
             _STOP,
+            # The tool parser strips a tool-call turn's content; none is left.
             {
-                "content": "",
+                "content": None,
+                "reasoning": reasoning,
                 "reasoning_content": reasoning,
                 "tool_calls": [{"name": "finish", "arguments": '{"message": "done"}'}],
             },
@@ -2134,7 +2255,7 @@ _REAL_PARSER_ROWS = [
             _REASONING_PARSERS,
             _THINKING,
             reply,
-            {"content": None, "reasoning_content": ""},
+            {"content": None, "reasoning": "", "reasoning_content": ""},
             finish_reason,
             id=f"empty-reasoning-{label}-{finish_reason}",
         )
@@ -2147,7 +2268,7 @@ _REAL_PARSER_ROWS = [
         _REASONING_PARSERS,
         _THINKING,
         {**_STOP, "generated_tokens": [2]},
-        {"content": None, "reasoning_content": ""},
+        {"content": None, "reasoning": "", "reasoning_content": ""},
         "stop",
         id="empty-reasoning-immediate-eos",
     ),
@@ -2183,9 +2304,26 @@ _REAL_PARSER_ROWS = [
         _REASONING_PARSERS,
         _THINKING,
         _LENGTH,
-        {"content": "answer", "reasoning_content": ""},
+        {"content": "answer", "reasoning": "", "reasoning_content": ""},
         "length",
         id="empty-reasoning-then-answer",
+    ),
+    *(
+        pytest.param(
+            "thinking</think>" + after_reasoning,
+            _REASONING_PARSERS,
+            {**_THINKING, **_FINISH_TOOLS},
+            _STOP,
+            {
+                "content": content,
+                "reasoning": "thinking",
+                "reasoning_content": "thinking",
+                **({"tool_calls": [_FINISH_FUNCTION] * calls} if calls else {}),
+            },
+            "tool_calls" if calls else "stop",
+            id=f"tool-call-turn-{label}",
+        )
+        for label, (after_reasoning, content, _, calls) in _TOOL_CALL_TURNS.items()
     ),
 ]
 
@@ -2216,6 +2354,30 @@ async def test_chat_real_parsers_shape_the_message(
     assert choice["finish_reason"] == expected_finish_reason
 
 
+@pytest.mark.parametrize("label", list(_TOOL_CALL_TURNS))
+def test_streamed_tool_call_turn_content(label):
+    after_reasoning, _, streamed_content, calls = _TOOL_CALL_TURNS[label]
+    text = "thinking</think>" + after_reasoning
+    options = _ChatRequestOptions.from_request({**_THINKING, **_FINISH_TOOLS}, {})
+    (parser,) = _streaming_chat_parsers(_REASONING_PARSERS, options, 1)
+
+    # One character at a time, except that a marker is one token and so arrives whole.
+    ends = [match.end() for match in re.finditer(r"</?think>|</?tool_call>|.", text, re.DOTALL)]
+    deltas = [
+        delta for end in ends for delta in parser.parse(text[:end], finished=end == len(text))
+    ]
+
+    assert "".join(delta.get("reasoning", "") for delta in deltas) == "thinking"
+    assert "".join(delta.get("content", "") for delta in deltas) == streamed_content
+    names = [
+        call["function"]["name"]
+        for delta in deltas
+        for call in delta.get("tool_calls", [])
+        if "name" in call.get("function", {})
+    ]
+    assert names == ["finish"] * calls
+
+
 # --- HTTP: streaming ----------------------------------------------------------
 
 
@@ -2233,6 +2395,8 @@ async def test_chat_real_parsers_shape_the_message(
 async def test_chat_streaming_builds_a_parser_per_choice(
     body, marker_prefixes, named_tool_choice, monkeypatch
 ):
+    # Whitespace before tool calls is held back only when tools are requested.
+    tools_requested = bool(marker_prefixes)
     parser = _parser(("<12><13>", {}))
     parser.streaming_markers = ("<tool_call>",)
     monkeypatch.setattr(chat_completions_module, "PARSER_MAPPING", {"p": parser})
@@ -2251,4 +2415,5 @@ async def test_chat_streaming_builds_a_parser_per_choice(
     assert streaming_parser.call_args.kwargs == {
         "marker_prefixes": marker_prefixes,
         "named_tool_choice": named_tool_choice,
+        "drop_whitespace_before_tool_calls": tools_requested,
     }
