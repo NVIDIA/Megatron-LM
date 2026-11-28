@@ -1,7 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Logging services use config; argument metadata retains its legacy format."""
+"""Logging services use the config container as their metadata source."""
 
+import json
 import sys
 from argparse import ArgumentParser, Namespace
 from dataclasses import asdict, fields
@@ -121,7 +122,7 @@ def test_tensorboard_uses_owned_directory_and_queue(monkeypatch, rank, enabled, 
         factory.assert_not_called()
 
 
-def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, run_config):
+def test_wandb_uses_owned_settings_and_config_container_metadata(monkeypatch, tmp_path, run_config):
     monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 1)
     wandb = SimpleNamespace(init=Mock())
     monkeypatch.setitem(sys.modules, 'wandb', wandb)
@@ -133,11 +134,14 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
         wandb_save_dir=str(tmp_path),
         log_interval=17,
     )
+    kitchen_path = tmp_path / 'kitchen.json'
+    kitchen_path.write_text('{"recipe": "test"}')
     args = Namespace(
         rank=0,
         world_size=1,
         log_interval=99,
         run_workload_inspector_server=False,
+        kitchen_config_file=str(kitchen_path),
         _runtime_state=object(),
     )
     before = vars(args).copy()
@@ -147,7 +151,10 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
     kwargs = wandb.init.call_args.kwargs
     assert kwargs['project'] == 'project' and kwargs['name'] == 'run'
     assert kwargs['entity'] == 'team' and kwargs['dir'] == str(tmp_path)
-    assert kwargs['config'] == {k: v for k, v in before.items() if not k.startswith('_')}
+    expected_config = run_config.to_dict()
+    expected_config['kitchen_config_file'] = str(kitchen_path)
+    expected_config['kitchen_config_file_contents'] = '{"recipe": "test"}'
+    assert kwargs['config'] == expected_config
     assert vars(args) == before
 
 
@@ -209,7 +216,7 @@ def test_finetune_reuses_registered_config(monkeypatch, run_config):
     assert global_vars.get_timers() is timers
 
 
-def test_tensorboard_metadata_preserves_legacy_args(monkeypatch):
+def test_tensorboard_metadata_uses_config_container(monkeypatch, run_config):
     from megatron.training import initialize
     from megatron.training.state import TrainState
 
@@ -219,11 +226,13 @@ def test_tensorboard_metadata_preserves_legacy_args(monkeypatch):
     monkeypatch.setattr(initialize, 'get_args', lambda: args)
     monkeypatch.setattr(initialize, 'get_train_state', lambda: train_state)
     monkeypatch.setattr(initialize, 'get_tensorboard_writer', lambda: writer)
-    monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', None)
     write_args_to_tensorboard()
-    assert writer.add_text.call_count == len(vars(args))
-    for name, value in vars(args).items():
-        writer.add_text.assert_any_call(name, str(value), global_step=13)
+    config = run_config.to_dict()
+    assert writer.add_text.call_count == len(config)
+    for name, value in config.items():
+        writer.add_text.assert_any_call(
+            name, json.dumps(value, indent=2, sort_keys=True, default=str), global_step=13
+        )
     assert args.log_interval == 99
     assert args.run_workload_inspector_server is False
 
