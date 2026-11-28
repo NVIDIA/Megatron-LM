@@ -48,7 +48,18 @@ class _Boundary(torch.autograd.Function):
     @staticmethod
     def forward(ctx, options, residual, routed, shared, write, retain, *reader_params):
         """Run the seam; ``ctx`` None is an inference call without autograd state."""
-        streams, replay, uses, slots, epsilon, batch_invariant, fuse, update_formats = options
+        (
+            streams,
+            replay,
+            uses,
+            slots,
+            epsilon,
+            batch_invariant,
+            fuse,
+            update_formats,
+            compact_scales_for_tp,
+            compact_grad_scales_for_tp,
+        ) = options
         formats = tuple(use[0] if use[0] == use[-1] else "both" for use in uses)
         from .forward_kernel import forward
 
@@ -68,6 +79,7 @@ class _Boundary(torch.autograd.Function):
             reads,
             gammas,
             outputs=formats,
+            compact_scales_for_tp=compact_scales_for_tp,
             num_streams=streams,
             epsilon=epsilon,
             inference=ctx is None,
@@ -96,8 +108,15 @@ class _Boundary(torch.autograd.Function):
         ctx.replay, ctx.index = replay, replay.record(residual, current, saved, slots)
         ctx.save_for_backward(saved.update, saved.coefficients, *saved.gammas, *saved.rstd)
         # Autograd owns the saved tensors. Keep only the other SavedWrite fields here.
-        ctx.write_metadata = (saved.controller_sizes, streams, saved.has_retention, len(updates))
+        ctx.write_metadata = (
+            saved.controller_sizes,
+            streams,
+            saved.has_retention,
+            len(updates),
+            saved.compact_scales_for_tp,
+        )
         ctx.leading, ctx.uses, ctx.update_formats = leading, uses, update_formats
+        ctx.compact_grad_scales_for_tp = compact_grad_scales_for_tp
         # Controller and norm weight parameters whose gradients may accumulate in the kernel.
         ctx.parameters = (
             (write, retain, *reader_params) if fuse else (None,) * (2 + len(reader_params))
@@ -137,7 +156,13 @@ class _Boundary(torch.autograd.Function):
             _main_grad_target(p) if used else None for p, used in zip(ctx.parameters, active)
         )
         grads, _ = backward(
-            saved, previous, dy, dc, main_grads=targets, update_formats=ctx.update_formats
+            saved,
+            previous,
+            dy,
+            dc,
+            main_grads=targets,
+            update_formats=ctx.update_formats,
+            compact_scales_for_tp=ctx.compact_grad_scales_for_tp,
         )
         if ctx.index == 0 and ctx.replay.previous is not None:
             # This seam applies the previous interval's last write: replay that interval now,
@@ -223,6 +248,7 @@ def fused_seam(
     *,
     num_streams,
     outputs=None,
+    compact_scales_for_tp=None,
     columns=None,
     interval=None,
     epsilon=1.0e-5,
@@ -235,7 +261,8 @@ def fused_seam(
     ``reads``/``gammas`` hold each reader's read logits and RMSNorm weight. ``outputs`` gives
     each reader's format (default BF16): "mxfp8" emits it directly from FP32 as rowwise MXFP8, or
     a tuple of two consumers' formats (e.g. ("bf16", "mxfp8"), "both" for short) returns one
-    output per consumer in that order, for the caller to hand each its tensor; their gradients
+    output per consumer in that order. A true entry in ``compact_scales_for_tp`` selects all-gather
+    order for that reader's forward scales and replayed column scales. Consumer gradients
     are summed by the backward kernel. With gradients the write records into ``interval`` (a
     ReplayInterval), and each MXFP8 reader's ``columns`` entry is a ColumnSlot that the interval's
     replay fills with its columnwise operand, for its consumers' weight-gradient GEMMs; the
@@ -262,6 +289,8 @@ def fused_seam(
         batch_invariant,
         fuse_wgrad_accumulation,
         p.update_formats,
+        compact_scales_for_tp,
+        p.compact_grad_scales_for_tp,
     )
     if not torch.is_grad_enabled():
         return _regroup(uses, _Boundary.forward(None, options, *inputs))
@@ -325,3 +354,4 @@ class PendingWideResidualWrites:
     write: torch.Tensor
     retain: torch.Tensor | None
     update_formats: tuple | None = None
+    compact_grad_scales_for_tp: bool = False

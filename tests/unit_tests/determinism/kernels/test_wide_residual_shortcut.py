@@ -55,11 +55,13 @@ from tests.unit_tests.fusions.test_wide_residual_shortcut import (
     linear,
     mx_inputs,
     mxfp8_test,
+    normalized_reader,
     offset_view,
     poison,
     poison_bytes,
     reference,
     reference_columns,
+    reference_mxfp8,
     replay_poisoned,
     run_with_scratch,
     te,
@@ -461,9 +463,20 @@ def test_interval_replay_matches_forward_bits(depth, streams, columns):
     for step in range(depth):
         _, updates, controllers, gammas = inputs(streams, 1 + step % 2, 96, 128, seed=917 + step)
         retain = controllers[1] if step % 3 else None
-        current, saved, _ = fwd(
-            (current, updates, (controllers[0], retain, *controllers[2:]), gammas), streams
+        compact = tuple(columns and (step + r) % 2 == 0 for r in range(len(gammas)))
+        current, saved, readers = fwd(
+            (current, updates, (controllers[0], retain, *controllers[2:]), gammas),
+            streams,
+            outputs=("mxfp8",) * len(gammas) if columns else None,
+            compact_scales_for_tp=compact,
         )
+        if columns:
+            for r, operand in enumerate(readers):
+                assert operand._with_gemm_swizzled_scales == (not compact[r])
+                reference = reference_mxfp8(
+                    normalized_reader(saved, states[-1], r), columnwise=False, compact=compact[r]
+                )
+                all_bytes_equal(buffers((operand,)), buffers((reference,)))
         tapes.append(saved)
         states.append(current)
     terminal = torch.empty_like(checkpoint)
@@ -477,7 +490,10 @@ def test_interval_replay_matches_forward_bits(depth, streams, columns):
     if columns:
         # TE independently quantizes the matched FP32 forward values of every reader.
         for before, tape, per_tape in zip(states, tapes, operands):
-            expected = tuple(reference_columns(tape, before, r) for r in range(len(per_tape)))
+            expected = tuple(
+                reference_columns(tape, before, r, compact=tape.compact_scales_for_tp[r])
+                for r in range(len(per_tape))
+            )
             assert_columns_equal(per_tape, expected)
     expected = [*states[1:], *(t.clone() for t in workspace_tensors(operands))]
 

@@ -37,6 +37,7 @@ class SavedWrite:
     num_streams: int = 3
     has_retention: bool = True
     update_count: int = 1
+    compact_scales_for_tp: tuple = ()
 
 
 def validate_num_streams(num_streams):
@@ -56,14 +57,14 @@ def _tensor(t, shape, dtype, device, name):
         raise ValueError(f"{name} must be contiguous {dtype} {tuple(shape)} on {device}")
 
 
-def allocate_operand(shape, device, *, rowwise=True, columnwise=False):
+def allocate_operand(shape, device, *, rowwise=True, columnwise=False, compact_scales_for_tp=False):
     """Allocate an MXFP8 operand with the requested TE orientations (its own
     quantizer: TE may change a tensor's quantizer usage)."""
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
     from transformer_engine_torch import DType  # constants does not re-export it in every TE
 
     quantizer = MXFP8Quantizer(DType.kFloat8E4M3, rowwise=rowwise, columnwise=columnwise)
-    quantizer.optimize_for_gemm = True
+    quantizer.optimize_for_gemm = not compact_scales_for_tp
     return quantizer.make_empty(shape, dtype=torch.bfloat16, device=device)
 
 

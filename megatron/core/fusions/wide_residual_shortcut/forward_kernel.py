@@ -66,6 +66,7 @@ def forward(
     gammas,
     *,
     outputs=None,
+    compact_scales_for_tp=None,
     num_streams=3,
     epsilon=1.0e-5,
     inference=False,
@@ -78,7 +79,8 @@ def forward(
     readers fold unrounded values. ``retain`` None is a static identity retention (not zero
     logits). ``outputs`` gives each reader's format (``OUTPUT_FORMATS``, default BF16), whatever
     the residual dtype: ``"mxfp8"`` is rowwise MXFP8 and ``"both"`` emits BF16 and MXFP8 from the
-    same normalized values.
+    same normalized values. A true entry in compact_scales_for_tp selects the scale layout for a TE
+    sequence-parallel all-gather and records it for backward replay.
 
     ``batch_invariant`` (inference) schedules every batch size like the smallest one.
 
@@ -138,9 +140,16 @@ def forward(
         None if inference else torch.empty(m, dtype=torch.float32, device=device) for _ in range(n)
     )
     buffers, operands = [], []
-    for fmt in outputs:
+    compact_scales_for_tp = (
+        (False,) * n if compact_scales_for_tp is None else tuple(compact_scales_for_tp)
+    )
+    for fmt, compact in zip(outputs, compact_scales_for_tp, strict=True):
         bf16 = None if fmt == "mxfp8" else torch.empty_like(updates[0])
-        mx = None if fmt == "bf16" else allocate_operand((m, h), device)
+        mx = (
+            None
+            if fmt == "bf16"
+            else allocate_operand((m, h), device, compact_scales_for_tp=compact)
+        )
         # Inference pads rows in-kernel; partial scale columns still need clearing.
         if mx is not None and (h % 128 or (m % 128 and not inference)):
             mx._rowwise_scale_inv.zero_()
@@ -160,6 +169,7 @@ def forward(
             num_streams,
             retain is not None,
             len(updates),
+            compact_scales_for_tp,
         )
     # Inference is a programmatic dependent launch: it reads only parameters and prefetches
     # into L2 before waiting on the previous kernel (griddepcontrol.wait).
@@ -178,6 +188,7 @@ def forward(
         # Logits (write, retain, read_a, read_b); read_b repeats read_a with one reader.
         controllers=(write, retain, reads[0], reads[-1]),
         saved_coefficients=c,
+        COMPACT_SCALES_FOR_TP=compact_scales_for_tp,
         PAD_ROWS=inference and mxfp8 and bool(m % 128),
         DEPENDENT=dependent,
         EXCHANGE=None,
@@ -424,14 +435,19 @@ def _owns_columns(cols, H: gl.constexpr, CONFIG: gl.constexpr):
 
 
 @g.jit
-def _emit_mxfp8(y, data, scale, coordinates, rows=None):
-    """Store MXFP8 data and TE-swizzled E8M0 scales of 32-value blocks per row.
+def _emit_mxfp8(y, data, scale, coordinates, COMPACT_SCALES_FOR_TP: gl.constexpr, rows=None):
+    """Store MXFP8 data and compact or GEMM-swizzled E8M0 scales of 32-value blocks per row.
 
     ``rows`` zeroes padded-row scales.
     """
     exponent, bits = _e8m0_scale(gl.max(gl.abs(y), 1))
     outer, inner, width = coordinates
-    index = _swizzled_scale_index(outer, inner, width)
+    stride = gl.cdiv(width, 128) * 4
+    index = (
+        outer * stride + inner
+        if COMPACT_SCALES_FOR_TP
+        else _swizzled_scale_index(outer, inner, width)
+    )
     scale_pointer, scale_mask = scale
     data_pointer, data_mask = data
     if rows is not None:
@@ -439,7 +455,13 @@ def _emit_mxfp8(y, data, scale, coordinates, rows=None):
             padding = (
                 (outer // 128 == (rows - 1) // 128) & (outer % 128 < 32) & (outer + offset >= rows)
             )
-            gl.store(scale_pointer + index + offset // 32 * 4, 0, scale_mask & padding)
+            gl.store(
+                scale_pointer
+                + index
+                + (offset * stride if COMPACT_SCALES_FOR_TP else offset // 32 * 4),
+                0,
+                scale_mask & padding,
+            )
     q = y * gl.expand_dims(bits.to(gl.float32, bitcast=True), 1)
     q = q.to(gl.float8e4nv).to(gl.uint8, bitcast=True)
     gl.store(data_pointer, gl.reshape(q, data_pointer.shape), data_mask)
@@ -448,7 +470,15 @@ def _emit_mxfp8(y, data, scale, coordinates, rows=None):
 
 @g.jit
 def _emit(
-    fragment, reads, target: gl.constexpr, row, cols, H: gl.constexpr, CONFIG: gl.constexpr, rows
+    fragment,
+    reads,
+    target: gl.constexpr,
+    row,
+    cols,
+    H: gl.constexpr,
+    CONFIG: gl.constexpr,
+    COMPACT_SCALES_FOR_TP: gl.constexpr,
+    rows,
 ):
     """Normalize a queued fragment and emit its reader's requested formats.
     When supplied, rows gives the true row count for padding the MXFP8 scales.
@@ -467,6 +497,7 @@ def _emit(
             (quantized + row * H + cols, mask),
             (scales, (group < H // 32) & _owns_columns(group, H // 32, CONFIG)),
             (row, group, H),
+            COMPACT_SCALES_FOR_TP,
             rows,
         )
 
@@ -539,6 +570,7 @@ def _forward_body(
     HAS_RETENTION: gl.constexpr,
     CONFIG: gl.constexpr,
     EPSILON: gl.constexpr = 1.0e-5,
+    COMPACT_SCALES_FOR_TP: gl.constexpr = (False, False),
     PAD_ROWS: gl.constexpr = False,
     DEPENDENT: gl.constexpr = False,
     EXCHANGE: gl.constexpr = None,
@@ -696,7 +728,17 @@ def _forward_body(
                     if target == (gl.program_id(1) if CONFIG.SPLIT else stage // NUM_SEGMENTS):
                         output_cols = cols + (stage % NUM_SEGMENTS) * width
                         rows = gl.num_programs(0) // K if PAD_ROWS else None
-                        _emit(queue[0], read_tensors, target, row, output_cols, H, CONFIG, rows)
+                        _emit(
+                            queue[0],
+                            read_tensors,
+                            target,
+                            row,
+                            output_cols,
+                            H,
+                            CONFIG,
+                            COMPACT_SCALES_FOR_TP[target],
+                            rows,
+                        )
                 queue = queue[1:]
 
 

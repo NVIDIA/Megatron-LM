@@ -1342,6 +1342,75 @@ def test_mxfp8_training_with_standalone_moe_layers():
 
 
 @pytest.mark.parametrize(
+    "tp,sequence_parallel,pattern",
+    [(2, True, "---"), (2, False, "---"), (2, True, "-*E-"), (4, True, "-*E-")],
+)
+@REQUIRES_FUSED_BACKWARD
+def test_mxfp8_tensor_parallel_matches_unfused(tp, sequence_parallel, pattern):
+    """Compare TP-local logits and gradients after a multi-write replay interval."""
+    if Utils.world_size % tp:
+        pytest.skip(f"requires a multiple of {tp} GPUs")
+    Utils.initialize_model_parallel(tp, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        opts = dict(
+            hidden=2048,
+            fp8="e4m3",
+            fp8_recipe="mxfp8",
+            tensor_model_parallel_size=tp,
+            sequence_parallel=sequence_parallel,
+            # The latent projection is local, while the shared expert uses TP collectives.
+            **({"moe_latent_size": 256} if "E" in pattern else NO_SHORTCUT),
+        )
+        model = _hybrid_model(pattern, residual_stream_recompute_num_layers=2, **opts)
+        twin = _unfused_twin(model, pattern, **opts)
+        layouts = []
+
+        def check_layout(module, args):
+            operand = args[0]
+            assert isinstance(operand, MXFP8Tensor)
+            layouts.append(operand._with_gemm_swizzled_scales)
+            assert layouts[-1] == (
+                not (module.parallel_mode == "column" and module.sequence_parallel)
+            )
+
+        for read in model.modules():
+            if isinstance(read, WriteReadNorm):
+                for (module, _), fmt in zip(read.consumers, read.consumer_formats):
+                    if fmt == "mxfp8":
+                        module.register_forward_pre_hook(check_layout)
+        tokens = 2048 * tp if sequence_parallel else 2048
+        positions = torch.arange(tokens, device="cuda")[None]
+        ids = (positions * 17 + positions // 97) % 128
+
+        def step(net):
+            logits = net(ids, positions, None)
+            logits.float().square().mean().backward()
+            return logits.detach().float()
+
+        out, reference = step(model), step(twin)
+
+        def relative_error(actual, expected):
+            return (actual.float() - expected.float()).norm() / expected.float().norm().clamp_min(
+                1e-12
+            )
+
+        assert set(layouts) == ({False, True} if "E" in pattern else {not sequence_parallel})
+        assert relative_error(out, reference) < 0.06
+        names = _unfused_names(model)
+        parameters = dict(twin.named_parameters())
+        for name, param in model.named_parameters():
+            grad = parameters[names[name]].grad
+            assert (grad is None) == (param.grad is None), name
+            if grad is not None:
+                assert torch.isfinite(param.grad).all(), name
+            if grad is not None and not name.endswith(("map.logit", "retention_logit")):
+                assert relative_error(param.grad, grad) < 0.20, name
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
     "overrides,message",
     [
         ({"recompute_granularity": "selective", "recompute_modules": [m]}, f"{m}'] recompute")
@@ -1353,10 +1422,6 @@ def test_mxfp8_training_with_standalone_moe_layers():
         ({"wide_residual": WideResidualConfig(num_streams=7)}, "num_streams"),
         ({"residual_stream_recompute_num_layers": 2, "cuda_graph_impl": "local"}, "CUDA graphs"),
         ({"fp8": "e4m3", "fp8_recipe": "mxfp8", "hidden_size": 1536}, "MXFP8 at a hidden_size"),
-        (
-            {"fp8": "e4m3", "fp8_recipe": "mxfp8", "tensor_model_parallel_size": 2},
-            "MXFP8 with tensor_model_parallel_size",
-        ),
         (
             {"fp8": "e4m3", "fp8_recipe": "mxfp8", "moe_shared_expert_gate": True},
             "MXFP8 shortcut blocks with moe_shared_expert_gate",

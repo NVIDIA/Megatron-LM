@@ -549,11 +549,16 @@ class WriteReadNorm(_FusedWideResidualConnection):
         if not 1 <= len(self.consumers) <= 2:
             raise RuntimeError("a fused read feeds one or two linked consumers")
         self.consumer_formats = tuple(gemm_format(*consumer) for consumer in self.consumers)
+        self.compact_scales_for_tp = False
         for (module, _), fmt in zip(self.consumers, self.consumer_formats):
             if fmt != "mxfp8":
                 continue
             if getattr(module, "_shortcut_replays_columns", False):
                 raise RuntimeError("a Linear takes at most one fused read as MXFP8")
+            # TE gathers the input (and its replayed columns for wgrad) along tokens.
+            self.compact_scales_for_tp |= (
+                module.parallel_mode == "column" and module.sequence_parallel
+            )
             module._shortcut_replays_columns = True
             module.register_forward_hook(self._install_replayed_columns_for_wgrad, with_kwargs=True)
 
@@ -621,6 +626,7 @@ class WriteReadNorm(_FusedWideResidualConnection):
                 tuple(read.read_map(return_logits=True) for read in reads),
                 (weight, *(read.weight for read in reads[1:])),
                 outputs=outputs,
+                compact_scales_for_tp=tuple(read.compact_scales_for_tp for read in reads),
                 columns=slots,
                 interval=interval,
                 num_streams=self.num_streams,
@@ -683,6 +689,11 @@ class DeferredWrite(_FusedWideResidualConnection):
         object.__setattr__(self, "target", target)
         producers = self.producers or (layer.seam_output_projection(),)
         self.update_formats = tuple(gemm_format(p, layer, gradients=True) for p in producers)
+        # Shared updates use one gradient. Compact scales also work for a local GEMM.
+        self.compact_grad_scales_for_tp = any(
+            fmt == "mxfp8" and p.parallel_mode == "row" and p.sequence_parallel
+            for p, fmt in zip(producers, self.update_formats)
+        )
 
     def forward(  # pylint: disable=arguments-differ
         self,
@@ -702,7 +713,13 @@ class DeferredWrite(_FusedWideResidualConnection):
         retain = None if self.retention is None else self.retention(return_logits=True)
         write_logits = self.write_map(return_logits=True)
         pending = PendingWideResidualWrites(
-            state[0], update, shared, write_logits, retain, update_formats=self.update_formats
+            state[0],
+            update,
+            shared,
+            write_logits,
+            retain,
+            update_formats=self.update_formats,
+            compact_grad_scales_for_tp=self.compact_grad_scales_for_tp,
         )
         self.target.hand(pending)
         return state[0]

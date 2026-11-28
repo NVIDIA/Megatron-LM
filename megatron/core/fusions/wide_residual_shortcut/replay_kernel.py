@@ -106,7 +106,7 @@ def bwd_wr_writeread_recompute_mxfp8(
     """Replay transitions on 32-row tiles, emitting the columns of every reader in READERS[j]
     after transition j. Each requested reader carries its saved rstd, gamma and destination.
     ``scales`` holds compact [row block, padded column] scales. A later kernel swizzles them
-    in whole sectors. Direct stores here would touch a separate 32-byte sector per column."""
+    in whole sectors for local GEMMs. Gathered operands receive the compact scales directly."""
     BLOCK_COLS: gl.constexpr = VEC * THREADS_N
     # Training shapes cover whole 128 x 128 scale tiles: no masks.
     EVEN: gl.constexpr = (M % 128 == 0) and (H % 128 == 0)
@@ -129,13 +129,13 @@ def bwd_wr_writeread_recompute_mxfp8(
     offsets = rr[:, None] * H + cc[None, :]
     residual_offsets = rr[:, None] * (S * H) + cc[None, :]
     PADDED_H: gl.constexpr = gl.cdiv(H, 128) * 128
-    OPERAND: gl.constexpr = gl.cdiv(M, 128) * 4 * PADDED_H  # compact scale bytes per operand
+    OPERAND: gl.constexpr = gl.cdiv(M, 128) * 4 * PADDED_H
     scale_index = rowtile * PADDED_H + cc
+    operand = 0
     # Updates load AHEAD transitions early, overlapping earlier transitions' stores.
     pending = ()
     for k in gl.static_range(min(AHEAD, N)):
         pending += (gl.load(updates[k] + offsets, mask, other),)
-    operand = 0
     for j in gl.static_range(N):
         if AHEAD == 0:
             pending = (gl.load(updates[j] + offsets, mask, other),)
@@ -166,8 +166,11 @@ def bwd_wr_writeread_recompute_mxfp8(
             y = _mul2(_mul2(x, r[:, None]), weight[None, :])
             if not EVEN:
                 y = gl.where(mask, y, 0.0)
-            _emit_columns(y, data[j][e] + offsets, scales + operand * OPERAND, scale_index, mask)
-            operand += 1
+            col_data, scale_out = data[j][e]
+            if scale_out is None:
+                scale_out = scales + operand * OPERAND
+                operand += 1
+            _emit_columns(y, col_data + offsets, scale_out, scale_index, mask)
         if j < len(outputs):
             next_values = ()
             for s in gl.static_range(S):
@@ -267,16 +270,25 @@ def _launch_columns(checkpoint, tapes, outputs, columns):
         readers.append(selected)
         stats.append(tuple(tape.rstd[i] for i in selected))
         gammas.append(tuple(tape.gammas[i] for i in selected))
-        data.append(tuple(cols[i]._columnwise_data for i in selected))
-        scales.extend(cols[i]._columnwise_scale_inv for i in selected)
+        targets = []
+        for i in selected:
+            col = cols[i]
+            scale = col._columnwise_scale_inv
+            if col._with_gemm_swizzled_scales:
+                scales.append(scale)
+                scale = None  # Replay writes scratch for the subsequent swizzle.
+            targets.append((col._columnwise_data, scale))
+        data.append(tuple(targets))
 
     vector, threads, warps, maxnreg, ahead = _MX_SCHEDULES[checkpoint.dtype]
     block = vector * threads
     tiles = cdiv(m, 128) * 4 * cdiv(h, 128) * (128 // block)
     padded_h = cdiv(h, 128) * 128
-    compact = torch.empty(
-        (len(scales), cdiv(m, 128) * 4, padded_h), dtype=torch.uint8, device=checkpoint.device
-    )
+    compact = None
+    if scales:
+        compact = torch.empty(
+            (len(scales), cdiv(m, 128) * 4, padded_h), dtype=torch.uint8, device=checkpoint.device
+        )
     bwd_wr_writeread_recompute_mxfp8[(tiles,)](
         checkpoint,
         tuple(t.update for t in tapes),
@@ -300,9 +312,10 @@ def _launch_columns(checkpoint, tapes, outputs, columns):
         maxnreg=maxnreg,
         num_warps=warps,
     )
-    bwd_wr_writeread_swizzle_scales[(cdiv(m, 128) * cdiv(h, 128), len(scales))](
-        compact, tuple(scales), m, padded_h, num_warps=1
-    )
+    if scales:
+        bwd_wr_writeread_swizzle_scales[(cdiv(m, 128) * cdiv(h, 128), len(scales))](
+            compact, tuple(scales), m, padded_h, num_warps=1
+        )
 
 
 def column_requests(tapes, prepare_columns):
@@ -330,7 +343,7 @@ def replay_interval(
     checkpoint, tapes, outputs=None, columns=None, *, prepare_columns=False, terminal_output=None
 ):
     """Replay N tapes from ``checkpoint``: return N predecessors and, per tape, one columnwise
-    MXFP8 operand per requested reader. A second kernel swizzles the MXFP8 scales.
+    MXFP8 operand per requested reader. A second kernel swizzles scales for local GEMMs.
 
     The predecessors are the checkpoint itself plus N - 1 scratch buffers (``outputs``), and
     ``terminal_output`` optionally receives the last tape's result. ``prepare_columns`` is
@@ -367,13 +380,21 @@ def replay_interval(
         columns = tuple(
             tuple(
                 (
-                    allocate_operand((m, h), checkpoint.device, rowwise=False, columnwise=True)
+                    allocate_operand(
+                        (m, h),
+                        checkpoint.device,
+                        rowwise=False,
+                        columnwise=True,
+                        compact_scales_for_tp=bool(
+                            tape.compact_scales_for_tp and tape.compact_scales_for_tp[i]
+                        ),
+                    )
                     if need
                     else None
                 )
-                for need in needs
+                for i, need in enumerate(needs)
             )
-            for needs in requested
+            for tape, needs in zip(tapes, requested)
         )
     targets = scratch + terminal
     if any(any(needs) for needs in requested):

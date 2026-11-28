@@ -84,6 +84,7 @@ def backward(
     on_columns_ready=None,
     main_grads=None,
     update_formats=None,
+    compact_scales_for_tp=False,
 ):
     """Gradients of one seam from its ``SavedWrite`` and predecessor residual.
 
@@ -99,8 +100,8 @@ def backward(
     give ``(main_grad, parameter dtype)``: that gradient is accumulated into ``main_grad`` as
     autograd's cast to the parameter dtype and DDP's add would, and returned as None.
     ``update_formats`` gives each update's gradient format: "bf16" (default) or "mxfp8", the
-    rowwise and columnwise MXFP8 operand its producer Linear's dgrad and wgrad take (E4M3, TE's
-    GEMM-swizzled scales), quantized from the BF16 gradient as TE would.
+    rowwise and columnwise MXFP8 operand its producer Linear's dgrad and wgrad take (E4M3),
+    quantized from the BF16 gradient as TE would. compact_scales_for_tp selects all-gather order.
     """
     n, streams, updates = len(saved.gammas), saved.num_streams, saved.update_count
     m, h = saved.update.shape
@@ -184,7 +185,9 @@ def backward(
     du = empty((m, h), dtype=torch.bfloat16) if "bf16" in formats else None
     du_mx, mx = None, None
     if "mxfp8" in formats:
-        du_mx = allocate_operand((m, h), previous.device, columnwise=True)
+        du_mx = allocate_operand(
+            (m, h), previous.device, columnwise=True, compact_scales_for_tp=compact_scales_for_tp
+        )
         mx = (
             du_mx._rowwise_data,
             du_mx._rowwise_scale_inv,
@@ -226,6 +229,7 @@ def backward(
         GEOMETRY=_Geometry(m, h, streams, saved.has_retention),
         GRID=grid,
         PAIRED=paired,
+        COMPACT_SCALES_FOR_TP=compact_scales_for_tp,
         outputs=_BackwardOutputs(
             residual_grad,
             du,
@@ -576,9 +580,10 @@ def _emit_update_mxfp8(
     SHARED: gl.constexpr,
     M: gl.constexpr,
     H: gl.constexpr,
+    COMPACT_SCALES_FOR_TP: gl.constexpr,
 ):
     """Quantize a 16x128 du slice (its BF16 rounding, as TE quantizes the BF16 gradient; column
-    half PART, first column ``column``) to MXFP8 in TE's GEMM layouts. Rowwise 1x32 blocks now;
+    half PART, first column ``column``) to MXFP8. Rowwise 1x32 blocks now;
     columnwise 32x1 blocks span a row-tile pair, so an even tile stashes its BF16 slice (shared
     memory, or a per-CTA global slot each thread rereads itself) and the odd tile quantizes both.
     Row tiles are 16 aligned rows and slices 128 aligned columns, so every scale index
@@ -606,12 +611,14 @@ def _emit_update_mxfp8(
     br = gl.arange(0, 16, layout=gl.constexpr(SliceLayout(1, SL)))[:, None]
     bb = gl.arange(0, 4, layout=gl.constexpr(SliceLayout(0, SL)))[None, :]
     # Scale index of row row_tile * 16 + br, block column // 32 + bb.
-    row_scale = (row_tile // 8 * gl.cdiv(H, 128) + column // 128) * 512
-    row_scale += row_tile % 2 * 256 + row_tile % 8 // 2 * 4
+    if COMPACT_SCALES_FOR_TP:
+        row_offset = (row_tile * 16 + br) * (gl.cdiv(H, 128) * 4) + column // 32 + bb
+    else:
+        row_scale = (row_tile // 8 * gl.cdiv(H, 128) + column // 128) * 512
+        row_scale += row_tile % 2 * 256 + row_tile % 8 // 2 * 4
+        row_offset = row_scale + (br * 16 + bb)
     gl.store(
-        row_scales + row_scale + (br * 16 + bb),
-        exponent.to(gl.uint8),
-        (column + bb * 32 < H) if not EVEN else None,
+        row_scales + row_offset, exponent.to(gl.uint8), (column + bb * 32 < H) if not EVEN else None
     )
     # Columnwise: the pair's 32 rows of each column share one scale.
     if row_tile % 2 == 0:
@@ -633,9 +640,13 @@ def _emit_update_mxfp8(
             gl.store(col_data + base - (1 - k) * 16 * H + local, quantized, mask)
         # Scale index of column column + cc, block row_tile // 2.
         pair = row_tile // 2
-        col_scale = (column // 128 * gl.cdiv(M, 128) + pair // 4) * 512 + pair % 4
+        if COMPACT_SCALES_FOR_TP:
+            col_offset = pair * (gl.cdiv(H, 128) * 128) + column + cc
+        else:
+            col_scale = (column // 128 * gl.cdiv(M, 128) + pair // 4) * 512 + pair % 4
+            col_offset = col_scale + (cc % 32 * 16 + cc // 32 * 4)
         gl.store(
-            col_scales + col_scale + (cc % 32 * 16 + cc // 32 * 4),
+            col_scales + col_offset,
             column_exponent.to(gl.uint8),
             (column + cc < H) if not EVEN else None,
         )
@@ -702,6 +713,7 @@ def _backward_body(
     GEOMETRY: gl.constexpr,
     GRID: gl.constexpr,
     PAIRED: gl.constexpr,
+    COMPACT_SCALES_FOR_TP: gl.constexpr,
     CARRY_DESC,
     R_DESC,
     DY0_DESC,
@@ -1119,7 +1131,18 @@ def _backward_body(
             if TILE_PAIRS:  # a global stash slot is rebuilt here: kept live, it costs registers
                 slot = stash if STASH_SHARED else outputs.update_stash + bid * 4096
                 mx = outputs.update_mxfp8
-                _emit_update_mxfp8(mx, slot, du, row_tile, du_column, part, STASH_SHARED, m, h)
+                _emit_update_mxfp8(
+                    mx,
+                    slot,
+                    du,
+                    row_tile,
+                    du_column,
+                    part,
+                    STASH_SHARED,
+                    m,
+                    h,
+                    COMPACT_SCALES_FOR_TP,
+                )
 
         row_tile = next_rp
         iteration += 1

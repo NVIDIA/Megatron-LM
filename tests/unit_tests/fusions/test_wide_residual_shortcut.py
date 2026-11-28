@@ -403,15 +403,31 @@ def normalized_reader(saved, previous, reader=0):
     return (x * saved.rstd[reader][:, None]) * saved.gammas[reader].float()
 
 
-def reference_columns(saved, previous, reader=0):
+def reference_columns(saved, previous, reader=0, *, compact=False):
     """TE's columnwise MXFP8 encoding of the emulated normalized reader."""
-    return mxfp8_quantizer(rowwise=False)(normalized_reader(saved, previous, reader))
+    return reference_mxfp8(
+        normalized_reader(saved, previous, reader), rowwise=False, compact=compact
+    )
 
 
-def mxfp8_quantizer(*, rowwise=True, columnwise=True):
+def mxfp8_quantizer(*, rowwise=True, columnwise=True, compact=False):
     quantizer = MXFP8Quantizer(DType.kFloat8E4M3, rowwise=rowwise, columnwise=columnwise)
-    quantizer.optimize_for_gemm = True
+    quantizer.optimize_for_gemm = not compact
     return quantizer
+
+
+def reference_mxfp8(x, *, rowwise=True, columnwise=True, compact=False):
+    operand = mxfp8_quantizer(rowwise=rowwise, columnwise=columnwise, compact=compact)(x)
+    # TE leaves unused compact scale bytes unspecified. The seam zeros its padding.
+    if compact:
+        rows, hidden = x.shape
+        if rowwise:
+            operand._rowwise_scale_inv[rows:].zero_()
+            operand._rowwise_scale_inv[:, hidden // 32 :].zero_()
+        if columnwise:
+            operand._columnwise_scale_inv[rows // 32 :].zero_()
+            operand._columnwise_scale_inv[:, hidden:].zero_()
+    return operand
 
 
 def assert_grads_close(actual, expected, first=(2e-5, 2e-5), fp32=(5e-4, 2e-4)):
@@ -1294,12 +1310,13 @@ def test_gtp_weight_gradient_matches_independent_columns(checkpointed):
 
 @mxfp8_test
 @pytest.mark.parametrize("hidden", [32, 96, 256, 2048, 3072, 6144, 10240])
-def test_generic_norm_matches_unfused_oracle(hidden):
+@pytest.mark.parametrize("compact", [False, True])
+def test_generic_norm_matches_unfused_oracle(hidden, compact):
     torch.manual_seed(947)
-    rows = 128
+    rows = 96 if compact else 128
     x = torch.randn(rows, hidden, device="cuda")
     gamma = torch.randn(hidden, device="cuda", dtype=BF16)
-    quantizer = mxfp8_quantizer(columnwise=False)
+    quantizer = mxfp8_quantizer(columnwise=False, compact=compact)
     expected_rs = (x.double().square().mean(-1) + 1.0e-5).rsqrt()
     # One identity-retained stream with zero update and a half-strength reader turns
     # residual=2*x into exactly x, isolating the production norm arithmetic.
@@ -1309,6 +1326,8 @@ def test_generic_norm_matches_unfused_oracle(hidden):
     actual_rs = torch.empty(rows, device=x.device, dtype=F32)
     actual = quantizer.make_empty(x.shape, dtype=BF16, device=x.device)
     actual._rowwise_scale_inv.zero_()
+    if compact:
+        actual._rowwise_scale_inv[rows:, : hidden // 32].fill_(0xA5)
     forward_kernel.FORWARD_KERNELS["mxfp8",][(rows,)](
         forward_kernel._WriteArgs(2 * x, update, update, torch.empty_like(x), None),
         read_tensors=forward_kernel._ReadArgs(
@@ -1319,6 +1338,8 @@ def test_generic_norm_matches_unfused_oracle(hidden):
         H=hidden,
         STREAMS=1,
         HAS_RETENTION=False,
+        COMPACT_SCALES_FOR_TP=(compact,),
+        PAD_ROWS=compact,
         CONFIG=configs._ForwardConfig(WIDTH=triton.next_power_of_2(hidden)),
         num_warps=4,
         enable_fp_fusion=False,
@@ -1326,7 +1347,9 @@ def test_generic_norm_matches_unfused_oracle(hidden):
     # Reduction order may change, but statistics must stay accurate against FP64.
     torch.testing.assert_close(actual_rs.double(), expected_rs, rtol=2e-6, atol=0)
     # Isolate encoding: TE must receive the same FP32 prequantization values.
-    expected = quantizer((x * actual_rs[:, None]) * gamma.float())
+    expected = reference_mxfp8(
+        (x * actual_rs[:, None]) * gamma.float(), columnwise=False, compact=compact
+    )
     assert torch.equal(actual._rowwise_data, expected._rowwise_data)
     assert torch.equal(actual._rowwise_scale_inv, expected._rowwise_scale_inv)
 
@@ -1418,17 +1441,22 @@ def test_reads_feed_every_declared_linear_from_one_column_take(monkeypatch, form
         (3, 2, 2048, 2048, BF16, ("mxfp8", "mxfp8")),  # dR alone through the TMA store ring
     ],
 )
-def test_update_gradient_mxfp8_matches_te(streams, readers, hidden, rows, residual, formats):
-    """The backward's MXFP8 update gradient (rowwise and columnwise data and GEMM-swizzled
-    scales) is byte for byte TE's quantization of the BF16 update gradient, for every update
+@pytest.mark.parametrize("compact", [False, True])
+def test_update_gradient_mxfp8_matches_te(
+    streams, readers, hidden, rows, residual, formats, compact
+):
+    """The rowwise and columnwise MXFP8 update gradient, including its compact or GEMM-swizzled
+    scales, matches TE quantization of the BF16 update gradient byte for byte for every update
     asking for it (a shortcut add may mix formats); the other gradients do not change."""
     updates = len(formats)
     raw = inputs(streams, readers, hidden, rows, updates=updates, residual_dtype=residual)
     with torch.no_grad():
         _, (saved, r, dys, carry) = backward_args(raw, streams)
         plain, _ = backward_kernel.backward(saved, r, dys, carry)
-        mixed, _ = backward_kernel.backward(saved, r, dys, carry, update_formats=formats)
-    expected = mxfp8_quantizer()(plain[1])
+        mixed, _ = backward_kernel.backward(
+            saved, r, dys, carry, update_formats=formats, compact_scales_for_tp=compact
+        )
+    expected = reference_mxfp8(plain[1], compact=compact)
     for grad, fmt in zip(mixed[1 : 1 + updates], formats):
         if fmt == "bf16":
             assert bytes_equal(grad, plain[1])
@@ -1539,6 +1567,8 @@ def test_direct_mxfp8_consumer_selection(monkeypatch, eligible):
     def projection():
         linear = torch.nn.Linear(4, 4)
         linear.projection = True
+        linear.parallel_mode = "column"
+        linear.sequence_parallel = True
         return linear
 
     layers = {n: SimpleNamespace(layer_number=n) for n in range(1, 5)}
@@ -1580,6 +1610,7 @@ def test_direct_mxfp8_consumer_selection(monkeypatch, eligible):
     (options,) = seen
     (slot,) = options["columns"]
     assert options["outputs"] == (only.consumer_formats,)
+    assert options["compact_scales_for_tp"] == (eligible,)
     assert isinstance(options["interval"], ReplayInterval) and options["interval"] is only.interval
     assert (slot is not None) == eligible
 
@@ -1661,6 +1692,9 @@ def test_deferred_write_uses_linked_producer_format():
     handed = []
     target = SimpleNamespace(hand=handed.append)
     linear, layer = torch.nn.Linear(4, 4), SimpleNamespace(config=SimpleNamespace(fp8="e4m3"))
+    linear.parallel_mode = "row"
+    linear.sequence_parallel = True
+
     def gemm_format(module, layer, *, gradients):
         return "mxfp8" if module is linear and gradients else "bf16"
 
@@ -1672,3 +1706,4 @@ def test_deferred_write_uses_linked_producer_format():
     write((routed, None), state=(routed,), dropout_probability=0.0, training=True, shared=shared)
     assert handed[-1].routed is routed and handed[-1].shared is shared
     assert handed[-1].update_formats == ("mxfp8", "bf16")
+    assert handed[-1].compact_grad_scales_for_tp

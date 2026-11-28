@@ -11,6 +11,12 @@ parameters, RMSNorm, 2-6 streams, a shared expert in shortcut blocks, no dropout
 at most 65536 local tokens per call, 16384 above hidden 4096, a GB300 for training, ...) are
 listed in the `moe_shortcut_wide_residual_norm_fusion` docstring.
 
+With tensor and sequence parallelism, a TE column-parallel linear all-gathers a fused
+read and its replayed weight-gradient operand. A row-parallel linear all-gathers its
+output gradient. The seam sets `compact_scales_for_tp` on operands used by these all-gathers.
+Operands used only by local GEMMs keep swizzled scales. MXFP8 with TP communication overlap
+remains unsupported.
+
 Every seam is one `fused_seam` call:
 
 | boundary | updates | readers | notes |
@@ -30,8 +36,8 @@ themselves, unlike a block's MoE read, which goes to the shared expert's first L
 During training, `--residual-stream-recompute-num-layers` sets the replay interval length
 (default one write). Each interval retains its first input residual and each write's tape.
 Before its backward GEMMs run, a replay kernel reconstructs the predecessor residuals and
-any columnwise MXFP8 operands needed for weight gradients. A second kernel arranges the
-MXFP8 scales in Transformer Engine's GEMM layout. Each interval triggers replay for its
+any columnwise MXFP8 operands needed for weight gradients. A second kernel swizzles scales for operands
+that need Transformer Engine's GEMM layout. Each interval triggers replay for its
 predecessor. A stack output hook handles the final interval when its consumers need columns.
 Replay hands out each predecessor once, so a second backward on a retained graph raises.
 

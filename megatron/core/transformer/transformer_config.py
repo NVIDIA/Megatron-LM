@@ -113,8 +113,6 @@ def _validate_shortcut_fusion_config(config, *, mxfp8_handoff=False):
         "context_parallel_size > 1": config.context_parallel_size != 1,
         "MXFP8 at a hidden_size other than a multiple of 1024 from 2048": mxfp8
         and (config.hidden_size < 2048 or config.hidden_size % 1024),
-        "MXFP8 with tensor_model_parallel_size > 1": mxfp8
-        and config.tensor_model_parallel_size != 1,
         "MXFP8 with tp_comm_overlap": mxfp8 and config.tp_comm_overlap,
         # An MXFP8 read's consumer takes the whole read once (its columns are shared, not sliced).
         "MXFP8 with mlp_chunks_for_training > 1": mxfp8 and config.mlp_chunks_for_training > 1,
