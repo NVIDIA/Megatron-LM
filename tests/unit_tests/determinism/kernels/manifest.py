@@ -1110,16 +1110,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "GEMM path; the SYRK paths are exercised only where the stack supports them.",
     ),
     KernelEntry(
-        name="mfsdp_compact_quantization",
-        sources=(
-            "megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/quantized_dbuffer.py",
-        ),
-        tests=(K + "test_mfsdp_quantization.py",),
-        kind="dispatch",
-        notes="MFSDP v2 writes TE MXFP8 quantization directly into compact unswizzled planes. "
-        "Replay checks all data and scale bytes for 32- and 96-row tensors on Blackwell.",
-    ),
-    KernelEntry(
         name="mfsdp_muon_dispatch",
         sources=("megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/muon.py",),
         tests=("tests/unit_tests/distributed/mfsdp_v2/test_muon.py",),
