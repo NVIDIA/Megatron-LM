@@ -413,6 +413,8 @@ def core_config_from_args(args, dataclass=TransformerConfig):
     """
     kw_args = {}
     for f in dataclasses.fields(dataclass):
+        if not f.init:
+            continue
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
         else:
@@ -468,6 +470,7 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     else:
         config = TransformerConfig(**kw_args)
     rng.finalize_model_config(config)
+    config.finalize()
     return config
 
 def load_yaml(yaml_path):

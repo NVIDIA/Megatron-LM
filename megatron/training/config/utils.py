@@ -64,6 +64,8 @@ def apply_config_overrides(config: "ConfigContainerBase", overrides: list[str]) 
             if index < len(names) - 1:
                 owner = getattr(owner, name)
         current = getattr(owner, names[-1])
+        if getattr(owner, "_finalized", False):
+            raise ValueError(f"Cannot override finalized config field {path!r}; create a new config")
         if is_dataclass(current):
             raise ValueError(f"Override a field within {path!r}, not the entire config section")
         if callable(current):

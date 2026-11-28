@@ -1551,6 +1551,7 @@ def test_gpt_embedding_groups_use_registered_model(monkeypatch, isolated_globals
             share_embeddings_and_output_weights=share_embeddings,
         )
     )
+    cfg.model.finalize()
     global_vars.set_run_config(cfg)
     global_vars.set_args(Namespace(untie_embeddings_and_output_weights=share_embeddings))
 

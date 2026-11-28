@@ -130,8 +130,7 @@ class HybridModelConfig(ModelConfig):
     def finalize(self) -> None:
         """Finalize nested model settings before the run derives optimizer precision."""
 
-        if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
-            self.transformer.finalize()
+        self.transformer.finalize()
 
 
 def _check_modelopt_spec_supported(use_wide_residual: bool) -> None:

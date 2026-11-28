@@ -31,7 +31,6 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.rope import Qwen3VLMultim
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_block import (
     Qwen3VLTransformerBlock,
 )
-from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.bridge.utils.packed_seq import get_packed_seq_q_cu_seqlens
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -41,6 +40,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import deprecate_inference_params
 
 

@@ -63,7 +63,13 @@ class TransformerConfig(ModelParallelConfig):
 
     The initialization function has an argument for each parameter,
     including those in ModelParallelConfig.
+
+    Construction leaves derived settings unresolved. Apply recipe overrides first,
+    then call ``finalize()`` before using this config to initialize parallelism or
+    build a model. Frameworks should own this call, rather than individual recipes.
     """
+
+    _finalized: bool = field(default=False, init=False, repr=False, compare=False)
 
     ####################
     # model architecture
@@ -1859,6 +1865,9 @@ class TransformerConfig(ModelParallelConfig):
         values and dynamically added attributes while producing an independent config.
         Fields introduced by the target class receive their declared defaults;
         required new fields must be supplied by constructing the target config directly.
+        A change of config type clears the finalization flag so the framework can
+        resolve the target subclass's fields. Existing derived values are retained;
+        construct a fresh config instead when changing architecture or topology.
 
         Args:
             config: The transformer config to copy.
@@ -1884,6 +1893,8 @@ class TransformerConfig(ModelParallelConfig):
                     "construct the config directly."
                 )
             setattr(new_config, name, value)
+        if cls is not type(config):
+            new_config._finalized = False
         return new_config
 
     def _validate_cp_layouts(self) -> None:
@@ -1911,11 +1922,47 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
-    def __post_init__(self):
-        """Python dataclass method that is used to modify attributes after initialization.
-        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
-        details.
+    def __post_init__(self) -> None:
+        """Leave derived fields unset until framework startup finalizes the config."""
+
+    def validate(self) -> None:
+        """Check a resolved copy without changing the editable config or backend policy.
+
+        The existing Core checks are interleaved with derivations. Until those are
+        separated, evaluating them on a private copy preserves their ordering and
+        keeps repeated validation non-mutating.
         """
+        resolved = deepcopy(self)
+        matmul = torch.backends.cuda.matmul
+        allow_bf16_reduction = matmul.allow_bf16_reduced_precision_reduction
+        try:
+            resolved._finalize()
+        finally:
+            matmul.allow_bf16_reduced_precision_reduction = allow_bf16_reduction
+
+    def finalize(self) -> None:
+        """Resolve and check settings once, after overrides and before runtime use.
+
+        A finalized config is fixed for the lifetime of its model. Repeated calls
+        do nothing; construct a new config to change its architecture or topology.
+        """
+        if self._finalized:
+            return
+        self._finalize()
+        self._finalized = True
+
+    def _finalize(self) -> None:
+        """Run the existing Core derivations and checks in their original order."""
+        from megatron.core.transformer.config_utils import str_to_callable, str_to_dtype
+
+        if isinstance(self.activation_func, str):
+            self.activation_func = str_to_callable(self.activation_func)
+        for name in ("params_dtype", "pipeline_dtype"):
+            value = getattr(self, name)
+            if isinstance(value, str):
+                setattr(self, name, str_to_dtype(value))
+        if self.attention_backend is None:
+            self.attention_backend = AttnBackend.auto
         super().__post_init__()
         self._validate_cp_layouts()
 
@@ -5317,8 +5364,8 @@ class MLATransformerConfig(TransformerConfig):
        Otherwise fall back to the unfused MLA.
     """
 
-    def __post_init__(self):
-        super().__post_init__()
+    def _finalize(self) -> None:
+        super()._finalize()
         if self.attention_latent_norm_epsilon is None:
             self.attention_latent_norm_epsilon = self.layernorm_epsilon
 

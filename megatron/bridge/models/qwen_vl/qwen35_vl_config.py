@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
 
 from megatron.bridge.models.qwen.modeling_qwen35.model_config import Qwen35HybridModelConfig
-from megatron.bridge.models.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 _QWEN_VISUAL_ENCODER_KEY = "qwen_visual"
 _IMAGES_MODALITY_KEY = "images"

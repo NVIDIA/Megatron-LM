@@ -78,7 +78,7 @@ def test_overrides_preserve_native_objects_and_leave_finalization_to_startup(run
     "layout", ["Et*2|t*2L", "[[embedding,decoder,decoder],[decoder,decoder,loss]]", "null"]
 )
 def test_pipeline_layout_override_is_normalized_at_finalization(run_config, layout):
-    from megatron.bridge.models.transformer_config import TransformerConfig
+    from megatron.core.transformer.transformer_config import TransformerConfig
 
     transformer = TransformerConfig(num_layers=4, hidden_size=128, num_attention_heads=4)
     run_config.model.transformer = transformer
@@ -86,6 +86,7 @@ def test_pipeline_layout_override_is_normalized_at_finalization(run_config, layo
         run_config,
         [
             "model.transformer.pipeline_model_parallel_size=2",
+            "model.transformer.pipeline_dtype=float32",
             f"model.transformer.pipeline_model_parallel_layout={layout}",
         ],
     )

@@ -301,7 +301,7 @@ def _yarn_get_concentration_factor(
 
 
 def _yarn_get_concentration_factor_from_config(config: TransformerConfig) -> float:
-    if hasattr(config, "yarn_rotary_scaling_factor"):
+    if getattr(config, "yarn_rotary_scaling_factor", None) is not None:
         return _yarn_get_concentration_factor(
             config.yarn_rotary_scaling_factor,
             getattr(config, "yarn_mscale", None),

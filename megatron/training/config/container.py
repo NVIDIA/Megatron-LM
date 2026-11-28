@@ -120,6 +120,11 @@ class ConfigContainerBase:
         finalize_model = getattr(getattr(self, "model", None), "finalize", None)
         if callable(finalize_model):
             finalize_model()
+        # Callback model configs may not have their own finalizer. Resolve their
+        # transformer too, after any model-specific derivations above.
+        transformer = getattr(getattr(self, "model", None), "transformer", None)
+        if transformer is not None:
+            transformer.finalize()
 
     @classmethod
     def from_dict(
@@ -471,15 +476,11 @@ class PretrainConfigContainer(ConfigContainerBase):
             else:
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 
-    def validate(self) -> None:
-        """Validate each section and the cross-config GTP, batch-size, and RL policies."""
-        if self.model is None:
-            raise ValueError("Training requires a model config")
-        if getattr(self.model, "transformer", None) is None:
-            raise ValueError("Training requires model.transformer to be configured")
+    def _with_finalized_model(self):
+        """Resolve model dependencies privately for checks before live finalization."""
         effective = self
         transformer = self.model.transformer
-        if not self._finalized and callable(getattr(transformer, "finalize", None)):
+        if not self._finalized:
             # Deferred recipes have not derived topology or initialization settings yet.
             # Validate their resolved values without changing the user's editable config.
             # Copy the outer dataclass explicitly: its attribute forwarding can delegate
@@ -489,7 +490,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 model=replace(self.model, transformer=copy.deepcopy(transformer)),
                 rng=replace(self.rng),
             )
-            # Core post-init also sets this process-wide precision flag. Validation
+            # Core finalization also sets this process-wide precision flag. Validation
             # must leave it alone, including when a config check raises.
             matmul = torch.backends.cuda.matmul
             allow_bf16_reduction = matmul.allow_bf16_reduced_precision_reduction
@@ -497,6 +498,15 @@ class PretrainConfigContainer(ConfigContainerBase):
                 ConfigContainerBase._finalize(effective)
             finally:
                 matmul.allow_bf16_reduced_precision_reduction = allow_bf16_reduction
+        return effective
+
+    def validate(self) -> None:
+        """Validate each section and the cross-config GTP, batch-size, and RL policies."""
+        if self.model is None:
+            raise ValueError("Training requires a model config")
+        if getattr(self.model, "transformer", None) is None:
+            raise ValueError("Training requires model.transformer to be configured")
+        effective = self._with_finalized_model()
         optimizer = effective._optimizer_with_model_precision()
         if self.train.freeze_all_layers:
             # Resolve aliases on the private copy first: Muon derives its layer-wise path
@@ -952,16 +962,16 @@ class PretrainConfigContainer(ConfigContainerBase):
 
             warn_rank_0('enabling --no-load-optim when skipping training.')
             self.checkpoint.load_optim = False
-        # Resolve model-derived topology before dataset and batch-size calculations,
-        # and model precision before deriving the optimizer settings below.
-        super()._finalize()
+        # Check launch-dependent policies using resolved topology before changing
+        # the live model. A failed batch/layout check must leave it editable.
+        effective = self._with_finalized_model()
         dataset = self.data.dataset
-        transformer = self.model.transformer
+        transformer = effective.model.transformer
         data_parallel_size = None
         if dataset is not None:
             # The world size is known here: data_parallel_size gets the agreement check the other
             # fields got at validation, before anything is written.
-            data_parallel_size = self.get_data_parallel_size()
+            data_parallel_size = effective.get_data_parallel_size()
             if self.data.is_sft() and transformer.dynamic_context_parallel:
                 # SFT pads each document to DP*CP alignment, then truncates to the pack
                 # width. That final width must preserve the same alignment.
@@ -1000,8 +1010,12 @@ class PretrainConfigContainer(ConfigContainerBase):
                         f"max_seqlen_per_dp_cp_rank {budget} = {total_cp_ranks * budget}) must "
                         f"cover one physical sample ({input_length})."
                     )
-        batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
-        self._validate_rl_config(batch_sizes[0])
+        batch_sizes = effective._resolve_batch_sizes(effective.get_batch_parallel_size())
+        effective._validate_rl_config(batch_sizes[0])
+        # Commit model derivations only after the launch checks, before deriving
+        # optimizer precision or copying model-owned fields into the dataset.
+        super()._finalize()
+        transformer = self.model.transformer
         optimizer = self._optimizer_with_model_precision()
         changes = {
             name: (getattr(self.optimizer, name), getattr(optimizer, name))
