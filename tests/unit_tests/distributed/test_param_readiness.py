@@ -20,6 +20,7 @@ from megatron.core.distributed.distributed_data_parallel import (
 )
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
+from megatron.core.transformer.experimental_attention_variant import csa
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import PARAM_READY_CALLBACK_ATTR, ensure_params_ready
@@ -184,3 +185,35 @@ class TestDSAFineGrainedReadiness:
         )
 
         assert DSAttention not in recurse_types
+
+
+def test_packed_compressor_uses_updated_ape(monkeypatch):
+    """A direct forward_packed call must pool with the gathered positional bias."""
+    ape = torch.nn.Parameter(torch.zeros(2, 1))
+    updated = torch.tensor([[1.0], [3.0]]).log()
+    setattr(ape, PARAM_READY_CALLBACK_ATTR, lambda: ape.data.copy_(updated))
+    # Isolate pooling from RoPE; the real pooling and parameter readiness paths run.
+    monkeypatch.setattr(csa, "_apply_unfused_rope", lambda x, *args: x)
+    module = SimpleNamespace(
+        ape=ape,
+        compress_ratio=2,
+        _project=lambda x: (x, torch.zeros_like(x)),
+        overlap=False,
+        norm=torch.nn.Identity(),
+        config=SimpleNamespace(apply_rope_fusion=False),
+        rotary_pos_emb=lambda *args, **kwargs: torch.zeros(2, 1, 1, 1),
+        head_dim=1,
+        qk_pos_emb_head_dim=0,
+        pg_collection=SimpleNamespace(cp=None),
+        rotate=False,
+    )
+    output = csa.Compressor.forward_packed(
+        module,
+        torch.tensor([1.0, 3.0, 5.0, 7.0]).reshape(4, 1, 1),
+        torch.tensor([0, 4], dtype=torch.int32),
+        max_seqlen_q=2,
+        compressed_group_ids=torch.tensor([0, 1]),
+        compressed_position_ids=torch.tensor([0, 1]),
+    )
+
+    torch.testing.assert_close(output, torch.tensor([2.5, 6.5]).reshape(2, 1, 1))
