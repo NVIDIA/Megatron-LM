@@ -14,6 +14,8 @@ __all__ = [
     "GLOBAL_MAX_BLOCKS",
     "paged_stash_copy_kernel",
     "paged_stash_pop_kernel",
+    "paged_stash_copy_page_kernel",
+    "paged_stash_pop_page_kernel",
 ]
 
 
@@ -37,6 +39,7 @@ def paged_stash_copy_kernel(
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     HAS_HOST_BUFFER: tl.constexpr,
+    NUM_TOKENS_DIV: tl.constexpr = 1,  # rows = *num_tokens_ptr // NUM_TOKENS_DIV
 ):
     """Stash variable-length MoE activations into a paged buffer (CUDA, or pinned host).
 
@@ -60,7 +63,7 @@ def paged_stash_copy_kernel(
     # Load overflow first (get in flight early); branch on it only before any write
     overflow = tl.load(overflow_ptr)
 
-    num_tokens = tl.load(num_tokens_ptr)
+    num_tokens = tl.load(num_tokens_ptr) // NUM_TOKENS_DIV
     required_pages = tl.cdiv(num_tokens, PAGE_SIZE)
 
     # Common case: load only CUDA state (and head_host for output when use_cuda)
@@ -84,6 +87,7 @@ def paged_stash_copy_kernel(
     if overflow == 1:
         # No stash; preserve heads so Python copy_ does not write garbage into the buffer.
         if pid == 0:
+            tl.store(spilled_to_host_ptr, 1)
             tl.store(new_free_list_head_ptr, head_cuda)
             tl.store(new_free_list_head_ptr + 1, head_host)
         return
@@ -168,6 +172,7 @@ def paged_stash_pop_kernel(
     PAGE_SIZE: tl.constexpr,
     HIDDEN_SIZE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    NUM_TOKENS_DIV: tl.constexpr = 1,  # rows = *num_tokens_ptr // NUM_TOKENS_DIV
 ):
     """Restore variable-length MoE activations from a paged buffer (CUDA, or pinned host).
 
@@ -189,7 +194,7 @@ def paged_stash_pop_kernel(
     # Load overflow first (get in flight early); branch on it only before any write
     overflow = tl.load(overflow_ptr)
 
-    num_tokens = tl.load(num_tokens_ptr)
+    num_tokens = tl.load(num_tokens_ptr) // NUM_TOKENS_DIV
     spill = tl.load(spilled_to_host_ptr)
     required_pages = tl.cdiv(num_tokens, PAGE_SIZE)
 
@@ -260,6 +265,206 @@ def paged_stash_pop_kernel(
             write_idx = (tail + page_slot) % cap
             tl.store(free_list_ptr + write_idx, page_id)
         token_idx += num_blocks
+
+    if pid == 0:
+        tl.store(new_free_list_tail_ptr, new_tail_cuda)
+        tl.store(new_free_list_tail_ptr + 1, new_tail_host)
+
+
+# Page-contiguous variants (TransformerConfig.moe_paged_stash_page_copy). A page holds PAGE_SIZE
+# consecutive rows both in the source tensor (rows page_slot * PAGE_SIZE ...) and in the stash
+# buffer (rows page_id * PAGE_SIZE ...), so each page is one contiguous run of
+# PAGE_SIZE * HIDDEN_SIZE elements. Work is split into CHUNK-element pieces of a page instead of one
+# row per iteration: narrow rows (router probs, scales) no longer pay a dependent page lookup and a
+# mostly-masked vector per row, and full pages copy without masks. CHUNK must be a power of two
+# that divides PAGE_SIZE * HIDDEN_SIZE. Results are bit-identical to the per-row kernels.
+
+
+@triton.jit
+def paged_stash_copy_page_kernel(
+    src_ptr,
+    cuda_dst_ptr,
+    host_dst_ptr,
+    num_tokens_ptr,
+    free_list_cuda_ptr,
+    free_list_host_ptr,
+    free_list_head_ptr,  # shape (2,): [cuda_head, host_head]
+    free_list_tail_ptr,  # shape (2,)
+    free_list_capacity_ptr,
+    page_record_ptr,
+    overflow_ptr,
+    host_spill_global_ptr,
+    spilled_to_host_ptr,
+    new_free_list_head_ptr,
+    PAGE_SIZE: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    CHUNK: tl.constexpr,
+    HAS_HOST_BUFFER: tl.constexpr,
+    NUM_TOKENS_DIV: tl.constexpr = 1,  # rows = *num_tokens_ptr // NUM_TOKENS_DIV
+):
+    """Same contract as paged_stash_copy_kernel, copying whole pages in contiguous chunks."""
+    PAGE_ELEMS: tl.constexpr = PAGE_SIZE * HIDDEN_SIZE
+    CHUNKS_PER_PAGE: tl.constexpr = (PAGE_ELEMS + CHUNK - 1) // CHUNK
+    pid = tl.program_id(axis=0)
+    num_programs = tl.num_programs(axis=0)
+
+    overflow = tl.load(overflow_ptr)
+    num_tokens = tl.load(num_tokens_ptr) // NUM_TOKENS_DIV
+    required_pages = tl.cdiv(num_tokens, PAGE_SIZE)
+
+    head_cuda = tl.load(free_list_head_ptr)
+    head_host = tl.load(free_list_head_ptr + 1)
+    tail_cuda = tl.load(free_list_tail_ptr)
+    cap_cuda = tl.load(free_list_capacity_ptr)
+
+    use_cuda = (tail_cuda - head_cuda) >= required_pages
+    spill = 0
+    dst_ptr = cuda_dst_ptr
+    free_list_ptr = free_list_cuda_ptr
+    head = head_cuda
+    cap = cap_cuda
+    new_head_cuda = head_cuda + required_pages
+    new_head_host = head_host
+
+    if overflow == 1:
+        if pid == 0:
+            tl.store(spilled_to_host_ptr, 1)
+            tl.store(new_free_list_head_ptr, head_cuda)
+            tl.store(new_free_list_head_ptr + 1, head_host)
+        return
+
+    if not use_cuda:
+        tail_host = tl.load(free_list_tail_ptr + 1)
+        cap_host = tl.load(free_list_capacity_ptr + 1)
+        use_host = HAS_HOST_BUFFER == 1 and (tail_host - head_host) >= required_pages
+        if use_host:
+            spill = 1
+            dst_ptr = host_dst_ptr
+            free_list_ptr = free_list_host_ptr
+            head = head_host
+            cap = cap_host
+            new_head_cuda = head_cuda
+            new_head_host = head_host + required_pages
+        else:
+            if pid == 0:
+                tl.store(overflow_ptr, 1)
+                tl.store(spilled_to_host_ptr, 1)
+                tl.store(new_free_list_head_ptr, head_cuda)
+                tl.store(new_free_list_head_ptr + 1, head_host)
+            return
+
+    if pid == 0:
+        tl.store(spilled_to_host_ptr, spill)
+        if spill == 1:
+            tl.store(host_spill_global_ptr, 1)
+
+    full_pages = num_tokens // PAGE_SIZE
+    tail_elems = (num_tokens - full_pages * PAGE_SIZE) * HIDDEN_SIZE
+    total_work = required_pages * CHUNKS_PER_PAGE
+    offs = tl.arange(0, CHUNK)
+    work = pid
+    while work < total_work:
+        page_slot = work // CHUNKS_PER_PAGE
+        chunk = work - page_slot * CHUNKS_PER_PAGE
+        page_id = tl.load(free_list_ptr + (head + page_slot) % cap)
+        if chunk == 0:
+            tl.store(page_record_ptr + page_slot, page_id)
+        elem = chunk * CHUNK + offs
+        src = src_ptr + page_slot.to(tl.int64) * PAGE_ELEMS + elem
+        dst = dst_ptr + page_id.to(tl.int64) * PAGE_ELEMS + elem
+        if page_slot < full_pages:
+            tl.store(dst, tl.load(src))
+        else:
+            mask = elem < tail_elems
+            tl.store(dst, tl.load(src, mask=mask, other=0), mask=mask)
+        work += num_programs
+
+    if pid == 0:
+        tl.store(new_free_list_head_ptr, new_head_cuda)
+        tl.store(new_free_list_head_ptr + 1, new_head_host)
+
+
+@triton.jit
+def paged_stash_pop_page_kernel(
+    cuda_src_ptr,
+    host_src_ptr,
+    dst_ptr,
+    num_tokens_ptr,
+    page_record_ptr,
+    spilled_to_host_ptr,
+    overflow_ptr,
+    free_list_cuda_ptr,
+    free_list_host_ptr,
+    free_list_tail_ptr,  # shape (2,)
+    free_list_capacity_ptr,
+    new_free_list_tail_ptr,
+    PAGE_SIZE: tl.constexpr,
+    HIDDEN_SIZE: tl.constexpr,
+    CHUNK: tl.constexpr,
+    NUM_TOKENS_DIV: tl.constexpr = 1,  # rows = *num_tokens_ptr // NUM_TOKENS_DIV
+):
+    """Same contract as paged_stash_pop_kernel, copying whole pages in contiguous chunks."""
+    PAGE_ELEMS: tl.constexpr = PAGE_SIZE * HIDDEN_SIZE
+    CHUNKS_PER_PAGE: tl.constexpr = (PAGE_ELEMS + CHUNK - 1) // CHUNK
+    pid = tl.program_id(axis=0)
+    num_programs = tl.num_programs(axis=0)
+
+    overflow = tl.load(overflow_ptr)
+    num_tokens = tl.load(num_tokens_ptr) // NUM_TOKENS_DIV
+    spill = tl.load(spilled_to_host_ptr)
+    required_pages = tl.cdiv(num_tokens, PAGE_SIZE)
+
+    tail_cuda = tl.load(free_list_tail_ptr)
+    tail_host = tl.load(free_list_tail_ptr + 1)
+    cap_cuda = tl.load(free_list_capacity_ptr)
+
+    if overflow == 1:
+        if pid == 0:
+            tl.store(new_free_list_tail_ptr, tail_cuda)
+            tl.store(new_free_list_tail_ptr + 1, tail_host)
+        return
+
+    src_ptr = cuda_src_ptr
+    free_list_ptr = free_list_cuda_ptr
+    tail = tail_cuda
+    cap = cap_cuda
+    new_tail_cuda = tail_cuda + required_pages
+    new_tail_host = tail_host
+
+    if spill == 1:
+        cap_host = tl.load(free_list_capacity_ptr + 1)
+        if cap_host == 0:
+            if pid == 0:
+                tl.store(new_free_list_tail_ptr, tail_cuda)
+                tl.store(new_free_list_tail_ptr + 1, tail_host)
+            return
+        src_ptr = host_src_ptr
+        free_list_ptr = free_list_host_ptr
+        tail = tail_host
+        cap = cap_host
+        new_tail_cuda = tail_cuda
+        new_tail_host = tail_host + required_pages
+
+    full_pages = num_tokens // PAGE_SIZE
+    tail_elems = (num_tokens - full_pages * PAGE_SIZE) * HIDDEN_SIZE
+    total_work = required_pages * CHUNKS_PER_PAGE
+    offs = tl.arange(0, CHUNK)
+    work = pid
+    while work < total_work:
+        page_slot = work // CHUNKS_PER_PAGE
+        chunk = work - page_slot * CHUNKS_PER_PAGE
+        page_id = tl.load(page_record_ptr + page_slot)
+        elem = chunk * CHUNK + offs
+        src = src_ptr + page_id.to(tl.int64) * PAGE_ELEMS + elem
+        dst = dst_ptr + page_slot.to(tl.int64) * PAGE_ELEMS + elem
+        if page_slot < full_pages:
+            tl.store(dst, tl.load(src))
+        else:
+            mask = elem < tail_elems
+            tl.store(dst, tl.load(src, mask=mask, other=0), mask=mask)
+        if chunk == 0:
+            tl.store(free_list_ptr + (tail + page_slot) % cap, page_id)
+        work += num_programs
 
     if pid == 0:
         tl.store(new_free_list_tail_ptr, new_tail_cuda)
