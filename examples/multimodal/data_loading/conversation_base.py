@@ -69,7 +69,7 @@ def conversation_open_medias(media_tag: str, media):
                 media = io.BytesIO(media)
             media = AVDecoder(media)
     else:
-        raise ValueError(f"Unknown tag: {tag}")
+        raise ValueError(f"Unknown tag: {media_tag}")
 
     return media
 
@@ -84,7 +84,7 @@ def conversation_convert_tag_to_objects(tag: str, value) -> list[Media]:
         raise ValueError(f"Unknown tag: {tag}")
 
     if len(result) == 0:
-        raise ValueError(f"Tag {tag} not found in sample: {raw}")
+        raise ValueError(f"Tag {tag} not found in sample")
 
     return result
 

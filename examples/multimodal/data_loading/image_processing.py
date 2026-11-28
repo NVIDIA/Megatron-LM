@@ -129,9 +129,7 @@ class ImageTilingStrategy(ABC):
         Transform the media and compute the transformation parameters.
         """
         transform_media_list = self.compute_params(media_list, num_tokens_available)
-        return [
-            self.apply_params(transform_media, **kwargs) for transform_media in transform_media_list
-        ]
+        return [self.apply_params(transform_media) for transform_media in transform_media_list]
 
     @abstractmethod
     def compute_params(
