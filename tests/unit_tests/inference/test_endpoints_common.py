@@ -809,8 +809,8 @@ async def test_failed_requests_are_reported(path, replies, expected_by_path):
 class TextDetokenizer:
     """Stands in for the incremental detokenizer, which only accepts HF fast tokenizers."""
 
-    def __init__(self, tokenizer, prompt_tokens):
-        del prompt_tokens
+    def __init__(self, tokenizer, prompt_tokens, *, remove_eos=True):
+        del prompt_tokens, remove_eos
         self._tokenizer = tokenizer
         self.text = ""
 
@@ -822,6 +822,9 @@ class TextDetokenizer:
     @property
     def text_length(self):
         return len(self.text)
+
+    def finish(self):
+        return ""
 
 
 def build_streaming_app(path, client, monkeypatch, **config):
