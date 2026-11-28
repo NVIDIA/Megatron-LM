@@ -993,6 +993,8 @@ def num_floating_point_operations(
             forward += counts[Symbols.MLP] * estimate(MLP)
         if counts[Symbols.MOE]:
             forward += counts[Symbols.MOE] * estimate(MoELayer)
+        if counts[Symbols.MLA]:
+            forward += counts[Symbols.MLA] * estimate(MLASelfAttention)
         if counts[Symbols.MAMBA]:
             from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
             from megatron.core.ssm.mamba_mixer import MambaMixer
