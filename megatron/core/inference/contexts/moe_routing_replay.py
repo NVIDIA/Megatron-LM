@@ -96,17 +96,17 @@ class MoERoutingReplayCache:
             self.store_block_routing(bid, block_pos, block_rout)
             offset += count
 
-    def reconstruct_routing_from_blocks(
+    def collect_block_routing(
         self, block_ids: List[int], total_routing_tokens: int
-    ) -> Optional[np.ndarray]:
-        """Reconstruct routing indices from per-block storage.
+    ) -> Optional[List[np.ndarray]]:
+        """Collect the per-block views of a request's routing, without copying.
 
         Args:
             block_ids: Ordered list of block IDs for the request.
             total_routing_tokens: Expected number of routing tokens.
 
         Returns:
-            ndarray of shape `[total_routing_tokens, num_layers, topk]` or `None`.
+            Views into the per-block arrays, `total_routing_tokens` rows in all, or `None`.
         """
         block_size = self.block_size_tokens
         routing_parts = []
@@ -126,7 +126,23 @@ class MoERoutingReplayCache:
 
         if not routing_parts or tokens_collected != total_routing_tokens:
             return None
+        return routing_parts
 
+    def reconstruct_routing_from_blocks(
+        self, block_ids: List[int], total_routing_tokens: int
+    ) -> Optional[np.ndarray]:
+        """Reconstruct routing indices from per-block storage.
+
+        Args:
+            block_ids: Ordered list of block IDs for the request.
+            total_routing_tokens: Expected number of routing tokens.
+
+        Returns:
+            ndarray of shape `[total_routing_tokens, num_layers, topk]` or `None`.
+        """
+        routing_parts = self.collect_block_routing(block_ids, total_routing_tokens)
+        if routing_parts is None:
+            return None
         return np.concatenate(routing_parts, axis=0)
 
     # =========================================================================
