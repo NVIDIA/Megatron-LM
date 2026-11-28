@@ -179,8 +179,8 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
         and ``num_frames``. Preprocessed video dictionaries may also include
         ``video_frame_indices`` and ``video_fps`` timing metadata.
     Audio:
-        Audio does not yet have any supported data preprocessing or modeling
-        formats.
+        ``"audio"`` raises ``NotImplementedError``. Audio preprocessing is not
+        implemented.
     """
     if multi_modal_data is None:
         return None
@@ -198,6 +198,9 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
             "multi_modal_data['media_cache_key'] is internal and must not be "
             "provided; media identity is computed automatically."
         )
+    # Name audio before the generic modality error. Unknown keys stay generic.
+    if "audio" in unsupported:
+        raise NotImplementedError("Audio preprocessing is not implemented.")
     if unsupported:
         raise NotImplementedError(
             f"Unsupported multimodal modalities: {sorted(unsupported)}; "
