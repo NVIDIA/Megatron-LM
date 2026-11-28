@@ -685,7 +685,9 @@ GTP_remat supports **PyTorch / Mcore sharded distributed checkpointing** (`--ckp
 
 Consistent with §3.2, GTP_remat stays *loosely coupled* to the checkpoint stack: there is **no GTP_remat-specific checkpoint format or call path**. The shared `make_sharded_tensors_for_checkpoint` helper became GTP_remat-aware and **delegates internally** to a GTP_remat variant only when the `state_dict` actually contains a `GTPShardedParam` (a no-op otherwise), so call sites are unchanged and non-GTP_remat runs are byte-identical.
 
-**Save-side call workflow.** The diagram below traces the save path — from `model.sharded_state_dict()` through the `make_*` helpers down to the terminal `ShardedTensor` / `ShardedObject` sinks. The GTP_remat footprint is deliberately tiny: exactly **one new function** (`make_sharded_tensors_for_checkpoint_with_gtp_remat`, in `gtp.py`, which sets `replica_id` for the GTP_remat-*duplicated* entries) plus **one modified function** (the per-tensor `make_tp_sharded_tensor_for_checkpoint` in `core/utils.py`, made GTP_remat-aware in place to emit the GTP_remat-*sharded* offsets). Every other helper is untouched.
+**Save-side call workflow.** The shared checkpoint helpers select replica IDs
+and describe GTP shards. Padded weights use a `GTPCheckpointFactory` to expose
+only real rows for serialization.
 
 ![GTP_remat + DCP checkpoint-save call workflow](../../images/generalized_tensor_parallel/0613_gtp_dcp_save_call_workflow.png)
 
@@ -703,7 +705,22 @@ Because the offsets reconstruct the global shape, the checkpoint is independent 
 
 **`_extra_state`.** This is TransformerEngine's per-module **FP8 calibration state** — for delayed-scaling recipes it holds the `recipe`, the forward/backward `scale` tensors and `amax_history` buffers, plus picklable `extra_fp8_variables`; for BF16 (non-FP8) runs it is an empty tensor. Because it is a pickled byte blob rather than a tensor with a meaningful shape, it is emitted as a `ShardedObject` (via `make_sharded_object_for_checkpoint`), not a `ShardedTensor`. Its amax/scale statistics are *per-tensor globals* for the **full** weight (amax is reduced across the FP8 group), so every GTP_remat peer carries an identical copy — which is exactly why it takes the replicated path above, with `gtp_rank` folded into its `replica_id`.
 
-**Alignment padding & cross-topology reshard.** When `_gtp_slice_one_param` pads `out_features` to a multiple of `gtp_remat_size · pad_for_alignment`, the saved global describes the *padded* shape, so the helper sets `allow_shape_mismatch=True`. DCP then tolerates a load-side topology whose alignment yields a different padded size — the unpadded data overlaps and the tail pad rows are zeros GTP_remat recomputes (§3.7 covers how that padding is laid out per rank).
+**Alignment padding & cross-topology reshard.** Checkpoints store only real
+weight rows, using logical global shapes and offsets. Saving uses local views
+without gathering; loading restores physical shard shapes and zero-fills padding,
+including padding-only ranks. Uneven checkpoint shards require PyTorch ≥2.6.
+Padded SwiGLU uses the same factory with a gate/up split; existing interleaving
+restrictions still apply.
+
+Complete per-parameter optimizer tensors reuse this mapping, including native-FP8
+weights with dequantized checkpoint payloads. Bucket-based optimizer padding is
+unchanged; partial flattened model-space optimizer tensors are unsupported.
+
+For legacy padded checkpoints, loading into this factory along the TP-sharded row
+axis requires known source TP1 (ETP1 for routed experts). Multiple or unknown source
+TP partitions require conversion using the original layout because padding may
+occur between partitions. The padding-tolerance helper from PR #7293 remains
+available for legacy layouts.
 
 > Note: the SSM `in_proj` weights — Mamba's (`mamba_mixer.py`, split `[z|x|B|C|dt]`) and gated-delta-product's (`gated_delta_product.py`, split householder-major into `z|V*|K*|Q|b*|a`) — are a special case: they are saved as split chunks whose boundaries do not line up with the GTP_remat slice boundaries, under the pad-stripped TP-local global shapes a non-GTP_remat run uses, so they need no `allow_shape_mismatch` and the checkpoint matches a non-GTP_remat run byte-for-byte.
 >
