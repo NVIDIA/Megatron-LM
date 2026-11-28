@@ -285,8 +285,8 @@ class NcclTransferBackend:
                     yield meta, t.dst_layer, t.dst_lo, t.dst_hi
 
     def _kv_block_view(self, block_id: int, layers: slice, heads: slice) -> torch.Tensor:
-        """One block's (kv, layer, token, head, dim) fragment in the
-        [2, L, B, T, H, d] paged buffer."""
+        """One block's (plane, layer, token, head, dim) fragment in the
+        [planes, L, B, T, H, d] paged buffer."""
         return self._memory_buffer[:, layers, block_id, :, heads, :]
 
     # --- decode side ---------------------------------------------------------
@@ -324,12 +324,13 @@ class NcclTransferBackend:
                     scatters.append(_make_copy(view, buf))
         else:
             geo = self._geometry
+            planes = self._memory_buffer.shape[0]  # K and V; one for index-key caches.
             for meta, layers, heads in self._kv_transfers(records, mine_is_src=False):
                 n_layers = layers.stop - layers.start
                 n_heads = heads.stop - heads.start
                 for block in dst_block_ids:
                     buf = torch.empty(
-                        (2, n_layers, geo.tokens_per_block, n_heads, geo.head_dim),
+                        (planes, n_layers, geo.tokens_per_block, n_heads, geo.head_dim),
                         dtype=dtype,
                         device=device,
                     )

@@ -94,6 +94,7 @@ class PendingKvImport:
     cached_prefix_block_count: int
     handle: Any
     future: asyncio.Future
+    dsa_handle: Any = None  # DSA index-key import over the same blocks.
     ssm: PendingSSMImport | None = None
     block_hash_salt: str | None = None
     request_metadata: HandoffRequestMetadata | None = None

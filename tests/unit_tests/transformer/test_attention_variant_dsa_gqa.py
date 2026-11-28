@@ -1340,11 +1340,24 @@ class TestDSGQADynamicInference:
 
     @pytest.mark.parametrize("backend", ["reference", "min-memory-triton"])
     @pytest.mark.parametrize("head_dim", [128, 256])
-    def test_decode_logprobs_match_training(self, monkeypatch, backend, head_dim):
-        """The same weights and token histories give close full-vocabulary logprobs."""
+    @pytest.mark.parametrize("dsa_backend", ["triton", "flashinfer", "flashinfer-nvfp4"])
+    def test_decode_logprobs_match_training(self, monkeypatch, backend, head_dim, dsa_backend):
+        """The same weights and token histories give close full-vocabulary logprobs, also with
+        NVFP4 index keys ("flashinfer-nvfp4"), which may select a few different keys once a
+        prompt exceeds the top-k."""
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             pytest.skip("Native DSA decode requires Blackwell")
         pytest.importorskip("cutlass.cute")
+        from megatron.core.transformer.experimental_attention_variant import (
+            dsa_gqa_flashinfer,
+            dsa_gqa_inference,
+        )
+
+        dsa_backend, _, index_key_dtype = dsa_backend.partition("-")
+        if dsa_backend == "flashinfer" and not dsa_gqa_flashinfer.HAVE_FLASHINFER_DSA:
+            pytest.skip("FlashInfer's DSA kernels are not installed")
+        if index_key_dtype == "nvfp4" and not dsa_gqa_flashinfer.HAVE_FLASHINFER_DSA_NVFP4:
+            pytest.skip("FlashInfer's NVFP4 indexer kernels are not installed")
         torch.manual_seed(53)
         vocab_size, decode_steps = 1024, 8
         prompt_lengths = (31, 63, 513)
@@ -1421,6 +1434,8 @@ class TestDSGQADynamicInference:
                 num_cuda_graphs=None,
                 materialize_only_last_token_logits=True,
                 use_flashinfer_fused_rope=False,
+                dsa_backend=dsa_backend,
+                dsa_indexer_key_dtype=index_key_dtype or "bf16",
             ),
         )
         for request_id, length in enumerate(prompt_lengths):
@@ -1433,9 +1448,10 @@ class TestDSGQADynamicInference:
             )
 
         decode_calls = []
-        from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference
-
-        decode_target, decode_name = dsa_gqa_inference, "dsa_gqa_decode"
+        if dsa_backend == "flashinfer":
+            decode_target, decode_name = dsa_gqa_flashinfer, "flashinfer_sparse_attention"
+        else:
+            decode_target, decode_name = dsa_gqa_inference, "dsa_gqa_decode"
         original_decode = getattr(decode_target, decode_name)
 
         def capture_decode(*args, **kwargs):
@@ -1483,12 +1499,14 @@ class TestDSGQADynamicInference:
                 )
                 # The fused native backend has a different BF16 softmax rounding
                 # order. Its uniform 0.02-nat budget permits about 2% probability
-                # error; retain a separate aggregate mean-error budget.
+                # error; retain a separate aggregate mean-error budget. NVFP4 index keys
+                # can select a few different keys once a prompt exceeds the top-k, which
+                # the training forward (BF16 indexer) does not, so they get 0.05 nats.
                 torch.testing.assert_close(
                     actual,
                     expected,
                     rtol=0,
-                    atol=2e-2,
+                    atol=5e-2 if index_key_dtype == "nvfp4" else 2e-2,
                     msg=lambda message: f"Step {step}, request IDs {request_ids}:\n{message}",
                 )
                 delta = (actual - expected).abs()
@@ -1506,7 +1524,8 @@ class TestDSGQADynamicInference:
                         new_tokens=targets.cpu(),
                     )
 
-        # The native graph path also launches empty decode rows during prefill.
+        # Both backends run once per attention layer and step; the native graph path also
+        # launches empty decode rows during prefill.
         expected_calls = 2 * (decode_steps + 1)
         assert len(decode_calls) == expected_calls
         # Keep the aggregate error budget in addition to the elementwise checks above.
@@ -1515,4 +1534,7 @@ class TestDSGQADynamicInference:
         logging.getLogger(__name__).info(
             "Model logprob parity: max_abs=%s mean_abs=%s", all_errors.max().item(), mean_abs_error
         )
-        assert mean_abs_error <= 2.5e-3, f"Mean logprob error: {mean_abs_error} nats"
+        # NVFP4 index keys measured 2.9e-3 to 3.2e-3 nats (their selection differs from the BF16
+        # indexer of the training forward on the prompt longer than the top-k).
+        budget = 5e-3 if index_key_dtype == "nvfp4" else 2.5e-3
+        assert mean_abs_error <= budget, f"Mean logprob error: {mean_abs_error} nats"
