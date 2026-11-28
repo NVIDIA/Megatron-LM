@@ -6,7 +6,7 @@ import operator
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -50,6 +50,7 @@ from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
+from .attention_context.dsa_flashinfer_metadata import FlashInferDSAMetadata
 from .attention_context.dsa_metadata import DSAMetadata
 from .attention_context.mamba_metadata import (
     MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
@@ -468,7 +469,16 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.dsa_indexer_head_dim = (
             getattr(model_config, "dsa_indexer_head_dim", 0) if self.cache_dsa_indexer_keys else 0
         )
-        self.dsa_metadata: Optional[DSAMetadata] = None
+        self.dsa_metadata: Optional[Union[DSAMetadata, FlashInferDSAMetadata]] = None
+        if self.cache_dsa_indexer_keys:
+            self.dsa_backend = inference_config.dsa_backend
+            if self.dsa_backend not in ("triton", "flashinfer"):
+                raise ValueError(f"Unknown DSA inference backend {self.dsa_backend!r}.")
+            if inference_config.num_speculative_tokens and self.dsa_backend != "flashinfer":
+                raise NotImplementedError(
+                    "Speculative decoding with DSA sparse attention needs "
+                    "dsa_backend='flashinfer'; the triton backend decodes one token per request."
+                )
         if self.cache_mla_latent:
             assert (
                 inference_config.block_size_tokens == 64
@@ -489,6 +499,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.num_attention_heads_per_partition = core_divide(num_attention_heads, tp_size)
         else:
             self.num_attention_heads_per_partition = 1
+        if self.cache_dsa_indexer_keys and self.dsa_backend == "flashinfer":
+            # FlashInfer's step plan depends on the query heads (above counts KV heads) and top-k.
+            self.dsa_query_heads = core_divide(model_config.num_attention_heads, tp_size)
+            self.dsa_index_topk = model_config.dsa_indexer_topk
 
         self.batch_invariant_mode = model_config.batch_invariant_mode
         self.num_speculative_tokens = inference_config.num_speculative_tokens
@@ -1870,9 +1884,27 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             NVLSAllGatherVDispatcher.set_real_token_count_tensor(self.gpu_view.real_token_count)
 
         if self.cache_dsa_indexer_keys:
-            self.dsa_metadata = DSAMetadata(
-                max_requests=self.max_requests, max_tokens=self.max_tokens
-            )
+            if self.dsa_backend == "flashinfer":
+                from megatron.core.transformer.experimental_attention_variant import (
+                    dsa_gqa_flashinfer,
+                )
+
+                dsa_gqa_flashinfer.require_flashinfer_dsa()
+                self.dsa_metadata = FlashInferDSAMetadata(
+                    max_requests=self.max_requests,
+                    max_tokens=self.max_tokens,
+                    max_kv_blocks=self.max_kv_block_count,
+                    block_size_tokens=self.block_size_tokens,
+                    max_sequence_length=self.max_sequence_length,
+                    query_heads=self.dsa_query_heads,
+                    index_topk=self.dsa_index_topk,
+                    # A speculative-decoding verify step adds 1 + k rows per decode request.
+                    decode_tokens=1 + self.num_speculative_tokens,
+                )
+            else:
+                self.dsa_metadata = DSAMetadata(
+                    max_requests=self.max_requests, max_tokens=self.max_tokens
+                )
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
@@ -2015,7 +2047,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             return
 
         # The early-return paths above preserve addresses and their captured graphs.
-        if self.dsa_metadata is not None:
+        if isinstance(self.dsa_metadata, DSAMetadata):
             self.dsa_metadata.topk_workspace = None
 
         if self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD:
@@ -2090,6 +2122,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # rather than being inferred from the request counts.
         if self.mtp_metadata.is_varlen_forward:
             return False
+        # The graphed commit pass is uniform (num_speculative_tokens rows per request) and is
+        # captured once per request count, so it takes the decode kernel even on a mixed step.
+        if self.mtp_metadata.is_graphed_commit_forward:
+            return True
         if self._using_cuda_graph_this_step:
             return self.padded_batch_dimensions.prefill_req_count == 0
         return self.num_prefill_requests == 0
@@ -2303,10 +2339,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
 
+    def _dsa_layer_slot(self, layer_number: int) -> int:
+        """The index-key cache plane of a layer: the MTP draft plane during MTP forwards, as for
+        the KV cache (see `append_key_value_cache`)."""
+        if self.mtp_metadata.forward_active:
+            return self.mtp_kv_layer_slot
+        return self.layer_map[layer_number - 1]
+
     def append_dsa_key_cache(self, layer_number: int, key: Tensor) -> None:
         """Append learned simplified-indexer keys to their paged cache."""
         assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
-        attention_layer_number = self.layer_map[layer_number - 1]
+        attention_layer_number = self._dsa_layer_slot(layer_number)
         block_idx = self.gpu_view.token_to_block_idx[: self.padded_active_token_count]
         local_kv_seq_idx = self.gpu_view.token_to_local_position_within_kv_block[
             : self.padded_active_token_count
@@ -2326,7 +2369,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     def dsa_key_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
         """Return a layer's learned indexer-key cache and active block table."""
         assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
-        attention_layer_number = self.layer_map[layer_number - 1]
+        attention_layer_number = self._dsa_layer_slot(layer_number)
         assert self.active_attn_metadata is not None
         return (
             self.dsa_memory_buffer[attention_layer_number],
@@ -3172,10 +3215,22 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
 
         if self.cache_dsa_indexer_keys:
+            # The triton backend's plan also splits off the leading decode requests.
+            extra = {}
+            if isinstance(self.dsa_metadata, DSAMetadata):
+                extra["num_decode_requests"] = attn_dimensions.decode_req_count
+            else:
+                # Only prefill requests can take the FlashInfer plan's prefill tiles, so size them
+                # by the graph's padded prefill count (the step's own when eager), not every request.
+                extra["padded_prefill_requests"] = (
+                    self.padded_batch_dimensions.prefill_req_count
+                    if self.using_cuda_graph_this_step()
+                    else attn_dimensions.prefill_req_count
+                )
             self.dsa_metadata.update(
                 self._cpu_mha_query_lengths[:real_bs].tolist(),
                 self._cpu_mha_kv_seq_lengths[:real_bs].tolist(),
-                num_decode_requests=attn_dimensions.decode_req_count,
+                **extra,
                 padded_tokens=self.padded_active_token_count,
                 padded_requests=padded_bs,
                 decode_only=self.is_decode_only(),
