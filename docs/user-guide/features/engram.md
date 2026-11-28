@@ -19,7 +19,9 @@ n-grams are hashed into large embedding tables. The rows that are looked up are 
 the hidden state and added to the residual stream before the layer runs. The numerics follow
 the official DeepSeek Engram implementation (commit `fb7f84a21f91223715394a33a1dc24bbfb7f788e`)
 and the Engram paper v2 (arXiv 2601.07372). The `qwen` variant follows the Qwen per-layer
-embedding (PLE) layout.
+embedding (PLE) layout. The `deepseek_v41` variant follows the Engram module of DeepSeek-V4.1
+as [NVIDIA/Megatron-LM#7224](https://github.com/NVIDIA/Megatron-LM/pull/7224) implements it,
+which has no short convolution.
 
 The tables dominate the memory: one table set can hold hundreds of millions of rows. They are
 always sharded by rows, in the EP layout: rows are sharded over the expert-parallel (EP) group
@@ -41,20 +43,33 @@ python pretrain_hybrid.py ... \
 `--engram-variant` selects the hashing conventions and how the memory enters the hidden states.
 All variants share the tables and every distributed mechanism.
 
-| | `deepseek` (default) | `qwen` |
-|---|---|---|
-| Token preprocessing | Offline tokenizer compression artifact (`--engram-tokenizer-map`) | Raw token IDs, no artifact |
-| Hash multipliers | PCG64, stored in the artifact | splitmix64, computed in process |
-| Table sizes | Next unused prime above each order's budget | Per-head n-th prime after the shared budget |
-| n-gram boundary | Left padding with the compressed pad token (`--engram-pad-token-id`) | Windows reset at every EOS (`--engram-eos-token-id`) |
-| Projections | Biased key and value projections | Bias-free key and value projections |
-| Gate | Group RMSNorm of key and hidden state | As `deepseek`, with zero-centered gamma |
+| | `deepseek` (default) | `deepseek_v41` | `qwen` |
+|---|---|---|---|
+| Token preprocessing | Offline tokenizer compression artifact (`--engram-tokenizer-map`) | As `deepseek` | Raw token IDs, no artifact |
+| Hash multipliers | PCG64, stored in the artifact | As `deepseek` | splitmix64, computed in process |
+| Table sizes | Next unused prime above each order's budget | As `deepseek` | Per-head n-th prime after the shared budget |
+| n-gram boundary | Left padding with the compressed pad token (`--engram-pad-token-id`) | As `deepseek` | Windows reset at every EOS (`--engram-eos-token-id`) |
+| Projections | Biased key and value projections | One bias-free projection for the keys and the value | Bias-free key and value projections |
+| Gate | Group RMSNorm of key and hidden state | Per-channel gate weights, FP32 arithmetic | As `deepseek`, with zero-centered gamma |
+| Short convolution | Yes | No | Yes |
+| Positions of a packed row that hold no token | Gated like every position | Gate closed | Gated like every position |
+
+The `deepseek_v41` variant computes the forward of the DeepSeek-V4.1 module and uses its
+parameter names (`wkv`, `q_weight`, `k_weight`). It ignores `--engram-kernel-size`. With BF16
+parameters it adds the memory to the hidden states in FP32 and rounds once. Its tables remain one
+per hash head, whereas the DeepSeek-V4.1 module stores one fused table per layer.
+
+The positions of a packed row that hold no token are those after the last document boundary.
+The `--sft` path counts the padding at the
+end of a row as part of the last document, so its rows have no such position and their padding
+is gated like every position.
 
 The `qwen` variant also needs `--engram-unigram-vocab-size`, the Hugging Face `vocab_size` that
 bounds the multipliers. The padded vocabulary must not exceed it, and every
 `--engram-vocab-sizes` entry must be equal.
 
-`tools/engram/generate_tokenizer_map.py` builds the `deepseek` artifact. It is the only
+`tools/engram/generate_tokenizer_map.py` builds the artifact of the `deepseek` and
+`deepseek_v41` variants. It is the only
 component that loads a Hugging Face tokenizer. `tools/engram/convert_qwen_ple.py` converts
 Hugging Face PLE weights into per-head prime tables and loads them into Engram modules.
 
@@ -69,7 +84,7 @@ Engram is enabled by `--engram-vocab-sizes`.
 | `--engram-max-ngram-order` | 3 | Largest n-gram order hashed |
 | `--engram-num-hash-heads` | 8 | Hash heads (tables) per order |
 | `--engram-memory-dim` | 512 | Memory width per order, split evenly over its heads |
-| `--engram-kernel-size` | 4 | Kernel size of the causal short convolution, dilated by the maximum order |
+| `--engram-kernel-size` | 4 | Kernel size of the causal short convolution, dilated by the maximum order; unused by `deepseek_v41` |
 | `--engram-hash-seed` | 0 | Seed of the hash multipliers |
 | `--engram-embedding-lr-multiplier` | 5.0 | Multiplier on the tables' maximum and minimum learning rates |
 | `--engram-embedding-weight-decay` | 0.0 | Weight decay of the tables |
@@ -155,7 +170,8 @@ The tables' optimizer state follows the checkpoint format:
   the microbatch token IDs and broadcasts them to every stage. Every model chunk then reads its
   memory's tokens without a forward-time collective.
 - Sequence parallelism: hashing runs on the full sequence before the sequence-parallel split,
-  and the short convolution fetches its left context from the previous tensor-parallel rank.
+  and the short convolution, in the variants that have it, fetches its left context from the
+  previous tensor-parallel rank.
 - Context parallelism: the memory follows the zigzag layout, which all layers must run in
   (`--attention-cp-layout`, `--linear-cp-layout`). It restores the token
   row from the shards of the context-parallel ranks, hashes it, and keeps the rows of its own
@@ -203,3 +219,5 @@ storage are not supported.
 The package comes from the Engram support in
 [NVIDIA/Megatron-LM#7231](https://github.com/NVIDIA/Megatron-LM/pull/7231) and
 [NVIDIA/Megatron-LM#7553](https://github.com/NVIDIA/Megatron-LM/pull/7553) by Li Tao.
+The fusion of the `deepseek_v41` variant follows the DeepSeek-V4.1 Engram module by Deyu Fu and
+Hongxiao Bai in [NVIDIA/Megatron-LM#7224](https://github.com/NVIDIA/Megatron-LM/pull/7224).

@@ -154,8 +154,8 @@ def test_bf16_parameters_fuse_bf16_and_fp32_hidden_states(tmp_path, hidden_dtype
     hidden = torch.randn(4, 2, 8, device="cuda", dtype=hidden_dtype, requires_grad=True)
     memory = module(hidden, input_ids)
     assert memory.dtype == torch.bfloat16
-    # What the layer does with the memory: the sum is in the dtype of the hidden states.
-    output = hidden + memory
+    # What the layers ask for: the hidden states with the memory added, in their own dtype.
+    output = module(hidden, input_ids, add_to_hidden_states=True)
     assert output.dtype == hidden_dtype
 
     output.float().square().sum().backward()

@@ -40,7 +40,7 @@ from ._test_utils import write_tokenizer_map
 _requires_te = pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine is not available")
 
 
-def _engram_config(tmp_path, layer_ids=(2,)):
+def _engram_config(tmp_path, layer_ids=(2,), variant="deepseek"):
     artifact = write_tokenizer_map(tmp_path / "map.json", vocab_size=16, layer_ids=layer_ids)
     return EngramConfig(
         global_vocab_sizes=(17, 19),
@@ -52,6 +52,7 @@ def _engram_config(tmp_path, layer_ids=(2,)):
         hash_seed=0,
         boundary_token_id=0,
         tokenizer_map_path=str(artifact),
+        variant=variant,
     )
 
 
@@ -198,10 +199,13 @@ class _MemoryStub(torch.nn.Module):
         super().__init__()
         self.value = value
         self.calls = []
+        self.add_requests = []
 
-    def forward(self, hidden_states, input_ids, packed_seq_params=None):
+    def forward(self, hidden_states, input_ids, packed_seq_params=None, add_to_hidden_states=False):
         self.calls.append(input_ids)
-        return torch.full_like(hidden_states, self.value)
+        self.add_requests.append(add_to_hidden_states)
+        residual = torch.full_like(hidden_states, self.value)
+        return hidden_states + residual if add_to_hidden_states else residual
 
 
 class _SingleRankGroup:
@@ -294,12 +298,38 @@ def test_transformer_layer_adds_the_memory_before_the_input_layernorm(monkeypatc
         layer._forward_attention(hidden_states, input_ids=input_ids)
     torch.testing.assert_close(normed_inputs[0], hidden_states + 0.5)
     assert layer.engram.calls == [input_ids]
+    # The layer has the module add its memory, so the module chooses the precision of the add.
+    assert layer.engram.add_requests == [True]
 
     # An outer hyper-connection wrapper that already applied the memory skips it here.
     with pytest.raises(_StopAfterLayerNorm):
         layer._forward_attention(hidden_states, input_ids=input_ids, skip_engram=True)
     assert normed_inputs[1] is hidden_states
     assert len(layer.engram.calls) == 1
+
+
+@pytest.mark.parametrize("variant", ["deepseek", "deepseek_v41"])
+def test_transformer_layer_returns_what_the_module_adds(tmp_path, variant):
+    """The layer returns the module's hidden states, not its own sum.
+
+    BF16 shows the difference for the deepseek_v41 fusion, which adds in FP32 and rounds once.
+    """
+    engram_spec = ModuleSpec(
+        module=Engram,
+        params={"engram_config": _engram_config(tmp_path, layer_ids=(2,), variant=variant)},
+    )
+    layer = _transformer_layer(
+        TransformerLayerSubmodules(engram=engram_spec), layer_number=2, params_dtype=torch.bfloat16
+    )
+    generator = torch.Generator().manual_seed(5)
+    input_ids = torch.randint(0, 16, (4, 64), generator=generator)
+    hidden_states = torch.randn(64, 4, 8, generator=generator).to(torch.bfloat16)
+
+    added = layer._maybe_apply_engram(hidden_states, input_ids)
+    assert torch.equal(added, layer.engram(hidden_states, input_ids, add_to_hidden_states=True))
+    rounded_first = hidden_states + layer.engram(hidden_states, input_ids)
+    assert torch.count_nonzero(rounded_first - hidden_states) > 0
+    assert torch.equal(added, rounded_first) == (variant == "deepseek")
 
 
 def test_two_stage_attention_path_refuses_an_engram_layer(monkeypatch):
@@ -471,6 +501,7 @@ def test_mhc_wrapper_adds_the_memory_to_the_n_stream_once(fast_path):
     # The memory joins the residual streams before the read gate, exactly once.
     torch.testing.assert_close(wrapper.hyper_connection.inputs[0], hidden_states + 0.25)
     assert memory.calls == [input_ids]
+    assert memory.add_requests == [True]
     if not fast_path:
         assert inner_layer.calls[0]["skip_engram"] is True
         assert inner_layer.calls[0]["input_ids"] is input_ids

@@ -13,6 +13,10 @@ Engram parameters must match after the TP sum that
 The TP x CP cases (four ranks or more) add context parallelism on top: each rank forwards its
 sequence-parallel slice of its zigzag (or, for packed rows, per-document zigzag) CP shard, and
 the gradients must match after the TP sum and the CP sum that DDP performs over dp_cp.
+
+The ``deepseek_v41`` cases run the same comparisons for the fusion without the convolution,
+which exchanges no halo, and check that the positions after the last document boundary of a
+packed row keep a closed gate on the rank that holds them.
 """
 
 import os
@@ -44,7 +48,9 @@ _BATCH_SIZE = 2
 _HIDDEN_SIZE = 8
 
 
-def _build_module(tmp_path, tp_group, sequence_parallel, cp_group=None, kernel_size=4):
+def _build_module(
+    tmp_path, tp_group, sequence_parallel, cp_group=None, kernel_size=4, variant="deepseek"
+):
     artifact = tmp_path / "map.json"
     if not artifact.exists():
         write_tokenizer_map(artifact, vocab_size=32, layer_ids=(1,))
@@ -58,6 +64,7 @@ def _build_module(tmp_path, tp_group, sequence_parallel, cp_group=None, kernel_s
         hash_seed=0,
         boundary_token_id=0,
         tokenizer_map_path=str(artifact),
+        variant=variant,
     )
     torch.manual_seed(2026)
     module = Engram(
@@ -67,15 +74,26 @@ def _build_module(tmp_path, tp_group, sequence_parallel, cp_group=None, kernel_s
         pg_collection=make_pg_collection(tp=tp_group, cp=cp_group),
     )
     with torch.no_grad():
-        # A nonzero convolution branch so the halo exchange and its gradients matter.
-        module.short_conv.weight.normal_(mean=0.0, std=0.05)
+        if engram_config.variant_spec.has_short_convolution:
+            # A nonzero convolution branch so the halo exchange and its gradients matter.
+            module.short_conv.weight.normal_(mean=0.0, std=0.05)
+        else:
+            # Gate weights away from their initial ones, so their gradients matter.
+            module.q_weight.normal_(mean=1.0, std=0.2)
+            module.k_weight.normal_(mean=1.0, std=0.2)
     return module.to(torch.cuda.current_device())
 
 
-# A one-tap kernel has no left context, so no halo may be exchanged.
-@pytest.mark.parametrize("kernel_size", [4, 1])
+# A one-tap kernel has no left context, so no halo may be exchanged; the deepseek_v41 fusion
+# has no convolution at all.
+_VARIANT_AND_KERNEL_SIZE = [("deepseek", 4), ("deepseek", 1), ("deepseek_v41", 4)]
+
+
+@pytest.mark.parametrize("variant,kernel_size", _VARIANT_AND_KERNEL_SIZE)
 @pytest.mark.parametrize("tp_size", [2, 4])
-def test_sp_sliced_gradients_match_full_sequence_reference(tmp_path_factory, tp_size, kernel_size):
+def test_sp_sliced_gradients_match_full_sequence_reference(
+    tmp_path_factory, tp_size, variant, kernel_size
+):
     Utils.initialize_distributed()
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
@@ -88,9 +106,11 @@ def test_sp_sliced_gradients_match_full_sequence_reference(tmp_path_factory, tp_
     device = torch.device("cuda", torch.cuda.current_device())
     tmp_path = tmp_path_factory.getbasetemp()
 
-    sp_module = _build_module(tmp_path, tp_group, sequence_parallel=True, kernel_size=kernel_size)
+    sp_module = _build_module(
+        tmp_path, tp_group, sequence_parallel=True, kernel_size=kernel_size, variant=variant
+    )
     reference_module = _build_module(
-        tmp_path, tp_group, sequence_parallel=False, kernel_size=kernel_size
+        tmp_path, tp_group, sequence_parallel=False, kernel_size=kernel_size, variant=variant
     )
     for sp_param, ref_param in zip(sp_module.parameters(), reference_module.parameters()):
         torch.testing.assert_close(sp_param, ref_param)
@@ -143,9 +163,11 @@ def test_sp_sliced_gradients_match_full_sequence_reference(tmp_path_factory, tp_
 # Unpacked rows, packed (THD) rows of two long documents, and a packed row of 4-token documents.
 # In the last one the first positions of the row, whose left context is zeros, also sit on TP
 # rank 1, so a halo taken from the restored row would show.
-@pytest.mark.parametrize("kernel_size", [4, 1])
+@pytest.mark.parametrize("variant,kernel_size", _VARIANT_AND_KERNEL_SIZE)
 @pytest.mark.parametrize("layout", ["unpacked", "packed", "packed_short_documents"])
-def test_tp_and_cp_gradients_match_full_sequence_reference(tmp_path_factory, layout, kernel_size):
+def test_tp_and_cp_gradients_match_full_sequence_reference(
+    tmp_path_factory, layout, variant, kernel_size
+):
     """TP2 x CP2 with sequence parallelism, for unpacked and packed (THD) rows.
 
     The CP paths convolve the whole CP-local sequence on every TP rank; each rank must keep and
@@ -169,10 +191,15 @@ def test_tp_and_cp_gradients_match_full_sequence_reference(tmp_path_factory, lay
     tmp_path = tmp_path_factory.getbasetemp()
 
     module = _build_module(
-        tmp_path, tp_group, sequence_parallel=True, cp_group=cp_group, kernel_size=kernel_size
+        tmp_path,
+        tp_group,
+        sequence_parallel=True,
+        cp_group=cp_group,
+        kernel_size=kernel_size,
+        variant=variant,
     )
     reference_module = _build_module(
-        tmp_path, None, sequence_parallel=False, kernel_size=kernel_size
+        tmp_path, None, sequence_parallel=False, kernel_size=kernel_size, variant=variant
     )
     for parameter, ref_param in zip(module.parameters(), reference_module.parameters()):
         torch.testing.assert_close(parameter, ref_param)
@@ -235,3 +262,49 @@ def test_tp_and_cp_gradients_match_full_sequence_reference(tmp_path_factory, lay
     ):
         assert parameter.grad is not None, name
         torch.testing.assert_close(parameter.grad, ref_param.grad, msg=name)
+
+
+def test_v41_gate_stays_closed_after_the_last_boundary_under_sequence_parallelism(tmp_path_factory):
+    """A packed row whose last document ends inside the second sequence-parallel rank's slice.
+
+    Each rank selects its slice of the row's valid positions, so only the rank that holds the
+    positions after the last boundary closes gates, and both ranks match the full-sequence
+    module.
+    """
+    Utils.initialize_distributed()
+    rank = torch.distributed.get_rank()
+    tp_size = 2
+    tp_group = torch.distributed.new_group(ranks=list(range(tp_size)))
+    if rank >= tp_size:
+        return
+    device = torch.device("cuda", torch.cuda.current_device())
+    tmp_path = tmp_path_factory.getbasetemp()
+
+    sp_module = _build_module(tmp_path, tp_group, sequence_parallel=True, variant="deepseek_v41")
+    reference_module = _build_module(
+        tmp_path, None, sequence_parallel=False, variant="deepseek_v41"
+    )
+
+    full_sequence = _SEQUENCE_PER_RANK * tp_size
+    # The two documents end at position 18 of 24, in the middle of rank 1's slice.
+    valid_length = full_sequence - _SEQUENCE_PER_RANK // 2
+    cu_seqlens = torch.tensor([0, 8, valid_length], dtype=torch.int32, device=device)
+    packed_seq_params = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu_seqlens)
+    generator = torch.Generator(device="cpu").manual_seed(13)
+    tokens = torch.randint(0, 32, (1, full_sequence), generator=generator, dtype=torch.int64).to(
+        device
+    )
+    hidden_full = torch.randn(
+        full_sequence, 1, _HIDDEN_SIZE, generator=generator, dtype=torch.float64
+    ).to(device)
+
+    sequence_slice = slice(rank * _SEQUENCE_PER_RANK, (rank + 1) * _SEQUENCE_PER_RANK)
+    local_output = sp_module(hidden_full[sequence_slice], tokens, packed_seq_params)
+    reference_output = reference_module(hidden_full, tokens, packed_seq_params)
+    torch.testing.assert_close(local_output, reference_output[sequence_slice])
+
+    assert torch.count_nonzero(reference_output[valid_length:]) == 0
+    assert torch.count_nonzero(reference_output[:valid_length]) > 0
+    closed = torch.arange(full_sequence, device=device)[sequence_slice] >= valid_length
+    assert torch.count_nonzero(local_output[closed]) == 0
+    assert torch.count_nonzero(local_output[~closed]) > 0
