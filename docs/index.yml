@@ -88,6 +88,9 @@ navigation:
           - page: "Design Document: MoE Router Replay Feature"
             path: ./api-guide/router_replay.md
             slug: router-replay
+      - page: "Cross-Layer Indexer Distillation"
+        path: ./user-guide/features/dsa_cross_layer_distillation.md
+        slug: dsa-cross-layer-distillation
       - page: "Megatron FSDP"
         path: ./user-guide/features/megatron_fsdp.md
         slug: megatron-fsdp
