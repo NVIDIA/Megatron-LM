@@ -171,27 +171,43 @@ class GPTFIMDataset(GPTDataset):
         sample = np.concatenate(sample_parts)
 
         sample_len = sample.shape[0]
-        segment_breaks = np.argwhere(sample == self.eod_tok_id)
-
-        if segment_breaks.shape != (0, 1):  # then there is an EOD token in this example
-            curr_start_position = 0
-            new_samples = []
-            for loc in np.nditer(segment_breaks):
-                # Only permute non-empty segments.
-                if loc - curr_start_position > 0:
-                    # permute {prefix, suffix, middle} or {suffix, prefix, middle}
-                    permuted = self._fim_split_and_permute_sequence(sample[curr_start_position:loc])
-                    new_samples += [permuted, [self.eod_tok_id]]
-
-                curr_start_position = loc + 1  # jump over the EOD token
-            # Permute the segment after the last EOD
-            permuted = self._fim_split_and_permute_sequence(sample[curr_start_position:])
-            new_samples.append(permuted)
-
-            sample = np.concatenate(new_samples)
+        inter_document_masking = getattr(self.config, "inter_document_masking", False)
+        document_lengths = [sample_len]
+        if inter_document_masking:
+            # FIM changes document lengths. Keep each source document separate
+            # while permuting, then clip its length to the final sample window.
+            permuted_parts = [self._fim_permute_document(part) for part in sample_parts]
+            document_lengths = []
+            remaining = sample_len
+            for part in permuted_parts:
+                length = min(len(part), remaining)
+                if length > 0:
+                    document_lengths.append(length)
+                    remaining -= length
+            sample = np.concatenate(permuted_parts)
         else:
-            sample = self._fim_split_and_permute_sequence(sample)
+            segment_breaks = np.argwhere(sample == self.eod_tok_id)
 
+            if segment_breaks.shape != (0, 1):  # then there is an EOD token in this example
+                curr_start_position = 0
+                new_samples = []
+                for loc in np.nditer(segment_breaks):
+                    # Only permute non-empty segments.
+                    if loc - curr_start_position > 0:
+                        # permute {prefix, suffix, middle} or {suffix, prefix, middle}
+                        permuted = self._fim_split_and_permute_sequence(
+                            sample[curr_start_position:loc]
+                        )
+                        new_samples += [permuted, [self.eod_tok_id]]
+
+                    curr_start_position = loc + 1  # jump over the EOD token
+                # Permute the segment after the last EOD
+                permuted = self._fim_split_and_permute_sequence(sample[curr_start_position:])
+                new_samples.append(permuted)
+
+                sample = np.concatenate(new_samples)
+            else:
+                sample = self._fim_split_and_permute_sequence(sample)
         diff = sample.shape[0] - sample_len
         if diff > 0:  # too long
             sample = sample[:sample_len]
@@ -203,8 +219,21 @@ class GPTFIMDataset(GPTDataset):
         return (
             np.array(sample, dtype=np.int64),
             np.array(document_ids, dtype=np.int64),
-            [sample_len],
+            document_lengths,
         )
+
+    def _fim_permute_document(self, document: np.ndarray) -> np.ndarray:
+        """Permute one source document without moving tokens across its boundary."""
+        parts = []
+        start = 0
+        for end in np.flatnonzero(document == self.eod_tok_id):
+            if end > start:
+                parts.append(self._fim_split_and_permute_sequence(document[start:end]))
+            parts.append(document[end : end + 1])
+            start = int(end) + 1
+        if start < len(document):
+            parts.append(self._fim_split_and_permute_sequence(document[start:]))
+        return np.concatenate(parts) if parts else document
 
     def _fim_permute_sequence(self, sequence, rate):
         return self._permute(
