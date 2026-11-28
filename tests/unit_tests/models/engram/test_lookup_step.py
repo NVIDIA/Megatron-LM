@@ -224,9 +224,9 @@ def test_lookup_ahead_of_a_recomputed_region(tmp_path, monkeypatch, variant, ker
     packed_seq_params = _packed(7, _SEQUENCE - 5)
     packed_seq_params.cu_seqlens_q = packed_seq_params.cu_seqlens_q.to(device)
     lookups = []
-    table_lookup = module.embedding.forward
+    table_lookup = module._lookup
     monkeypatch.setattr(
-        module.embedding, "forward", lambda hash_ids: lookups.append(1) or table_lookup(hash_ids)
+        module, "_lookup", lambda hash_ids: lookups.append(1) or table_lookup(hash_ids)
     )
 
     plain = module(hidden, tokens, packed_seq_params)

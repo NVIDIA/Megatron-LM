@@ -13,7 +13,8 @@ MODEL_ARGS:
 
   # The Engram n-gram memory on one layer of the first pipeline stage, with its table rows
   # sharded over the data-parallel group (--engram-parallel-size 2 on PP2 x DP2). The second
-  # stage holds no Engram parameters and gets an empty Engram optimizer.
+  # stage holds no Engram parameters and gets an empty Engram optimizer. The NCCL lookup:
+  # the symmetric transport needs the NCCL device bitcode, which CI images do not ship.
   --engram-vocab-sizes: "[1009 1009]"
   --engram-layer-ids: "[3]"
   --engram-variant: qwen
@@ -22,6 +23,7 @@ MODEL_ARGS:
   --engram-num-hash-heads: 4
   --engram-memory-dim: 64
   --engram-parallel-size: 2
+  --engram-communication-backend: nccl
 
   --tensor-model-parallel-size: 1
   --pipeline-model-parallel-size: 2

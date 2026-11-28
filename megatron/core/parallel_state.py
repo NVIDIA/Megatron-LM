@@ -3085,6 +3085,18 @@ def destroy_model_parallel():
     except Exception:  # finalize must never block teardown
         pass
 
+    # Abort the Engram symmetric transports that are still open (no device barrier, which a
+    # failed peer would never join; a no-op once they are closed) before their row groups go.
+    # None is open unless the module was loaded, so it is not imported here.
+    try:
+        engram_symmetric_lookup = sys.modules.get("megatron.core.models.engram.symmetric_lookup")
+        if engram_symmetric_lookup is not None:
+            engram_symmetric_lookup.close_engram_transports()
+    except Exception:
+        logger.warning(
+            "Failed to close the Engram symmetric transports during teardown", exc_info=True
+        )
+
     # Forget the Engram table groups and flags that initialize_engram_parallel_state cached, so
     # the next model-parallel setup creates its own. Nothing is cached unless the module was
     # loaded, so it is not imported here.
