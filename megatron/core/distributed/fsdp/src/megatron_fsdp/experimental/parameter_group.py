@@ -36,17 +36,13 @@ from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout, TensorAtomic
 
 if HAVE_TE:
-    from .quantized_dbuffer import QuantizedDBuffer, effective_dtype, update_mxfp8_tensor
+    from .quantized_dbuffer import QuantizedDBuffer, effective_dtype
 else:
     QuantizedDBuffer = DBuffer
 
     def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
         """Without TE, all parameters use their native storage dtype."""
         return tensor.dtype
-
-    def update_mxfp8_tensor(*args, **kwargs) -> None:
-        """Without TE, no parameter group holds MXFP8 weights to update."""
-        raise RuntimeError("update_mxfp8_tensor requires Transformer Engine.")
 
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
@@ -396,8 +392,6 @@ class FsdpParameterGroup:
         fsdp_parameters: list[FsdpParameter] = []
         main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, (parameter, fqns) in enumerate(parameter_to_fqns.items()):
-            # No GEMM runs during initialization. MXFP8 scales stay compact until
-            # the first unshard installs padded scales for compute.
             unsharded_tensor = self._unsharded_model_weight.get_tensor_view(index)
             if parameter.is_meta:
                 # A meta Parameter cannot set .data to a real tensor because their
@@ -502,9 +496,7 @@ class FsdpParameterGroup:
                 rowwise=Phase.FORWARD in missing_phases, columnwise=Phase.BACKWARD in missing_phases
             )
             ready_phases = missing_phases
-        self._install_unsharded_parameters(
-            rowwise=Phase.FORWARD in ready_phases, columnwise=Phase.BACKWARD in ready_phases
-        )
+        self._install_unsharded_parameters()
         self.bind_unsharded_parameters()
         event = torch.cuda.current_stream().record_event()
         for ready_phase in ready_phases:
@@ -517,28 +509,11 @@ class FsdpParameterGroup:
         for event in dict.fromkeys(self._unshard_events[p] for p in requested_phases):
             torch.cuda.current_stream().wait_event(event)
 
-    def _install_unsharded_parameters(
-        self, *, rowwise: bool = True, columnwise: bool = True
-    ) -> None:
-        """Update each FsdpParameter's unsharded data and scales from the weight buffer.
-
-        ``rowwise`` and ``columnwise`` select the newly gathered MXFP8 planes to
-        install, preserving planes already installed for the other phase. Regular
-        compute weights ignore them. Replicated weights also need installation
-        after optimizer updates because their padded MXFP8 scales are copies.
-        """
-        unsharded_model_weight = self._unsharded_model_weight
+    def _install_unsharded_parameters(self) -> None:
+        """Rebind each parameter to the allocated data and scales in the weight buffer."""
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            tensor_view = unsharded_model_weight.get_tensor_view(index)
-            # TE saves an MXFP8 Parameter itself for backward and reads its planes when
-            # backward runs. Update that Parameter in place, preserving any planes
-            # that were already gathered for the other phase.
-            if isinstance(unsharded_model_weight, DBuffer):
-                fsdp_parameter.unsharded.data = tensor_view
-            else:
-                update_mxfp8_tensor(
-                    tensor_view, fsdp_parameter.unsharded, rowwise=rowwise, columnwise=columnwise
-                )
+            # TE saves the Parameter itself for backward, so update it in place.
+            fsdp_parameter.unsharded.data = self._unsharded_model_weight.get_tensor_view(index)
 
     def _allgather_model_weight(self, *, rowwise: bool = True, columnwise: bool = True) -> None:
         """Allocate the gather buffer and fill it from sharded compute weights.
@@ -591,7 +566,7 @@ class FsdpParameterGroup:
             self._unshard_events.clear()
 
         # Clear readiness so the next unshard refreshes Parameter data/scales,
-        # but never free persistent compute weights or their padded scale copies.
+        # but never free persistent compute weights.
         if unsharded_model_weight.is_alias_of(self.model_weight):
             return
         if isinstance(unsharded_model_weight, DBuffer):
@@ -601,13 +576,6 @@ class FsdpParameterGroup:
         unsharded_model_weight.release_storage(rowwise_only=rowwise_only)
         for parameter in self.fsdp_parameters:
             weight = parameter.unsharded
-            # TE #3518 requires padded scale copies on the Parameter, separate
-            # from the buffer's compact scales. Release these copies too.
-            # https://github.com/NVIDIA/TransformerEngine/issues/3518
-            if weight._rowwise_scale_inv is not None:
-                weight._rowwise_scale_inv.untyped_storage().resize_(0)
-            if not rowwise_only and weight._columnwise_scale_inv is not None:
-                weight._columnwise_scale_inv.untyped_storage().resize_(0)
             # Keep an empty data view for TE's device queries when neither plane
             # remains. Otherwise, remove the released plane from the tensor.
             if rowwise_only and weight._columnwise_data is not None:

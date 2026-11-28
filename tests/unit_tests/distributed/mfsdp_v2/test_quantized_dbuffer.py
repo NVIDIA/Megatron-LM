@@ -19,7 +19,6 @@ quantized_dbuffer = pytest.importorskip(
     reason="Transformer Engine MXFP8 support is required.",
 )
 QuantizedDBuffer = quantized_dbuffer.QuantizedDBuffer
-update_mxfp8_tensor = quantized_dbuffer.update_mxfp8_tensor
 
 import transformer_engine_torch as tex
 from transformer_engine.pytorch import is_mxfp8_available
@@ -31,6 +30,21 @@ pytestmark = pytest.mark.launch_on_gb200
 requires_mxfp8 = pytest.mark.skipif(
     not is_mxfp8_available(), reason="MXFP8 quantization is not available."
 )
+
+
+@pytest.mark.parametrize("shape", [(16, 128), (32, 32), (32, 64), (32, 96), (32, 160)])
+def test_quantized_dbuffer_rejects_unaligned_shapes(distributed_setup, shape):
+    """Reject layouts whose compact scales cannot be consumed directly by TE."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    layout = quantized_dbuffer.GlobalLayout(
+        tensor_shapes=[shape],
+        tensor_to_offset=[0],
+        size=shape[0] * shape[1],
+        rank_to_offset=[0] * mesh.size(),
+    )
+    with pytest.raises(ValueError, match="rows divisible by 32 and columns divisible by 128"):
+        QuantizedDBuffer(mesh, [Replicate()], layout, device)
 
 
 @requires_mxfp8
@@ -45,10 +59,9 @@ requires_mxfp8 = pytest.mark.skipif(
 @pytest.mark.parametrize(
     "make_shapes",
     [
-        pytest.param(lambda num_ranks: [(128, 128), (128, 128), (64, 64), (32, 64)], id="mixed"),
+        pytest.param(lambda num_ranks: [(128, 256), (96, 128), (64, 128), (32, 128)], id="mixed"),
         # One 32-row tensor per layout chunk, so every shard ends with a 32-row tensor.
-        # TE's quantize kernel writes scales for whole 64-row chunks, so compact scale
-        # views would be written beyond: https://github.com/NVIDIA/TransformerEngine/issues/3689
+        # Regress TE's former out-of-bounds stores on 32-row compact scale views: https://github.com/NVIDIA/TransformerEngine/issues/3689
         pytest.param(lambda num_ranks: [(32, 128)] * num_ranks, id="short_tensors"),
     ],
 )
@@ -101,8 +114,7 @@ def test_quantized_dbuffer_quantization_matches_te(
             actual = getattr(view, attribute)
             expected = getattr(reference, attribute)
             # TE's allocating quantizer pads scales; our views keep them compact.
-            # Ignore the padding. GEMM support for compact scales is tracked in:
-            # https://github.com/NVIDIA/TransformerEngine/issues/3518
+            # Compare only the logical scales.
             torch.testing.assert_close(
                 actual, expected[: actual.shape[0], : actual.shape[1]], rtol=0, atol=0
             )
@@ -114,11 +126,11 @@ def test_quantized_dbuffer_quantization_matches_te(
 
 
 @requires_mxfp8
-def test_quantized_dbuffer_updated_tensor_supports_gemm(distributed_setup):
-    """Compute tensors prepare gathered scales for rowwise and columnwise GEMMs."""
+def test_quantized_dbuffer_tensor_supports_gemm(distributed_setup):
+    """Compact gathered scales support rowwise and columnwise GEMMs."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    shapes = [(128, 128), (128, 128), (64, 64), (32, 64)]
+    shapes = [(128, 256), (96, 128), (64, 128), (32, 128)]
     quantized = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, device)
     main_weight = DBuffer(
         mesh, [BlockAtomic(32)], quantized.rowwise_data.layout, torch.float32, device
@@ -132,7 +144,7 @@ def test_quantized_dbuffer_updated_tensor_supports_gemm(distributed_setup):
     for index, shape in enumerate(shapes):
         tensor_view = gathered.get_tensor_view(index)
         compute_tensor = tensor_view.detach()
-        update_mxfp8_tensor(tensor_view, compute_tensor)
+        compute_tensor.data = tensor_view
         reference = quantizer(gathered_main.get_tensor_view(index))
         for layout, inner_dim in (("TN", shape[1]), ("NN", shape[0])):
             activation = quantizer(torch.randn((64, inner_dim), device=device))
@@ -151,7 +163,7 @@ def test_quantized_dbuffer_redistributes_every_plane(distributed_setup):
         pytest.skip("QuantizedDBuffer redistribution requires at least two ranks.")
 
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    shapes = [(64, 64)]
+    shapes = [(64, 128)]
     source = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, distributed_setup.device)
     for plane in source.planes:
         shard_size = plane.local_buffer.numel() // mesh.size()
@@ -181,7 +193,7 @@ def test_quantized_dbuffer_redistributes_selected_planes(distributed_setup, roww
 
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    shapes = [(128, 64), (32, 128)]
+    shapes = [(128, 128), (32, 128)]
     source = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, device)
     for index, plane in enumerate(source.planes):
         plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
@@ -227,16 +239,16 @@ def test_quantized_dbuffer_redistributes_selected_planes(distributed_setup, roww
 
 @requires_mxfp8
 @pytest.mark.parametrize("rowwise", [True, False], ids=["rowwise", "columnwise"])
-def test_quantized_dbuffer_partial_updated_tensor_supports_gemm(distributed_setup, rowwise):
+def test_quantized_dbuffer_partial_tensor_supports_gemm(distributed_setup, rowwise):
     """Compute tensors carrying only gathered rowwise or columnwise planes support their GEMMs.
 
     Forward GEMMs (TN) read rowwise planes and backward data-gradient GEMMs (NN)
-    read columnwise planes. The (64, 64) and (32, 64) shapes need padded scales.
+    read columnwise planes, including compact scales for 32- and 64-row weights.
     """
     columnwise = not rowwise
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    shapes = [(128, 128), (64, 64), (32, 64)]
+    shapes = [(128, 128), (64, 128), (32, 128)]
     quantized = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, device)
     main_weight = DBuffer(
         mesh, [BlockAtomic(32)], quantized.rowwise_data.layout, torch.float32, device
@@ -255,7 +267,7 @@ def test_quantized_dbuffer_partial_updated_tensor_supports_gemm(distributed_setu
     for index, shape in enumerate(shapes):
         tensor_view = gathered.get_tensor_view(index)
         compute_tensor = tensor_view.detach()
-        update_mxfp8_tensor(tensor_view, compute_tensor)
+        compute_tensor.data = tensor_view
         reference = quantizer(gathered_main.get_tensor_view(index))
         layout, inner_dim = ("TN", shape[1]) if rowwise else ("NN", shape[0])
         activation = quantizer(torch.randn((64, inner_dim), device=device))
@@ -268,11 +280,11 @@ def test_quantized_dbuffer_is_alias_of(distributed_setup):
     """Views alias every plane across storage release; independent buffers do not."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     source = QuantizedDBuffer.empty(
-        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+        mesh, [Replicate()], [(128, 128), (32, 128)], distributed_setup.device
     )
     view = source.view([BlockAtomic(32)])
     separate = QuantizedDBuffer.empty(
-        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+        mesh, [Replicate()], [(128, 128), (32, 128)], distributed_setup.device
     )
 
     assert source.is_alias_of(view)
@@ -298,7 +310,7 @@ def test_quantized_dbuffer_can_redistribute_locally(distributed_setup, mesh_axis
         mesh_dim_names=("dp", "local"),
     )[mesh_axis]
     source = QuantizedDBuffer.empty(
-        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+        mesh, [Replicate()], [(128, 128), (32, 128)], distributed_setup.device
     )
     view = source.view([BlockAtomic(32)])
 
@@ -312,7 +324,7 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
     """A sharded view aliases exactly this rank's slice of each replicated plane."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     source = QuantizedDBuffer.empty(
-        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+        mesh, [Replicate()], [(128, 128), (32, 128)], distributed_setup.device
     )
     for plane in source.planes:
         plane.local_buffer.zero_()
@@ -347,7 +359,7 @@ def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out, sh
     if distributed_setup.world_size < 2:
         pytest.skip("QuantizedDBuffer all-gather requires at least two ranks.")
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    shapes = [(96, 64), (32, 128)]
+    shapes = [(96, 128), (32, 256)]
     source = QuantizedDBuffer.empty(
         mesh, [BlockAtomic(32)], shapes, distributed_setup.device, shard_layout=shard_layout
     )
@@ -355,7 +367,7 @@ def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out, sh
     assert source.columnwise_data.layout == data_layout
     assert data_layout.has_equal_shard_sizes == (shard_layout is ShardLayout.PADDED)
     if shard_layout is ShardLayout.UNPADDED:
-        assert data_layout.size == 96 * 64 + 32 * 128
+        assert data_layout.size == 96 * 128 + 32 * 256
 
     for index, plane in enumerate(source.planes):
         plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
@@ -393,7 +405,7 @@ def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(
     source = QuantizedDBuffer.empty(
         mesh,
         [BlockAtomic(32), BlockAtomic(32)],
-        [(128, 64), (32, 128)],
+        [(128, 128), (32, 128)],
         distributed_setup.device,
         shard_layout=shard_layout,
     )
@@ -407,7 +419,7 @@ def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(
         out = QuantizedDBuffer.empty(
             mesh,
             [Replicate(), Replicate()],
-            [(128, 64), (32, 128)],
+            [(128, 128), (32, 128)],
             distributed_setup.device,
             shard_layout=shard_layout,
         )

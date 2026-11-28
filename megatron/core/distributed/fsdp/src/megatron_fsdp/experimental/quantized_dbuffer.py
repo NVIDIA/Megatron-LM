@@ -18,7 +18,6 @@ import functools
 from collections.abc import Iterable
 
 import torch
-import torch.nn.functional as F
 from torch.distributed import DeviceMesh
 from torch.distributed.tensor.placement_types import Placement
 
@@ -44,7 +43,9 @@ _MXFP8_BLOCK_SIZE = 32
 @functools.cache
 def _get_quantizer(*, rowwise: bool, columnwise: bool) -> MXFP8Quantizer:
     """Return a shared MXFP8 quantizer with the given usages."""
-    return MXFP8Quantizer(_MXFP8_DTYPE, rowwise=rowwise, columnwise=columnwise)
+    quantizer = MXFP8Quantizer(_MXFP8_DTYPE, rowwise=rowwise, columnwise=columnwise)
+    quantizer.optimize_for_gemm = False
+    return quantizer
 
 
 def effective_dtype(tensor: torch.Tensor) -> torch.dtype:
@@ -88,77 +89,14 @@ def _block_atomic_to_flat(placements: Iterable[Placement]) -> tuple[Placement, .
     )
 
 
-def _pad_rowwise_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Pad rowwise scales to TE's physical allocation shape."""
-    shape = _get_quantizer(rowwise=True, columnwise=True).get_scale_shape(
-        (scale.shape[0], scale.shape[1] * _MXFP8_BLOCK_SIZE), columnwise=False
-    )
-    if scale.shape == shape:
-        return scale
-    return F.pad(scale, (0, shape[1] - scale.shape[1], 0, shape[0] - scale.shape[0]))
-
-
-def _pad_columnwise_scale(scale: torch.Tensor) -> torch.Tensor:
-    """Pad columnwise scales to TE's physical allocation shape."""
-    shape = _get_quantizer(rowwise=True, columnwise=True).get_scale_shape(
-        (scale.shape[0] * _MXFP8_BLOCK_SIZE, scale.shape[1]), columnwise=True
-    )
-    if scale.shape == shape:
-        return scale
-    return F.pad(scale, (0, shape[1] - scale.shape[1], 0, shape[0] - scale.shape[0]))
-
-
-def update_mxfp8_tensor(
-    src: MXFP8Tensor, dst: MXFP8Tensor, *, rowwise: bool = True, columnwise: bool = True
-) -> None:
-    """Update ``dst`` in place from ``src``, a compact view of the allocated planes.
-
-    ``rowwise`` and ``columnwise`` select the newly gathered planes, which are taken
-    from ``src`` with padded scales. Planes gathered earlier for the other phase stay
-    as installed on ``dst``, and planes absent from ``src`` are cleared. ``src`` is
-    not modified.
-    """
-    # Work around TE rejecting compact MXFP8 scales in GEMM:
-    # https://github.com/NVIDIA/TransformerEngine/issues/3518
-    # Pad only newly installed planes. Repadding the other phase's scales
-    # would replace them with a new copy not covered by its readiness event.
-    # TODO: Remove update_mxfp8_tensor once TE accepts compact scales.
-    # Callers can assign dst.data = src directly; there will be
-    # no padded copies to preserve across phases.
-    # Planes installed earlier for the other phase; dst.data = src replaces them.
-    rowwise_planes = (dst._rowwise_data, dst._rowwise_scale_inv)
-    columnwise_planes = (dst._columnwise_data, dst._columnwise_scale_inv)
-    # MXFP8Tensor's data setter shares src's plane tensors with dst without copying.
-    # It also takes src's quantizer, whose usage matches the allocated planes as TE
-    # checks, and src's unswizzled-scales flag. Planes absent from src are cleared.
-    # dst stays the same object, which TE may have saved for backward. The fixes
-    # below only rebind dst's attributes, so src is left untouched.
-    dst.data = src
-    if src._rowwise_data is not None:
-        if rowwise:
-            dst._rowwise_scale_inv = _pad_rowwise_scale(src._rowwise_scale_inv)
-        else:
-            # Allocated but not newly gathered: the other phase installed these planes.
-            assert rowwise_planes[0] is not None, "Expected previously installed rowwise planes."
-            dst._rowwise_data, dst._rowwise_scale_inv = rowwise_planes
-    if src._columnwise_data is not None:
-        if columnwise:
-            dst._columnwise_scale_inv = _pad_columnwise_scale(src._columnwise_scale_inv)
-        else:
-            # Allocated but not newly gathered: the other phase installed these planes.
-            assert (
-                columnwise_planes[0] is not None
-            ), "Expected previously installed columnwise planes."
-            dst._columnwise_data, dst._columnwise_scale_inv = columnwise_planes
-
-
 class QuantizedDBuffer:
     """The MFSDP storage and lifecycle for one TE MXFP8 tensor.
 
     The data layout owns the parameter-to-rank partition. Scale planes use its
     compact MXFP8 coordinates, so every plane on a rank describes the same
-    local data rows. TE-only padding is added when materializing a wrapper for
-    compute, not to distributed storage.
+    local data rows. Rows must be divisible by 32 and columns by 128, so
+    unswizzled scales need no padding. Requires TE fixes #3710 (quantization)
+    and #3768 (GEMM preparation).
     """
 
     rowwise_data: DBuffer
@@ -177,11 +115,9 @@ class QuantizedDBuffer:
         tensor_shapes = layout.tensor_shapes
         if not tensor_shapes or any(len(shape) != 2 for shape in tensor_shapes):
             raise ValueError("QuantizedDBuffer requires one or more 2D MXFP8 tensor shapes.")
-        if any(
-            shape[0] % _MXFP8_BLOCK_SIZE or shape[1] % _MXFP8_BLOCK_SIZE for shape in tensor_shapes
-        ):
+        if any(shape[0] % _MXFP8_BLOCK_SIZE or shape[1] % 128 for shape in tensor_shapes):
             raise ValueError(
-                f"QuantizedDBuffer requires dimensions divisible by {_MXFP8_BLOCK_SIZE}."
+                "QuantizedDBuffer requires rows divisible by 32 and columns divisible by 128."
             )
         layout.validate_for_row_atomic(block_size=_MXFP8_BLOCK_SIZE)
         placements = tuple(placements)
@@ -301,29 +237,7 @@ class QuantizedDBuffer:
         ), "quantize_() requires both rowwise and columnwise planes to be allocated."
 
         for index in range(len(self.rowwise_data.layout.tensor_shapes)):
-            # TE's MXFP8 quantize kernel writes scale_inv in its padded physical
-            # layout (see _pad_rowwise_scale and _pad_columnwise_scale) and stores
-            # scales for every row of its 64-row chunk, including rows beyond the
-            # tensor (https://github.com/NVIDIA/TransformerEngine/issues/3689). The
-            # compact plane views are smaller than that whenever this rank's shard
-            # is not a multiple of 64 rows, so quantizing into them is an
-            # out-of-bounds write: into the next rank's chunk of a replicated plane,
-            # or beyond the end of the local buffer. This is the producer-side
-            # counterpart of the GEMM padding in update_mxfp8_tensor() (TE issue 3518):
-            # quantize into padded scales and copy the compact region back. Once TE
-            # quantizes into compact scales in bounds, this loop body reduces to:
-            #   self.get_tensor_view(index).quantize_(main_weight.get_tensor_view(index))
-            tensor = self.get_tensor_view(index)
-            tensor._rowwise_scale_inv = _pad_rowwise_scale(tensor._rowwise_scale_inv)
-            tensor._columnwise_scale_inv = _pad_columnwise_scale(tensor._columnwise_scale_inv)
-            tensor.quantize_(main_weight.get_tensor_view(index))
-            for plane, padded in (
-                (self.rowwise_scale, tensor._rowwise_scale_inv),
-                (self.columnwise_scale, tensor._columnwise_scale_inv),
-            ):
-                compact = plane.get_tensor_view(index)
-                if padded.shape != compact.shape:
-                    compact.copy_(padded[: compact.shape[0], : compact.shape[1]])
+            self.get_tensor_view(index).quantize_(main_weight.get_tensor_view(index))
 
     @property
     def planes(self) -> tuple[DBuffer, DBuffer, DBuffer, DBuffer]:
