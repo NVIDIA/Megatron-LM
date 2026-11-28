@@ -1466,7 +1466,7 @@ class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageA
 
         if self.config.cuda_graph_impl == "transformer_engine":
             cuda_graph_output = self._te_cuda_graph_mlp_capture_output(
-                mlp_output_with_bias, residual
+                mlp_output_with_bias, residual, mlp_state
             )
             if cuda_graph_output is not None:
                 return cuda_graph_output

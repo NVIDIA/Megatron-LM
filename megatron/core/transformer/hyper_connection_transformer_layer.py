@@ -89,18 +89,18 @@ class HyperConnectionTransformerLayer(
                     f"The inactive {stage} branch requires an identity hyper connection."
                 )
 
-        unsupported_moe_cuda_graph_modules = {
-            CudaGraphModule.moe,
-            CudaGraphModule.moe_router,
-            CudaGraphModule.moe_preprocess,
-        }
-        if self.is_moe_layer and unsupported_moe_cuda_graph_modules.intersection(
-            self.config.cuda_graph_modules
+        if (
+            self.config.cuda_graph_impl != "transformer_engine"
+            and self.is_moe_layer
+            and {
+                CudaGraphModule.moe,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.moe_preprocess,
+            }.intersection(self.config.cuda_graph_modules)
         ):
             raise NotImplementedError(
-                "HyperConnectionTransformerLayer does not support MoE CUDA graph "
-                "scopes. Disable the moe, moe_router, and moe_preprocess CUDA graph modules "
-                "when combining mHC with a MoE MLP submodule."
+                "HyperConnectionTransformerLayer does not support the requested MoE CUDA graph "
+                "scopes. Local mHC MoE layers require disabling moe, moe_router and moe_preprocess."
             )
 
         # GraphableMegatronModule calls create_mcore_cudagraph_manager before the MLP is

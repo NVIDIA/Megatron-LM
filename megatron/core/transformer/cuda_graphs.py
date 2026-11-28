@@ -2617,7 +2617,7 @@ def _pair_hybrid_layers_enabled(config: TransformerConfig) -> bool:
 
 
 def _hybrid_mtp_graphs_supported(config: TransformerConfig) -> bool:
-    """Whether cuda_graph_pair_hybrid_layers can also graph the layers of Hybrid MTP blocks.
+    """Whether Hybrid MTP layers can be captured with the model's TE graph settings.
 
     A graph keeps the activations of one call per microbatch, so a block that runs once per MTP
     depth (mtp_use_repeated_layer) stays eager. TE graphs capture MTP layers with the model's
@@ -2848,6 +2848,10 @@ class TECudaGraphHelper:
 
     def _discover_layers(self):
         """Discover captureable layers from the model and populate internal data structures."""
+        from megatron.core.models.hybrid.layers.hybrid_hyper_connection import (
+            HyperConnectionHybridLayer,
+        )
+
         self.chunks_with_decoder = []
         self.num_layers_per_chunk = []
         self.callables_per_chunk = []
@@ -2855,10 +2859,11 @@ class TECudaGraphHelper:
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
         pair_hybrid_layers = _pair_hybrid_layers_enabled(self.config)
-        # Per-layer graphs leave Hybrid MTP blocks eager: such a block is a HybridStack, which is
-        # not graphable as a whole. With pairing, its layers are graphed like decoder layers.
+        # mHC captures each eligible MTP wrapper independently. Other Hybrid MTP blocks
+        # opt into capture through layer pairing.
         graph_hybrid_mtp = (
-            pair_hybrid_layers
+            self.config.cuda_graph_impl == "transformer_engine"
+            and (pair_hybrid_layers or self.config.enable_mhc_connections)
             and bool(self.config.mtp_num_layers)
             and _hybrid_mtp_graphs_supported(self.config)
         )
@@ -2922,9 +2927,15 @@ class TECudaGraphHelper:
                         # hybrid_layer_config_list can set apart from the model config.
                         eager_moe_layers = []
                         for layer in mtp_block_layers:
+                            # An mHC wrapper owns the graph; its inner layer owns the MoE.
+                            inner = (
+                                layer.inner_layer
+                                if isinstance(layer, HyperConnectionHybridLayer)
+                                else layer
+                            )
                             blocking_features = (
-                                _hybrid_mtp_moe_blocking_features(layer.config)
-                                if getattr(layer, "is_moe_layer", False)
+                                _hybrid_mtp_moe_blocking_features(inner.config)
+                                if getattr(inner, "is_moe_layer", False)
                                 else []
                             )
                             if blocking_features:
@@ -3144,12 +3155,18 @@ class TECudaGraphHelper:
                 self.seq_length, self.micro_batch_size
             )
 
+            from megatron.core.models.hybrid.layers.hybrid_hyper_connection import (
+                HyperConnectionHybridLayer,
+            )
             from megatron.core.transformer.identity_op import IdentityOp
             from megatron.core.transformer.transformer_layer import TransformerLayer
 
+            attention_layer = (
+                layer.inner_layer if isinstance(layer, HyperConnectionHybridLayer) else layer
+            )
             contains_self_attn = (
-                isinstance(layer, TransformerLayer)
-                and not isinstance(layer.self_attention, IdentityOp)
+                isinstance(attention_layer, TransformerLayer)
+                and not isinstance(attention_layer.self_attention, IdentityOp)
                 and (
                     not self.config.cuda_graph_modules
                     or CudaGraphModule.attn in self.config.cuda_graph_modules

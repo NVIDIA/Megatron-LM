@@ -403,9 +403,16 @@ class P2PCommunicator:
                 req.wait()
             reqs = None
 
-        if config.batch_p2p_comm and config.batch_p2p_sync:
+        if (
+            config.batch_p2p_comm
+            and config.batch_p2p_sync
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             # To protect against race condition when using batch_isend_irecv().
             # User should assert that we have a modern enough PyTorch to not need this
+            # Eager execution retains this device-wide fence. During graph capture,
+            # the request waits above record the stream dependencies instead; a
+            # device synchronization is illegal inside the captured region.
             torch.cuda.synchronize()
 
         return tensor_recv_prev, tensor_recv_next, reqs

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from typing import Optional, Tuple
 
@@ -7,19 +7,25 @@ from torch import Tensor
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection_cuda_graphs import (
+    TECudaGraphHyperConnectionHybridLayerMixin,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import (
+    GraphableMegatronModule,
     MegatronModule,
     convert_module_to_dtype_except_fp32_marked,
 )
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
-class HyperConnectionHybridLayer(MegatronModule):
+class HyperConnectionHybridLayer(
+    TECudaGraphHyperConnectionHybridLayerMixin, GraphableMegatronModule
+):
     """Layer-boundary mHC wrapper for HybridStack layers.
 
     Hybrid layers already own their local residual paths. Each wrapped layer is
@@ -36,11 +42,21 @@ class HyperConnectionHybridLayer(MegatronModule):
         super().__init__(config=config)
         self.inner_layer = layer
         self.layer_number = layer.layer_number
+        if config.cuda_graph_impl == "transformer_engine":
+            self._validate_te_graph_inner_layer()
         self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)
         if config.params_dtype is not None:
             convert_module_to_dtype_except_fp32_marked(self.hyper_connection, config.params_dtype)
         if hasattr(layer, 'tp_group'):
             self.tp_group = layer.tp_group
+
+    def create_mcore_cudagraph_manager(self, config: TransformerConfig) -> None:
+        """Keep the existing local-graph ownership on the inner layer.
+
+        This wrapper owns TE training graphs only. In particular, inheriting the
+        graphable protocol must not create a second local manager around the
+        inner layer's existing manager.
+        """
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """Delegate Mamba inference state shape requests to the wrapped layer."""
@@ -74,8 +90,11 @@ class HyperConnectionHybridLayer(MegatronModule):
                 input_ids=input_ids,
             )
             return output, None
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        inner = self.inner_layer.forward if is_graph_capturing() else self.inner_layer
         if isinstance(self.inner_layer, TransformerLayer):
-            output = self.inner_layer(
+            output = inner(
                 hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
@@ -90,7 +109,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             extra_kwargs = {}
             if packed_sequence_cp_metadata is not None:
                 extra_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
-            output = self.inner_layer(
+            output = inner(
                 hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
@@ -176,7 +195,7 @@ class HyperConnectionHybridLayer(MegatronModule):
     def forward(
         self,
         hidden_states: Tensor,
-        attention_mask: Tensor,
+        attention_mask: Optional[Tensor] = None,
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,
         sequence_len_offset: Optional[Tensor] = None,
@@ -230,6 +249,28 @@ class HyperConnectionHybridLayer(MegatronModule):
                 f"vs {tuple(aggregated.shape)} input."
             )
 
+        hidden_states = self._apply_mhc_post(
+            h_res,
+            residual,
+            h_post,
+            layer_output_with_bias,
+            dropout_prob=dropout_prob,
+            bias_dropout_fusion=bias_dropout_fusion,
+            mhc_recompute_manager=mhc_recompute_manager,
+        )
+        return hidden_states, context
+
+    def _apply_mhc_post(
+        self,
+        h_res: Tensor,
+        residual: Tensor,
+        h_post: Tensor,
+        layer_output_with_bias: Tuple[Tensor, Optional[Tensor]],
+        dropout_prob: float,
+        bias_dropout_fusion: bool,
+        mhc_recompute_manager=None,
+    ) -> Tensor:
+        """Expand the branch output back to n streams with H_res, H_post and bias-dropout-add."""
         is_last_in_recompute_block = bool(
             mhc_recompute_manager is not None
             and getattr(mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
@@ -251,4 +292,4 @@ class HyperConnectionHybridLayer(MegatronModule):
             and hidden_states.dtype != self.config.params_dtype
         ):
             hidden_states = hidden_states.to(self.config.params_dtype)
-        return hidden_states, context
+        return hidden_states

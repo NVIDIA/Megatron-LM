@@ -395,7 +395,7 @@ class _RecomputeRegion:
         self._function = function
         self._layout = _ArgLayout(args)
         # Taken before the function draws any random number.
-        self._rng_states = _tp_random()._get_all_rng_states()
+        self._rng_states, self._rng_contents = _tp_random()._get_recompute_rng_states()
         self._te_context = _TERecomputeContext(use_te_context)
         self._retained_storage_ptrs = (
             frozenset(t.untyped_storage().data_ptr() for t in self._layout.tensors_of(args))
@@ -450,14 +450,14 @@ class _RecomputeRegion:
             )
 
         leaves = self._unstash_inputs()
-        with _tp_random()._fork_rng():
-            _tp_random()._set_all_rng_states(*self._rng_states)
+        with _tp_random()._replay_rng_states(self._rng_states, self._rng_contents):
             with torch.enable_grad(), self._te_context.second_pass(), suspend_tensor_observations():
                 outputs = _as_tuple(self._function(*self._layout.rebuild(leaves)))
 
         self._share_rebuilt_storages(outputs)
         self._rebuilt = (outputs, leaves)
-        self._function = self._layout = self._rng_states = self._te_context = None
+        self._function = self._layout = self._rng_states = self._rng_contents = None
+        self._te_context = None
         self._output_aliases = ()
         self.state = _RegionState.REBUILT
 
