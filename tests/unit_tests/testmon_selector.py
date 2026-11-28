@@ -82,7 +82,10 @@ def _run(args: argparse.Namespace) -> int:
         os.environ["COVERAGE_FILE"] = f".coverage.unit_tests.rank{rank}"
         if rank == 0:
             database = _database(args.cache_dir, args.phase)
-            _clear_database_files(database)
+            if args.append:
+                validate_phase(args.cache_dir, args.phase)
+            else:
+                _clear_database_files(database)
             (database.parent / "metadata.json").unlink(missing_ok=True)
             os.environ["TESTMON_DATAFILE"] = str(database)
             pytest_args.extend(
@@ -180,6 +183,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("baseline", "select"), required=True)
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--phase", choices=PHASES, required=True)
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Record another baseline environment without clearing the completed phase database.",
+    )
     parser.add_argument("pytest_args", nargs=argparse.REMAINDER)
     return parser
 
@@ -188,7 +196,10 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] in ("select", "prepare"):
         return _run_plan(argv)
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.append and args.mode != "baseline":
+        parser.error("--append requires --mode baseline")
     try:
         return _run(args)
     except (OSError, RuntimeError, ValueError) as error:

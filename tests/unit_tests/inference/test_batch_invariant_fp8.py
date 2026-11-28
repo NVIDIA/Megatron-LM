@@ -53,7 +53,9 @@ def test_dense_tensorwise_fp8_admission(fp8):
         )
 
 
-@pytest.mark.parametrize("recipe", ["mxfp8", "delayed", "blockwise"])
+@pytest.mark.parametrize(
+    "recipe", [pytest.param("mxfp8", marks=pytest.mark.launch_on_gb200), "delayed", "blockwise"]
+)
 @torch.inference_mode()
 def test_dense_fp8_target_batch_invariance(monkeypatch, recipe):
     assert Utils.world_size == 1
