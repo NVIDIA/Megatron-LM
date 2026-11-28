@@ -274,6 +274,9 @@ class _GroupExchangePlan:
     stage1_routed_indices: list[int]  # k -> n: routed params whose g_home is this rank
     tp_exchanges: dict[int, tuple[list[int], dict[int, int]]]  # tp_dim -> (k's, j -> t_home)
     tp_complete: list[int]  # k: complete after stage 1 (no TP axis), skips stage 2
+    # Local index -> home for each contiguous chunk of the routed list.
+    pipeline_homes: list[dict[int, int]] = dataclasses.field(default_factory=list)
+    pipeline_skip_reason: str | None = None
     # a2a routing metadata per stage ("s1f", "s1b", ("s2f", pd), ("s2b", pd)), filled by
     # the route_* helpers on the first step.
     route_plans: dict = dataclasses.field(default_factory=dict)
@@ -345,6 +348,12 @@ class LayerShardedMuon(TensorParallelMuon):
             than two param groups or without CUDA. Requires the groups' domains to
             be disjoint; groups sharing a (gtp_remat, tp) domain are automatically
             serialized (NCCL forbids concurrent collectives on one communicator).
+        pipeline_chunks: Overlap one chunk's Newton-Schulz with other chunks' exchanges
+            within a serially scheduled group. Uses the existing NS batch boundaries for
+            equal-shape, evenly homed GTP-only groups with multiple batches. When disjoint
+            groups run on concurrent streams, group-level overlap takes priority. Groups
+            with the same (GTP-remat, TP) domain are scheduled serially and remain eligible.
+            Defaults to False.
         All other args: same as :class:`TensorParallelMuon`. In particular
             ``split_qkv`` / ``is_qkv_fn`` / ``qkv_split_shapes``, ``tp_mode`` and
             ``pg_collection`` only take effect on the path that delegates to the
@@ -383,6 +392,7 @@ class LayerShardedMuon(TensorParallelMuon):
         ns_batch_size: int = 1,
         use_syrk: bool = False,
         concurrent_groups: bool = True,
+        pipeline_chunks: bool = False,
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
@@ -451,6 +461,8 @@ class LayerShardedMuon(TensorParallelMuon):
         self.extra_scale_factor = extra_scale_factor
         self.concurrent_groups = concurrent_groups
         self._group_streams: list | None = None
+        self.pipeline_chunks = pipeline_chunks
+        self._ns_streams: dict[torch.device, torch.cuda.Stream] = {}
         # id(param) -> (g_home, t_home). Set via set_param_ns_homes(); until then step()
         # delegates to the parent.
         self._param_ns_homes: dict[int, tuple[int, int]] = {}
@@ -459,6 +471,7 @@ class LayerShardedMuon(TensorParallelMuon):
         self._warned_no_homes = False
         self._warned_missing_homes = False
         self._warned_shared_domain = False
+        self._logged_pipeline_skip_reasons: set[str] = set()
         # param_group index -> (gtp_remat_group, tp_group), overriding the constructor
         # defaults. Set via set_group_process_groups().
         self._group_process_groups: dict[int, tuple] = {}
@@ -713,6 +726,9 @@ class LayerShardedMuon(TensorParallelMuon):
                 }
                 tp_exchanges[pd] = (positions, t_home)
 
+        pipeline_homes, pipeline_skip_reason = self._build_pipeline_homes(
+            params, specs, routed, g_home, gtp_remat_group, gtp_remat_size, tp_size
+        )
         return _GroupExchangePlan(
             param_ids=tuple(id(p) for p in params),
             specs=specs,
@@ -724,7 +740,112 @@ class LayerShardedMuon(TensorParallelMuon):
             stage1_routed_indices=stage1_routed_indices,
             tp_exchanges=tp_exchanges,
             tp_complete=by_tp_dim[None],
+            pipeline_homes=pipeline_homes,
+            pipeline_skip_reason=pipeline_skip_reason,
         )
+
+    def _build_pipeline_homes(
+        self, params, specs, routed, g_home, gtp_remat_group, gtp_remat_size, tp_size
+    ) -> tuple[list[dict[int, int]], str | None]:
+        chunk_size = gtp_remat_size * self.ns_batch_size
+        if not self.pipeline_chunks:
+            return [], None
+        if not routed:
+            return [], "the group has no routed matrices"
+        if self.use_syrk:
+            return [], "SYRK is enabled"
+        if tp_size > 1 or gtp_remat_size <= 1:
+            return [], "chunk pipelining requires a multi-rank GTP-only group"
+        if len(routed) <= chunk_size:
+            return [], "the group fits in a single exchange chunk"
+        if (
+            not params[routed[0]].is_cuda
+            or torch.distributed.get_backend(gtp_remat_group) != 'nccl'
+        ):
+            return [], "chunk pipelining requires CUDA tensors and NCCL"
+        if len({specs[i].full_shape for i in routed}) != 1:
+            return [], "the routed matrices have different full shapes"
+
+        # All ranks derive the same schedule. Each full chunk must give each
+        # home exactly one original NS batch, in the original matrix order.
+        chunks = []
+        for start in range(0, len(routed), chunk_size):
+            count = min(chunk_size, len(routed) - start)
+            homes = {i: g_home[start + i] for i in range(count)}
+            if any(
+                len(indices) * gtp_remat_size != count
+                for indices in params_by_home(count, homes, gtp_remat_size)
+            ):
+                return [], "a chunk assigns different numbers of matrices to its NS homes"
+            chunks.append(homes)
+        return chunks, None
+
+    def _step_routed_pipeline(self, params, shards, plan, gtp_remat_group, lr):
+        """Run the one-axis exchange with one lookahead chunk to bound temporary memory."""
+        device = shards[0].device
+        comm = torch.cuda.current_stream(device)
+        compute = self._ns_streams.get(device)
+        if compute is None:
+            compute = self._ns_streams[device] = torch.cuda.Stream(device=device)
+
+        def launch(start, stop, homes):
+            with _phase("a2a_fwd"):
+                full, indices = route_to_ns_home(
+                    shards[start:stop],
+                    homes,
+                    gtp_remat_group,
+                    plan=plan.route_plans.setdefault(("pipeline_fwd", start), {}),
+                )
+            compute.wait_stream(comm)
+            with torch.cuda.stream(compute), _phase("ns"):
+                for tensor in full:
+                    tensor.record_stream(compute)
+                outputs = self._run_ns(
+                    {
+                        i: self._strip_pad(tensor, plan.pad_lengths[start + i])
+                        for i, tensor in zip(indices, full)
+                    }
+                )
+                outputs = [
+                    self._restore_pad(outputs[i], plan.pad_lengths[start + i]) for i in indices
+                ]
+                done = compute.record_event()
+            return indices, outputs, done
+
+        def finish(start, stop, homes, pending):
+            indices, outputs, done = pending
+            comm.wait_event(done)
+            with _phase("a2a_bwd"):
+                for tensor in outputs:
+                    tensor.record_stream(comm)
+                updates = route_from_ns_home(
+                    outputs,
+                    indices,
+                    shards[start:stop],
+                    homes,
+                    gtp_remat_group,
+                    plan=plan.route_plans.setdefault(("pipeline_bwd", start), {}),
+                )
+            with _phase("update"):
+                for param, update in zip(params[start:stop], updates):
+                    if update is not None:
+                        self._apply_update(param, update, lr)
+
+        with fp32_matmul_precision(self.fp32_matmul_prec):
+            try:
+                chunks = iter(plan.pipeline_homes)
+                start, homes = 0, next(chunks)
+                stop = len(homes)
+                pending = launch(start, stop, homes)
+                for next_homes in chunks:
+                    next_stop = stop + len(next_homes)
+                    next_pending = launch(stop, next_stop, next_homes)
+                    finish(start, stop, homes, pending)
+                    start, stop, homes, pending = stop, next_stop, next_homes, next_pending
+                finish(start, stop, homes, pending)
+            finally:
+                # Also join the auxiliary stream if a launch or update raises.
+                comm.wait_stream(compute)
 
     def _step_groups(self, streams: list | None, ready: torch.cuda.Event | None) -> None:
         for group_index, group in enumerate(self.param_groups):
@@ -746,6 +867,20 @@ class LayerShardedMuon(TensorParallelMuon):
             if not params:
                 continue
             plan = self._plan_for(group_index, params, gtp_remat_group, tp_group)
+            skip_reason = plan.pipeline_skip_reason
+            if streams is not None and plan.pipeline_homes:
+                skip_reason = (
+                    "parameter groups run on concurrent CUDA streams "
+                    "(use --muon-no-concurrent-groups to serialize them)"
+                )
+            if skip_reason and skip_reason not in self._logged_pipeline_skip_reasons:
+                self._logged_pipeline_skip_reasons.add(skip_reason)
+                log_single_rank(
+                    logger,
+                    logging.INFO,
+                    "LayerShardedMuon: skipping chunk pipelining: %s.",
+                    skip_reason,
+                )
 
             # 1. Momentum update on the local shard.
             with _phase("momentum"):
@@ -777,6 +912,11 @@ class LayerShardedMuon(TensorParallelMuon):
             # The rank-local shards that enter the GTP_remat / TP routing path.
             local_param_shards = [params[i] for i in plan.routed]
             local_ns_input_shards = [ns_input(p) for p in local_param_shards]
+            if streams is None and plan.pipeline_homes:
+                self._step_routed_pipeline(
+                    local_param_shards, local_ns_input_shards, plan, gtp_remat_group, lr
+                )
+                continue
             stage1_routed_indices = plan.stage1_routed_indices
             route_plans = plan.route_plans
 
