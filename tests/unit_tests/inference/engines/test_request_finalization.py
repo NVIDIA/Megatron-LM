@@ -2,7 +2,6 @@
 
 import asyncio
 from collections import deque
-from functools import partial
 from types import SimpleNamespace
 from unittest import mock
 
@@ -31,12 +30,17 @@ from tests.unit_tests.inference.text_generation_controllers.test_text_generation
 @pytest.mark.parametrize("mtp", [False, True])
 @pytest.mark.parametrize("prefix_caching", [False, True])
 @pytest.mark.parametrize("trim_stop", [False, True])
-async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping(
+async def test_finished_request_keeps_its_routing_after_its_blocks_are_reused(
     path, mtp, prefix_caching, trim_stop
 ):
-    """A finishes while B reuses its blocks; A's complete result remains intact."""
+    """A finishes and B reuses its blocks before the engine's bookkeeping runs; A's routing
+    was reconstructed by the controller before the release, and its result is complete."""
     context = _make_async_sched_context(total_request_count=2)
     context.num_decode_requests = 2
+    # Routed tokens per row: the prompt, one generated token and, with MTP, a verified draft.
+    context.request_kv_length_offsets = torch.tensor([2, 2])
+    context.request_query_lengths = torch.tensor([1 + int(mtp)] * 2)
+    context.get_active_sequence_lengths = mock.Mock(return_value=torch.tensor([3 + int(mtp)] * 2))
     context.request_metadata["termination_id"] = torch.tensor([1, 99])
     context.active_request_metadata["termination_id"] = torch.tensor([1, 99])
     context.chunked_prefill_request_id = -1
@@ -112,21 +116,11 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
         row: [(torch.tensor([-0.1]), torch.tensor([1])) for _ in range(score_count)]
         for row in range(2)
     }
-    completed = {}
-    finalize = partial(
-        engine._finalize_finished_requests,
-        completed,
-        {"chunked_prefill_request_id": -1, "active_token_count": 2, "step_count": 3},
-        True,
-    )
 
     def reuse_finished_blocks(*args):
-        assert set(completed) == {10}
+        # The step is still inside the controller: nothing appended, nothing published.
         assert not future.done()
-        assert engine.get_request(11).generated_tokens == [9]
-        np.testing.assert_array_equal(
-            completed[10][0].routing_indices, expected_routing[: 2 + score_count - int(trim_stop)]
-        )
+        assert engine.get_request(10).generated_tokens == [8]
         allocator.release_memory_blocks(blocks[:2])
         reused = allocator.allocate_memory_blocks(2).clone()
         assert set(reused.tolist()) == set(blocks[:2].tolist())
@@ -144,9 +138,10 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
         controller._sampled_tokens_cuda[:2] = samples
         controller._sampled_mtp_tokens_cuda = torch.zeros((2, 2), dtype=torch.long)
         controller._accepted_tokens_per_request = accepted
-        controller._dynamic_step_context_bookkeeping(
-            finalize_requests=finalize, log_probs=log_probs, top_n_logprobs=top_n
+        result = controller._dynamic_step_context_bookkeeping(
+            log_probs=log_probs, top_n_logprobs=top_n
         )
+        finished_routing_parts = result["finished_routing_parts"]
     else:
         sample_result = SimpleNamespace(
             sampled_tokens_cpu_view=samples,
@@ -161,8 +156,14 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
             if path == "overlap"
             else controller._run_async_sched_update_requests
         )
-        method(sample_result, context.get_active_sequence_lengths() + 1, finalize_requests=finalize)
+        result = method(sample_result, context.get_active_sequence_lengths() + 1)
+        finished_routing_parts = result.finished_routing_parts
 
+    # The views cover every routed token and survived the reuse: B's routing went into the
+    # fresh arrays of the reallocated blocks.
+    np.testing.assert_array_equal(
+        np.concatenate(finished_routing_parts[10]), expected_routing[: 2 + score_count]
+    )
     assert not future.done()
     active, finished = engine.post_process_requests(
         request_ids=torch.tensor([10, 11]),
@@ -174,7 +175,7 @@ async def test_finalization_precedes_reuse_but_publication_waits_for_bookkeeping
         log_probs=log_probs,
         top_n_logprobs=top_n,
         consumed_chunked_prefill_request_id=-1,
-        completed_requests=completed,
+        finished_routing_parts=finished_routing_parts,
     )
     assert active == [11]
     assert future.result() is finished[0]

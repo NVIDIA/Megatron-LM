@@ -922,8 +922,17 @@ class CoordinatorMixin:
                 entry = self.requests.get(request_id)
                 if entry is not None:
                     request = entry.record[-1]
-                    # Force active requests to finish on the next step.
-                    request.sampling_params.num_tokens_to_generate = len(request.generated_tokens)
+                    # Force active requests to finish on the next step, keeping the tokens
+                    # the pending step's bookkeeping still appends.
+                    pending_tokens = (
+                        self._pending_record.appended_tokens().get(request_id, [])
+                        if self._pending_record is not None
+                        else []
+                    )
+                    request.sampling_params.num_tokens_to_generate = min(
+                        request.sampling_params.num_tokens_to_generate,
+                        len(request.generated_tokens) + len(pending_tokens),
+                    )
                     active_ids = self.context.request_ids[: self.context.total_request_count]
                     matches = torch.where(active_ids == request_id)[0]
                     if matches.numel() > 0:

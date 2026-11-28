@@ -106,6 +106,7 @@ def test_suspend_clears_only_recomputed_cache(cache_mode, expect_clear):
 
     engine = object.__new__(DynamicInferenceEngine)
     engine.state = EngineState.RUNNING
+    engine._pending_record = None
     engine.context = context
     engine.controller = SimpleNamespace(_async_sched_forward=Mock())
     engine.unified_memory_level = 0
@@ -166,6 +167,7 @@ async def test_async_forward_discards_before_scheduling_and_publishes_after_forw
     context.active_token_count = 0
     context.chunked_prefill_request_id = -1
     context.num_prefill_requests = 0
+    context.enable_prefix_caching = False
     context.config = SimpleNamespace(async_sched_mode=AsyncScheduleMode.LEGACY)
     context.dynamo_helper.queue_kv_stored_event({"block_hashes": [7]})
 
@@ -182,9 +184,9 @@ async def test_async_forward_discards_before_scheduling_and_publishes_after_forw
         order.append("schedule")
         context.dynamo_helper.queue_kv_stored_event(payload)
 
-    async def forward(*, finalize_requests):
+    async def forward(*, after_launch):
         order.append("forward")
-        assert finalize_requests.func == engine._finalize_finished_requests
+        assert after_launch == engine.drain_bookkeeping
         listener.assert_not_called()
         return SimpleNamespace(decode_only=False, output={"output": True})
 
@@ -197,6 +199,9 @@ async def test_async_forward_discards_before_scheduling_and_publishes_after_forw
 
     engine = object.__new__(DynamicInferenceEngine)
     engine.state = EngineState.RUNNING
+    engine._pending_record = None
+    engine.stop_word_being_finished_ids = set()
+    engine.track_generated_token_events = False
     engine.context = context
     engine.logging_step_interval = 0
     engine.schedule_waiting_requests = schedule
@@ -209,8 +214,8 @@ async def test_async_forward_discards_before_scheduling_and_publishes_after_forw
         "megatron.core.inference.engines.dynamic.loop.nvtx_range_pop", lambda *_: None
     )
 
-    result, _, _ = await DynamicInferenceEngine.async_forward(engine)
+    record = await DynamicInferenceEngine.async_forward(engine)
 
-    assert result == {"output": True, "completed_requests": {}}
+    assert record.step_result == {"output": True}
     assert order == ["discard", "schedule", "forward", "publish"]
     listener.assert_called_once_with("stored", payload)

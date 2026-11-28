@@ -1498,17 +1498,20 @@ def test_finished_handoff_keeps_only_committed_blocks(committed_blocks, reserve_
 
 
 @pytest.mark.parametrize("reserve_blocks", [1, 2])
-def test_finished_routing_blocks_drop_the_speculative_reserve(reserve_blocks):
-    """Routing reconstruction aborts on any block without stored routing.
+def test_finished_routing_is_reconstructed_without_the_speculative_reserve(reserve_blocks):
+    """The snapshot takes the committed blocks only, over the routed length.
 
     The main model never writes into the reserve, so it has no routing, and
-    `reconstruct_routing_from_blocks` tests `routing is None` before its `remaining <= 0`
-    break. Shipping the reserve therefore turns the whole reconstruction into None and silently
-    drops `moe_topk_indices` from the response.
+    `collect_block_routing` tests `routing is None` before its `remaining <= 0` break.
+    Shipping the reserve would turn the whole routing into None and silently drop
+    `moe_topk_indices` from the response.
     """
     context = _make_async_sched_context(total_request_count=2)
+    collect = mock.Mock(side_effect=lambda blocks, routed: (tuple(blocks), routed))
     context.kv_block_allocator = SimpleNamespace(
-        routing_replay=SimpleNamespace(has_data=mock.Mock(return_value=True)),
+        routing_replay=SimpleNamespace(
+            has_data=mock.Mock(return_value=True), collect_block_routing=collect
+        ),
         enable_handoff_pinning=False,
     )
     context.request_to_kv_block_ids = torch.tensor(
@@ -1524,21 +1527,25 @@ def test_finished_routing_blocks_drop_the_speculative_reserve(reserve_blocks):
 
     result = controller._dynamic_step_context_bookkeeping()
 
-    assert result["finished_routing_block_ids"] == {10: [10, 11], 11: [12]}
+    routed = (context.request_kv_length_offsets + context.request_query_lengths).tolist()
+    assert result["finished_routing_parts"] == {10: ((10, 11), routed[0]), 11: ((12,), routed[1])}
 
 
 @pytest.mark.parametrize(
-    "termination_ids, stop_word_finished_ids, expected_finished_routing_block_ids",
+    "termination_ids, stop_word_finished_ids, expected_routed_blocks",
     [([99, 99, 99], set(), {}), ([99, 2, 99], set(), {11: [41]}), ([99, 99, 99], {11}, {11: [41]})],
 )
 def test_run_async_sched_resolve_compacts_without_forward_sync(
-    termination_ids, stop_word_finished_ids, expected_finished_routing_block_ids
+    termination_ids, stop_word_finished_ids, expected_routed_blocks
 ):
     sample_tokens = torch.tensor([1, 2, 3], dtype=torch.int64)
     context = _make_async_sched_context(total_request_count=3)
     context.request_metadata["termination_id"] = torch.tensor(termination_ids)
     controller = _make_async_sched_controller(context)
     context.kv_block_allocator.routing_replay.has_data.return_value = True
+    context.kv_block_allocator.routing_replay.collect_block_routing = mock.Mock(
+        side_effect=lambda blocks, routed: (tuple(blocks), routed)
+    )
     context.request_to_kv_block_ids = torch.tensor([[40], [41], [42]])
     controller._synchronize_async_sched_event = mock.Mock()
     controller._get_stop_word_finished_ids_callback = mock.Mock(return_value=stop_word_finished_ids)
@@ -1569,7 +1576,13 @@ def test_run_async_sched_resolve_compacts_without_forward_sync(
     assert not hasattr(result, "compaction_done_event")
     controller._synchronize_async_sched_event.assert_not_called()
     assert torch.equal(result.survivor_idxs, expected_survivor_idxs)
-    assert result.finished_routing_block_ids == expected_finished_routing_block_ids
+    # Each finished row's routing is taken over its consumed length: the resolved length
+    # less the token just sampled.
+    routed = context.get_active_sequence_lengths().tolist()
+    assert result.finished_routing_parts == {
+        request_id: (tuple(blocks), routed[context.request_ids.tolist().index(request_id)])
+        for request_id, blocks in expected_routed_blocks.items()
+    }
     controller._compact_async_sched_forward.assert_called_once_with(expected_survivor_idxs)
     context.commit_sampled_tokens.assert_not_called()
     context.resolve_requests.assert_called_once()
@@ -1642,7 +1655,7 @@ def test_async_sched_step_overlap_order():
             finished_handoff_block_ids={},
             finished_handoff_ssm_slots={},
             finished_handoff_decode_tokens={},
-            finished_routing_block_ids={},
+            finished_routing_parts={},
             log_probs_result=None,
         )
     )
@@ -1822,7 +1835,7 @@ def test_async_sched_step_yields_after_resolution_outside_inference_mode():
             finished_handoff_block_ids={},
             finished_handoff_ssm_slots={},
             finished_handoff_decode_tokens={},
-            finished_routing_block_ids={},
+            finished_routing_parts={},
             log_probs_result=None,
         )
     )
@@ -1969,7 +1982,7 @@ def test_async_sched_no_overlap_updates_before_admission(
         finished_handoff_block_ids={},
         finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
-        finished_routing_block_ids={},
+        finished_routing_parts={},
         log_probs_result=None,
     )
     input_ids = torch.empty(1, dtype=torch.int64)
@@ -2078,7 +2091,7 @@ def test_async_sched_no_overlap_finishes_with_matching_ep_base_forward():
         finished_handoff_block_ids={},
         finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
-        finished_routing_block_ids={},
+        finished_routing_parts={},
         log_probs_result=None,
     )
     controller._run_async_sched_sample = mock.Mock(return_value=sample_result)
@@ -2133,7 +2146,7 @@ def test_async_sched_mtp_overlap_step_order():
         finished_handoff_block_ids={},
         finished_handoff_ssm_slots={},
         finished_handoff_decode_tokens={},
-        finished_routing_block_ids={},
+        finished_routing_parts={},
         log_probs_result=None,
     )
     input_ids = torch.empty(9, dtype=torch.int64)

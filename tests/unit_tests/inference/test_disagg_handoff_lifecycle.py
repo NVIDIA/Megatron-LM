@@ -2110,6 +2110,7 @@ class _CoordinatorLoopPrefillEngine(DisaggDynamicInferenceEngine):
         self._ep_consensus_loop_counter = 0
         self._last_ep_consensus = (0, False)
         self.use_synchronous_zmq_collectives = False
+        self._pending_record = None
         self.waiting_request_ids = deque([7])
         self.context = SimpleNamespace(
             step_count=0, prefix_cache_lru_clock=0, get_active_request_count=lambda: 0
@@ -2136,7 +2137,7 @@ class _CoordinatorLoopPrefillEngine(DisaggDynamicInferenceEngine):
             self.state = EngineState.STOPPING
         return 0
 
-    async def async_step(self, *, verbose=False):
+    async def async_forward(self):
         # The prompt finishes prefill in one step and leaves the batch; its detached
         # recurrent-state slot stays pinned until decode releases the handoff.
         self.step_calls += 1

@@ -2566,6 +2566,7 @@ class TestPerBlockRouting(PrefixCachingTestBase):
         engine.track_generated_token_events = False
         engine.num_speculative_tokens = 0
         engine.stop_word_being_finished_ids = set()
+        engine.stop_word_finished_request_ids = set()
         active_ids, finished_requests = engine.post_process_requests(
             request_ids=torch.tensor([request.request_id]),
             finished_request_ids=torch.tensor([request.request_id]),
@@ -2575,7 +2576,11 @@ class TestPerBlockRouting(PrefixCachingTestBase):
             accepted_tokens=None,
             log_probs=[[-0.4]],
             consumed_chunked_prefill_request_id=-1,
-            finished_routing_block_ids={request.request_id: block_ids},
+            finished_routing_parts={
+                request.request_id: ctx.kv_block_allocator.routing_replay.collect_block_routing(
+                    block_ids, 2 * bs + 3
+                )
+            },
         )
 
         expected = routing[: 2 * bs + 3]
