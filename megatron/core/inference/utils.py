@@ -2,11 +2,12 @@
 
 import asyncio
 import contextlib
+import gc
 import logging
 import multiprocessing
 import sys
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -145,6 +146,61 @@ class InferenceMode:
             yield
         finally:
             cls.unset_active()
+
+
+class DeferredFullGC:
+    """Process-wide switch that stops CPython's automatic full garbage collections.
+
+    `defer_full` keeps CPython's automatic collection of young objects and stops its full
+    collections for as long as the engine serves. A full collection walks every live
+    container object of the process - that is to say, every request in flight, every record,
+    etcetera. This is on the host's critical path and takes a very long time.
+    Nothing is lost by skipping full garbage collection: young-object garbage collection
+    has been observed to be sufficient to avoid memory leaks.
+
+    An engine with `gc_mode="defer_full"` sets it at start and on `resume()`, and unsets it on
+    `suspend()` and `shutdown()`. The collector's thresholds are process-wide, so is this state.
+    """
+
+    # CPython's generation-2 threshold while full collections are deferred.
+    # This is meant to represent a very high-water mark.
+    DEFERRED_THRESHOLD: int = 2**31 - 1
+    # The generation-2 threshold that `set_active` replaced; None while inactive.
+    _replaced_threshold: Optional[int] = None
+
+    @classmethod
+    def is_active(cls) -> bool:
+        """Return True while automatic full collections are deferred."""
+        return cls._replaced_threshold is not None
+
+    @classmethod
+    def set_active(cls) -> None:
+        """Stop CPython's automatic full collections. Idempotent."""
+        if cls.is_active():
+            return
+        threshold0, threshold1, cls._replaced_threshold = gc.get_threshold()
+        gc.set_threshold(threshold0, threshold1, cls.DEFERRED_THRESHOLD)
+
+    @classmethod
+    def collect_if_due(cls) -> None:
+        """Run the deferred full collection, if one is due, while the engine is idle."""
+        if cls.is_active() and gc.get_count()[2] > cls._replaced_threshold:
+            gc.collect()
+
+    @classmethod
+    def unset_active(cls) -> int:
+        """Restore CPython's automatic full collections and run the deferred one. Idempotent.
+
+        Returns:
+            int: The number of unreachable objects the collection found; 0 when inactive.
+        """
+        if not cls.is_active():
+            return 0
+        threshold0, threshold1, _ = gc.get_threshold()
+        gc.set_threshold(threshold0, threshold1, cls._replaced_threshold)
+        cls._replaced_threshold = None
+        # Reference cycles that outlived the young generations have waited for this collection.
+        return gc.collect()
 
 
 def device_memory_summary() -> str:

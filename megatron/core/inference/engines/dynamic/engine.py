@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
-import gc
 import logging
 import time
 from collections import OrderedDict, deque
@@ -25,7 +24,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     DecodeOnly,
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, InferenceMode
+from megatron.core.inference.utils import Counter, DeferredFullGC, InferenceMode
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -177,8 +176,6 @@ class DynamicInferenceEngine(
     # Instances created without __init__ run in the default gc mode whatever the config default
     # is, so their suspend, resume, step and idle hooks leave Python GC unchanged.
     gc_mode: str = "default"
-    _in_custom_gc_mode: bool = False
-    _gc_freeze_pending: bool = False
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -810,69 +807,24 @@ class DynamicInferenceEngine(
             )
 
     def _enter_custom_gc_mode(self) -> None:
-        """Apply `gc_mode` after CUDA graph capture during engine start or resume.
+        """Apply `gc_mode` during engine start or resume (see `DeferredFullGC`)."""
+        if self.gc_mode == "defer_full":
+            DeferredFullGC.set_active()
 
-        On PyTorch < 2.9 (`FREEZE_GC` in `cuda_graphs.py`), each capture is bracketed with a
-        process-wide `gc.freeze()` and `gc.unfreeze()`, so a graph captured inline later, for
-        a batch shape that `create_cuda_graphs` skipped, would unfreeze the heap frozen here.
-        Serving is not expected to hit that path.
-        """
-        if self.gc_mode == "default":
-            return
-        self._in_custom_gc_mode = True
-        self._collect_and_freeze_gc()
-        # freeze_pending=True means we want to freeze again when the engine first drains,
-        # after the first requests have built their long-lived state. A drain only counts
-        # after an engine step has run, so we need to record the _gc_mode_entry_step.
-        self._gc_freeze_pending = True
-        self._gc_mode_entry_step = self.context.step_count
-
-    def _freeze_gc_after_first_request_drain(self) -> None:
-        """Freeze the state built by the first requests, then start scheduled collection."""
-        self._gc_freeze_pending = False
-        self._collect_and_freeze_gc()
-        if self.gc_mode == "freeze_overlap":
-            # Automatic GC stays on until here. Disabling it from engine setup left all garbage
-            # from first-use kernel compilation for one long collection after the first forward.
-            self._gc_was_enabled = gc.isenabled()
-            gc.disable()
-            self.controller._overlap_gc = True
-
-    def _collect_and_freeze_gc(self) -> None:
-        """Collect, then exclude long-lived engine objects from later GC scans."""
-        gc.collect()
-        gc.freeze()
-        # A second collect() is needed for freeze() to take effect.
-        gc.collect()
-
-    def _collect_gc_while_idle(self, drained: bool) -> None:
-        """Do the GC work `gc_mode` owes while every EP rank is idle."""
-        if not self._in_custom_gc_mode:
-            return
-        if self._gc_freeze_pending:
-            if drained and self.context.step_count > self._gc_mode_entry_step:
-                self._freeze_gc_after_first_request_drain()
-        elif self.controller._overlap_gc:
-            self.controller._trigger_gc_now()
+    def _collect_gc_while_idle(self) -> None:
+        """Run the full collection `gc_mode` deferred, if one is due, while the engine is idle."""
+        if self.gc_mode == "defer_full":
+            DeferredFullGC.collect_if_due()
 
     def _exit_custom_gc_mode(self) -> None:
-        """Stop using custom `gc_mode` and go back to the Python default GC mode."""
-        if not self._in_custom_gc_mode:
+        """Restore CPython's automatic full collections and run the one `gc_mode` deferred."""
+        if self.gc_mode != "defer_full":
             return
-        self._in_custom_gc_mode = False
-        self._gc_freeze_pending = False
-        if self.controller._overlap_gc:
-            self.controller._overlap_gc = False
-            if self._gc_was_enabled:
-                gc.enable()
-        gc.collect()
-        gc.unfreeze()
-        # Anything collected now became cyclic garbage while frozen, so freezing kept it alive.
         allocated = torch.cuda.memory_allocated()
-        collected = gc.collect()
+        collected = DeferredFullGC.unset_active()
         if collected:
             logger.info(
-                f"gc_mode={self.gc_mode} retained {collected} garbage objects holding "
+                f"gc_mode={self.gc_mode} deferred {collected} garbage objects holding "
                 f"{allocated - torch.cuda.memory_allocated()} bytes of CUDA memory until now"
             )
 

@@ -4,7 +4,6 @@ import asyncio
 import concurrent
 import copy
 import functools
-import gc
 import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -316,9 +315,6 @@ class TextGenerationController(MTPControllerMixin):
             self.dp_group = parallel_state.get_data_parallel_group()
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
-
-        # Default False, unless overridden by gc_mode="freeze_overlap" in the engine.
-        self._overlap_gc = False
 
         # The language model holds the vocab, the MTP block and the embedding; a multimodal
         # wrapper keeps it under `language_model`.
@@ -1017,17 +1013,6 @@ class TextGenerationController(MTPControllerMixin):
             assert logits.data_ptr() == self._all_logits_cuda.data_ptr()
         else:
             self._all_logits_cuda = logits
-
-        # The forward is queued on the GPU. Collect now, while it runs, instead of letting
-        # automatic collection start right before the next launch.
-        if self._overlap_gc:
-            self._trigger_gc_now()
-
-    def _trigger_gc_now(self) -> None:
-        """Trigger GC now by CPython's thresholds."""
-        count, threshold = gc.get_count(), gc.get_threshold()
-        if threshold[0] and count[0] > threshold[0]:
-            gc.collect(next(gen for gen in (2, 1, 0) if count[gen] > threshold[gen]))
 
     def _rewind_kv_cache(self, accepted_counts_cpu: Optional[Tensor] = None) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
