@@ -1066,6 +1066,32 @@ class TestPipelineParallelLayoutTransformerBlock:
         )
 
     @pytest.mark.parametrize(
+        "pp_size, layout, should_assert_error",
+        [
+            # MTP in the last virtual stage of the first PP rank (PP2, VPP2)
+            (2, "Et|t|tm|L", True),
+            # MTP on the first PP rank without VPP (PP2, VPP1)
+            (2, "Etttm|L", True),
+            # MTP with the loss on the last PP rank (PP2, VPP2)
+            (2, "Et|t|t|mL", False),
+            # Standalone MTP stage on a middle PP rank (PP4)
+            (4, "Et|t|tm|L", False),
+            # Without pipeline parallelism the only rank holds MTP
+            (1, "EtttmL", False),
+        ],
+    )
+    def test_mtp_not_on_first_pp_rank(self, pp_size, layout, should_assert_error):
+        context = (
+            pytest.raises(AssertionError, match="first pp rank")
+            if should_assert_error
+            else nullcontext()
+        )
+        with context:
+            PipelineParallelLayerLayout.from_str(layout, pp_size).validate_layer_layout(
+                num_layers=3, mtp_num_layers=1
+            )
+
+    @pytest.mark.parametrize(
         "pp_size, input_layout",
         [
             (2, "Et|t*4|t|tL"),
