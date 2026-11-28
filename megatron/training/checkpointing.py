@@ -682,6 +682,39 @@ class CheckpointType(Enum):
     FSDP_DTENSOR = auto()
 
 
+def _layer_wise_param_layout(optimizer_cfg) -> str:
+    """Names the LayerWise parameter layout, which determines how its optimizer state is saved."""
+    return 'shard_aligned' if optimizer_cfg.use_layer_wise_param_layout else 'compact'
+
+
+def _check_layer_wise_param_layout(ckpt_metadata: Optional[dict], optimizer_cfg) -> None:
+    """Rejects LayerWise optimizer state saved with the other parameter layout.
+
+    The compact and shard-aligned layouts save differently structured optimizer state in every
+    sharding type, so a mismatch otherwise fails deep inside the checkpoint load. Checkpoints
+    saved before the layout was recorded are not checked.
+    """
+    saved_layout = (ckpt_metadata or {}).get('layer_wise_param_layout')
+    if saved_layout is None or not getattr(
+        optimizer_cfg, 'use_layer_wise_distributed_optimizer', False
+    ):
+        return
+    run_layout = _layer_wise_param_layout(optimizer_cfg)
+    if saved_layout != run_layout:
+        fix = (
+            'pass --no-use-layer-wise-param-layout'
+            if saved_layout == 'compact'
+            else 'drop --no-use-layer-wise-param-layout'
+        )
+        raise RuntimeError(
+            f'The checkpoint was saved with the {saved_layout} LayerWise parameter layout, but '
+            f'this run uses the {run_layout} layout, so its optimizer state cannot be loaded. '
+            f'To resume it, {fix} (optimizer.use_layer_wise_param_layout='
+            f'{saved_layout == "shard_aligned"}); or pass --no-load-optim to start from a fresh '
+            'optimizer.'
+        )
+
+
 def _build_sharded_state_dict_metadata(
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     *,
@@ -729,6 +762,9 @@ def _build_sharded_state_dict_metadata(
             )
         else:
             metadata['distrib_optim_sharding_type'] = 'dp_reshardable'
+
+    if getattr(optimizer_cfg, 'use_layer_wise_distributed_optimizer', False):
+        metadata['layer_wise_param_layout'] = _layer_wise_param_layout(optimizer_cfg)
 
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
@@ -3261,6 +3297,7 @@ def load_checkpoint(
                         'Fully parallel load is not supported for dp_zero_gather_scatter checkpoints. '
                         'Please remove --ckpt-fully-parallel-load flag'
                     )
+            _check_layer_wise_param_layout(sharded_sd_metadata, cfg.optimizer)
         else:
             gen_sd_optim = None
             gen_sd_opt_param_scheduler = None
