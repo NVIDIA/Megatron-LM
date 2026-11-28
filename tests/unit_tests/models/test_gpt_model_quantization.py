@@ -14,7 +14,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, te_reads_legacy_grouped_env
 
 try:
     from megatron.core.extensions.kitchen import (
@@ -613,7 +613,8 @@ class TestGPTModelTEQuantizationConfig:
         if not is_op_fuser_grouped_tensor_path_supported(None, torch.bfloat16):
             pytest.skip("Native BF16 grouped GEMM requires a supported GPU and cuBLASLt version")
 
-        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        if te_reads_legacy_grouped_env():
+            monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
         linear_paths = [f"{experts_path}.linear_fc{idx}" for idx in (1, 2)]
         precision_recipe = RecipeConfig.from_config_dict(
             {
