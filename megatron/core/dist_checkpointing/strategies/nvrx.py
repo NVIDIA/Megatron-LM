@@ -2,7 +2,6 @@
 
 """Helpers for interacting with the experimental nvidia-resiliency-ext API."""
 
-from importlib import import_module
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from typing import Any, Callable, Dict
@@ -14,41 +13,12 @@ try:
 except ImportError:
     HAVE_PACKAGING = False
 
-NVRX_MIN_VERSION = "0.6.0"
+NVRX_MIN_VERSION = "0.7.1"
 
 
 def has_nvrx_async_support() -> bool:
-    """Checks whether the NVRx async checkpointing symbols Megatron uses are importable."""
-    try:
-        core = import_module("nvidia_resiliency_ext.checkpointing.async_ckpt.core")
-        cached_metadata_reader = import_module(
-            "nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader"
-        )
-        filesystem_async = import_module(
-            "nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async"
-        )
-        state_dict_saver = import_module(
-            "nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver"
-        )
-    except (ImportError, ModuleNotFoundError):
-        return False
-
-    required_symbols = (
-        getattr(core, "AsyncCallsQueue", None),
-        getattr(core, "AsyncRequest", None),
-        getattr(cached_metadata_reader, "CachedMetadataFileSystemReader", None),
-        getattr(filesystem_async, "FileSystemWriterAsync", None),
-        getattr(filesystem_async, "get_write_results_queue", None),
-        getattr(state_dict_saver, "CheckpointMetadataCache", None),
-        getattr(state_dict_saver, "save_state_dict_async_finalize", None),
-        getattr(state_dict_saver, "save_state_dict_async_plan", None),
-    )
-    if not is_nvrx_min_version():
-        return False
-
-    return all(symbol is not None for symbol in required_symbols) and hasattr(
-        filesystem_async, "_results_queue"
-    )
+    """Checks whether an NVRx with the async checkpointing API Megatron uses is installed."""
+    return is_nvrx_min_version()
 
 
 def make_nvrx_async_request(

@@ -95,10 +95,9 @@ class TestGlobalMetadataReuse:
                 )
                 assert reduce_scatter_mock.call_count == 0
 
-            assert (
-                load_strategy_cached_metadata
-                is resume_ckpt_context['save_strategy'].cached_global_metadata
-            )
+            # The save handed the loaded metadata to NVRx, and neither strategy keeps it.
+            assert resume_ckpt_context['load_strategy'].cached_global_metadata is None
+            assert resume_ckpt_context['save_strategy'].cached_global_metadata is None
 
             assert resume_ckpt_context['save_strategy'].validated_loaded_metadata_reuse
 
