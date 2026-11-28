@@ -797,13 +797,13 @@
   "type": null
  },
  "verify_integrity": {
-  "action": "_StoreTrueAction",
+  "action": "_StoreFalseAction",
   "choices": null,
-  "const": true,
-  "default": false,
+  "const": false,
+  "default": true,
   "nargs": 0,
   "option_strings": [
-   "--verify-integrity"
+   "--disable-verify-integrity"
   ],
   "required": false,
   "type": null

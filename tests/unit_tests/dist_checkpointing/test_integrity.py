@@ -106,3 +106,42 @@ class TestIntegrity:
             # CheckpointingException, hash mismatch
             with pytest.raises(CheckpointingException):
                 verify_integrity_manifest(ckpt_dir)
+
+    def test_load_without_manifest_needs_it_only_when_required(
+        self, init_model_parallel, tmp_path_dist_ckpt
+    ):
+        """A checkpoint saved without hashes loads unless the manifest is explicitly required."""
+        state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets(
+                'keyA', torch.ones(1, 1), replica_id=Utils.rank
+            )
+        }
+        load_state_dict = {
+            'sd_keyA': ShardedTensor.from_rank_offsets(
+                'keyA', torch.empty(1, 1), replica_id=Utils.rank
+            )
+        }
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_load_without_manifest', sync=True) as ckpt_dir:
+            save(state_dict, ckpt_dir, verify_integrity=False)
+
+            loaded = load(
+                load_state_dict, ckpt_dir, verify_integrity=True, require_integrity_manifest=False
+            )
+            assert torch.equal(loaded['sd_keyA'], torch.ones(1, 1))
+
+            with pytest.raises(CheckpointingException, match="Integrity manifest not found"):
+                load(load_state_dict, ckpt_dir, verify_integrity=True)
+
+    def test_present_manifest_is_checked_even_when_not_required(
+        self, init_model_parallel, tmp_path_dist_ckpt
+    ):
+        with TempNamedDir(tmp_path_dist_ckpt / 'test_present_manifest', sync=True) as ckpt_dir:
+            metadata_file = Path(ckpt_dir / "metadata.json")
+            if torch.distributed.get_rank() == 0:
+                metadata_file.write_text(json.dumps({"test_metadata": 1}))
+                save_integrity_manifest(ckpt_dir)
+                metadata_file.write_text(json.dumps({"test_metadata": 11}))
+            torch.distributed.barrier()
+
+            with pytest.raises(CheckpointingException, match="hash mismatch"):
+                verify_integrity_manifest(ckpt_dir, require_manifest=False)

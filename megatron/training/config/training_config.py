@@ -795,7 +795,7 @@ class CheckpointConfig:
     replication_factor: int = 2
     """Number of machines storing the replica of a given rank's data."""
 
-    verify_integrity: bool = False
+    verify_integrity: bool = field(default=True, metadata={"argparse_meta": {"arg_names": ["--disable-verify-integrity"]}})
     """Whether to hash checkpointing files during save and validate their integrity during load."""
 
     stream_ckpt_dequant: bool = False
@@ -868,10 +868,6 @@ class CheckpointConfig:
                     "A compatible nvidia-resiliency-ext installation is required to enable "
                     "async save with async_strategy='nvrx'."
                 )
-
-        if self.verify_integrity:
-            assert self.ckpt_format == "torch_dist", \
-                f"`verify_integrity` is only supported with torch_dist checkpoint format."
 
         if self.ckpt_convert_format is not None:
             assert self.ckpt_convert_save is not None
