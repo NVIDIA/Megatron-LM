@@ -402,9 +402,10 @@ def test_losses_match_baseline(
 
     Gradients reduce-scatter within DP-inner every backward and accumulate into main_grad;
     the DP-outer reduction (all-reduce for HSDP, reduce-scatter for HFSDP) runs only on the
-    last microbatch. overlap_outer_communication moves that reduction to its own stream,
-    which changes where it executes, not what it computes -- so losses stay bit-identical to
-    the serialized path. Both zero_grad modes are covered.
+    last microbatch. overlap_outer_communication moves that reduction, and the HFSDP
+    first-microbatch DP-outer all-gather that refreshes compute weights, to their own
+    streams, which changes where they execute, not what they compute -- so losses stay
+    bit-identical to the serialized path. Both zero_grad modes are covered.
     """
     world_size = distributed_setup.world_size
     device = distributed_setup.device

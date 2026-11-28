@@ -45,7 +45,7 @@ def _sharded_unit(setup, model, grad_accumulation_count):
 def _graph_task(model, inputs, node):
     """Materialize one unit for an independently executed forward/backward node."""
     with model.context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
-        model.context.allgather_stream.wait_stream(model.context.current_stream())
+        model.context.pre_forward()
         model.unshard()
         consumer = model if node is None else model[node]
         loss = consumer(inputs).square().mean()

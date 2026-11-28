@@ -60,6 +60,9 @@ class FsdpContext:
     outer_reduction_stream: torch.cuda.Stream
     # Active mode, controlled by finalize_gradients().
     _gradient_finalization_mode: GradientFinalizationMode
+    # Runs the post-optimizer DP-outer all-gather that refreshes model_weight.
+    # Aliases allgather_stream unless DP-outer overlap is enabled.
+    outer_allgather_stream: torch.cuda.Stream
     use_symmetric_memory: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
     execution_order: ExecutionOrder
@@ -128,8 +131,8 @@ class FsdpContext:
         #   (False, True):  all-gather and inner reduction share; outer is separate.
         #   (True, True):   all-gather, inner reduction, and outer reduction each
         #                  have a separate stream.
-        # Outer all-gather separation is not implemented yet; the outer option
-        # currently affects only reduction.
+        # overlap_outer_communication also gives the post-optimizer DP-outer
+        # all-gather its own stream; otherwise it shares the all-gather stream.
         self.inner_reduction_stream = torch.cuda.Stream(device)
         self.allgather_stream = (
             torch.cuda.Stream(device)
@@ -140,6 +143,9 @@ class FsdpContext:
             torch.cuda.Stream(device)
             if overlap_outer_communication
             else self.inner_reduction_stream
+        )
+        self.outer_allgather_stream = (
+            torch.cuda.Stream(device) if overlap_outer_communication else self.allgather_stream
         )
 
     @property
@@ -279,6 +285,20 @@ class FsdpContext:
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
+
+    def pre_forward(self) -> None:
+        """Order the all-gather streams after compute, including the optimizer step.
+
+        Call on the root before its first unshard of a forward. Compute weights are
+        synced from main weights on the current stream, so this orders the forward's
+        gathers after that sync and forks the all-gather streams into any active
+        CUDA-graph capture. The DP-outer all-gather stream forks here rather than from
+        the all-gather stream, so DP-outer gathers never queue behind DP-inner gathers.
+        """
+        current_stream = self.current_stream()
+        self.allgather_stream.wait_stream(current_stream)
+        if self.outer_allgather_stream is not self.allgather_stream:
+            self.outer_allgather_stream.wait_stream(current_stream)
 
     def pre_backward(self) -> None:
         """Fork the reduce-scatter stream into any active CUDA-graph capture.

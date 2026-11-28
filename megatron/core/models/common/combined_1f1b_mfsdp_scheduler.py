@@ -9,8 +9,7 @@ def _make_unshard_forward_hook(owner: FsdpModule):
 
     def hook(submodule, _args, _kwargs):
         if owner.is_root():
-            context = owner.context
-            context.allgather_stream.wait_stream(context.current_stream())
+            owner.context.pre_forward()
         owner.unshard()
 
     return hook

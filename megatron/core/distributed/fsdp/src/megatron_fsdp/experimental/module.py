@@ -279,7 +279,7 @@ class FsdpModule:
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
 
         if self.is_root():
-            context.allgather_stream.wait_stream(context.current_stream())
+            context.pre_forward()
 
         if context.is_recording_execution_order:
             # The first iteration is training. Include recomputation so replay
@@ -312,11 +312,9 @@ class FsdpModule:
                 ``phase``, which must then be FORWARD or BACKWARD.
 
         External schedulers invoking this directly (rather than through the
-        automatic ``pre_forward`` hook) must first synchronize the all-gather
-        stream on the root by calling
-        ``context.allgather_stream.wait_stream(context.current_stream())``
-        before this when ``self.is_root()``; the automatic forward path
-        performs that root sync in ``pre_forward()`` immediately before this.
+        automatic ``pre_forward`` hook) must first call ``context.pre_forward()``
+        before this when ``self.is_root()``; the automatic forward path makes
+        that call in ``pre_forward()`` immediately before this.
         """
         with self._nvtx_range("unshard"):
             compute_stream = self.context.current_stream()
@@ -361,7 +359,7 @@ class FsdpModule:
         order.advance()
 
     def _unshard_parameter_groups(self, phase: Phase | None) -> None:
-        """Ask each group to gather missing weights on the all-gather stream."""
+        """Schedule each group's DP-outer and DP-inner weight gathers."""
         if phase not in (Phase.FORWARD, Phase.BACKWARD, None):
             raise ValueError(
                 f"Unsharding requires a FORWARD, BACKWARD, or None phase, got {phase!r}."
@@ -371,9 +369,21 @@ class FsdpModule:
         # weights serve both phases already.
         if phase is Phase.BACKWARD and self._schedule_policy.unshard_all_planes_in_backward:
             phase = None
-        with torch.cuda.stream(self.context.allgather_stream):
+        context = self.context
+        allgather_stream = context.allgather_stream
+        outer_allgather_stream = context.outer_allgather_stream
+        with torch.cuda.stream(allgather_stream):
             for group in self._parameter_groups:
-                group.unshard_parameters(phase)
+                missing_phases = group.missing_unshard_phases(phase)
+                if not missing_phases:
+                    continue
+                if group.requires_outer_unshard:
+                    # Root pre-forward has already ordered this stream after weight sync.
+                    with torch.cuda.stream(outer_allgather_stream):
+                        group.unshard_outer()
+                    if outer_allgather_stream is not allgather_stream:
+                        allgather_stream.wait_stream(outer_allgather_stream)
+                group.unshard_inner(missing_phases)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
