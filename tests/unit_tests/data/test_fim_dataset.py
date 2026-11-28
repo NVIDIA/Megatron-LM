@@ -1,5 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
+import numpy as np
 import pytest
 import torch
 
@@ -8,6 +11,53 @@ from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetC
 from megatron.core.datasets.utils import compile_helpers, get_blend_from_list
 from megatron.core.tokenizers import MegatronTokenizer
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.mark.parametrize("defer_mmap", [False, True])
+def test_fim_cached_indices(defer_mmap, tmp_path):
+    """Deferred FIM indices select the same shuffled samples as eager indices."""
+    documents = [np.array([1, 2, 3, 4, 99]), np.array([11, 12, 13, 14, 99])]
+    dataset = object.__new__(GPTFIMDataset)
+    dataset.dataset = SimpleNamespace(
+        get=lambda doc, offset=0, length=None: documents[doc][offset : offset + length]
+    )
+    dataset.config = SimpleNamespace(
+        defer_npy_index_mmap=defer_mmap, path_to_cache=str(tmp_path), tokenizer=None
+    )
+    dataset.unique_description_hash = "fim-cache-test"
+    dataset.index_split = SimpleNamespace(name="train")
+    dataset.fim_rate = 0.0
+    dataset.fim_spm_rate = 0.0
+    dataset.fim_split_sample = None
+    dataset.no_fim_prefix = None
+    dataset.prefix_tok_id, dataset.middle_tok_id, dataset.suffix_tok_id = 95, 96, 97
+    dataset.pad_tok_id, dataset.eod_tok_id = 98, 99
+    dataset.np_rng = np.random.RandomState(1234)
+
+    indices = {
+        "document_index": np.array([1, 0], dtype=np.int32),
+        "sample_index": np.array([[0, 0], [0, 2], [0, 4]], dtype=np.int32),
+        "shuffle_index": np.array([1, 0], dtype=np.uint32),
+    }
+    for name, index in indices.items():
+        np.save(tmp_path / f"fim-cache-test-GPTFIMDataset-train-{name}.npy", index)
+    if defer_mmap:
+        dataset.document_index, dataset.sample_index, dataset.shuffle_index = (
+            dataset._build_document_sample_shuffle_indices()
+        )
+        assert dataset.shuffle_index is None
+    else:
+        dataset.document_index, dataset.sample_index, dataset.shuffle_index = indices.values()
+
+    for sample_id, expected in [(0, [13, 14, 99]), (1, [11, 12, 13]), (0, [13, 14, 99])]:
+        tokens, document_ids, lengths = dataset._query_document_sample_shuffle_indices(sample_id)
+        np.testing.assert_array_equal(tokens, expected)
+        np.testing.assert_array_equal(document_ids, [1])
+        assert lengths == [3]
+    if defer_mmap:
+        for name in indices:
+            assert isinstance(getattr(dataset, name), np.memmap)
+            assert not getattr(dataset, name).flags.writeable
 
 
 @pytest.mark.parametrize("spm_rate", [0.0, 1.0])
