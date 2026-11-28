@@ -99,9 +99,8 @@ class FusedLayerNorm(torch.nn.Module):
         if hidden_size not in persist_ln_hidden_sizes or not HAVE_PERSIST_LAYER_NORM:
             persist_layer_norm = False
 
-        if not persist_layer_norm and not HAVE_FUSED_LAYER_NORM:
-            # TODO: Add pytorch only layer norm
-            raise ValueError(f'Apex must be installed to use FusedLayerNorm.')
+        self.use_torch_fallback = not persist_layer_norm and not HAVE_FUSED_LAYER_NORM
+
 
         if isinstance(hidden_size, numbers.Integral):
             hidden_size = (hidden_size,)
@@ -129,7 +128,7 @@ class FusedLayerNorm(torch.nn.Module):
             init.zeros_(self.bias)
 
     def forward(self, input: Tensor) -> Tensor:
-        """Normalize ``input`` with Apex's persistent or fused affine LayerNorm kernel."""
+        """Normalize ``input`` with an available persistent, fused, or PyTorch implementation."""
         weight = self.weight + 1 if self.zero_centered_gamma else self.weight
 
         if self.persist_layer_norm:
@@ -146,6 +145,11 @@ class FusedLayerNorm(torch.nn.Module):
             # created to prevent this.
             output = make_viewless_tensor(
                 inp=output, requires_grad=input.requires_grad, keep_graph=True
+            )
+
+        elif self.use_torch_fallback:
+            return torch.nn.functional.layer_norm(
+                input, self.hidden_size, weight, self.bias, self.eps
             )
 
         else:
