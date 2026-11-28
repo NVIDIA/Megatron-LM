@@ -2319,3 +2319,80 @@ def test_disagg_engine_resolves_handoff_methods_from_mixin():
             engine_cls.add_request_with_kv_handoff
             is InferenceStateHandoffMixin.add_request_with_kv_handoff
         )
+
+
+class _IdleRankLoopEngine(DynamicInferenceEngine):
+    """An idle rank beside a busy peer on the real coordinator loop; the test resolves each dummy
+    forward's future, and each launch records which earlier dummies had completed."""
+
+    def __init__(self, *, iterations):
+        self.state, self._state_events = EngineState.RUNNING, {
+            s: asyncio.Event() for s in EngineState
+        }
+        self.rank, self.tp_ep_world_size, self.ep_consensus_interval = 0, 2, 1
+        self._ep_consensus_loop_counter, self._last_ep_consensus = 0, (0, False)
+        self.use_synchronous_zmq_collectives, self.waiting_request_ids = False, deque()
+        self.context = SimpleNamespace(
+            step_count=0, prefix_cache_lru_clock=0, get_active_request_count=lambda: 0
+        )
+        self.step_start_event, self.step_end_event = mock.Mock(), mock.Mock()
+        self.futures, self.launches, self._left = [], [], iterations
+        self.controller = SimpleNamespace(
+            dummy_forward=lambda: self.launches.append(self.completed()),
+            submit_device_wait=self._submit,
+            release_device_waiter=lambda: None,
+        )
+        self.expert_parallel_zmq_communicator = SimpleNamespace(
+            all_reduce_max=self._busy_peer_consensus
+        )
+
+    def _submit(self):
+        self.futures.append(asyncio.get_running_loop().create_future())
+        return self.futures[-1]
+
+    def completed(self):
+        return [future.done() for future in self.futures]
+
+    async def _busy_peer_consensus(self, local_work, consensus, async_op):
+        return max(local_work, 1), consensus
+
+    def schedule_requests(self):
+        self._left -= 1
+        if self._left < 0:
+            self.state = EngineState.STOPPING
+        return 0
+
+    async def _world_barrier(self):
+        return None
+
+    async def shutdown(self):
+        return None
+
+    def run(self):
+        """Run the loop; the device completes the pending dummy on every loop turn."""
+
+        async def device():
+            while True:
+                await asyncio.sleep(0)
+                for future in self.futures:
+                    if not future.done():
+                        future.set_result(None)
+
+        async def main():
+            completer = asyncio.ensure_future(device())
+            try:
+                await asyncio.wait_for(
+                    DynamicInferenceEngine.run_engine_with_coordinator.__wrapped__(self), 30
+                )
+            finally:
+                completer.cancel()
+
+        asyncio.run(main())
+        return self
+
+
+def test_idle_rank_awaits_each_dummy_forward_through_the_waiter():
+    engine = _IdleRankLoopEngine(iterations=4).run()
+    assert engine.launches == [[], [True], [True, True], [True, True, True]]
+    assert engine.context.step_count == 4 and all(f.done() for f in engine.futures)
+    engine.step_end_event.synchronize.assert_not_called()

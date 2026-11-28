@@ -2,11 +2,17 @@
 
 import asyncio
 import contextlib
+import ctypes
+import glob
 import logging
 import multiprocessing
+import os
+import signal
 import sys
+import threading
+from collections import deque
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -435,3 +441,127 @@ if sys.version_info < (3, 13):
 else:
     asyncio_QueueShutDown = asyncio.QueueShutDown
     asyncio_Queue = asyncio.Queue
+
+
+# Pick a signal that is unused.
+GPU_WAKE_SIGNAL = signal.SIGRTMIN + 4
+
+_cuda_runtime_lib: Optional[ctypes.CDLL] = None
+
+
+def cuda_runtime() -> ctypes.CDLL:
+    """The CUDA runtime library with `cudaLaunchHostFunc` bound."""
+    global _cuda_runtime_lib
+    if _cuda_runtime_lib is None:
+        site = os.path.dirname(os.path.dirname(torch.__file__))
+        candidates = [None]
+        for pattern in ("torch/lib/libcudart*.so*", "nvidia/cuda_runtime/lib/libcudart.so*"):
+            candidates.extend(sorted(glob.glob(os.path.join(site, pattern))))
+        for candidate in candidates:
+            try:
+                lib = ctypes.CDLL(candidate)
+                launch = lib.cudaLaunchHostFunc
+            except (OSError, AttributeError):
+                continue
+            launch.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            launch.restype = ctypes.c_int
+            _cuda_runtime_lib = lib
+            break
+        else:
+            raise RuntimeError(
+                "the inference engine awaits its device work through cudaLaunchHostFunc, which no "
+                "CUDA runtime library exposes in this process"
+            )
+    return _cuda_runtime_lib
+
+
+class DeviceWaiter:
+    """Awaitable completion of device work.
+
+    `submit()` records an event on the current stream, or takes one already recorded, and on a
+    private wait stream ordered behind it enqueues the host interrupt signal.
+    When the work completes, CUDA's callback thread raises the signal.
+    Once Python receives the signal, the handler moves the completed futures to the front of the
+    event loop's ready queue, instead of letting them wait at their normal position in queue.
+    """
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError(
+                "the device waiter needs the event loop in the main thread, where CPython runs "
+                f"signal handlers; this loop runs in thread {threading.current_thread().name!r}"
+            )
+        self._loop = loop
+        self._pending: deque = deque()  # (event, future)
+        self._cudart = cuda_runtime() if torch.cuda.is_available() else None
+        self._wait_stream = torch.cuda.Stream() if self._cudart is not None else None
+        self._raise = ctypes.cast(getattr(ctypes.CDLL(None), "raise"), ctypes.c_void_p).value
+        self._read_fd, self._write_fd = os.pipe()
+        os.set_blocking(self._read_fd, False)
+        os.set_blocking(self._write_fd, False)
+        self._previous_handler = signal.signal(GPU_WAKE_SIGNAL, self._on_signal)
+        self._previous_wakeup_fd = signal.set_wakeup_fd(self._write_fd, warn_on_full_buffer=False)
+        loop.add_reader(self._read_fd, self._on_readable)
+
+    def submit(self, event: Optional[torch.cuda.Event] = None) -> asyncio.Future:
+        """A future resolved once `event` completes, or, without one, once the work queued so far
+        on the current stream has completed."""
+        future = self._loop.create_future()
+        if self._cudart is None:
+            future.set_result(None)
+            return future
+        if event is None:
+            event = torch.cuda.Event()
+            event.record()
+        elif event.query():
+            future.set_result(None)
+            return future
+        self._wait_stream.wait_event(event)
+        self._launch_wake(self._wait_stream)
+        self._pending.append((event, future))
+        return future
+
+    def _launch_wake(self, stream: torch.cuda.Stream) -> None:
+        """Enqueue the CPU interrupt on the stream."""
+        error = self._cudart.cudaLaunchHostFunc(
+            ctypes.c_void_p(stream.cuda_stream),
+            ctypes.c_void_p(self._raise),
+            ctypes.c_void_p(GPU_WAKE_SIGNAL),
+        )
+        if error != 0:
+            raise RuntimeError(f"cudaLaunchHostFunc failed with CUDA error {error}")
+
+    def _on_signal(self, signum, frame) -> None:
+        self._resolve_completed()
+
+    def _on_readable(self) -> None:
+        try:
+            while os.read(self._read_fd, 4096):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+        self._resolve_completed()
+
+    def _resolve_completed(self) -> None:
+        ready, n = self._loop._ready, len(self._loop._ready)
+        while self._pending and self._pending[0][0].query():
+            _, future = self._pending.popleft()
+            if not future.done():
+                future.set_result(None)
+        # Run the awaiting tasks next, ahead of the rest of the ready queue.
+        ready.extendleft([ready.pop() for _ in range(len(ready) - n)])
+
+    def close(self) -> None:
+        """Restore the signal handler, drop the reader, cancel what is pending."""
+        if self._read_fd is None:
+            return
+        self._loop.remove_reader(self._read_fd)
+        signal.set_wakeup_fd(self._previous_wakeup_fd)
+        signal.signal(GPU_WAKE_SIGNAL, self._previous_handler)
+        os.close(self._read_fd)
+        os.close(self._write_fd)
+        self._read_fd = None
+        for _, future in self._pending:
+            if not future.done():
+                future.cancel()
+        self._pending.clear()
