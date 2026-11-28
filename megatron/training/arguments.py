@@ -959,6 +959,11 @@ def validate_args(args, defaults={}):
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
             '--fp8-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
 
+    if args.fp8_param_rounding == 'fixed_threshold':
+        assert args.fp8_param_gather and args.fp8_recipe == 'blockwise' and args.use_distributed_optimizer, \
+            '--fp8-param-rounding fixed_threshold requires --fp8-param-gather, --fp8-recipe blockwise, ' \
+            'and --use-distributed-optimizer'
+
     if args.fp4_param_gather:
         assert args.use_distributed_optimizer or args.use_torch_fsdp2 or args.use_megatron_fsdp or not torch.is_grad_enabled(), \
             '--fp4-param-gather only supported with distributed optimizer, torch fsdp2, megatron fsdp, or inference mode'
@@ -1902,6 +1907,14 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--fp8-param-gather', action='store_true',
                        help='Keep the compute param in fp8 (do not use any other intermediate '
                             'dtype) and perform the param all-gather in fp8.')
+    group.add_argument('--fp8-param-rounding', default='nearest',
+                       choices=['nearest', 'fixed_threshold'],
+                       help='How FP32 master shards round to FP8 params with --fp8-param-gather and '
+                            '--fp8-recipe blockwise. "fixed_threshold" gives each weight a fixed '
+                            'rounding threshold, so small RL-scale updates reach the FP8 params '
+                            'and checkpoint values never sit on rounding ties.')
+    group.add_argument('--fp8-param-rounding-seed', type=int, default=0,
+                       help='Seed for the per-weight thresholds of --fp8-param-rounding fixed_threshold.')
     # TE precision config file
     group.add_argument('--te-precision-config-file', default=None,
                        help='Configuration file to select per-module precision overrides. '

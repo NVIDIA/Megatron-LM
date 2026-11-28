@@ -124,6 +124,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- fused elementwise (jit_fuser / torch.compile)
     KernelEntry(
+        name="fp8_param_fixed_threshold_snap",
+        sources=("megatron/core/fp8_param_rounding.py",),
+        tests=(K + "test_fp8_param_rounding.py",),
+        kind="torch.compile",
+        notes="Elementwise snap of FP32 master shards for --fp8-param-rounding fixed_threshold; integer "
+        "hash and E4M3 grid arithmetic, no reductions.",
+    ),
+    KernelEntry(
         name="fused_bias_swiglu",
         sources=("megatron/core/fusions/fused_bias_swiglu.py",),
         tests=(K + "test_fused_activations.py", R + 'test_activation_replay.py'),
