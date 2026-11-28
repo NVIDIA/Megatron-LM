@@ -78,7 +78,10 @@ def inprocess_restart(train, args):
         )
 
     initialize = inprocess.Compose(
-        inprocess.initialize.RetryController(min_world_size=args.inprocess_active_world_size),
+        inprocess.initialize.RetryController(
+            max_iterations=args.inprocess_max_iterations,
+            min_world_size=args.inprocess_active_world_size,
+        ),
         inprocess.nested_restarter.NestedRestarterHandlingCompleted(),
     )
 
@@ -116,6 +119,7 @@ def inprocess_restart(train, args):
         completion_timeout=timedelta(seconds=args.inprocess_completion_timeout),
         monitor_process_interval=timedelta(seconds=args.inprocess_monitor_process_interval),
         monitor_thread_interval=timedelta(seconds=args.inprocess_monitor_thread_interval),
+        progress_watchdog_interval=timedelta(seconds=args.inprocess_progress_watchdog_interval),
         last_call_wait=timedelta(seconds=args.inprocess_last_call_wait),
         soft_timeout=timedelta(seconds=args.inprocess_soft_timeout),
         hard_timeout=timedelta(seconds=args.inprocess_hard_timeout),
