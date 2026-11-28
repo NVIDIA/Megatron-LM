@@ -4661,7 +4661,8 @@ def train(
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
-        if cfg.dist.align_grad_reduce:
+        # MFSDP v2 needs the last backward outside no_sync to launch its reduction.
+        if cfg.dist.align_grad_reduce and not isinstance(model[0], FullyShardedDataParallelV2):
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
