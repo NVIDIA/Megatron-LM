@@ -160,8 +160,9 @@ class FsdpParameterGroup:
             grad_scale: Multiplier applied after the mesh-size averaging.
                 See ``fully_shard``.
             parameter_to_owner: Construction-time mapping from original parameters to
-                owner ranks in ``mesh``. Every TensorAtomic parameter needs an entry;
-                entries for other parameters and non-TensorAtomic groups are ignored.
+                owner ranks in ``mesh``. TensorAtomic parameters without an entry are added by
+                element count; entries for other parameters and non-TensorAtomic groups are
+                ignored.
             shard_layout: Whether RowAtomic/BlockAtomic layouts pad to equal rank segments
                 or pack without padding into generally unequal ones. See ``fully_shard``.
         """
@@ -186,7 +187,7 @@ class FsdpParameterGroup:
             main_weight_placements,
             placement_types=TensorAtomic,
         ):
-            self._validate_parameter_to_owner(parameter_to_fqns, parameter_to_owner)
+            self._assign_default_owners(parameters, parameter_to_owner)
         self._initialize_buffers(
             parameters,
             parameter_to_owner,
@@ -232,15 +233,21 @@ class FsdpParameterGroup:
                 )
         return parameter_to_fqns, dtype, requires_grad
 
-    @staticmethod
-    def _validate_parameter_to_owner(
-        parameter_to_fqns: dict[nn.Parameter, list[str]],
-        parameter_to_owner: dict[nn.Parameter, int],
+    def _assign_default_owners(
+        self, parameters: tuple[nn.Parameter, ...], parameter_to_owner: dict[nn.Parameter, int]
     ) -> None:
-        """Report by FQN the first parameter that has no owner assignment."""
-        for parameter, fqns in parameter_to_fqns.items():
+        """Assign parameters without an owner, largest first, to the rank owning fewest elements.
+
+        The context shares ``parameter_to_owner`` across groups, so the balance spans them.
+        """
+        load: dict[int, int] = {}
+        for parameter, owner in parameter_to_owner.items():
+            load[owner] = load.get(owner, 0) + parameter.numel()
+        for parameter in sorted(parameters, key=lambda parameter: -parameter.numel()):
             if parameter not in parameter_to_owner:
-                raise ValueError(f"parameter_to_owner is missing entries for parameters {fqns!r}.")
+                owner = min(range(self.mesh.size()), key=lambda rank: (load.get(rank, 0), rank))
+                parameter_to_owner[parameter] = owner
+                load[owner] = load.get(owner, 0) + parameter.numel()
 
     def _build_layout(
         self,
@@ -272,6 +279,9 @@ class FsdpParameterGroup:
             shapes,
             dp_size=self.mesh.size(),
             tensor_owners=(parameter_to_owner[parameter] for parameter in parameters),
+            # Kernels with vectorized loads (e.g. Inductor's Triton) fault on tightly packed,
+            # misaligned tensors. 128 elements is also a multiple of the MXFP8 block.
+            alignment=128,
         )
 
     def _initialize_buffers(

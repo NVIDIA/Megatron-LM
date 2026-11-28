@@ -92,8 +92,9 @@ class FsdpContext:
             parameter_to_owner: Construction-time owner assignments for TensorAtomic
                 parameters, keyed by the original parameters before sharding. Owners are
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
-                that mesh. Every TensorAtomic parameter needs an entry; other entries are
-                ignored. Tensors are packed by owner without changing logical parameter order.
+                that mesh. TensorAtomic parameters without an entry go whole, largest first, to
+                the rank owning the fewest elements so far; other entries are ignored. Tensors
+                are packed by owner without changing logical parameter order.
             gradient_finalization_mode: Initial mode restored when a gradient-finalization
                 scope exits. The default waits automatically; callers that own the wait
                 can select REDUCE_OUTER and call finish_grad_sync() after backward.
@@ -118,7 +119,7 @@ class FsdpContext:
         self._registered_modules: list[nn.Module] = []
         self._roots = WeakKeyDictionary()
         self._module_names = WeakKeyDictionary()
-        self.parameter_to_owner = parameter_to_owner
+        self.parameter_to_owner = dict(parameter_to_owner or {})
         self._is_finalized = False
         # The two overlap options independently split streams from the inner
         # reduction stream. With (overlap_allgather_reduction,

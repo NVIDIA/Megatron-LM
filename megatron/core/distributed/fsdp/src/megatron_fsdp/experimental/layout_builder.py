@@ -247,7 +247,7 @@ def build_for_row_atomic_unpadding(
 
 
 def build_for_tensor_atomic(
-    shapes: Iterable[Shape], dp_size: int, *, tensor_owners: Iterable[int]
+    shapes: Iterable[Shape], dp_size: int, *, tensor_owners: Iterable[int], alignment: int = 1
 ) -> GlobalLayout:
     """Compute global tensor element offsets from a per-tensor owner-rank list.
 
@@ -271,6 +271,8 @@ def build_for_tensor_atomic(
         dp_size: Data-parallel shard count for this global layout.
         tensor_owners: Owner rank of each tensor, in tensor-id order. Every rank
             must be an integer in ``[0, dp_size)``.
+        alignment: Start every tensor, and every rank segment, at a multiple of this many
+            elements, leaving gaps. With 1 the segments are packed tightly.
 
     Returns:
         Global layout whose per-rank segments are gap-free and whose ``size`` is
@@ -297,19 +299,21 @@ def build_for_tensor_atomic(
     numels = [shape.numel() for shape in tensor_shapes]
 
     per_rank = [0] * dp_size
+    offset_in_rank = []
     for numel, owner in zip(numels, tensor_owners):
-        per_rank[owner] += numel
+        start = -(-per_rank[owner] // alignment) * alignment
+        offset_in_rank.append(start)
+        per_rank[owner] = start + numel
+    per_rank = [-(-numel // alignment) * alignment for numel in per_rank]
     rank_to_offset = tuple(itertools.accumulate(per_rank[:-1], initial=0))
-    next_offsets = list(rank_to_offset)
-    tensor_to_offset = []
-    for numel, owner in zip(numels, tensor_owners):
-        tensor_to_offset.append(next_offsets[owner])
-        next_offsets[owner] += numel
+    tensor_to_offset = [
+        rank_to_offset[owner] + start for owner, start in zip(tensor_owners, offset_in_rank)
+    ]
 
     layout = GlobalLayout(
         tensor_shapes=tensor_shapes,
         tensor_to_offset=tensor_to_offset,
-        size=sum(numels),
+        size=sum(per_rank),
         rank_to_offset=rank_to_offset,
     )
     layout.validate_for_tensor_atomic()
