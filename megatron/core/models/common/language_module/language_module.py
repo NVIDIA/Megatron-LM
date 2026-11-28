@@ -17,6 +17,8 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_observation import is_observing_tensor
+from megatron.core.tensor_parallel.layers import log_lm_head_chunking_once
 from megatron.core.transformer.cuda_graphs import CudaGraphManager
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
@@ -143,6 +145,94 @@ class LanguageModule(MegatronModule):
         if return_argmax:
             return loss, argmax
         return loss
+
+    def can_chunk_lm_head_loss(
+        self,
+        labels: Optional[Tensor],
+        loss_mask: Optional[Tensor],
+        output_weight: Optional[Tensor],
+        runtime_gather_output: Optional[bool],
+    ) -> bool:
+        """Whether the main LM head runs over sequence chunks (``lm_head_loss_num_chunks``).
+
+        The config rejects at build time what it can; the conditions checked here are only
+        known per call. A head that cannot be chunked takes the plain path, and says so once.
+        """
+        num_chunks = getattr(self.config, "lm_head_loss_num_chunks", 1)
+        if num_chunks <= 1 or labels is None:
+            # Off, or the caller wants the logits themselves.
+            return False
+        supports = getattr(self.output_layer, "supports_chunked_loss", None)
+        if loss_mask is None:
+            # The loss mask is the gradient that the loss function sends back.
+            reason = "the model was called without a loss mask"
+        elif supports is None or not supports(output_weight, runtime_gather_output):
+            reason = (
+                "the output layer does not support it here (frozen or detached weight, output "
+                "gathered across tensor-parallel ranks, deferred embedding wgrad or CPU "
+                "offloading)"
+            )
+        elif is_observing_tensor("output_logits"):
+            reason = "the output logits are being observed"
+        elif not self.config.calculate_per_token_loss and torch.is_grad_enabled():
+            # The other reductions divide by counts that only the schedule has.
+            reason = "calculate_per_token_loss is off"
+        else:
+            log_lm_head_chunking_once(
+                f"LM head: projecting and scoring the sequence in {num_chunks} chunks "
+                "(lm_head_loss_num_chunks)."
+            )
+            return True
+        log_lm_head_chunking_once(
+            f"LM head: lm_head_loss_num_chunks={num_chunks} is set but the main head is NOT "
+            f"chunked, because {reason}."
+        )
+        return False
+
+    def compute_chunked_lm_head_loss(
+        self,
+        hidden_states: Tensor,
+        labels: Tensor,
+        loss_mask: Tensor,
+        output_weight: Optional[Tensor],
+    ) -> Tensor:
+        """Output projection and cross entropy over sequence chunks.
+
+        Same result as ``output_layer`` followed by ``compute_language_model_loss``, without the
+        logits of the whole sequence. See ``LinearCrossEntropyChunked``.
+
+        Args:
+            hidden_states (Tensor): Final hidden states, [seq length, batch size, hidden size]
+            labels (Tensor): The labels of dimension [batch size, seq length]
+            loss_mask (Tensor): The loss mask of dimension [batch size, seq length]
+            output_weight (Tensor): Shared embedding/output weight, if any
+
+        Returns:
+            Tensor: Loss tensor of dimensions [batch size, sequence_length]
+        """
+
+        def chunk_loss_fn(logits: Tensor, start: int, end: int) -> Tensor:
+            return self.compute_language_model_loss(
+                labels[:, start:end], self._scale_logits(logits)
+            )
+
+        upstream = None
+        if torch.is_grad_enabled() and hidden_states.requires_grad:
+            # The loss function sums loss * loss_mask and the schedule scales that sum by
+            # grad_scale_func, so this is the gradient that will reach the per-token loss.
+            upstream = loss_mask.to(torch.float32)
+            if self.config.grad_scale_func is not None:
+                upstream = upstream * self.config.grad_scale_func(
+                    torch.ones(1, device=upstream.device)
+                ).to(upstream.dtype)
+
+        return self.output_layer.forward_chunked_loss(
+            hidden_states,
+            chunk_loss_fn,
+            upstream,
+            self.config.lm_head_loss_num_chunks,
+            weight=output_weight,
+        )
 
     def setup_embeddings_and_output_layer(self) -> None:
         """Sets up embedding layer in first stage and output layer in last stage.
