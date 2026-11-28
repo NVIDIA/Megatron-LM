@@ -41,10 +41,15 @@ group.
 Nothing bounds that wait when a peer stops issuing calls: a rank that raises between two
 transport calls (out of memory in a lookup, say) or dies leaves its peers spinning, and no
 PyTorch watchdog sees it, since the transport issues no ``torch.distributed`` work. The failing
-rank aborts its transports on the way out (``pretrain``), so it exits promptly; the spinning
-peers then end only when the launcher stops them, as torchrun's agent or
-``srun --kill-on-bad-exit`` do when one process fails. A silent peer death needs a hang
-detector (such as the NVIDIA Resiliency Extension's) or the job's time limit.
+rank aborts its transports on the way out (``initialize_engram_transports`` while it registers
+the tables at startup, ``pretrain`` afterwards) and enters no collective that would wait for
+those peers, so it exits promptly; the spinning peers then end only when the launcher stops
+them, as torchrun's agent or ``srun --kill-on-bad-exit`` do when one process fails. A silent
+peer death needs a hang detector (such as the NVIDIA Resiliency Extension's) or the job's time
+limit.
+
+Only a failure that the transport itself shares within the row group, raised as
+:class:`EngramRowGroupError` on every rank after the same exchange, leaves the ranks in step.
 """
 
 from __future__ import annotations
@@ -349,12 +354,24 @@ def exchange_lookup_counts(
     )
 
 
+class EngramRowGroupError(RuntimeError):
+    """A failure that every rank of a row group raises after the same exchange.
+
+    The ranks leave their transport calls at the same point, so each of them may enter a host
+    collective next. Any other exception out of a transport call is raised by one rank alone:
+    its peers go on to the next exchange, where they spin-wait for the rank that failed.
+    """
+
+
 def prepare_table_windows(transport, key, tables: Sequence[Tensor], send_counts: Tensor):
     """Run the count exchange of one lookup and keep every rank's table windows current.
 
     Describes this rank's table storage, exchanges the count rows, raises on every rank when
     any rank could not describe its tables, and re-registers the windows on every rank when any
     rank's storage changed. Returns the :class:`LookupCounts` of the exchange.
+
+    Tables that some rank cannot describe or register raise :class:`EngramRowGroupError` on
+    every rank of the row group. Any other exception is raised by this rank alone.
     """
     changed, error, layout = transport.describe_tables(key, tables)
     counts = exchange_lookup_counts(
@@ -366,12 +383,18 @@ def prepare_table_windows(transport, key, tables: Sequence[Tensor], send_counts:
                 "Engram row rank %d cannot use its table storage: %s", transport.rank, error
             )
         reason = f"; on this rank: {error}" if error is not None else ""
-        raise RuntimeError(
+        raise EngramRowGroupError(
             f"Cannot prepare Engram table windows on row ranks {list(counts.error_ranks)}"
             f"{reason}. Each failing rank logs its own cause."
         )
     if counts.changed_ranks:
-        transport.register_tables(key, counts.metadata)
+        try:
+            transport.register_tables(key, counts.metadata)
+        except RuntimeError as exc:
+            if getattr(transport, "failed", False):
+                # The transport shared the registration outcomes and raised on every rank.
+                raise EngramRowGroupError(str(exc)) from exc
+            raise
     return counts
 
 
@@ -722,8 +745,9 @@ def initialize_engram_transports(model_chunks, pg_collection, engram_config) -> 
 
     Collective over the default (WORLD) group and called on every rank, including pipeline
     stages without Engram layers, which create nothing. Startup has four steps, and each ends
-    with an object gather over the default group, so a failure on any rank raises on every
-    rank instead of leaving its peers in a collective or a device spin-wait:
+    with an object gather over the default group. In the first three steps a failure on any
+    rank reaches that gather and raises on every rank, instead of leaving its peers in a
+    collective; in the last one only a failure that the row group shares does:
 
     1. local: find the symmetric Engram tables, check that DDP did not put their buffers in
        torch_memory_saver regions, resolve the row group, check the toolchain, create the NCCL
@@ -737,10 +761,16 @@ def initialize_engram_transports(model_chunks, pg_collection, engram_config) -> 
        A rank that fails inside one of them is NCCL's to report, and may leave its peers
        waiting in it;
     4. publish the workspace and register every table window eagerly, so unregisterable table
-       storage fails at startup.
+       storage fails at startup. This step communicates on the device, where a rank waits for
+       its row group without a time limit. Tables that some rank cannot describe or register
+       raise :class:`EngramRowGroupError` on every rank of the row group after the same
+       exchange, so those ranks still reach the gather. Any other exception is taken for the
+       failure of one rank alone, whose peers wait for it in the next exchange and will never
+       join a gather. It is raised at once, without the gather, so the process ends and the
+       launcher can stop the ranks that wait for it, in that exchange or in the gather.
 
-    A failed start aborts what it created and leaves no state behind. Returns at once unless
-    the symmetric backend is configured.
+    A failed start aborts what it created, without a device barrier or any other collective,
+    and leaves no state behind. Returns at once unless the symmetric backend is configured.
     """
     global _INITIALIZED
     if engram_config is None or _communication_backend(engram_config) != "symmetric":
@@ -879,13 +909,28 @@ def _start_engram_transports(model_chunks, pg_collection, engram_config) -> None
                     device=embedding.table_row_base.device,
                 )
                 prepare_table_windows(transport, embedding, weights, send_counts)
-    except Exception as exc:
+    except EngramRowGroupError as exc:
+        # Every rank of the row group raised this after the same exchange, so all of them
+        # reach the gather below and every rank of the default group raises.
         failure = exc
         logger.error(
             "Engram symmetric transport cannot register table windows on rank %d",
             rank,
             exc_info=exc,
         )
+    except Exception:
+        # Not a failure the row group shares, so this rank may have failed alone after device
+        # communication began. Its row-group peers then go on to a device call that spin-waits
+        # for this rank, without a time limit, and do not join the gather below: waiting for
+        # them there would hold this rank until the process group times out. Raise now
+        # instead: the caller aborts the transport and the failure ends this process, which
+        # lets the launcher stop the other ranks.
+        logger.error(
+            "Engram symmetric transport cannot register table windows on rank %d",
+            rank,
+            exc_info=True,
+        )
+        raise
     _raise_on_every_rank(_gather_world(_problem(failure)), failure, "register table windows")
 
 

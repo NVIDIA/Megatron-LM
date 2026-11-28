@@ -299,22 +299,42 @@ def test_engram_window_registration_failure_is_collective(monkeypatch, failed_ra
     transport.barrier.assert_called_once()
 
 
-@pytest.mark.parametrize("failing", ["barrier", "window"])
+@pytest.mark.parametrize("failing", ["barrier", "window", "destroy"])
 def test_engram_failed_clean_close_aborts(monkeypatch, failing):
     """A clean close that cannot finish aborts the communicator before it re-raises, so no
-    communicator, window or GIN resource is left behind for a later abort to miss."""
+    communicator, window or GIN resource is left behind for a later abort to miss. That holds
+    for its last step too: the transport drops a communicator it could not destroy."""
     transport = _host_transport(monkeypatch)
     comm, transport.device_view = transport.comm, object()
     transport.window = SimpleNamespace(close=Mock())
     if failing == "barrier":
         transport.barrier.side_effect = RuntimeError("simulated barrier failure")
-    else:
+    elif failing == "window":
         broken = SimpleNamespace(close=Mock(side_effect=RuntimeError("simulated window failure")))
         transport.windows[0] = SimpleNamespace(window=broken)
+    else:
+        comm.destroy.side_effect = RuntimeError("simulated destroy failure")
     with pytest.raises(RuntimeError, match=f"simulated {failing} failure"):
         transport.close(clean=True)
     comm.abort.assert_called_once_with()
-    comm.destroy.assert_not_called()
+    assert comm.destroy.call_count == (failing == "destroy")
+    assert transport.comm is None and transport.window is None and transport.windows == {}
+
+
+def test_engram_clean_close_destroys_without_aborting(monkeypatch):
+    """A clean close that finishes closes every window and destroys the communicator; it never
+    aborts it."""
+    transport = _host_transport(monkeypatch)
+    comm, transport.device_view = transport.comm, object()
+    workspace = transport.window = SimpleNamespace(close=Mock())
+    table = SimpleNamespace(close=Mock())
+    transport.windows[0] = SimpleNamespace(window=table)
+    transport.close(clean=True)
+    transport.barrier.assert_called_once_with()
+    table.close.assert_called_once_with()
+    workspace.close.assert_called_once_with()
+    comm.destroy.assert_called_once_with()
+    comm.abort.assert_not_called()
     assert transport.comm is None and transport.window is None and transport.windows == {}
 
 

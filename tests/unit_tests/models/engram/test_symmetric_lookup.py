@@ -441,7 +441,9 @@ def _start_failures_case(rank):
     the table check of the first gather, the local preparation, the workspace allocation, the
     transport initialization, and the eager registration. A failed allocation stops every rank
     before any of them initializes its transport, whose NCCL calls would wait for the rank that
-    failed.
+    failed. The eager registration fails on both ranks of the row group together, through the
+    count rows or the registration outcomes, so they still reach the last gather and the stage
+    without tables raises with them.
     """
     groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
     group = groups[rank // 2]
@@ -474,6 +476,19 @@ def _start_failures_case(rank):
         def describe_tables(self, key, tables):
             changed, _, layout = super().describe_tables(key, tables)
             return changed, ("ValueError: simulated host table" if rank == 1 else None), layout
+
+    class FailingRegistration(Recording):
+        # What the device transport does once the row group exchanged its registration
+        # outcomes and rank 1 reported a failure: every rank sets ``failed`` and raises.
+        failed = False
+
+        def describe_tables(self, key, tables):
+            _, error, layout = super().describe_tables(key, tables)
+            return True, error, layout
+
+        def register_tables(self, key, metadata):
+            self.failed = True
+            raise RuntimeError("simulated unregistered window on row ranks [1]")
 
     def available():
         return _transport_module(rank, Recording)
@@ -532,11 +547,19 @@ def _start_failures_case(rank):
             resolved,
             r"cannot register table windows on ranks \[0, 1\]",
         ),
+        # Rank 1 cannot register a window, which the transport reports to its whole row group.
+        (
+            "window",
+            stage,
+            lambda: _transport_module(rank, FailingRegistration),
+            resolved,
+            r"cannot register table windows on ranks \[0, 1\]",
+        ),
     ]
     # Ranks with tables reach the allocation once the first gather passed, and the
     # initialization once the allocation passed on every rank.
-    reaches_prepare = ("prepare", "initialize", "register")
-    reaches_initialize = ("initialize", "register")
+    reaches_prepare = ("prepare", "initialize", "register", "window")
+    reaches_initialize = ("initialize", "register", "window")
     for name, chunk, require, row_group, message in scenarios:
         symmetric_lookup.require_symmetric_transport = require
         symmetric_lookup._engram_row_group = row_group
@@ -545,7 +568,7 @@ def _start_failures_case(rank):
         # Every rank raises, including the stage without tables, so none is left waiting.
         with pytest.raises(RuntimeError, match=message) as error:
             symmetric_lookup.initialize_engram_transports([chunk], None, _SYMMETRIC_2MB)
-        if name == "register" and rank < 2:
+        if name in ("register", "window") and rank < 2:
             assert "row ranks [1]" in str(error.value), name
         # The failing rank names its own cause.
         if rank == 1 and name == "saver":
@@ -561,6 +584,51 @@ def _start_failures_case(rank):
 
 def test_cpu_transport_start_failures_raise_on_every_rank(tmp_path):
     _spawn(tmp_path, _start_failures_case)
+
+
+def _lone_failure_case(rank, report):
+    """Rank 1 fails alone before the count exchange of its second Engram module.
+
+    The stages are those of the lifecycle case, with two Engram modules on the first one. When
+    rank 1 fails, rank 0 is in that exchange and ranks 2 and 3, the stage without tables, are
+    in the last gather of the start-up: all three wait for rank 1.
+    """
+    groups = [dist.new_group([0, 1]), dist.new_group([2, 3])]
+    group = groups[rank // 2]
+    chunk = _stage_chunk(group, tables=rank < 2)
+    if rank < 2:
+        chunk.second = _stage_chunk(group).embedding
+
+    class FailingAlone(ReferenceEngramTransport):
+        def describe_tables(self, key, tables):
+            if rank == 1 and self.describes == 1:
+                raise RuntimeError("simulated failure of rank 1 alone")
+            return super().describe_tables(key, tables)
+
+    symmetric_lookup.require_symmetric_transport = lambda: _transport_module(rank, FailingAlone)
+    symmetric_lookup._engram_row_group = lambda pg_collection, engram_config: group
+    try:
+        symmetric_lookup.initialize_engram_transports([chunk], None, _SYMMETRIC_2MB)
+    except Exception as exc:
+        if rank == 1:
+            left = len(symmetric_lookup._TRANSPORTS)
+            Path(report).write_text(f"{type(exc).__name__}: {exc}; transports left: {left}")
+        raise
+
+
+def test_cpu_rank_failing_alone_ends_while_its_peers_wait(tmp_path):
+    """The process of a rank that fails alone ends with its own error.
+
+    ``mp.spawn`` stands in for the launcher: it stops the ranks that wait once one process has
+    failed. Were rank 1 to wait for them in the last gather, it would report the time-out of
+    the process group instead of its own error.
+    """
+    report = tmp_path / "rank1"
+    with pytest.raises(mp.ProcessRaisedException):
+        _spawn(tmp_path, _lone_failure_case, str(report))
+    assert report.read_text() == (
+        "RuntimeError: simulated failure of rank 1 alone; transports left: 0"
+    )
 
 
 # --- Single-process cases ----------------------------------------------------------------------
@@ -854,6 +922,103 @@ def test_failed_start_reports_its_own_error_when_the_abort_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="simulated start failure"):
         symmetric_lookup.initialize_engram_transports([], None, SYMMETRIC)
     assert stuck.calls == [False]
+    assert symmetric_lookup._TRANSPORTS == {} and not symmetric_lookup._INITIALIZED
+
+
+@pytest.mark.usefixtures("isolated_registry")
+@pytest.mark.parametrize("call", ["describe", "register"])
+@pytest.mark.parametrize("failing", [0, 1])
+def test_rank_failing_alone_during_registration_raises_without_a_gather(monkeypatch, call, failing):
+    """A rank that fails alone once device communication began raises at once.
+
+    This process is row rank 0 of two and fails alone while it registers its first or its
+    second embedding: before the count exchange (``describe``), or after it, in a registration
+    whose outcome the transport did not share with the row group (``register``). Its peer goes
+    on to the next exchange and spin-waits for this rank there, so it never joins the last
+    gather of the start-up. The rank must not wait there either: it issues no further device
+    call and enters no gather, aborts its transport and raises its own error. The transport
+    and the gathers are mocked, so this checks the decisions of the failing rank only.
+    """
+    row_group, failure = object(), RuntimeError("simulated failure of this rank alone")
+    gathers, issued = [], []
+    embeddings = [
+        SimpleNamespace(
+            tables=[SimpleNamespace(weight=torch.zeros(3, DIM))],
+            table_sizes=(6,),
+            embedding_dim=DIM,
+            ep_group=row_group,
+            ep_size=2,
+            table_row_base=torch.zeros(1, dtype=torch.int64),
+        )
+        for _ in range(2)
+    ]
+
+    class LoneTransport(_ClosingTransport):
+        """Records the device calls of this rank; its peer would mirror every row."""
+
+        rank, size = 0, 2
+        # Unset, as on a device transport whose registration outcomes were not exchanged.
+        failed = False
+
+        def prepare(self):
+            pass
+
+        def initialize(self):
+            pass
+
+        def barrier(self):
+            issued.append("barrier")
+
+        def describe_tables(self, key, tables):
+            if call == "describe" and key is embeddings[failing]:
+                raise failure
+            return True, None, ((0, 32),) * len(tables)
+
+        def exchange(self, source, plan):
+            issued.append("exchange")
+            return source.clone()
+
+        def register_tables(self, key, metadata):
+            if call == "register" and key is embeddings[failing]:
+                raise failure
+            issued.append("register")
+
+    transport = LoneTransport()
+
+    def gather(item):
+        # The reports of a two-stage world: ranks 0 and 1 are the row group and report alike,
+        # rank 2 is a pipeline stage without Engram tables.
+        gathers.append(item)
+        if isinstance(item, symmetric_lookup._StartReport):
+            return [item, item, item._replace(tables=(), members=None, unique_id=None)]
+        return [item, item, None]
+
+    monkeypatch.setattr(symmetric_lookup, "_gather_world", gather)
+    monkeypatch.setattr(symmetric_lookup, "_sharded_embeddings", lambda chunk: chunk)
+    monkeypatch.setattr(symmetric_lookup, "_engram_row_group", lambda pg, config: row_group)
+    monkeypatch.setattr(symmetric_lookup, "_nvlink_domain", lambda: ("host", "node"))
+    monkeypatch.setattr(symmetric_lookup, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(
+        symmetric_lookup,
+        "require_symmetric_transport",
+        lambda: _transport_module(0, lambda group, **options: transport),
+    )
+    monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [0, 1])
+    monkeypatch.setattr(dist, "get_global_rank", lambda group, rank: rank)
+
+    with pytest.raises(RuntimeError) as error:
+        symmetric_lookup.initialize_engram_transports([embeddings], None, _SYMMETRIC_2MB)
+    # Its own error, as raised, not one agreed on over the default group.
+    assert error.value is failure
+    # The gathers of the three steps before device communication, and none after the failure.
+    assert len(gathers) == 3
+    # The embedding before the failing one is registered; then no device call follows the
+    # failure, which comes after the count exchange when the registration itself raises.
+    assert issued == ["barrier"] + ["exchange", "register"] * failing + ["exchange"] * (
+        call == "register"
+    )
+    # The transport is aborted, without a device barrier, and no state is left behind.
+    assert transport.calls == [False]
     assert symmetric_lookup._TRANSPORTS == {} and not symmetric_lookup._INITIALIZED
 
 

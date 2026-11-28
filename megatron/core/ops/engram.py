@@ -635,7 +635,8 @@ class EngramDeviceTransport:
         # Set by the first barrier: every rank has zeroed its workspace flags.
         self.published = False
         # Set when a registration failed on some rank: the ranks may hold different windows,
-        # which only an abort releases.
+        # which only an abort releases. register_tables() sets it on every rank of the row
+        # group before it raises, which tells that failure apart from one of a single rank.
         self.failed = False
 
     def prepare(self) -> None:
@@ -971,8 +972,9 @@ class EngramDeviceTransport:
         later lookups reuse fewer windows and register more.
 
         A rank that cannot register a window still issues every registration of its peers, and
-        one more exchange shares each rank's outcome: on any failure every rank raises, and the
-        transport can then only be aborted.
+        one more exchange shares each rank's outcome: on any failure every rank sets ``failed``
+        and raises, and the transport can then only be aborted. Any other exception out of this
+        method is raised by this rank alone, whose peers go on to the next transport call.
         """
         description = self.pending.pop(key, None)
         registered = self.tables.get(key)
@@ -1152,8 +1154,9 @@ class EngramDeviceTransport:
         window is closed and the communicator destroyed. Use it only where every rank of the
         row group arrives (the normal end of training). Otherwise, and always after a failed
         registration, the communicator is aborted without any device barrier, which cannot
-        hang on a failed peer. A clean close whose barrier, synchronization or window close
-        raises aborts the communicator before it re-raises, so nothing is left registered.
+        hang on a failed peer. A clean close that raises at any step (the barrier, the
+        synchronization, a window close or the destruction of the communicator) aborts the
+        communicator before it re-raises, so nothing is left registered or allocated.
         """
         if self.comm is None:
             # At most prepare() ran: release its workspace.
@@ -1167,10 +1170,12 @@ class EngramDeviceTransport:
                     for entry in self.windows.values():
                         entry.window.close()
                     self.window.close()
+                    # The references are dropped below either way: a communicator that could
+                    # not be destroyed must be aborted here, or nothing could release it.
+                    self.comm.destroy()
                 except BaseException:
                     self._abort_after_failed_close()
                     raise
-                self.comm.destroy()
             else:
                 # Initialization may have failed before the device communicator existed.
                 self.comm.abort()
