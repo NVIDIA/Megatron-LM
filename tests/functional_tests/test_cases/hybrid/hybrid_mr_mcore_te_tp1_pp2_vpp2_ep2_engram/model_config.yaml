@@ -1,0 +1,79 @@
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+MODEL_ARGS:
+  # A hybrid stack with MoE on PP2 x VPP2 (one '|' segment per virtual chunk) x DP2 with EP2.
+  --spec: "[megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec]"
+  --hybrid-layer-pattern: "*E|*E|*E|*E"
+  --num-layers: 8
+  --hidden-size: 256
+  --ffn-hidden-size: 512
+  --num-attention-heads: 4
+  --num-experts: 8
+  --moe-ffn-hidden-size: 256
+  --moe-router-topk: 2
+  --moe-router-load-balancing-type: aux_loss
+  --moe-aux-loss-coeff: 1.0e-2
+  --moe-token-dispatcher-type: alltoall
+  --moe-grouped-gemm: true
+  --disable-bias-linear: true
+
+  # The Engram n-gram memory on the attention layers of the first and of both middle virtual
+  # chunks (the last chunk has none), with its tables sharded over the expert-parallel group.
+  # The qwen variant hashes raw token IDs and needs no tokenizer-map artifact.
+  --engram-vocab-sizes: "[1009 1009]"
+  --engram-layer-ids: "[1 3 5]"
+  --engram-variant: qwen
+  --engram-eos-token-id: 1
+  --engram-unigram-vocab-size: 256
+  --engram-num-hash-heads: 4
+  --engram-memory-dim: 64
+
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 2
+  --expert-model-parallel-size: 2
+  --micro-batch-size: 1
+  --global-batch-size: 16
+  --seq-length: 128
+  --max-position-embeddings: 128
+  --train-iters: 50
+  --mock-data: true
+  --tokenizer-type: NullTokenizer
+  --vocab-size: 256
+  --data-cache-path: ${DATA_CACHE_PATH}
+  --split: 949,50,1
+  --distributed-backend: nccl
+  --lr: 0.00015
+  --lr-decay-style: cosine
+  --min-lr: 1.0e-5
+  --lr-warmup-iters: 2
+  --weight-decay: 1e-2
+  --clip-grad: 1.0
+  --hidden-dropout: 0.0
+  --attention-dropout: 0.0
+  --normalization: RMSNorm
+  --swiglu: true
+  --position-embedding-type: rope
+  --transformer-impl: transformer_engine
+  --bf16: true
+  --deterministic-mode: true
+  --use-distributed-optimizer: true
+  --no-gradient-accumulation-fusion: true
+  --untie-embeddings-and-output-weights: true
+  --log-params-norm: true
+  --log-num-zeros-in-grad: true
+  --log-interval: 1
+  --log-memory-to-tensorboard: true
+  --tensorboard-dir: ${TENSORBOARD_PATH}
+  --save: ${CHECKPOINT_SAVE_PATH}
+  --load: ${CHECKPOINT_LOAD_PATH}
+  --save-interval: 10000
+  --eval-interval: 1000
+  --eval-iters: 2
+  --ckpt-format: torch_dist
+TEST_TYPE: regular
+METRICS:
+  - lm loss
+  - num-zeros

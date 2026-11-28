@@ -15,6 +15,7 @@ Guides for Megatron Core training and inference features.
 - [Fine-Grained Activation Offloading](fine_grained_activation_offloading.md)
 - [Low-Precision Training Guide](low_precision_training.md)
 - [Mixture of Experts](moe.md)
+- [Engram n-gram memory](engram.md)
 - [Megatron-FSDP](megatron_fsdp.md)
 - [Distributed Optimizer](dist_optimizer.md)
 - [Weighted Checkpoint Merge](checkpoint-merge.md)

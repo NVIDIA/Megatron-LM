@@ -8,6 +8,7 @@ import torch
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
+from megatron.core.models.engram import EngramConfig, apply_engram_to_hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_inference_stack_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec as default_hybrid_stack_spec,
@@ -53,6 +54,12 @@ class HybridModelConfig(ModelConfig):
 
     builder: ClassVar[str] = "megatron.training.models.hybrid.HybridModelBuilder"
     transformer: TransformerConfig
+    engram_config: EngramConfig | None = None
+    """Hashed n-gram memory (Engram / Qwen PLE) attached to the configured global layers.
+    ``HybridModelBuilder`` validates it against ``transformer`` and sets
+    ``transformer.engram_enabled`` when it builds a stage. With expert parallelism and no MoE
+    experts, also pass ``engram_enabled=True`` to ``TransformerConfig``, which checks that
+    combination before any builder runs."""
     fp16_lm_cross_entropy: bool = False
     logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
@@ -218,6 +225,15 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         Note:
             Virtual pipeline model parallelism is not supported for Hybrid models.
         """
+        if self._model_config.engram_config is not None and (
+            self._model_config.transformations is not None
+            or self._model_config.restore_modelopt_state
+        ):
+            # Not validated: this builder would compose the memory into the ModelOpt stack spec
+            # (the one of the transformations, or the one restore_modelopt_state selects) and
+            # into a distillation teacher (a second copy of the tables), and the ModelOpt hooks
+            # (state restore, QAD freeze, KD conversion) have never run with it.
+            raise ValueError("Engram does not support ModelOpt model building.")
         hybrid_stack_spec = resolve_hybrid_stack_spec(self._model_config)
 
         assert (
@@ -231,6 +247,28 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             )
         else:
             padded_vocab_size = self._model_config.vocab_size
+
+        engram_config = self._model_config.engram_config
+        if engram_config is not None:
+            transformer_config = self._model_config.transformer
+            # Checked for every model config, before any layer is built: one assembled without
+            # EngramConfig.from_args has not been through the startup validation, and the
+            # padded vocabulary is only known here.
+            engram_config.validate_startup(transformer_config, padded_vocab_size)
+            # The stack spec carries the memory to every transformer layer type, and
+            # TransformerLayer builds it only for the configured global layer numbers.
+            hybrid_stack_spec = apply_engram_to_hybrid_stack_spec(
+                hybrid_stack_spec,
+                engram_config,
+                self._model_config.hybrid_layer_pattern,
+                transformer_config,
+            )
+            # The model, the training loop and the batch function hand the token IDs to the
+            # memory only when this switch is set, and all of them read it from this config
+            # object, which the model keeps as its own. Set it with the memory, so that they
+            # agree with the layers built from the spec above; EngramConfig.from_args has
+            # already done so, a config assembled without it may not have.
+            transformer_config.engram_enabled = True
 
         pre_process = (
             pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
@@ -296,6 +334,13 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         Returns:
             List of model stages.
         """
+        engram_config = self._model_config.engram_config
+        if engram_config is not None:
+            # Before any stage is built: build_model repeats these checks for its stage, with
+            # the padded vocabulary, but only this entry point knows whether FSDP wraps them.
+            engram_config.validate_startup(
+                self._model_config.transformer, use_fsdp=use_megatron_fsdp or use_torch_fsdp2
+            )
         transformer_config = self._model_config.transformer
         composed_pre_wrap_hook = compose_hooks(self._model_config.pre_wrap_hooks)
         model_list = unimodal_build_distributed_models(
