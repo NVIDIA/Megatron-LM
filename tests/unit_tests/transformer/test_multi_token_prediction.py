@@ -34,6 +34,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -4112,6 +4113,69 @@ class TestMultiTokenPredictionHybrid:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
         MTPLossLoggingHelper.tracker = {}
+
+    def test_mtp_gradient_to_external_projection_with_sequence_parallelism(self, monkeypatch):
+        """The MTP loss reaches the external embedding projection on both TP ranks."""
+        if Utils.world_size % 2:
+            pytest.skip("requires a world size divisible by TP2")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        tp_group = get_tensor_model_parallel_group()
+        monkeypatch.setattr(
+            MTPLossAutoScaler, "main_loss_backward_scale", torch.ones((), device="cuda")
+        )
+
+        hidden_size = 32
+        torch.manual_seed(_SEED)
+        projection = torch.nn.Linear(hidden_size, hidden_size, bias=False).cuda()
+        features = torch.randn(16, 1, hidden_size).cuda()
+        positions = torch.arange(16, device="cuda").unsqueeze(0)
+        tokens = torch.randint(32, (1, 16)).cuda()
+        labels = tokens.roll(-1, dims=1)
+
+        def projection_gradient(sequence_parallel):
+            torch.manual_seed(_SEED)
+            model_parallel_cuda_manual_seed(_SEED)
+            config = TransformerConfig(
+                num_layers=1,
+                hidden_size=hidden_size,
+                num_attention_heads=4,
+                ffn_hidden_size=64,
+                tensor_model_parallel_size=2,
+                sequence_parallel=sequence_parallel,
+                freeze_base_model_for_mtp=True,
+                mtp_num_layers=1,
+                mtp_detach_heads=False,
+                hidden_dropout=0.0,
+                attention_dropout=0.0,
+                gradient_accumulation_fusion=False,
+                use_cpu_initialization=True,
+            )
+            model = HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=32,
+                max_sequence_length=16,
+                hybrid_layer_pattern="-/-",
+                position_embedding_type="none",
+            ).cuda()
+            projection.zero_grad(set_to_none=True)
+            embeddings = projection(features)
+            if sequence_parallel:
+                embeddings = scatter_to_sequence_parallel_region(embeddings, group=tp_group)
+            loss = model(
+                input_ids=tokens,
+                position_ids=positions,
+                attention_mask=None,
+                decoder_input=embeddings,
+                labels=labels,
+            )
+            loss.mean().backward()
+            return projection.weight.grad
+
+        expected = projection_gradient(False)
+        assert expected is not None and expected.norm() > 0
+        actual = projection_gradient(True)
+        torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-6)
 
     @pytest.mark.parametrize("tp,cp", [(1, 1), (2, 1), (1, 2), (2, 2)])
     @pytest.mark.parametrize("with_mask", [False, True])
