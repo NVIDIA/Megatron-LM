@@ -29,7 +29,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import _add_network_size_args, parse_args
 from megatron.training.initialize import _set_random_seed
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, te_reads_legacy_grouped_env
 
 
 def test_op_fuser_transformer_config_args_are_exposed():
@@ -2229,7 +2229,7 @@ class TestTEGroupedMLP:
 
         if "scale_bias" not in inspect.signature(GroupedLinear.__init__).parameters:
             pytest.skip("Installed TE op fuser GroupedLinear lacks `scale_bias` support")
-        if single_grouped_bias:
+        if single_grouped_bias and te_reads_legacy_grouped_env():
             monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
 
         Utils.destroy_model_parallel()
@@ -2366,7 +2366,8 @@ class TestTEGroupedMLP:
         ):
             pytest.skip("Installed TE lacks native single grouped bias support")
 
-        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        if te_reads_legacy_grouped_env():
+            monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
 
         def build_experts(single_weight, single_bias):
             config = TransformerConfig(
@@ -2516,15 +2517,14 @@ class TestTEGroupedMLP:
 
         IMPORTANT: this test does NOT verify that TE's underlying cuDSL fused grouped
         MLP kernel is actually invoked. That kernel additionally requires SM100
-        (Blackwell) compute capability, plus `NVTE_CUTEDSL_FUSED_GROUPED_MLP` set, plus
+        (Blackwell) compute capability, plus 256-row expert split alignment, plus
         a fusion-registration that happens at TE module import. On H100/A100 hardware
         (which is the current CI matrix) the kernel is unavailable regardless and TE
         falls back to its basic-op path — the Megatron wrapper still runs end-to-end
         and the loss still decreases. So this test covers the wrapper code this PR
         adds; it does not cover the cuDSL kernel selection. The functional test
-        `moe/gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser` sets the env var
-        in its recipe as Blackwell forward-compat, but on current CI hardware it also
-        runs basic-op.
+        `moe/gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser` also runs basic-op
+        on current CI hardware.
         """
         try:
             from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401

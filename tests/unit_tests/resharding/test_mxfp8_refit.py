@@ -8,6 +8,7 @@ from megatron.core.resharding.copy_services.base import CopyService
 from megatron.core.resharding.execution import execute_reshard_plan
 from megatron.core.resharding.transforms import MXFP8ReshardTransform
 from megatron.core.resharding.utils import ReshardPlan, TransferOp
+from tests.unit_tests.test_utilities import te_reads_legacy_grouped_env
 
 _IS_BLACKWELL = torch.cuda.is_available() and (torch.cuda.get_device_properties(0).major >= 10)
 
@@ -761,7 +762,8 @@ class TestTEGroupedParameterRefit:
                     single_grouped_weight=single_grouped_weight,
                 )
 
-        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        if te_reads_legacy_grouped_env():
+            monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
         source = make_grouped_linear(source_single_grouped, seed=123)
         destination = make_grouped_linear(destination_single_grouped, seed=456)
         torch.cuda.synchronize()
