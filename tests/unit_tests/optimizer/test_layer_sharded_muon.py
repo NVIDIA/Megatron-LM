@@ -478,6 +478,9 @@ _PARITY_CASES = {
     "uneven_homes": dict(rows=4, Q=8, N=3, momentum=0.95, nesterov=True, homes="uneven"),
     "no_homes_fallback": dict(rows=16, Q=24, N=3, momentum=0.95, nesterov=False, homes=None),
     "gtp_padding": dict(rows=4, Q=24, N=1, momentum=0.95, nesterov=False, homes="even", pad=3),
+    "capturable": dict(
+        rows=8, Q=16, N=4, momentum=0.95, nesterov=True, homes="even", capturable=True
+    ),
 }
 
 
@@ -486,14 +489,18 @@ def test_step_matches_duplicated_mode(case):
     """Two steps of LayerShardedMuon equal all_gather + NS + reshard bitwise.
 
     Cases: even home assignment, uneven assignment (idle ranks), no homes at all (the
-    TensorParallelMuon fallback), and GTP alignment padding (stripped before NS, scale on
-    the true dims, restored before the reverse exchange).
+    TensorParallelMuon fallback), GTP alignment padding (stripped before NS, scale on
+    the true dims, restored before the reverse exchange), and capturable mode (0-dim CUDA
+    tensor lr, update applied with ``addcmul_``).
     """
     c = _PARITY_CASES[case]
     _require_multi_rank()
     S, r = dist.get_world_size(), dist.get_rank()
     if c["homes"] == "uneven" and S < 4:
         pytest.skip("uneven assignment needs >= 4 ranks")
+    capturable = c.get("capturable", False)
+    if capturable and torch.empty(0).device.type != "cuda":
+        pytest.skip("capturable mode needs CUDA")
     pad, lr, momentum, nesterov = c.get("pad", 0), 1e-2, c["momentum"], c["nesterov"]
 
     torch.manual_seed(_SEED + 10)
@@ -509,7 +516,11 @@ def test_step_matches_duplicated_mode(case):
         if pad:
             p.pad_length = pad
     extra = {"pg_collection": _pg_stub(gtp_remat=_world())} if c["homes"] is None else {}
+    if capturable:
+        extra["capturable"] = True
     opt = _muon(params, momentum=momentum, nesterov=nesterov, gtp_remat_group=_world(), **extra)
+    if capturable:
+        assert isinstance(opt.param_groups[0]["lr"], torch.Tensor)
     if c["homes"] == "even":
         opt.set_param_ns_homes({id(p): (i % S, 0) for i, p in enumerate(params)})
     elif c["homes"] == "uneven":
@@ -533,7 +544,11 @@ def test_step_matches_duplicated_mode(case):
             orth = orth * (max(clean.shape) ** 0.5) * 1.0  # optimizer's multiply order
             restored = torch.nn.functional.pad(orth, (0, 0, 0, pad)) if pad else orth
             rows = restored.shape[0] // S
-            ref_w[i].add_(restored[r * rows : (r + 1) * rows], alpha=-lr)
+            update = restored[r * rows : (r + 1) * rows]
+            if capturable:
+                ref_w[i].addcmul_(update, torch.tensor(lr, dtype=torch.float32), value=-1)
+            else:
+                ref_w[i].add_(update, alpha=-lr)
             assert torch.equal(params[i].data, ref_w[i]), (
                 f"{case}: param {i} on rank {r} at step {step} differs, "
                 f"max_diff={(params[i].data - ref_w[i]).abs().max().item():.2e}"
