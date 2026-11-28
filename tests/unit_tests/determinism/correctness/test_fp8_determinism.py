@@ -21,6 +21,7 @@ import torch
 
 from tests.unit_tests.determinism.correctness.test_gpt_model import make_gpt_runner
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact
+from tests.unit_tests.test_utilities import te_reads_legacy_grouped_env
 
 # Hopper = SM 9.0, Blackwell = SM 10.0+. mxfp8 + nvfp4 need Blackwell.
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
@@ -72,7 +73,8 @@ class TestQuantizationDeterminism:
         if "single_grouped_weight" not in inspect.signature(te.GroupedLinear).parameters:
             pytest.skip("Transformer Engine lacks single grouped parameters")
 
-        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+        if te_reads_legacy_grouped_env():
+            monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
         with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
             linear = te.GroupedLinear(
                 2,

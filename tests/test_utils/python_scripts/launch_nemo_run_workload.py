@@ -247,17 +247,23 @@ def main(
         volumes=artifacts,
     )
 
+    transformer_bucket = "tests/unit_tests/transformer/**/*.py"
+    nonblocking_nccl_bucket = "tests/unit_tests/transformer/test_thd_correctness.py"
     if (
         scope == "unit-tests"
-        and test_case == "tests/unit_tests/transformer/**/*.py"
+        and test_case in (transformer_bucket, nonblocking_nccl_bucket)
         and environment == "dev"
         and tag == "latest"
         and platform == "dgx_h100"
     ):
-        # NCCL 2.31 finalization waits for peers. Nonblocking communicators let
-        # PyTorch start every communicator's finalization before waiting, avoiding
-        # cyclic waits between the CP group's P2P and collective communicators (#7744).
-        executor.env_vars["TORCH_NCCL_USE_COMM_NONBLOCKING"] = "1"
+        if test_case == nonblocking_nccl_bucket:
+            # NCCL 2.31 finalization waits for peers. Nonblocking communicators let
+            # PyTorch start every communicator's finalization before waiting, avoiding
+            # cyclic waits between the CP group's P2P and collective communicators (#7744).
+            # Only this bucket needs it; elsewhere it races PyTorch's watchdog against
+            # coalesced collectives, which hangs or segfaults a rank.
+            executor.env_vars["TORCH_NCCL_USE_COMM_NONBLOCKING"] = "1"
+        # Both buckets keep the NCCL finalization diagnostics.
         executor.env_vars["PYTEST_ADDOPTS"] = "-o faulthandler_timeout=600"
         executor.env_vars["TORCH_CPP_LOG_LEVEL"] = "INFO"
         executor.env_vars["NCCL_DEBUG_SUBSYS"] = "INIT,BOOTSTRAP,ENV,DESTROY"
