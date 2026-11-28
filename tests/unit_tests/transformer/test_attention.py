@@ -644,6 +644,10 @@ def test_qk_layernorm_from_config_fallback():
         )
         assert isinstance(attn.q_layernorm, te_pytorch.LayerNorm)
         assert isinstance(attn.k_layernorm, te_pytorch.LayerNorm)
+        # Q/K norm parameters need TP sums independently of the model-level config.
+        for norm in (attn.q_layernorm, attn.k_layernorm):
+            assert norm.weight.sum_gradients_across_tp_domain
+            assert norm.bias.sum_gradients_across_tp_domain
     finally:
         Utils.destroy_model_parallel()
 
