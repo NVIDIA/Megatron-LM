@@ -11,12 +11,15 @@ the boundary — that is what both published references do.
 
 import torch
 
+from megatron.core.models.engram.cp_layout import thd_partition_index
+from megatron.core.models.engram.engram import _row_cu_seqlens
 from megatron.core.models.engram.hashing import (
     build_ngram_hashes,
     segment_starts_from_cu_seqlens,
     shift_right_within_segments,
     valid_positions_from_cu_seqlens,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 
 _PAD = 0
 _MULTIPLIERS = torch.tensor([13, 17, 19], dtype=torch.int64)
@@ -144,3 +147,29 @@ def test_eos_and_cu_seqlens_boundaries_compose():
     assert not torch.equal(both[:, 5], only_eos[:, 5])
     # Position 3 begins an EOS-delimited document and is unaffected by the packed boundary.
     torch.testing.assert_close(both[:, 3], only_eos[:, 3])
+
+
+def test_padded_documents_are_bounded_by_their_row_positions():
+    """A row that pads its documents is hashed and split by the positions they occupy.
+
+    Such a row may carry the token counts of its documents in ``cu_seqlens_q`` and their
+    positions in ``cu_seqlens_q_padded``.
+    """
+    # Two documents of 3 tokens, each padded to 4 positions. The padding holds a token other
+    # than the window fill, so a window that reached back into it would show.
+    doc_a = torch.tensor([[1, 2, 3, 9]], dtype=torch.int64)
+    doc_b = torch.tensor([[4, 5, 6, 9]], dtype=torch.int64)
+    packed = torch.cat([doc_a, doc_b], dim=1)
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=torch.tensor([0, 3, 6], dtype=torch.int32),
+        cu_seqlens_q_padded=torch.tensor([0, 4, 8], dtype=torch.int32),
+    )
+    boundaries = _row_cu_seqlens(packed_seq_params)
+
+    # The second document starts at position 4, not 3: it hashes as it does on its own.
+    torch.testing.assert_close(_hash(packed, cu_seqlens=boundaries)[:, 4:], _hash(doc_b))
+    # Context parallelism splits the 4 positions of each document, not its 3 tokens: of the
+    # 4 chunks of a document, rank 0 owns chunks 0 and 3 and rank 1 owns chunks 1 and 2.
+    torch.testing.assert_close(thd_partition_index(boundaries, 2, 0), torch.tensor([0, 3, 4, 7]))
+    torch.testing.assert_close(thd_partition_index(boundaries, 2, 1), torch.tensor([1, 2, 5, 6]))

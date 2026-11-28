@@ -150,7 +150,7 @@ def test_layer_layout_is_the_one_hybrid_stack_selects(
     layout_manager_kwargs = {}
 
     class CapturingLayoutManager:
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
             layout_manager_kwargs.update(kwargs)
 
     monkeypatch.setattr(hybrid_block_module, "ContextParallelLayoutManager", CapturingLayoutManager)

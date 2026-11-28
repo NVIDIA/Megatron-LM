@@ -59,7 +59,11 @@ class HybridModelConfig(ModelConfig):
     builder: ClassVar[str] = "megatron.training.models.hybrid.HybridModelBuilder"
     transformer: TransformerConfig
     engram_config: EngramConfig | None = None
-    """Hashed n-gram memory (Engram / Qwen PLE) attached to the configured global layers."""
+    """Hashed n-gram memory (Engram / Qwen PLE) attached to the configured global layers.
+    ``HybridModelBuilder`` validates it against ``transformer`` and sets
+    ``transformer.engram_enabled`` when it builds a stage. With expert parallelism and no MoE
+    experts, also pass ``engram_enabled=True`` to ``TransformerConfig``, which checks that
+    combination before any builder runs."""
     fp16_lm_cross_entropy: bool = False
     logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
@@ -250,16 +254,25 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
 
         engram_config = self._model_config.engram_config
         if engram_config is not None:
-            # The padded vocabulary is only known here; the stack spec carries the memory to
-            # every transformer layer type, and TransformerLayer builds it only for the
-            # configured global layer numbers.
-            engram_config.validate_vocabulary(padded_vocab_size)
+            transformer_config = self._model_config.transformer
+            # Checked for every model config, before any layer is built: one assembled without
+            # EngramConfig.from_args has not been through the startup validation, and the
+            # padded vocabulary is only known here.
+            engram_config.validate_startup(transformer_config, padded_vocab_size)
+            # The stack spec carries the memory to every transformer layer type, and
+            # TransformerLayer builds it only for the configured global layer numbers.
             hybrid_stack_spec = apply_engram_to_hybrid_stack_spec(
                 hybrid_stack_spec,
                 engram_config,
                 self._model_config.hybrid_layer_pattern,
-                self._model_config.transformer,
+                transformer_config,
             )
+            # The model, the training loop and the batch function hand the token IDs to the
+            # memory only when this switch is set, and all of them read it from this config
+            # object, which the model keeps as its own. Set it with the memory, so that they
+            # agree with the layers built from the spec above; EngramConfig.from_args has
+            # already done so, a config assembled without it may not have.
+            transformer_config.engram_enabled = True
 
         pre_process = (
             pre_process if pre_process is not None else is_pp_first_stage(pg_collection.pp)
@@ -325,6 +338,13 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         Returns:
             List of model stages.
         """
+        engram_config = self._model_config.engram_config
+        if engram_config is not None:
+            # Before any stage is built: build_model repeats these checks for its stage, with
+            # the padded vocabulary, but only this entry point knows whether FSDP wraps them.
+            engram_config.validate_startup(
+                self._model_config.transformer, use_fsdp=use_megatron_fsdp or use_torch_fsdp2
+            )
         transformer_config = self._model_config.transformer
         # Collective over every rank, so it runs here and not in build_model: it creates the
         # sharded Engram table groups on the pg_collection that the model stages and DDP share.

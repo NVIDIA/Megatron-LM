@@ -151,7 +151,9 @@ class EngramGroupRMSNorm(torch.nn.Module):
     parity tests) keep their own precision.
     """
 
-    def __init__(self, width: int, group_size: int, eps: float, zero_centered: bool, **factory):
+    def __init__(
+        self, width: int, group_size: int, eps: float, zero_centered: bool, **factory
+    ) -> None:
         super().__init__()
         if width % group_size != 0:
             raise ValueError(f"width ({width}) must be divisible by group_size ({group_size}).")
@@ -205,12 +207,19 @@ def _gather_tokens_across_cp(
 def _row_cu_seqlens(packed_seq_params: PackedSeqParams | None) -> Tensor | None:
     """Return the packed document boundaries for this microbatch, or None when unpacked.
 
+    The boundaries are the positions the documents occupy in the row, which is what the hash
+    windows and the context-parallel partition index: ``cu_seqlens_q_padded`` when the
+    parameters carry it, and ``cu_seqlens_q`` otherwise. The two differ for a row that pads
+    its documents and keeps their token counts in ``cu_seqlens_q``.
+
     ``get_batch`` keeps ``cu_seqlens`` as ``(1, N)`` for consistency and squeezes it to 1-D
     before building PackedSeqParams, so accept either and hand back a 1-D tensor.
     """
     if packed_seq_params is None:
         return None
-    cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
+    cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+    if cu_seqlens is None:
+        cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
     if cu_seqlens is None:
         return None
     return cu_seqlens.reshape(-1)
@@ -221,19 +230,18 @@ def _row_document_bounds(
 ) -> tuple[Tensor | None, Tensor | None]:
     """Return the row positions of the packed documents and, if known, their token counts.
 
-    ``cu_seqlens_q`` holds the positions the documents occupy in the row. The exception is a
-    context-parallel row in the contiguous layout (``contiguous_cp``): its ``cu_seqlens_q``
-    counts the tokens of the documents, and ``cu_seqlens_q_padded``, which a row that pads
-    its documents carries, holds the positions. The token counts are returned for such a row
-    only, and are None otherwise.
+    The positions are those of :func:`_row_cu_seqlens`. The token counts are known for a
+    context-parallel row in the contiguous layout (``contiguous_cp``) that pads its documents:
+    its ``cu_seqlens_q`` counts the tokens of the documents, and its ``cu_seqlens_q_padded``
+    holds their positions. They are returned for such a row only, and are None otherwise.
     """
-    cu_seqlens = _row_cu_seqlens(packed_seq_params)
-    if cu_seqlens is None or not contiguous_cp:
-        return cu_seqlens, None
-    cu_seqlens_padded = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
-    if cu_seqlens_padded is None:
-        return cu_seqlens, None
-    return cu_seqlens_padded.reshape(-1), cu_seqlens.diff()
+    positions = _row_cu_seqlens(packed_seq_params)
+    if positions is None or not contiguous_cp:
+        return positions, None
+    token_boundaries = getattr(packed_seq_params, "cu_seqlens_q", None)
+    if getattr(packed_seq_params, "cu_seqlens_q_padded", None) is None or token_boundaries is None:
+        return positions, None
+    return positions, token_boundaries.reshape(-1).diff()
 
 
 class _ContextParallelConvHalo(torch.autograd.Function):
@@ -780,6 +788,11 @@ class Engram(MegatronModule):
         states in FP32 and rounds once, as DeepSeek-V4.1 does; the ``gated_conv`` fusion adds in
         the hidden dtype.
 
+        Without it the residual has the dtype of the hidden states, except in the ``gated_conv``
+        fusion when they are wider than the dense Engram parameters (BF16 parameters under
+        ``fp32_residual_connection``): it then has the parameter dtype, and adding it promotes
+        it to that of the hidden states.
+
         ``lookup`` takes the result of an earlier :meth:`lookup` call for the same microbatch;
         ``input_ids`` and ``packed_seq_params`` are then unused. Without it the lookup runs
         here, which is the same computation in one call.
@@ -823,7 +836,15 @@ class Engram(MegatronModule):
         try:
             shared_value = self.value_projection(memory)
             key = self.key_norm(self.key_projection(memory)).view_as(streams)
-            query = self.query_norm(hidden_states).view_as(streams)
+            query = self.query_norm(hidden_states)
+            parameter_dtype = self.short_conv.weight.dtype
+            if torch.finfo(query.dtype).bits > torch.finfo(parameter_dtype).bits:
+                # Hidden states wider than the parameters (BF16 parameters under
+                # fp32_residual_connection) are normalized in their own dtype and the query is
+                # then rounded, so the gate and the convolution run in the parameter dtype.
+                # Their result is added to the hidden states, which keep their dtype.
+                query = query.to(parameter_dtype)
+            query = query.view_as(streams)
             score = (key * query).sum(dim=-1) / math.sqrt(self.hidden_size)
             score = score.abs().clamp_min(1e-6).sqrt() * score.sign()
             gate = score.sigmoid().unsqueeze(-1)
