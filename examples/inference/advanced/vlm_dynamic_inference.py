@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Helpers for VLM dynamic-batching inference.
 
@@ -26,7 +26,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
-from megatron.training import print_rank_0
+from megatron.training import get_run_config, print_rank_0
 from megatron.training.checkpointing import (
     get_checkpoint_name,
     get_checkpoint_tracker_filename,
@@ -492,8 +492,10 @@ def get_model(is_vlm: bool) -> MegatronModule:
 
         model = _get_model(partial(model_provider, gpt_builder), wrap_with_ddp=False)
 
-    assert args.load is not None
-    args.exit_on_missing_checkpoint = True
+    checkpoint = get_run_config().checkpoint
+    assert checkpoint.load is not None
+    # Inference must not start from random weights.
+    checkpoint.exit_on_missing_checkpoint = True
     load_checkpoint(
         ddp_model=model,
         optimizer=None,

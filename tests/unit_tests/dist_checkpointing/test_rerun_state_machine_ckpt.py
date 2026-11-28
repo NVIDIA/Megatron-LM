@@ -1,8 +1,16 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+import pytest
 import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedObject
-from megatron.core.rerun_state_machine import RerunMode, RerunState, RerunStateMachine
+from megatron.core.rerun_state_machine import (
+    RerunDiagnostic,
+    RerunErrorInjector,
+    RerunMode,
+    RerunState,
+    RerunStateMachine,
+)
+from megatron.training.config import RerunStateMachineConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -155,3 +163,36 @@ class TestRerunStateMachineCheckpointContract:
         sd = machine.state_dict(data_iterator=None, ckpt_format="fsdp_dtensor", force=True)
         assert sd is not None
         self._assert_sharded_object_shape(sd["sharded"])
+
+    @pytest.mark.parametrize("mode", list(RerunMode))
+    def test_native_mode_preserves_checkpoint_restore_precedence(self, mode):
+        saved = RerunStateMachine(
+            mode=RerunMode.VALIDATE_RESULTS,
+            error_injector=RerunErrorInjector(7, RerunDiagnostic.PERSISTENT_ERROR),
+        )
+        saved.state = RerunState.WILL_RERUN_FROM_CHECKPOINT
+        saved.current_iteration = 5
+        checkpoint = saved.state_dict(None, "torch_dist")
+        checkpoint["sharded"] = checkpoint["sharded"].data
+        config = RerunStateMachineConfig(rerun_mode=mode.value, error_injection_rate=19)
+        config.validate()
+        resumed = RerunStateMachine(
+            mode=RerunMode(config.rerun_mode),
+            error_injector=RerunErrorInjector(
+                config.error_injection_rate, RerunDiagnostic(config.error_injection_type)
+            ),
+        )
+        resumed.load_state_dict(checkpoint)
+        if mode == RerunMode.DISABLED:
+            assert resumed.mode == RerunMode.DISABLED
+            assert resumed.error_injector.error_injection_rate == 19
+            assert resumed.state == RerunState.NOT_RUNNING_YET
+        else:
+            assert resumed.mode == RerunMode.VALIDATE_RESULTS
+            assert resumed.error_injector.error_injection_rate == 7
+            assert resumed.error_injector.error_injection_type == RerunDiagnostic.PERSISTENT_ERROR
+            assert resumed.current_iteration == 5
+            assert resumed.state == RerunState.WILL_RERUN_FROM_CHECKPOINT
+        # Restored runtime policy must not rewrite the caller's recipe.
+        assert config.rerun_mode == mode.value
+        assert config.error_injection_rate == 19

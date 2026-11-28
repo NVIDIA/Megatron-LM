@@ -136,6 +136,61 @@ def test_batch_invariant_clamped_squared_relu_matches_training_rounding():
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("clamp_scale", [None, 16.0])
+@pytest.mark.parametrize(
+    "rows,n_used,hidden", [(1, 1, 1856), (37, 37, 1856), (300, 129, 1856), (256, 256, 2688)]
+)
+def test_batch_invariant_squared_relu_quantize_matches_unfused(rows, n_used, hidden, clamp_scale):
+    """The fused BI activation + MXFP8 quantize kernel is bitwise the two-kernel sequence.
+
+    Covers alignment-padding rows (permutation map -1), rows past n_used, magnitudes across
+    the whole BF16 range (MXFP8 scale saturation, subnormals) and signed zeros.
+    """
+    from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu
+    from megatron.core.inference.moe.batch_invariant import (
+        squared_relu_with_probs,
+        squared_relu_with_probs_quantize_mxfp8,
+    )
+    from megatron.core.inference.moe.fused_moe import _quantize_mxfp8_used_rows
+
+    torch.manual_seed(rows * 7 + n_used)
+    x = torch.randn(rows, hidden, device="cuda", dtype=torch.float32)
+    x = x * torch.exp2(torch.randint(-60, 60, (rows, hidden // 32, 1), device="cuda")).repeat(
+        1, 1, 32
+    ).view(rows, hidden)
+    x = x.to(torch.bfloat16)
+    x[0, :32] = 0.0
+    x[0, 32:64] = -0.0
+    probs = torch.rand(rows, device="cuda", dtype=torch.float32)
+    permutation_map = torch.arange(rows, device="cuda", dtype=torch.int32)
+    permutation_map[1::5] = -1
+    n_used_t = _vt(n_used)
+
+    unfused = _quantize_mxfp8_used_rows(
+        squared_relu_with_probs(
+            x, permutation_map, n_used_t, probs, clamp_scale, zero_padding=True
+        ),
+        n_used_t,
+    )
+    fused = squared_relu_with_probs_quantize_mxfp8(x, permutation_map, n_used_t, probs, clamp_scale)
+
+    assert torch.equal(
+        fused.data[:n_used].view(torch.uint8), unfused.data[:n_used].view(torch.uint8)
+    )
+    assert torch.equal(fused.scale.view(torch.uint8), unfused.scale.view(torch.uint8))
+
+    if clamp_scale is None:
+        # Live rows also match quantizing training's fused weighted squared ReLU output.
+        live = (permutation_map[:n_used] >= 0).nonzero().flatten()
+        expected = weighted_squared_relu(x, probs.unsqueeze(1))
+        expected[permutation_map < 0] = 0
+        reference = _quantize_mxfp8_used_rows(expected, n_used_t)
+        assert torch.equal(
+            fused.data[live].view(torch.uint8), reference.data[live].view(torch.uint8)
+        )
+        assert torch.equal(fused.scale.view(torch.uint8), reference.scale.view(torch.uint8))
+
+
 @pytest.mark.internal
 class TestComputeLocalTokensPerExpert:
 

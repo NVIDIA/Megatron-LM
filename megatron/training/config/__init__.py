@@ -7,6 +7,7 @@ from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import TargetAllowlist, target_allowlist
 from megatron.training.config.resilience_config import (
     FaultInjectorConfig,
+    FaultToleranceConfig,
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )

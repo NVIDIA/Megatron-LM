@@ -66,7 +66,7 @@ def _causal_conv1d_varlen_kernel(
         acc += bias[None, :]
 
     # Load per-token request ID and request start position
-    req_id = tl.load(seq_idx_ptr + t_off, mask=t_mask, other=0)  # (BLOCK_T,)
+    req_id = tl.load(seq_idx_ptr + t_off, mask=t_mask, other=0).to(tl.int64)  # (BLOCK_T,) int64
     req_start = tl.load(seq_start_ptr + t_off, mask=t_mask, other=0)  # (BLOCK_T,)
 
     # Unrolled convolution over WIDTH taps (typically 4)

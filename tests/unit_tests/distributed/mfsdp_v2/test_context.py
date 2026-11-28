@@ -11,6 +11,7 @@ from weakref import ref
 
 import pytest
 import torch
+import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard
@@ -21,9 +22,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     PrefetchOrder,
     RuntimePolicy,
     SchedulePolicy,
+    finalize_gradients,
     fully_shard,
     fully_shard_context,
-    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionEvent,
@@ -280,7 +281,7 @@ def test_sibling_roots_finish_grad_sync_once_after_last_microbatch(
     finish_grad_sync = Mock(wraps=context.finish_grad_sync)
     monkeypatch.setattr(context, "finish_grad_sync", finish_grad_sync)
 
-    with microbatch(context, is_last=False):
+    with finalize_gradients(context, enabled=False):
         model(torch.ones(2, 4, device=device)).sum().backward()
     finish_grad_sync.assert_not_called()
 
@@ -422,8 +423,8 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
     assert model.inner.context is first_context
 
 
-def test_microbatch_scopes_context(distributed_setup):
-    """microbatch() should scope state on the supplied FSDP context."""
+def test_finalize_gradients_scopes_context(distributed_setup):
+    """Finalization is enabled by default and scoped to the supplied context."""
     world_size = distributed_setup.world_size
     device = distributed_setup.device
 
@@ -433,10 +434,13 @@ def test_microbatch_scopes_context(distributed_setup):
         for layer in model:
             fully_shard(layer, mesh=mesh, placements=_default_placements())
 
-    with microbatch(context, is_last=False):
-        assert not context.is_last_microbatch
+    with finalize_gradients(context, enabled=False):
+        assert not context.finalize_gradients
+        with finalize_gradients(context):
+            assert context.finalize_gradients
+        assert not context.finalize_gradients
 
-    assert context.is_last_microbatch
+    assert context.finalize_gradients
 
 
 @pytest.mark.parametrize("overlap_allgather_reduction", [False, True])
@@ -459,3 +463,15 @@ def test_communication_stream_assignment(
     ) == overlap_outer_communication
     if overlap_outer_communication:
         assert context.outer_reduction_stream != context.allgather_stream
+
+
+def test_delayed_wgrad_requires_caller_managed_sync(distributed_setup):
+    """Delayed weight gradients require explicit gradient synchronization."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = te.Linear(16, 16, device=device, delay_wgrad_compute=True)
+    with (
+        fully_shard_context(FsdpContext(device=device)),
+        pytest.raises(ValueError, match="caller_managed_grad_sync=True"),
+    ):
+        fully_shard(model, mesh=mesh, placements=_default_placements())

@@ -175,6 +175,14 @@ class OptimizerConfig:
     RMSNorm gamma only; other parameters retain their existing policy.
     """
 
+    embedding_min_norm: Optional[float] = None
+    """Trigger threshold for input word-embedding row L2 norms after an optimizer update.
+
+    Rows with nonzero norms below this value are rescaled to twice this value. Disabled when
+    ``None`` and requires the distributed optimizer. Exact-zero rows are left unchanged because
+    they have no direction along which to rescale.
+    """
+
     apply_wd_to_qk_layernorm: bool = False
     """If true, apply weight decay to qk layernorm as a special case."""
 
@@ -557,6 +565,20 @@ class OptimizerConfig:
 
     def validate(self) -> None:
         """Check optimizer-local settings without modifying the config."""
+
+        if self.embedding_min_norm is not None and (
+            not math.isfinite(self.embedding_min_norm) or self.embedding_min_norm <= 0.0
+        ):
+            raise ValueError("embedding_min_norm must be a finite positive value")
+
+        if self.embedding_min_norm is not None and self.optimizer_cuda_graph:
+            raise ValueError("embedding_min_norm is not supported with optimizer_cuda_graph")
+
+        # HybridDeviceOptimizer keeps the authoritative master copy of offloaded parameters
+        # on the CPU and overwrites the GPU copy from it, which would undo the projection.
+        # Offload also requires the precision-aware optimizer, which has no FP32 master here.
+        if self.embedding_min_norm is not None and self.optimizer_cpu_offload:
+            raise ValueError("embedding_min_norm is not supported with optimizer CPU offload")
 
         if self.rmsnorm_weight_decay_mult is not None and (
             not math.isfinite(self.rmsnorm_weight_decay_mult)

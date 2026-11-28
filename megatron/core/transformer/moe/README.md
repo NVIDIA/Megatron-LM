@@ -108,6 +108,26 @@ Detailed documentation for each feature is available in the [Feature Documentati
 ### Use the pre-defined config to train the popular MoE models
 We have provided some pre-defined config to train the popular MoE models in the [Megatron-MoE-Model-Zoo](https://github.com/yanring/Megatron-MoE-ModelZoo/tree/main) repository. You can use them as a reference to configure your training script. Currently we have added the config for Mixtral 8x7B, Mixtral 8x22B, DeepSeek-V3, Qwen3-30B-A3B, Qwen3-235B-A22B.
 
+### Default backends and SequentialMLP deprecation
+
+The default training token dispatcher is `alltoall`, and `moe_grouped_gemm=True` selects grouped
+experts on the Transformer Engine backend. Existing
+`--moe-grouped-gemm` launch arguments remain valid. To explicitly use the previous choices,
+pass `--moe-token-dispatcher-type allgather` and `--no-moe-grouped-gemm` (also spelled
+`--disable-moe-grouped-gemm`). Python callers can set `moe_grouped_gemm=False`.
+
+`SequentialMLP` is deprecated. Constructing it emits a `FutureWarning` once on the primary rank.
+It remains available for local-backend, checkpoint, and per-expert post-training workflows.
+The local backend still selects `SequentialMLP` even with `moe_grouped_gemm=True`; migrate to
+the Transformer Engine backend to use `TEGroupedMLP`. Grouped experts require `add_bias_linear=False` or
+`bias_dropout_fusion=False` when using linear biases.
+
+With `--use-checkpoint-args`, an explicitly saved `moe_grouped_gemm` setting is still restored;
+changing the default does not convert a SequentialMLP checkpoint's weight or optimizer layout.
+The dispatcher remains a runtime choice: pass `--moe-token-dispatcher-type allgather` explicitly
+to retain it when resuming. Inference-specific dispatchers and optional GroupedTensor, fused MLP,
+and single-grouped-weight settings retain their existing defaults.
+
 ### General Performance Tips
 #### Training arguments
 The following flags are general performance flags that can help to achieve higher performance on almost all workloads. Check if you have enabled all of them in your training script.
@@ -758,7 +778,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 ### Token Dispatching
 | Argument | Description | Default |
 |----------|-------------|---------|
-| --moe-token-dispatcher-type | Dispatcher: allgather, alltoall, flex | allgather |
+| --moe-token-dispatcher-type | Dispatcher: allgather, alltoall, flex | alltoall |
 | --moe-enable-deepep | Enable DeepEP (with flex) | False |
 | --moe-expert-capacity-factor | Capacity factor | None |
 | --moe-pad-expert-input-to-capacity | Pad to capacity | False |
@@ -768,7 +788,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 ### Performance Optimization
 | Argument | Description | Default |
 |----------|-------------|---------|
-| --moe-grouped-gemm | Use GroupedGEMM | False |
+| --moe-grouped-gemm | Use GroupedGEMM; disable with --no-moe-grouped-gemm | True |
 | --overlap-moe-expert-parallel-comm | Batch-level EP overlap | False |
 | --delay-wgrad-compute | Split dgrad/wgrad compute | False |
 | --moe-shared-expert-intermediate-size | Shared expert FFN size | None |

@@ -57,7 +57,6 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
-from megatron.core._batch_api_compat import deprecated_hybrid_cp_kwargs
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.packed_seq_params import PackedSeqParams
 
@@ -1347,7 +1346,9 @@ def resolve_gtp_pad_for_alignment(*, fp4=False, fp8_recipe=None, fp8=False):
     return 1
 
 
-def grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_dir, pad_for_alignment):
+def grant_shape_mismatch_for_gtp_padding(
+    sharded_state_dict, checkpoint_dir, pad_for_alignment, sharded_strategy=None
+):
     """Decide, per tensor, whether a checkpoint-vs-expected shape mismatch is GTP padding.
 
     Reads the checkpoint's real on-disk shape and sets ``allow_shape_mismatch`` for every
@@ -1364,6 +1365,9 @@ def grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_dir, pad
 
     ``pad_for_alignment`` must come from the caller (the training recipe), not ``GTP_CONFIG`` --
     that global is only set when GTP is active in *this* process.
+
+    ``sharded_strategy`` reads the checkpoint metadata; pass the strategy of the load that follows
+    so that both share its metadata cache. Defaults to the default load strategy.
     """
     from megatron.core.dist_checkpointing.dict_utils import nested_values
 
@@ -1374,7 +1378,7 @@ def grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_dir, pad
     try:
         from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
 
-        checkpoint_metadata = load_tensors_metadata(str(checkpoint_dir))
+        checkpoint_metadata = load_tensors_metadata(str(checkpoint_dir), sharded_strategy)
     except Exception as e:  # noqa: BLE001
         logger.warning(
             f"grant_shape_mismatch_for_gtp_padding: could not read metadata, "
@@ -2442,7 +2446,6 @@ def is_submodule(module, parent_module, strict=True):
 ########################
 
 
-@deprecated_hybrid_cp_kwargs
 def get_batch_on_this_tp_rank(
     batch: dict[str, torch.Tensor],
     has_cu_seqlens: bool,
@@ -2505,7 +2508,7 @@ def get_batch_on_this_tp_rank(
         dict[str, torch.Tensor]: The batch dict with all tensors populated on
         every TP rank. Keys include 'tokens', 'labels', 'loss_mask',
         'position_ids', 'attention_mask', 'cu_seqlens', 'cu_seqlens_padded',
-        'max_seqlen', 'local_cp_size', and 'hybrid_cp_group'.
+        'max_seqlen', 'local_cp_size', and 'dynamic_cp_group'.
     """
 
     def _broadcast(item):
@@ -2721,7 +2724,7 @@ def get_batch_on_this_tp_rank(
             'cu_seqlens_padded': cu_seqlens_padded,
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,
-            'hybrid_cp_group': None,
+            'dynamic_cp_group': None,
         }
 
     if needs_padding_mask:
@@ -2838,7 +2841,7 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
         'dataset_id',
         'max_seqlen',
         'local_cp_size',
-        'hybrid_cp_group',
+        'dynamic_cp_group',
     )
 
     if cp_size > 1:
@@ -2970,7 +2973,7 @@ def _resolve_dynamic_cp_group_for_batch(
     else:
         local_cp_size = int(local_cp_size)
 
-    runtime_cp_group = batch.get('hybrid_cp_group')
+    runtime_cp_group = batch.get('dynamic_cp_group')
     if runtime_cp_group is None:
         if dynamic_cp_group_func is None:
             raise ValueError("dynamic_cp_group_func is required to resolve the dynamic CP group")
@@ -2983,11 +2986,10 @@ def _resolve_dynamic_cp_group_for_batch(
             "Dynamic CP group size does not match local_cp_size: "
             f"group has {runtime_cp_size} ranks, metadata requests {local_cp_size}."
         )
-    batch['hybrid_cp_group'] = runtime_cp_group
+    batch['dynamic_cp_group'] = runtime_cp_group
     return runtime_cp_group
 
 
-@deprecated_hybrid_cp_kwargs
 def get_batch_on_this_cp_rank(
     batch: Dict[str, Any],
     dynamic_cp: bool,

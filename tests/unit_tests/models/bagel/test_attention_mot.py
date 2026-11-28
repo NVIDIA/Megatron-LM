@@ -76,7 +76,7 @@ except ImportError:
     HAVE_BAGEL_PKG = False
 
 try:
-    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 
     HAVE_WRAPPED_NORM = True
 except ImportError:

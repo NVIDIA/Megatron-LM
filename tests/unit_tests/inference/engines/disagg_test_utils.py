@@ -230,7 +230,7 @@ def snapshot_source(engine, request):
         state["conv"] = context.mamba_conv_states[:, slot].detach().cpu().clone()
         state["recurrent"] = context.mamba_ssm_states[:, slot].detach().cpu().clone()
     assert engine._pinned_handoff_blocks[101] == blocks
-    assert (context.kv_block_allocator.block_ref_counts[blocks] > 0).all()
+    assert (context.kv_block_allocator.pc_state.block_ref_counts[blocks] > 0).all()
     return metadata, state
 
 
@@ -377,4 +377,4 @@ def assert_released(engine):
     assert not engine.requests
     assert not engine.waiting_request_ids
     assert engine.context.total_request_count == 0
-    assert (engine.context.kv_block_allocator.block_ref_counts == 0).all()
+    assert (engine.context.kv_block_allocator.pc_state.block_ref_counts == 0).all()

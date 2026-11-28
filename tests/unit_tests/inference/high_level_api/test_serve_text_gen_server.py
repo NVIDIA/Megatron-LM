@@ -10,6 +10,7 @@ caller and the server cannot drift apart unnoticed.
 """
 
 import inspect
+import os
 import socket
 from unittest.mock import MagicMock, create_autospec
 
@@ -57,16 +58,25 @@ def autospec_start(monkeypatch):
 def fake_mp(monkeypatch):
     """Record spawn-context replicas without starting processes or sharing server state."""
     fake = MagicMock()
+    sentinel_fds = []
 
-    def make_process(**_kwargs):
+    def make_process(**kwargs):
         process = MagicMock()
         process.is_alive.return_value = False
+        # A sentinel that never becomes readable keeps the fake replica alive.
+        sentinel_reader, sentinel_writer = os.pipe()
+        sentinel_fds.extend((sentinel_reader, sentinel_writer))
+        process.sentinel = sentinel_reader
+        # A started replica signals readiness on the pipe passed as its last argument.
+        process.start.side_effect = lambda: kwargs["args"][-1].send(True)
         return process
 
     fake.Process.side_effect = make_process
     monkeypatch.setattr(tgs, "_SERVER_PROCESS_CONTEXT", fake)
     monkeypatch.setattr(tgs, "_SERVER_PROCESSES", [])
-    return fake
+    yield fake
+    for fd in sentinel_fds:
+        os.close(fd)
 
 
 class TestServeMatchesStartTextGenServer:

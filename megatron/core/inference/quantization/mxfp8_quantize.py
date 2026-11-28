@@ -205,6 +205,9 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc
     total_scale_bytes = n_row_blocks * n_col_blocks * MXFP8_SCALE_ROW_BLOCK * MXFP8_SCALE_COL_BLOCK
     assert out_scale.numel() == total_scale_bytes
 
+    # The kernel reads rows as contiguous storage.
+    x = x.contiguous()
+
     # The quantization kernel only writes logical scale entries. Clear the
     # padded rows and columns so reused storage matches freshly quantized output.
     out_scale_bytes = out_scale.view(torch.uint8)

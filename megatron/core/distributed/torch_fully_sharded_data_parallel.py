@@ -71,6 +71,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             HAVE_FSDP
         ), 'TorchFullyShardedDataParallel requires PyTorch >= 2.4.0 with FSDP 2 support.'
 
+        ddp_config.finalize()
         super().__init__(config=config, module=module)
 
         if process_group is None:

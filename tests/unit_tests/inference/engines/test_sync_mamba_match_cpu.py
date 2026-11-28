@@ -6,7 +6,17 @@ from types import SimpleNamespace
 
 import pytest
 
+from megatron.core.inference.contexts.prefix_cache_registry import PrefixCacheRegistry
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+
+
+def _mamba_allocator(cached):
+    """Build an allocator stub whose prefix-cache registry holds `cached` Mamba blocks."""
+    if cached is None:
+        return None
+    registry = PrefixCacheRegistry()
+    registry.register_mamba(list(cached.values()), list(cached.keys()))
+    return SimpleNamespace(registry=registry)
 
 
 @pytest.mark.parametrize(
@@ -20,7 +30,7 @@ from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngin
     ],
 )
 def test_scheduler_finds_farthest_cached_mamba_boundary(hashes, cached, expected):
-    allocator = None if cached is None else SimpleNamespace(hash_to_block_id=cached)
+    allocator = _mamba_allocator(cached)
     engine = SimpleNamespace(context=SimpleNamespace(mamba_slot_allocator=allocator))
     request = SimpleNamespace(precomputed_block_hashes=hashes)
     assert DynamicInferenceEngine._find_mamba_match_count(engine, request) == expected

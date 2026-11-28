@@ -194,25 +194,29 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
 
 
 @contextmanager
-def microbatch(context: FsdpContext, is_last: bool) -> Iterator[None]:
-    """Mark an FSDP microbatch as the last accumulation microbatch.
+def finalize_gradients(context: FsdpContext, enabled: bool = True) -> Iterator[None]:
+    """Control whether backward finalizes accumulated gradients in this context.
 
-    Non-final microbatches still release unsharded weights, but defer automatic
-    gradient synchronization. HSDP/HFSDP also defer DP-outer gradient reduction
-    until the last microbatch. Wrap both forward and backward in this scope.
+    When enabled, backward launches DP-outer reductions and automatically waits
+    for gradient reductions unless the caller manages that wait. When disabled,
+    inner reductions and weight cleanup still run, but outer reductions and the
+    automatic completion wait are deferred.
+
+    Wrap both forward and backward. This scope only changes the finalization
+    setting; entering or exiting it does not launch reductions or wait for them.
 
     Args:
-        context: FSDP context whose roots should use this microbatch state.
-        is_last: Whether this scope contains the last accumulation microbatch.
+        context: FSDP context whose modules should use this finalization setting.
+        enabled: Whether backward should finalize gradients. Defaults to True.
     """
     context.ensure_finalized()
-    previous_state = context.is_last_microbatch
-    context.is_last_microbatch = is_last
+    previous_state = context.finalize_gradients
+    context.finalize_gradients = enabled
 
     try:
         yield
     finally:
-        context.is_last_microbatch = previous_state
+        context.finalize_gradients = previous_state
 
 
 def _attach_mixin(module: nn.Module) -> None:

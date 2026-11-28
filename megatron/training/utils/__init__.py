@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from megatron.training.utils.common_utils import (
     average_losses_across_data_parallel_group,
@@ -24,6 +24,7 @@ from megatron.training.utils.common_utils import (
     print_rank_last,
     reduce_max_stat_across_model_parallel_group,
     report_memory,
+    setup_multi_storage_client,
     to_empty_if_meta_device,
     unwrap_model,
     update_use_dist_ckpt,

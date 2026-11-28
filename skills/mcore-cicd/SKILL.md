@@ -14,13 +14,21 @@ metadata:
 
 For PR-label or trigger questions, lead with the exact values:
 
-- No label: `scope=mr-github-slim`, `n_repeat=2`, `lightweight=false`.
-- `container::lts` only switches the container image path to LTS and combines
-  with any scope label. **Opt-in only — attach it solely when the user
+- `Run Merge-Queue jobs`: selects the actual merge-group configuration:
+  `scope=L1`, `n_repeat=1`, `lightweight=false`, `cadence=mergegroup`, no cadence
+  bypass, full unit buckets, dev images, AWS H100 routing, MBridge L1, no NeMo RL.
+  Normal training steps and golden-value comparisons remain enabled. PR approval
+  controls and platform/downstream eligibility still apply.
+- `Run functional tests`: `scope=L1`, `n_repeat=5`, `lightweight=false`.
+- `Run tests`: `scope=L1`, `n_repeat=1`, `lightweight=true` (four steps, no golden comparison).
+- No scope label: `scope=L0`, `n_repeat=2`, `lightweight=false`.
+- `container::lts` switches the container image path to LTS outside merge-queue
+  mode. **Opt-in only — attach it solely when the user
   explicitly asks for LTS validation; never add it on your own initiative, even
   for a container or dependency change.**
 - `Run MBridge tests` additionally triggers the MBridge L1 suite.
-- `Run NeMoRL tests` additionally triggers NeMo RL's Megatron functional test suite.
+- `Run NeMoRL tests` additionally triggers NeMo RL's Megatron functional test suite
+  outside merge-queue mode.
 - ⚠️ **WARNING — destructive remote write.** `tools/trigger_internal_ci.py`
   **force-pushes the current branch** to the internal GitLab remote as
   `pull-request/<branch>`. Always run with `--dry-run` first and confirm the
@@ -65,19 +73,33 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 
 | Condition | `scope` | `n_repeat` | `lightweight` | Notes |
 |-----------|---------|-----------|---------------|-------|
-| Merge group | `mr-github` | 1 | false | Automatic, no label needed |
-| _(no label)_ | `mr-github-slim` | 2 | false | Slim subset only |
+| Merge group or `Run Merge-Queue jobs` | `L1` | 1 | false | Shared configuration; wins over other scope/image/downstream labels |
+| `Run tests` | `L1` | 1 | true | Lightweight run without golden comparisons |
+| `Run functional tests` | `L1` | 5 | false | Five full repetitions |
+| Schedule / manual dispatch | `L1` | 5 | false | CI workload default |
+| _(no scope label)_ | `L0` | 2 | false | PR default |
+
+`Run Merge-Queue jobs` and actual merge groups share `MERGE_QUEUE_JOBS` in the
+configure step. They use `cadence=mergegroup`, retain cadence filtering, disable
+selective unit tests, select dev images and AWS H100 routing, request MBridge L1,
+and skip NeMo RL. Non-maintainer or non-member PRs retain ephemeral runner routing.
+Ordinary `Run tests` and `Run functional tests` labels bypass cadence filtering.
+The merge-queue and functional-test labels share the approval queue's global
+functional-test slot and are held when `ALLOW_PR_RUN_ALL_TESTS=false`.
 
 **Orthogonal image label:**
 
 | Label | Effect |
 |-------|--------|
-| **`container::lts`** | Build on the older long-term-support NGC PyTorch base instead of `dev`'s latest — a backward-compat check, not a different test set (combinable with any scope label) |
+| **`container::lts`** | Build on the older long-term-support NGC PyTorch base instead of `dev`'s latest; ignored in merge-queue mode |
 | **`Run MBridge tests`** | Also triggers the MBridge L1 test suite |
-| **`Run NeMoRL tests`** | Also triggers NeMo RL's Megatron functional test suite |
+| **`Run NeMoRL tests`** | Also triggers NeMo RL's Megatron functional test suite outside merge-queue mode |
 
 Adding a label does not itself start `cicd-main.yml`; apply it before the next
 synthetic PR push or rerun the workflow after applying it.
+
+For combining queued changes into one validation PR, use
+[batch-and-test-mergequeue-prs](../batch-and-test-mergequeue-prs/SKILL.md).
 
 ### Which label to attach when opening a PR
 

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -47,6 +47,9 @@ def test_chunked_moe_preserves_aligned_token_metadata(sequence_parallel, monkeyp
         recompute_mlp=False,
         mlp=RecordingMoE(),
         pg_collection=SimpleNamespace(tp=group),
+    )
+    layer._run_mlp_in_chunks = MethodType(
+        transformer_layer.TransformerLayer._run_mlp_in_chunks, layer
     )
     monkeypatch.setattr(
         transformer_layer.tensor_parallel, "scatter_to_sequence_parallel_region", scatter

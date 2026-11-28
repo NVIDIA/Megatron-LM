@@ -16,10 +16,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     RuntimePolicy,
     SchedulePolicy,
+    finalize_gradients,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
-    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import (
@@ -161,7 +161,7 @@ def test_overlaps_communication_and_compute(
         """Run one optimizer step consuming two microbatches."""
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index in range(2):
-            with microbatch(context, is_last=microbatch_index == 1):
+            with finalize_gradients(context, enabled=microbatch_index == 1):
                 model(x).sum().backward()
         optimizer.step()
 
@@ -291,7 +291,7 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
     def train_one_step() -> None:
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index in range(2):
-            with microbatch(context, is_last=microbatch_index == 1):
+            with finalize_gradients(context, enabled=microbatch_index == 1):
                 model(x).sum().backward()
         optimizer.step()
 

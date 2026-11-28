@@ -267,7 +267,7 @@ def test_mtp_padding_layout_conversion_uses_activation_tp_ownership(monkeypatch)
     from megatron.core.transformer import multi_token_prediction as mtp
 
     cp_group = SimpleNamespace(size=lambda: 2)
-    tp_group = object()
+    tp_group = SimpleNamespace(size=lambda: 2)
     tp_cp_group = object()
     plan = object()
     block = SimpleNamespace(
@@ -331,3 +331,73 @@ def test_mtp_padding_layout_conversion_uses_activation_tp_ownership(monkeypatch)
     )
     assert seen == ["scatter", "convert_mask", "gather"]
     torch.testing.assert_close(result.padding_mask, torch.tensor([[True, False, False, True]]))
+
+
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_mtp_attn_res_sources_use_runtime_cp_groups(monkeypatch, sequence_parallel):
+    """AttnRes depth sources follow the hidden state's resolved runtime CP groups."""
+    from types import SimpleNamespace
+
+    static_cp_group = SimpleNamespace(size=lambda: 1)
+    runtime_cp_group = SimpleNamespace(size=lambda: 2)
+    tp_group = SimpleNamespace(size=lambda: 2)
+    static_tp_cp_group, runtime_tp_cp_group = object(), object()
+    expected_tp_cp_group = runtime_tp_cp_group if sequence_parallel else static_tp_cp_group
+    plan = object()
+    block = SimpleNamespace(
+        config=SimpleNamespace(
+            _linear_cp_layout_explicit=True,
+            linear_cp_layout="contiguous",
+            attention_cp_layout="zigzag",
+        ),
+        cp_group=static_cp_group,
+        tp_group=tp_group,
+        tp_cp_group=static_tp_cp_group,
+        sequence_parallel=sequence_parallel,
+    )
+    # Static CP=1 with a runtime CP=2 microbatch: only the resolved groups need conversion.
+    packed_seq_params = SimpleNamespace(
+        local_cp_size=2,
+        cp_group=runtime_cp_group,
+        tp_cp_group=runtime_tp_cp_group,
+        cp_singleton_group=None,
+    )
+    target_batch = {name: None for name in ("tokens", "position_ids", "labels", "loss_mask")}
+    cp_batch = SimpleNamespace(
+        boundary_layout="contiguous",
+        thd_plan=plan,
+        get_batch=lambda layout: target_batch,
+        get_packed_seq_params=lambda layout: None,
+    )
+    converted = []
+
+    def convert(value, source, target, cp, sp, tp, tp_cp, thd_plan):
+        assert (source, target) == ("contiguous", "zigzag")
+        assert cp is runtime_cp_group and tp_cp is expected_tp_cp_group
+        assert tp is tp_group and sp is sequence_parallel and thd_plan is plan
+        converted.append(value)
+        return value + 1
+
+    monkeypatch.setattr(mtp, "convert_cp_layout", convert)
+    hidden_states = torch.zeros(2, 1, 8)
+    sources = (torch.full((2, 1, 8), 2.0), torch.full((2, 1, 8), 3.0))
+    result = mtp.MultiTokenPredictionBlock.prepare_cp_layout(
+        block,
+        input_ids=None,
+        position_ids=None,
+        hidden_states=hidden_states,
+        decoder_input=None,
+        mhc_multistream=None,
+        labels=None,
+        loss_mask=None,
+        mtp_input_mask=None,
+        packed_seq_params=packed_seq_params,
+        cp_batch=cp_batch,
+        attn_res_sources=sources,
+    )
+    assert len(converted) == 1 + len(sources)
+    torch.testing.assert_close(result.hidden_states, hidden_states + 1)
+    assert isinstance(result.attn_res_sources, tuple)
+    assert len(result.attn_res_sources) == len(sources)
+    for actual, source in zip(result.attn_res_sources, sources):
+        torch.testing.assert_close(actual, source + 1)

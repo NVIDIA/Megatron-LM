@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+from megatron.core.ops.loss.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 
 
 class _FakeTPGroup:

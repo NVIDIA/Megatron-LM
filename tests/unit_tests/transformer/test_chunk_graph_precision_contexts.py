@@ -384,7 +384,7 @@ class TestChunkGraphPrecisionContexts:
             ).cuda()
             layer.train()
             hidden = torch.randn(16, 2, 64, dtype=torch.bfloat16, device="cuda", requires_grad=True)
-            output, _ = layer(hidden_states=hidden, attention_mask=None)
+            output, _ = layer(hidden, attention_mask=None)
             return checkpoint_nodes(output)
 
         Utils.initialize_model_parallel(tensor_model_parallel_size=1)

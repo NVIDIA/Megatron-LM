@@ -15,7 +15,7 @@ can however signal whether the training is converged).
 ## Training and Export Workflow
 
 In practice, speculative decoding should be combined with quantization (weights and kv-cache)
-to achieve the the highest tokens-per-second-per-user (or TPS) without changing the quality of
+to achieve the highest tokens-per-second-per-user (or TPS) without changing the quality of
 the model. We provide quantization-aware training (QAT) receipt with self-distillation in the following.
 
 

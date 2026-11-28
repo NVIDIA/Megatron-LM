@@ -40,6 +40,8 @@ MODEL_ARGS:
   --expert-model-parallel-size: 2
   --sequence-parallel: true
   --num-experts: 8
+  --moe-token-dispatcher-type: allgather
+  --no-moe-grouped-gemm: true
   --use-distributed-optimizer: true
   --moe-router-load-balancing-type: sinkhorn
   --moe-router-topk: 1

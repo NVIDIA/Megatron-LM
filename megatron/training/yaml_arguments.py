@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -239,7 +239,6 @@ def validate_yaml(args, defaults={}):
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 
-
     # Support for variable sequence lengths across batches/microbatches.
     # set it if the dataloader supports generation of variable sequence lengths
     # across batches/microbatches. Due to additional communication overhead
@@ -323,8 +322,6 @@ def validate_yaml(args, defaults={}):
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
         assert args.min_lr <= args.lr
-    if args.save is not None:
-        assert args.save_interval is not None
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -333,8 +330,11 @@ def validate_yaml(args, defaults={}):
             args.model_parallel.fp16 or args.model_parallel.bf16
         ), 'residual connection in fp32 only supported when using fp16 or bf16.'
 
-    if args.language_model.moe_grouped_gemm:
-        assert args.model_parallel.bf16, 'Currently GroupedGEMM for MoE only supports bf16 dtype.'
+    if (
+        args.language_model.num_moe_experts is not None
+        and args.language_model.moe_grouped_gemm
+        and args.language_model.transformer_impl != "local"
+    ):
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 

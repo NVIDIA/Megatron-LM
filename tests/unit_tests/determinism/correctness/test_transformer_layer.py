@@ -145,7 +145,7 @@ RUNNER = BitExactRunner(
 # Helpers reused by the specialty (perf/racing/jitter) sub-tests below.
 # ---------------------------------------------------------------------------
 def _fwd_bwd(layer, hidden, mask):
-    out = layer(hidden_states=hidden, attention_mask=mask)
+    out = layer(hidden, attention_mask=mask)
     # TransformerBlock returns a tensor; some layer types return a tuple.
     out = out[0] if isinstance(out, tuple) else out
     loss = out.float().pow(2).mean()

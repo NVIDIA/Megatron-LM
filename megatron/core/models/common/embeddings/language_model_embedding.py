@@ -65,6 +65,9 @@ class LanguageModelEmbedding(MegatronModule):
             tp_group=self.tp_group,
             pg_collection=pg_collection,
         )
+        # Distinguish the input table from an untied output layer. The optimizer uses this
+        # marker for input-embedding-specific post-update transforms.
+        self.word_embeddings.weight.is_word_embedding_parameter = True
 
         # Position embedding (serial).
         if self.add_position_embedding:

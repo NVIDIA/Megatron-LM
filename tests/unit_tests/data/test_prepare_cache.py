@@ -134,7 +134,6 @@ def _build_prepare_cache_args(file_prefixes, data_cache_path, **overrides):
         micro_batch_size=2,
         gtp_weight_remat_size=1,
         phase_transition_iterations=None,
-        iteration=0,
         mock_data=False,
         sft=False,
         fim_data=False,

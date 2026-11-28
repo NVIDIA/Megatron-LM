@@ -11,6 +11,7 @@ import pytest
 
 from megatron.core.enums import ModelType
 from megatron.training import training as training_mod
+from megatron.training.models import ModelConfig
 from megatron.training.state import TrainState
 
 
@@ -582,8 +583,13 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
     unwrapped_model = SimpleNamespace()
     builder.build_distributed_models.return_value = [wrapped_model]
     builder_cls = mock.Mock(return_value=builder)
-    model_config = mock.Mock()
+    # setup_model_and_optimizer builds through a typed ModelConfig and reads the MTP-freeze
+    # and GTP weight-remat settings from its transformer config.
+    model_config = mock.Mock(spec=ModelConfig)
     model_config.get_builder_cls.return_value = builder_cls
+    model_config.transformer = mock.Mock(
+        freeze_base_model_for_mtp=False, gtp_weight_remat_size=1, expert_gtp_weight_remat_size=1
+    )
     cfg = SimpleNamespace(
         model=model_config,
         profiling=mock.Mock(),
@@ -597,6 +603,13 @@ def test_config_container_forwards_layer_wise_optimizer_to_model_builder(
         rng=SimpleNamespace(data_parallel_random_init=False),
         rl=SimpleNamespace(perform_rl_step=False),
         validation=SimpleNamespace(skip_train=True),
+        train=SimpleNamespace(micro_batch_size=1),
+        # setup_model_and_optimizer reads the load policy from the checkpoint section (#8558).
+        checkpoint=SimpleNamespace(
+            load=None, pretrained_checkpoint=None, load_optim=False, ckpt_convert_format=None
+        ),
+        # Without MPU, the batch-size guard reads the DP size from the config (#8234).
+        get_batch_parallel_size=lambda: 1,
     )
     pg_collection = mock.Mock()
 

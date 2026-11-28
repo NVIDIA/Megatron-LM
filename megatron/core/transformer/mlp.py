@@ -502,6 +502,15 @@ def apply_swiglu_sharded_factory(
     else:
         is_dp_sharded = False
 
+    source_param = getattr(original_sh_ten.data, "_gtp_dequant_src", original_sh_ten.data)
+    gtp_size = getattr(source_param, "gtp_remat_size", 1)
+    if gtp_size > 1 and not is_dp_sharded:
+        from megatron.core.tensor_parallel.gtp_ckpt_util import make_gtp_swiglu_sharded_factory
+
+        return make_gtp_swiglu_sharded_factory(
+            original_sh_ten, sharded_offsets, singleton_local_shards, gtp_size
+        )
+
     @torch.no_grad()
     def sh_ten_build_fn(
         key: str, t: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]

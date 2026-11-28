@@ -161,9 +161,10 @@ class AttnResHybridLayer(MegatronModule):
             values, output_norm_weight=fused_norm.weight if fused_norm is not None else None
         )
 
+        # TransformerLayer and MambaLayer take hidden_states positional-only (#8523): PyTorch
+        # full-backward hooks track only positional inputs, so pass the activation positionally.
         if isinstance(self.inner_layer, TransformerLayer):
             inner_kwargs = dict(
-                hidden_states=aggregated,
                 attention_mask=attention_mask,
                 inference_context=None,
                 rotary_pos_emb=rotary_pos_emb,
@@ -180,19 +181,18 @@ class AttnResHybridLayer(MegatronModule):
                     "AttnResHybridLayer: transformer entries do not take "
                     "packed_sequence_cp_metadata (chunkwise-CP Mamba metadata)."
                 )
-            output = self.inner_layer(**inner_kwargs)
+            output = self.inner_layer(aggregated, **inner_kwargs)
         else:
             # Non-transformer entries (e.g. MambaLayer) accept only the common
             # arguments — same contract as HyperConnectionHybridLayer's inner call.
             inner_kwargs = dict(
-                hidden_states=aggregated,
                 attention_mask=attention_mask,
                 inference_context=None,
                 packed_seq_params=packed_seq_params,
             )
             if packed_sequence_cp_metadata is not None:
                 inner_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
-            output = self.inner_layer(**inner_kwargs)
+            output = self.inner_layer(aggregated, **inner_kwargs)
         if isinstance(output, tuple):
             output = output[0]
 

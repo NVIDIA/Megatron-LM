@@ -185,13 +185,14 @@ class MegatronLLM(_MegatronLLMBase):
         With ``blocking=True`` (default), this blocks the calling thread until
         the engine loop terminates via :meth:`shutdown` -- suitable for
         standalone serving scripts. With ``blocking=False``, this returns once
-        the HTTP frontend is up (primary) or immediately (workers); the engine
-        loop continues in the background runtime, and the user can call
-        :meth:`generate` / :meth:`shutdown` afterward.
+        every frontend replica is listening (primary) or immediately (workers);
+        the engine loop continues in the background runtime, and the user can
+        call :meth:`generate` / :meth:`shutdown` afterward.
 
         Raises:
             ValueError: if ``use_coordinator=False`` (HTTP serving requires
                 the coordinator path).
+            RuntimeError: if a frontend replica exits before it is listening.
         """
         if not self._use_coordinator:
             raise ValueError("MegatronLLM.serve() requires use_coordinator=True")
@@ -203,9 +204,13 @@ class MegatronLLM(_MegatronLLMBase):
 
             from megatron.core.inference.text_generation_server.dynamic_text_gen_server.text_generation_server import (  # pylint: disable=line-too-long
                 start_text_gen_server,
+                stop_text_gen_server,
             )
 
             assert self._coord_runtime is not None
+            # Set before the call so a shutdown() that races the startup from another thread,
+            # or follows a KeyboardInterrupt out of it, stops the frontend.
+            self._serve_started = True
             start_text_gen_server(
                 coordinator_addr=self._coord_runtime.coord_addr,
                 tokenizer=self._controller.tokenizer,
@@ -224,7 +229,9 @@ class MegatronLLM(_MegatronLLMBase):
                 default_top_k=serve_config.default_top_k,
                 eval_mode=serve_config.eval_mode,
             )
-            self._serve_started = True
+            # shutdown() may have run while the replicas were coming up.
+            if self._shutdown_called:
+                stop_text_gen_server()
 
         if blocking:
             # Block until the engine loop terminates (shutdown was invoked
