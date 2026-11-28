@@ -51,14 +51,14 @@ from tests.unit_tests.test_utilities import Utils
     ],
 )
 def test_sample_counts_without_model_or_runtime(monkeypatch, overrides, phase, iteration, expected):
-    train = TrainingConfig(train_iters=10, train_samples=80, global_batch_size=8)
+    train = TrainingConfig(
+        train_iters=10, train_samples=80, global_batch_size=8, phase_transition_iterations=phase
+    )
     validation = ValidationConfig(eval_iters=2, eval_interval=5, **overrides)
     for name in ("get_args", "get_run_config", "get_train_state"):
         monkeypatch.setattr(training, name, Mock(side_effect=AssertionError("runtime access")))
     assert (
-        training.calculate_train_valid_test_num_samples(
-            train, validation, phase_transition_iterations=phase, iteration=iteration
-        )
+        training.calculate_train_valid_test_num_samples(train, validation, iteration=iteration)
         == expected
     )
     assert train.train_iters == 10
@@ -69,18 +69,26 @@ def mock_train_valid_test_datasets_provider(train_val_test_num_samples):
     return iter([1]), iter([2]), iter([3])
 
 
-@pytest.mark.parametrize("state", [None, SimpleNamespace(iteration=0)])
-def test_sample_counts_before_training_state(monkeypatch, run_config, state):
+@pytest.mark.parametrize(
+    "state,phases,expected_train",
+    [
+        (None, None, 80),
+        (SimpleNamespace(iteration=0), None, 80),
+        (SimpleNamespace(iteration=6), [5], 40),
+    ],
+)
+def test_sample_counts_before_training_state(
+    monkeypatch, run_config, state, phases, expected_train
+):
     run_config.train.train_iters = 10
     run_config.train.train_samples = 80
     run_config.train.global_batch_size = 8
+    run_config.train.phase_transition_iterations = phases
     run_config.validation.eval_iters = 2
     run_config.validation.eval_interval = 5
-    monkeypatch.setattr(
-        training, "get_args", lambda: SimpleNamespace(phase_transition_iterations=None)
-    )
+    monkeypatch.setattr(training, "get_args", Mock(side_effect=AssertionError("CLI args read")))
     monkeypatch.setattr(training, "get_train_state", lambda: state)
-    assert training.get_train_valid_test_num_samples() == (80, 48, 16)
+    assert training.get_train_valid_test_num_samples() == (expected_train, 48, 16)
 
 
 @pytest.mark.parametrize("enabled", [None, False, True])
