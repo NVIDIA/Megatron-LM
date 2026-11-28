@@ -1387,8 +1387,8 @@ def pretrain(
             to set already parse arguments.
         get_embedding_ranks: a function that takes a list of ranks for a pipeline
             group and returns those ranks that should have word embeddings.
-            For most models, these are the first and last pipeline stages.
-            If None, defaults to returning the first and last pipeline stages.
+            If None, GPT/Hybrid configs select input, tied-output, and MTP stages
+            automatically; other models default to the first and last stages.
         get_position_embedding_ranks: a function that takes a list of ranks for
             a pipeline group and returns those ranks that should have position
             embeddings. For most models, this is only the first pipeline stage.

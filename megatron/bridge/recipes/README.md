@@ -15,6 +15,8 @@ To get started, choose a recipe and adjust it for your model, data, and hardware
 You're welcome to modify, override, or extend it to suit your training run.
 Your recipe function should take no arguments. Set your dataset and dataloader through `cfg.data`;
 the framework finalizes the config for you when training starts.
+When constructing transformer settings, use `megatron.bridge.models.transformer_config.TransformerConfig`;
+it defers derived values until startup so your overrides are applied first.
 
 From the repository root, launch your recipe with:
 

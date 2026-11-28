@@ -10,13 +10,10 @@ sequence lengths or finalize configs. Python recipes must be trusted code.
 
 import argparse
 import importlib
-import logging
 import sys
 from collections.abc import Callable
 from pathlib import Path
 from pprint import pformat
-
-logger = logging.getLogger(__name__)
 
 
 def _load_callable(path: str) -> Callable:
@@ -42,7 +39,6 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("overrides", nargs="*", metavar="KEY=VALUE")
     options = parser.parse_args(argv)
-    logging.basicConfig(level=logging.INFO)
 
     # Direct script execution must also find the source-checkout package.
     root = str(Path(__file__).resolve().parents[1])
@@ -75,7 +71,7 @@ def main(argv: list[str] | None = None) -> None:
     if options.dry_run:
         config.validate()
         if safe_get_rank() == 0:
-            logger.info("Recipe config (not finalized):\n%s", pformat(config.to_dict()))
+            sys.stdout.write(f"Recipe config (not finalized):\n{pformat(config.to_dict())}\n")
         return
     pretrain(config, forward_step)
     # On failure, let torchrun report the exception and terminate peer ranks.

@@ -28,6 +28,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     enable_batch_invariant_mode,
 )
+from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     get_pg_rank,
@@ -54,9 +55,22 @@ from megatron.training.global_vars import (
     get_train_state,
     initialize_runtime_services,
 )
+from megatron.training.models.gpt import GPTModelConfig
+from megatron.training.models.hybrid import HybridModelConfig
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
+
+
+def _get_embedding_ranks(pp_ranks: list[int]) -> list[int]:
+    """Include input embeddings, tied output weights, and every MTP pipeline stage."""
+    embedding_ranks = [pp_ranks[0]]
+    if len(pp_ranks) > 1:
+        model_config = get_run_config().model
+        if model_config.share_embeddings_and_output_weights:
+            embedding_ranks.append(pp_ranks[-1])
+        embedding_ranks.extend(get_mtp_ranks(pp_ranks, model_config.transformer))
+    return sorted(set(embedding_ranks))
 
 
 def initialize_megatron(
@@ -102,6 +116,14 @@ def initialize_megatron(
     # Inference's args-only entrypoints keep their existing input boundary. Training
     # supplies a typed model config, including callback-based applications.
     model_config = cfg.model.transformer if training else args
+    if training and get_embedding_ranks is None and isinstance(
+        cfg.model, (GPTModelConfig, HybridModelConfig)
+    ):
+        get_embedding_ranks = _get_embedding_ranks
+    if args is None and training and model_config.deterministic_mode:
+        from megatron.training.determinism import apply_determinism_to_args
+
+        apply_determinism_to_args(model_config)
     transformer_config = getattr(cfg.model, "transformer", None)
     tp_comm_overlap = (
         transformer_config.tp_comm_overlap

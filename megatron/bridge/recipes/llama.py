@@ -13,10 +13,10 @@ Replace cfg.data and cfg.tokenizer together to train on tokenized real data.
 import torch
 import torch.nn.functional as F
 
+from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
-from megatron.core.transformer import TransformerConfig
 from megatron.training.config import (
     CheckpointConfig,
     DataConfig,

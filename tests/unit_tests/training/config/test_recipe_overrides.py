@@ -74,16 +74,31 @@ def test_overrides_preserve_native_objects_and_leave_finalization_to_startup(run
     assert not run_config._finalized
 
 
-@pytest.mark.parametrize("layout", ["Et*2|t*2L", "invalid", "[[E,t,t],[t,t,L]]", "null"])
-def test_pipeline_layout_override_requires_recipe_construction(run_config, layout):
-    transformer = run_config.model.transformer
-    original = transformer.pipeline_model_parallel_layout
-    with pytest.raises(ValueError, match="recipe factory"):
-        apply_config_overrides(
-            run_config, [f"model.transformer.pipeline_model_parallel_layout={layout}"]
-        )
-    assert transformer.pipeline_model_parallel_layout is original
+@pytest.mark.parametrize(
+    "layout", ["Et*2|t*2L", "[[embedding,decoder,decoder],[decoder,decoder,loss]]", "null"]
+)
+def test_pipeline_layout_override_is_normalized_at_finalization(run_config, layout):
+    from megatron.bridge.models.transformer_config import TransformerConfig
+
+    transformer = TransformerConfig(num_layers=4, hidden_size=128, num_attention_heads=4)
+    run_config.model.transformer = transformer
+    apply_config_overrides(
+        run_config,
+        [
+            "model.transformer.pipeline_model_parallel_size=2",
+            f"model.transformer.pipeline_model_parallel_layout={layout}",
+        ],
+    )
+    assert not isinstance(transformer.pipeline_model_parallel_layout, PipelineParallelLayerLayout)
     assert not run_config._finalized
+    transformer.finalize()
+    if layout == "null":
+        assert transformer.pipeline_model_parallel_layout is None
+    else:
+        assert isinstance(transformer.pipeline_model_parallel_layout, PipelineParallelLayerLayout)
+        assert transformer.pipeline_model_parallel_layout.layout == (
+            PipelineParallelLayerLayout.from_str("Et*2|t*2L", pipeline_model_parallel_size=2).layout
+        )
 
 
 @pytest.mark.parametrize(

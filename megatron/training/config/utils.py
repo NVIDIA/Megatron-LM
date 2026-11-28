@@ -32,8 +32,9 @@ def apply_config_overrides(config: "ConfigContainerBase", overrides: list[str]) 
     """Apply dotted KEY=VALUE overrides to existing public dataclass fields in place.
 
     Preserve native objects and callbacks; framework startup still owns finalization.
-    Config sections, callables, and constructor-normalized pipeline layouts must be
-    specified in the Python recipe rather than replaced by a CLI leaf assignment.
+    Config sections and callables must be specified in the Python recipe rather
+    than replaced by a CLI leaf assignment. Config classes own normalization and
+    derivation of dependent fields during finalization, after all overrides.
 
     Args:
         config: Native configuration to update.
@@ -62,10 +63,6 @@ def apply_config_overrides(config: "ConfigContainerBase", overrides: list[str]) 
                 raise ValueError(f"Not an editable config field: {path!r}")
             if index < len(names) - 1:
                 owner = getattr(owner, name)
-        if names[-1] == "pipeline_model_parallel_layout":
-            # TransformerConfig normalizes the layout and derives VPP settings
-            # during construction; a leaf assignment cannot safely repeat that.
-            raise ValueError(f"Define {path!r} in the recipe factory, not as an override")
         current = getattr(owner, names[-1])
         if is_dataclass(current):
             raise ValueError(f"Override a field within {path!r}, not the entire config section")
