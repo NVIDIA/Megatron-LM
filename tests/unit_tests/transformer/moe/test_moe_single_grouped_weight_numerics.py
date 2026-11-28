@@ -35,7 +35,11 @@ from megatron.training.global_vars import (
 from megatron.training.training import force_param_sync, setup_model_and_optimizer
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
+from tests.unit_tests.test_utilities import (
+    Utils,
+    sync_checkpoint_config,
+    te_reads_legacy_grouped_env,
+)
 
 try:
     from transformer_engine.pytorch.fp8 import check_fp8_support, check_nvfp4_support
@@ -113,8 +117,9 @@ class TestMoESingleGroupedWeightNumerics:
         self._old_single_param_env = os.environ.get("NVTE_GROUPED_LINEAR_SINGLE_PARAM")
         self._old_cutedsl_fused_grouped_mlp_env = os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP")
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-        os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = "1"
-        os.environ["NVTE_CUTEDSL_FUSED_GROUPED_MLP"] = "1"
+        if te_reads_legacy_grouped_env():
+            os.environ["NVTE_GROUPED_LINEAR_SINGLE_PARAM"] = "1"
+            os.environ["NVTE_CUTEDSL_FUSED_GROUPED_MLP"] = "1"
 
     def teardown_method(self, method):
         try:
