@@ -911,6 +911,25 @@ Link tables are logged from the first backward all-gather — the earliest point
 
 GTP supports both **full-iteration CUDA graphs** and **local/partial CUDA graphs**. The common integration keeps graph and eager chains separate, builds lazy prefetch links during warmup, materializes side streams before capture, and preserves stable addresses for captured communication buffers. Full-iteration capture has no boundary between individual layer graphs. Local capture divides the model into independently replayed graph runners, so communication at a runner boundary requires an explicit completion protocol. The features below describe CUDA-graph-specific GTP optimizations and the ownership rules required to make them safe.
 
+#### Full-iteration collective dispatch
+
+Repeated GTP-to-NCCL stream handoffs can create dense dependencies during
+full-iteration CUDA graph capture. GTP automatically detects full-iteration
+capture and enqueues weight all-gathers and ordinary gradient reduce-scatters
+directly on its communication streams, which use the highest supported CUDA
+stream priority. No additional configuration is required.
+
+![All-gather completion with private NCCL dispatch versus automatic direct GTP-stream dispatch during full-iteration capture](../../images/generalized_tensor_parallel/gtp_full_iteration_collective_dispatch.png)
+
+Compute waits on `ag_event` in both paths. During full-iteration capture, GTP
+records this event after the collective on the same stream, preserving compute
+overlap without an asynchronous NCCL Work handle for that dependency.
+
+Eager and partial-capture collective dispatch, prefetch, completion events and
+asynchronous gradient finalization are unchanged. Deferred FP32-sum reduce-scatter
+retains its asynchronous Work lifecycle. Initial validation used PyTorch
+`2.13.0a0+9186a08b2c`, CUDA 13.3 and NCCL 2.31.2.
+
 #### Cross-graph backward reduce-scatter overlap
 
 *Problem.* A local backward graph may launch GTP all-gathers and wgrad reduce-scatters on side streams. The conservative completion boundary drains both kinds of communication before releasing the next graph. This is correct, but it serializes the current graph's RS tail with otherwise independent compute in the next graph. Releasing the next graph earlier introduces two ownership requirements: each graph must drain only its own communication, and an RS input must remain alive until NCCL has stopped reading it even if another graph has started.
