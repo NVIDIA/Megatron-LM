@@ -45,6 +45,11 @@ def quick_gelu(x: torch.Tensor) -> torch.Tensor:
     return x * torch.sigmoid(1.702 * x)
 
 
+def unfused_fast_gelu(x: torch.Tensor) -> torch.Tensor:
+    """Fast GELU without shape-specialized compilation for variable-length projections."""
+    return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
+
+
 @jit_fuser
 def fast_gelu(x: torch.Tensor) -> torch.Tensor:
     """Fast GELU activation"""

@@ -1,0 +1,294 @@
+# Navigation for Megatron Core, derived from the toctrees in index.md.
+# Paths are relative to this file (docs/). Pages marked `orphan: true`
+# are kept under a hidden section so links to them resolve.
+navigation:
+  - page: "Megatron Core User Guide"
+    path: ./index.md
+    slug: /
+
+  - section: "About Megatron Core"
+    skip-slug: true
+    contents:
+      - page: "Overview"
+        path: ./get-started/overview.md
+        slug: overview
+      - page: "Release Notes"
+        path: ./get-started/releasenotes.md
+        slug: releasenotes
+
+  - section: "Get Started"
+    skip-slug: true
+    contents:
+      - page: "Installation"
+        path: ./get-started/install.md
+        slug: install
+      - page: "Quickstart"
+        path: ./get-started/quickstart.md
+        slug: quickstart
+
+  - section: "Basic Usage"
+    skip-slug: true
+    contents:
+      - page: "Data Preparation"
+        path: ./user-guide/data-preparation.md
+        slug: data-preparation
+      - page: "Training Examples"
+        path: ./user-guide/training-examples.md
+        slug: training-examples
+      - section: "Parallelism Guide"
+        path: ./user-guide/parallelism-guide.md
+        slug: parallelism-guide
+        contents:
+          - page: "Context Parallel Overview"
+            path: ./user-guide/features/context_parallel.md
+            slug: context-parallel
+          - page: "Custom Pipeline Model Parallel Layout"
+            path: ./user-guide/features/pipeline_parallel_layout.md
+            slug: pipeline-parallel-layout
+          - page: "Generalized Tensor Parallelism (GTP)"
+            path: ./api-guide/core/generalized_tensor_parallel.md
+            slug: generalized-tensor-parallel
+
+  - section: "Supported Models"
+    skip-slug: true
+    contents:
+      - section: "Supported Models"
+        path: ./models/index.md
+        slug: models
+        contents:
+          - page: "Language Models"
+            path: ./models/llms.md
+            slug: llms
+          - page: "Multimodal Models"
+            path: ./models/multimodal.md
+            slug: multimodal
+          - page: "Llama, Mistral and other Llama-like model support in Megatron-LM"
+            path: ./llama_mistral.md
+            slug: llama-mistral
+
+  - section: "Advanced Features"
+    skip-slug: true
+    contents:
+      - page: "Deterministic Training"
+        path: ./user-guide/deterministic-training.md
+        slug: deterministic-training
+      - section: "Mixture of Experts"
+        path: ./user-guide/features/moe.md
+        slug: moe
+        contents:
+          - page: "Combined 1F1B: Expert-Parallel All-to-All Overlap"
+            path: ./user-guide/features/moe_a2a_overlap.md
+            slug: moe-a2a-overlap
+          - page: "Multi-Token Prediction (MTP)"
+            path: ./user-guide/features/multi_token_prediction.md
+            slug: multi-token-prediction
+          - page: "Multi-Latent Attention"
+            path: ./user-guide/features/multi_latent_attention.md
+            slug: multi-latent-attention
+          - page: "Design Document: MoE Router Replay Feature"
+            path: ./api-guide/router_replay.md
+            slug: router-replay
+      - page: "Megatron FSDP"
+        path: ./user-guide/features/megatron_fsdp.md
+        slug: megatron-fsdp
+      - page: "Distributed Optimizer"
+        path: ./user-guide/features/dist_optimizer.md
+        slug: dist-optimizer
+      - page: "Checkpoint Merge"
+        path: ./user-guide/features/checkpoint-merge.md
+        slug: checkpoint-merge
+      - page: "Optimizer CPU Offloading"
+        path: ./user-guide/features/optimizer_cpu_offload.md
+        slug: optimizer-cpu-offload
+      - page: "Fine-Grained Activation Offloading"
+        path: ./user-guide/features/fine_grained_activation_offloading.md
+        slug: fine-grained-activation-offloading
+      - page: "Data Loading"
+        path: ./user-guide/data-loading.md
+        slug: data-loading
+      - page: "Megatron Energon"
+        path: ./user-guide/features/megatron_energon.md
+        slug: megatron-energon
+      - page: "Megatron RL"
+        path: ./user-guide/features/megatron_rl.md
+        slug: megatron-rl
+      - page: "Tokenizers"
+        path: ./user-guide/features/tokenizers.md
+        slug: tokenizers
+      - page: "Fused Gradient Descent and Weight Decay"
+        path: ./developer/gdn_ew_fusion.md
+        slug: gdn-ew-fusion
+
+  - section: "Inference"
+    skip-slug: true
+    contents:
+      - page: "Megatron Core Inference"
+        path: ./mcore-inference-user-guide.md
+        slug: mcore-inference-user-guide
+
+  - section: "Observability"
+    skip-slug: true
+    contents:
+      - page: "Overview"
+        path: ./user-guide/observability/index.md
+        slug: observability
+      - page: "Configuration"
+        path: ./user-guide/observability/configuration.md
+        slug: configuration
+      - page: "Span Groups"
+        path: ./user-guide/observability/span-groups.md
+        slug: span-groups
+      - page: "Metrics"
+        path: ./user-guide/observability/metrics.md
+        slug: metrics
+      - page: "Pipeline Parallelism"
+        path: ./user-guide/observability/pipeline-parallel.md
+        slug: pipeline-parallel
+      - page: "Extending Observability"
+        path: ./user-guide/observability/extending.md
+        slug: extending
+
+  - section: "Developer Guide"
+    skip-slug: true
+    contents:
+      - page: "Contributing"
+        path: ./developer/contribute.md
+        slug: contribute
+      - page: "Parallel State Deprecation"
+        path: ./developer/parallel-state-deprecation.md
+        slug: parallel-state-deprecation
+      - page: "Submitting Jobs"
+        path: ./developer/submit.md
+        slug: submit
+      - page: "On-Call Guide"
+        path: ./developer/oncall.md
+        slug: oncall
+      - page: "Generating Documentation"
+        path: ./developer/generate_docs.md
+        slug: generate-docs
+
+  - section: "API Reference"
+    skip-slug: true
+    contents:
+      - section: "Megatron Core API Guide"
+        path: ./api-guide/index.md
+        slug: api-guide
+        contents:
+          - section: "Model APIs"
+            path: ./api-guide/models/index.md
+            slug: models
+            contents:
+              - section: "models package"
+                path: ./api-guide/models/models.md
+                slug: models
+                contents:
+                  - page: "models.gpt package"
+                    path: ./api-guide/models/models.gpt.md
+                    slug: models-gpt
+                  - page: "models.t5 package"
+                    path: ./api-guide/models/models.t5.md
+                    slug: models-t5
+                  - page: "models.bert package"
+                    path: ./api-guide/models/models.bert.md
+                    slug: models-bert
+          - section: "Core APIs"
+            path: ./api-guide/core/index.md
+            slug: core
+            contents:
+              - page: "transformer package"
+                path: ./api-guide/core/transformer.md
+                slug: transformer
+              - page: "tensorparallel package"
+                path: ./api-guide/core/tensor_parallel.md
+                slug: tensor-parallel
+              - page: "pipelineparallel package"
+                path: ./api-guide/core/pipeline_parallel.md
+                slug: pipeline-parallel
+              - page: "fusions package"
+                path: ./api-guide/core/fusions.md
+                slug: fusions
+              - page: "distributed package"
+                path: ./api-guide/core/distributed.md
+                slug: distributed
+              - page: "datasets package"
+                path: ./api-guide/core/datasets.md
+                slug: datasets
+              - section: "distcheckpointing package"
+                path: ./api-guide/core/dist_checkpointing.md
+                slug: dist-checkpointing
+                contents:
+                  - page: "distcheckpointing.strategies package"
+                    path: ./api-guide/core/dist_checkpointing.strategies.md
+                    slug: dist-checkpointing-strategies
+          - section: "Internal Utilities"
+            path: ./api-guide/internal/index.md
+            slug: internal
+            contents:
+              - page: "Microbatches Calculator"
+                path: ./api-guide/internal/num_microbatches_calculator.md
+                slug: num-microbatches-calculator
+              - page: "Optimizer Parameters Scheduler"
+                path: ./api-guide/internal/optimizer_param_scheduler.md
+                slug: optimizer-param-scheduler
+
+  - section: "Resources"
+    skip-slug: true
+    contents:
+      - page: "Hybrid Model Migration"
+        path: ./user-guide/hybrid-model-migration.md
+        slug: hybrid-model-migration
+      - page: "Advanced Topics"
+        path: ./advanced/index.md
+        slug: advanced
+
+  - section: "Additional Pages"
+    skip-slug: true
+    hidden: true
+    contents:
+      - page: "API Backward Compatibility Checking"
+        path: ./api-backwards-compatibility-check.md
+        slug: api-backwards-compatibility-check
+      - page: "Determinism Developer Reference"
+        path: ./developer/determinism/README.md
+        slug: determinism
+      - page: "Determinism Glossary"
+        path: ./developer/determinism/glossary.md
+        slug: glossary
+      - page: "Determinism Operation Catalog"
+        path: ./developer/determinism/op-catalog.md
+        slug: op-catalog
+      - page: "Determinism Status"
+        path: ./developer/determinism/status.md
+        slug: status
+      - page: "Kernel Determinism Testing"
+        path: ./developer/determinism/testing.md
+        slug: testing
+      - page: "Megatron Discussions"
+        path: ./discussions/README.md
+        slug: discussions
+      - page: "Documentation Development"
+        path: ./documentation.md
+        slug: documentation
+      - section: "User Guide"
+        path: ./user-guide/index.md
+        slug: user-guide
+        contents:
+          - page: "msc_integration"
+            path: ./user-guide/msc_integration.md
+            slug: msc-integration
+          - section: "Advanced Features"
+            path: ./user-guide/features/index.md
+            slug: features
+            contents:
+              - page: "CUDA Graph"
+                path: ./user-guide/features/cuda_graph.md
+                slug: cuda-graph
+              - page: "Low-Precision Training Guide"
+                path: ./user-guide/features/low_precision_training.md
+                slug: low-precision-training
+              - page: "MoE Paged Stash"
+                path: ./user-guide/features/paged_stash.md
+                slug: paged-stash
+              - page: "Offline Logits Knowledge Distillation"
+                path: ./user-guide/features/offline_logits_distillation.md
+                slug: offline-logits-distillation

@@ -17,6 +17,7 @@ ENV_VARS:
 MODEL_ARGS:
   # Precision
   --bf16: true
+  --grad-reduce-in-bf16: true
   # Distributed args
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 1

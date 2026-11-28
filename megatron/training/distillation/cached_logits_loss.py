@@ -88,7 +88,6 @@ import torch.utils.data
 from megatron.core import parallel_state
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.common.language_module.language_module import LanguageModule
-from megatron.training import get_args
 from megatron.training.distillation.utils import (
     BATCHED_TAR_RE,
     CACHED_LOGITS_LOGPROB_SENTINEL,
@@ -114,6 +113,7 @@ from megatron.training.distillation.utils import (
     v2_iter_logprobs_tar_entries,
     v2_sorted_batched_tars,
 )
+from megatron.training.global_vars import get_run_config
 from megatron.training.utils import print_rank_last
 
 logger = logging.getLogger(__name__)
@@ -261,7 +261,13 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                 f"No batched tar shards (or unreadable metadata) found in '{logprobs_dir}'."
             )
         self._meta = meta
-        self._plan = self._build_plan(meta, dp_size=dp_size)
+        train = get_run_config().train
+        self._plan = self._build_plan(
+            meta,
+            dp_size=dp_size,
+            micro_batch_size=train.micro_batch_size,
+            global_batch_size=train.global_batch_size,
+        )
 
         # Whether this load run needs document-aware CP reslicing -- mirrors
         # training.py's has_cu_seqlens formula (training.py:3059) combined
@@ -358,7 +364,9 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
     # ------------------------------------------------------------------
 
     @classmethod
-    def _build_plan(cls, meta: Dict[str, Any], *, dp_size: int) -> LogprobsReshardPlan:
+    def _build_plan(
+        cls, meta: Dict[str, Any], *, dp_size: int, micro_batch_size: int, global_batch_size: int
+    ) -> LogprobsReshardPlan:
         saver = meta.get("saver", {})
         missing = [
             field
@@ -377,14 +385,13 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
                 f"format_version={saver['format_version']} tars are not readable "
                 "by TeacherTarDataset; use LegacyTeacherTarDataset instead."
             )
-        args = get_args()
         return LogprobsReshardPlan(
             mbs_save=int(saver["mbs_save"]),
             dp_save=int(saver["dp_size_save"]),
             gbs_save=int(saver["gbs_save"]),
-            mbs_load=int(args.micro_batch_size),
+            mbs_load=int(micro_batch_size),
             dp_load=int(dp_size),
-            gbs_load=int(args.global_batch_size),
+            gbs_load=int(global_batch_size),
         )
 
     # ------------------------------------------------------------------
@@ -802,38 +809,38 @@ class LegacyTeacherTarDataset(TeacherTarDataset):
         # If the metadata happens to record mbs_save / gbs_save (some late
         # v1-era saves did), reject mismatches up-front rather than producing
         # silently-wrong KD losses.
-        args = get_args()
+        train = get_run_config().train
         saver_meta = (meta or {}).get("saver", {})
         saved_mbs = saver_meta.get("mbs_save")
         saved_gbs = saver_meta.get("gbs_save")
-        if saved_mbs is not None and int(saved_mbs) != int(args.micro_batch_size):
+        if saved_mbs is not None and int(saved_mbs) != int(train.micro_batch_size):
             raise ValueError(
                 f"v1 cached-logits tars require mbs_load == mbs_save. "
-                f"saved={saved_mbs}, current={args.micro_batch_size}. "
+                f"saved={saved_mbs}, current={train.micro_batch_size}. "
                 "Regenerate the teacher cache with format_version=2 to "
                 "enable MBS resharding."
             )
-        if saved_gbs is not None and int(saved_gbs) != int(args.global_batch_size):
+        if saved_gbs is not None and int(saved_gbs) != int(train.global_batch_size):
             raise ValueError(
                 f"v1 cached-logits tars require gbs_load == gbs_save. "
-                f"saved={saved_gbs}, current={args.global_batch_size}. "
+                f"saved={saved_gbs}, current={train.global_batch_size}. "
                 "Regenerate the teacher cache with format_version=2 to "
                 "enable GBS resharding."
             )
 
         # v1 members are keyed by iteration and require gbs_load == gbs_save,
         # so iteration * gbs is the member's global start sample.
-        self._gbs = int(args.global_batch_size)
+        self._gbs = int(train.global_batch_size)
 
         # Map each current-rank microbatch to the saved rank and local
         # microbatch slot that holds the same global samples.
-        (self._source_dp_ranks, self._microbatch_sources, self._num_mb_save, dp_size_saved) = (
+        self._source_dp_ranks, self._microbatch_sources, self._num_mb_save, dp_size_saved = (
             self._compute_dp_remapping(
                 logprobs_dir,
                 dp_rank,
                 dp_size,
-                int(args.micro_batch_size),
-                int(args.global_batch_size),
+                int(train.micro_batch_size),
+                int(train.global_batch_size),
             )
         )
         if dp_size_saved != dp_size:
@@ -1182,6 +1189,7 @@ class CachedLogitsKDLoss:
         self._decode_threads = decode_threads
         self._msc_prefetch_depth = msc_prefetch_depth
         self._ignore_hash = ignore_hash
+        self._global_batch_size = int(get_run_config().train.global_batch_size)
 
         # ---- parallel-state bookkeeping ----
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -1204,7 +1212,7 @@ class CachedLogitsKDLoss:
 
         # ---- iteration / microbatch tracking ----
         # Both are global sample indices at which an iteration's batch starts:
-        # the trainer's (args.consumed_train_samples) and the one the most
+        # the trainer's (TrainState.consumed_train_samples) and the one the most
         # recently pulled teacher entry covers. Comparing the two verifies
         # teacher/student alignment.
         self._current_sample_start: Optional[int] = None
@@ -1217,7 +1225,7 @@ class CachedLogitsKDLoss:
 
     def _init_dataloader(self, start_sample: int) -> None:
         """Create the DataLoader starting from global sample *start_sample*."""
-        global_batch_size = int(get_args().global_batch_size)
+        global_batch_size = self._global_batch_size
         if start_sample % global_batch_size != 0:
             raise RuntimeError(
                 f"Cached-logits KD: training resumes at consumed sample "
@@ -1276,7 +1284,7 @@ class CachedLogitsKDLoss:
             student_logits: ``(seq_len, batch, local_vocab_size)`` – raw
                 (pre-softmax) student logits from this TP rank's vocab shard.
             sample_start: Global sample index the current training iteration's
-                batch starts at.  Defaults to ``args.consumed_train_samples``,
+                batch starts at.  Defaults to ``TrainState.consumed_train_samples``,
                 which ``training.py`` only advances after ``train_step()``
                 returns.
             microbatch_idx: Microbatch index within the current iteration.

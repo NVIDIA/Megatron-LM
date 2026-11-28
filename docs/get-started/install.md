@@ -1,11 +1,11 @@
-<!---
+{/*
    Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
    and proprietary rights in and to this software, related documentation
    and any modifications thereto. Any use, reproduction, disclosure or
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
--->
+*/}
 
 # Installation
 
@@ -55,17 +55,17 @@ uv pip install --group build
 uv pip install --no-build-isolation "megatron-core[training,dev]"
 ```
 
-```{note}
+<Note>
 `--no-build-isolation` requires build dependencies to be pre-installed in the environment. `torch` is needed because several `[dev]` packages (`mamba-ssm`, `nv-grouped-gemm`, and `transformer-engine`) import it at build time to compile CUDA kernels. Expect this step to take **20+ minutes** depending on your hardware. If you prefer pre-built binaries, the [NGC Container](#option-c-nvidia-gpu-cloud-ngc-container) ships with these pre-compiled.
-```
+</Note>
 
-```{warning}
+<Warning>
 Building from source can consume a large amount of memory. By default, the build runs one compiler job per CPU core, which can cause out-of-memory failures on machines with many cores. To limit parallel compilation jobs, set the `MAX_JOBS` environment variable before installing (for example, `MAX_JOBS=4`).
-```
+</Warning>
 
-```{tip}
+<Tip>
 For a lighter set of development dependencies without Transformer Engine and ModelOpt, use `[lts]` instead of `[dev]`: `uv pip install --no-build-isolation "megatron-core[training,lts]"`. The `[lts]` and `[dev]` extras are mutually exclusive.
-```
+</Tip>
 
 To clone the repository for examples:
 
@@ -91,9 +91,9 @@ uv pip install --group build
 uv pip install --no-build-isolation -e ".[training,dev]"
 ```
 
-```{tip}
+<Tip>
 If the build runs out of memory, limit parallel compilation jobs with `MAX_JOBS=4 uv pip install --no-build-isolation -e ".[training,dev]"`.
-```
+</Tip>
 
 
 ## Option C: NVIDIA GPU Cloud (NGC) Container
@@ -110,9 +110,9 @@ docker run --gpus all -it --rm \
   nvcr.io/nvidia/pytorch:26.08-py3
 ```
 
-```{note}
+<Note>
 The NGC PyTorch container constrains the Python environment globally using `PIP_CONSTRAINT`. The `-e PIP_CONSTRAINT=` flag above unsets this so that Megatron Core and its dependencies install correctly.
-```
+</Note>
 
 Then install Megatron Core inside the container (`torch` is already available in the NGC image):
 

@@ -6,7 +6,7 @@ SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 source "${SCRIPT_DIR}/conf/arguments.sh"
 
 # Default arguments of this script
-MLM_DEFAULT_ARGS="--finetune --auto-detect-ckpt-format --export-te-mcore-model --use-cpu-initialization"
+MLM_DEFAULT_ARGS="--finetune --auto-detect-ckpt-format --use-cpu-initialization"
 
 if [ -z ${HF_MODEL_CKPT} ]; then
     HF_MODEL_CKPT=${1}

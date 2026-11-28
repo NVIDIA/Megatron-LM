@@ -5,8 +5,14 @@ from megatron.training.config.container import InferenceConfigContainer, Pretrai
 from megatron.training.config.dataset_config import DataConfig, DataloaderConfig
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import TargetAllowlist, target_allowlist
+from megatron.training.config.offline_distillation_config import (
+    LogitsLoadConfig,
+    LogitsSaveConfig,
+    OfflineDistillationConfig,
+)
 from megatron.training.config.resilience_config import (
     FaultInjectorConfig,
+    FaultToleranceConfig,
     RerunStateMachineConfig,
     StragglerDetectionConfig,
 )

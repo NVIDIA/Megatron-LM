@@ -45,5 +45,6 @@ products:
     products:
       - inference_shards: ["tp=1,dp=2,role=prefill+tp=1,dp=2,role=decode"]
         environment: [dev]
-        scope: [mr-github]
+        # Legacy TE checkpoint metadata prevents server startup: https://github.com/NVIDIA/Megatron-LM/issues/9335
+        scope: [mr-github-broken]
         platforms: [dgx_gb200]

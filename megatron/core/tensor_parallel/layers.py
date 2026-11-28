@@ -615,13 +615,14 @@ def _linear_forward(
     )
     # Cross entropy transforms FP32 logits in place. Have TE write through a 2-D view of
     # the final-shaped allocation, then return the owning tensor rather than that view.
+    # cuBLASLt reads the bias in the output dtype, and TE >= 2.21 rejects any other bias dtype.
     te_general_gemm(
         weight,
         input_2d,
         out_dtype=output_dtype,
         layout="TN",
         out=output.view(-1, weight.size(0)),
-        bias=bias,
+        bias=None if bias is None else bias.to(output_dtype),
     )
     return output
 
@@ -1098,6 +1099,8 @@ def linear_with_grad_accumulation_and_async_allreduce(
                 )
                 linear_with_grad_accumulation_and_async_allreduce.warned = True
 
+    if gtp_remat_size > 1 and weight.requires_grad:
+        weight.record_wgrad_forward()
     return LinearWithGradAccumulationAndAsyncCommunication.apply(*args)
 
 
@@ -1356,6 +1359,7 @@ class ColumnParallelLinear(torch.nn.Module):
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
         inference_tp_ag_barrier: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of ColumnParallelLinear
 
@@ -1372,6 +1376,8 @@ class ColumnParallelLinear(torch.nn.Module):
                 can copy-out the previous AG output. For more information, refer to
                 ``barrier_before`` in ``multimem_all_gather``
                 (``megatron.core.inference.communication.torch_symm_triton.collectives``).
+            output_dtype (torch.dtype, optional): GEMM output dtype for this call.
+                Default None means the `output_dtype` arg in the constructor will be used.
 
         Returns:
             - output
@@ -1446,7 +1452,7 @@ class ColumnParallelLinear(torch.nn.Module):
             ),
             tp_group=self.tp_group,
             gtp_remat_size=self.gtp_remat_size,
-            output_dtype=self.output_dtype,
+            output_dtype=self.output_dtype if output_dtype is None else output_dtype,
         )
 
         gather_output = self.gather_output

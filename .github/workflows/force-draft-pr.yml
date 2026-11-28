@@ -4,33 +4,75 @@ name: Force Draft PR
 
 on:
   pull_request_target:
-    types: [opened]
+    types: [opened, ready_for_review]
     branches:
       - main
 
 permissions:
+  contents: read
   pull-requests: write
 
 jobs:
   force-draft:
     runs-on: ubuntu-latest
-    if: ${{ !github.event.pull_request.draft && github.repository == 'NVIDIA/Megatron-LM' }}
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    concurrency:
+      group: draft-gate-${{ github.event.pull_request.number }}-${{ github.event.action }}
+      cancel-in-progress: false
+    outputs:
+      decision: ${{ steps.gate.outputs.decision }}
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_ACTION: ${{ github.event.action }}
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check draft policy
+        id: gate
+        if: github.event.action == 'ready_for_review' || !github.event.pull_request.draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MEMBERS_TOKEN: ${{ secrets.PAT }}
+          PR_AUTHOR_ID: ${{ github.event.pull_request.user.id }}
+        run: |
+          decision=$(bash .github/scripts/pr_draft_gate.sh)
+          echo "decision=$decision" | tee -a "$GITHUB_OUTPUT"
+
       - name: Convert PR to draft
+        if: ${{ !cancelled() && (steps.gate.outputs.decision == 'draft' || steps.gate.outcome == 'failure') }}
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
-          gh pr ready --undo ${{ github.event.pull_request.number }} --repo ${{ github.repository }}
+          gh pr ready --undo "$PR_NUMBER" --repo "$GITHUB_REPOSITORY"
 
-      - name: Add comment explaining draft policy
+      - name: Explain the draft review flow
+        if: ${{ !cancelled() && github.event.action == 'opened' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr comment ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --body \
-            "This PR has been automatically converted to **draft** because all PRs must start as drafts.
+          if [[ "$GITHUB_RUN_ATTEMPT" != 1 ]]; then
+            existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments" \
+              --jq '.[] | select(.user.login == "github-actions[bot]" and (.body | startswith("<!-- megatron-lm-draft-review -->"))) | .id')
+            if [[ -n "$existing" ]]; then exit 0; fi
+          fi
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file .github/autobot/draft-review.md
 
-          When you are ready for review, click **Ready for Review** to begin the review process. This will:
-          1. Add the oncall reviewer (optional reviewer)
-          2. Add required review teams based on your changes
+      - name: Explain why the PR returned to draft
+        if: github.event.action == 'ready_for_review' && steps.gate.outputs.decision == 'draft'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MESSAGE: >-
+            Returned to draft. Request Autobot approval on the latest commit with
+            `/review-approve` or `/review-approve reset=true`, or apply
+            `skip-bot-approval`, then mark the PR ready again.
+        run: |
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body "$MESSAGE"
 
-          See the [contribution guide](https://github.com/NVIDIA/Megatron-LM/blob/main/docs/developer/submit.md) for more details."
+  assign-reviewer:
+    needs: force-draft
+    if: needs.force-draft.outputs.decision == 'ready'
+    uses: ./.github/workflows/oncall-assign.yml
+    secrets:
+      PAT: ${{ secrets.PAT }}

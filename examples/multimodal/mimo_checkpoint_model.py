@@ -13,6 +13,7 @@ from dataclasses import replace
 from megatron.training.global_vars import get_run_config
 import torch
 
+from megatron.core.activations import unfused_fast_gelu as _unfused_fast_gelu
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -35,15 +36,6 @@ _VISION_SIZE_FIELDS = (
     "num_query_groups",
     "kv_channels",
 )
-
-
-def _unfused_fast_gelu(x: torch.Tensor) -> torch.Tensor:
-    """Fast GELU without the global MCore torch.compile decorator.
-
-    The projection input's token count varies with the number and size of images, so a compiled
-    activation would recompile for each new shape.
-    """
-    return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
 
 
 _PROJECTION_ACTIVATIONS = {"gelu": torch.nn.functional.gelu, "fast_gelu": _unfused_fast_gelu}
@@ -129,7 +121,10 @@ def vision_projection_config(args, language_config: TransformerConfig, add_bias:
         num_layers=1,
         hidden_size=language_config.hidden_size,
         ffn_hidden_size=language_config.hidden_size,
-        num_attention_heads=1,
+        # The projection is an MLP with no attention, but TransformerConfig requires a head
+        # count divisible by the TP size. Inherit the language model's, which is valid at any TP
+        # the language model runs at (as LLaVA's projection config does).
+        num_attention_heads=language_config.num_attention_heads,
         activation_func=_PROJECTION_ACTIVATIONS[args.vision_projection_activation],
         gated_linear_unit=False,
         add_bias_linear=add_bias,

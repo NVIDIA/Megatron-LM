@@ -185,3 +185,83 @@ def test_layout_wire_roundtrip():
     rebuilt = SSMShardLayout(**dataclasses.asdict(lay))
     assert rebuilt == lay
     assert rebuilt.conv_dim_local == lay.conv_dim_local
+
+
+# Gated DeltaProduct: H Householder reflections pack the conv channels as
+# [V0 .. V(H-1) | K0 .. K(H-1) | Q], each section TP-sharded on its own
+# (gated_delta_product._get_conv_checkpoint_split_layout).
+H = 3
+GDP_CONV_DIM = H * D_INNER + (H + 1) * G
+
+
+def _gdp_layouts(tp, pp, num_householder=H):
+    per = M // pp
+    dims = SSMStateDims(
+        nheads=NHEADS,
+        headdim=HEADDIM,
+        d_state=DSTATE,
+        ngroups=NGROUPS,
+        d_conv=DCONV,
+        num_householder=num_householder,
+    )
+    layouts = {}
+    for p in range(pp):
+        for r in range(tp):
+            rank = p * tp + r
+            layouts[rank] = SSMShardLayout(
+                global_rank=rank,
+                tp_size=tp,
+                tp_rank=r,
+                layer_start=p * per,
+                num_layers=per,
+                dims=dims,
+            )
+    return layouts
+
+
+def _gdp_shard(conv_g, lay: SSMShardLayout):
+    """Shard a global GDP conv state the way the GDP mixer packs its local channels."""
+    s, e = lay.layer_range()
+    r, tp = lay.tp_rank, lay.tp_size
+    di_l, g_l = D_INNER // tp, G // tp
+    sections, offset = [], 0
+    for width, local in [(D_INNER, di_l)] * H + [(G, g_l)] * (H + 1):
+        sections.append(conv_g[s:e, offset + r * local : offset + (r + 1) * local])
+        offset += width
+    return torch.cat(sections, dim=1).contiguous()
+
+
+@pytest.mark.parametrize("src,dst", [((1, 1), (1, 1)), ((2, 1), (1, 1)), ((1, 1), (2, 2))])
+def test_gdp_conv_reshard_reconstructs_destination(src, dst):
+    conv_g = torch.arange(M * GDP_CONV_DIM * DCONV, dtype=torch.float32).reshape(
+        M, GDP_CONV_DIM, DCONV
+    )
+    src_lay, dst_lay = _gdp_layouts(*src), _gdp_layouts(*dst)
+    for lay in (*src_lay.values(), *dst_lay.values()):
+        assert lay.conv_dim_local == GDP_CONV_DIM // lay.tp_size
+    src_t = {rk: _gdp_shard(conv_g, lay) for rk, lay in src_lay.items()}
+    dst_t = {
+        rk: torch.zeros(lay.num_layers, lay.conv_dim_local, DCONV) for rk, lay in dst_lay.items()
+    }
+    plan = plan_ssm_reshard(list(src_lay.values()), list(dst_lay.values()))
+    for t in plan:
+        if t.is_conv:
+            apply_conv_transfer(t, src_t[t.src_rank], dst_t[t.dst_rank])
+    for rk, lay in dst_lay.items():
+        assert torch.equal(dst_t[rk], _gdp_shard(conv_g, lay)), f"rank {rk} ({src}->{dst})"
+
+
+def test_mamba2_layout_is_the_single_householder_case():
+    mamba2 = _layouts(1, 1)[0]
+    assert mamba2.conv_bands == ("x", "B", "C")
+    assert mamba2.conv_dim_local == CONV_DIM
+    assert [mamba2.band(b) for b in mamba2.conv_bands] == [
+        (D_INNER, D_INNER, 0),
+        (G, G, D_INNER),
+        (G, G, D_INNER + G),
+    ]
+
+
+def test_ssm_reshard_rejects_mismatched_householder_counts():
+    with pytest.raises(ValueError, match="conv layouts differ"):
+        plan_ssm_reshard(list(_gdp_layouts(1, 1).values()), list(_layouts(1, 1).values()))

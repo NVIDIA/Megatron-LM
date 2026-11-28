@@ -11,6 +11,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import yaml
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,6 +32,15 @@ def _python(script: str, args: list[str]) -> dict[str, str]:
     return dict(line.split("=", 1) for line in output.strip().splitlines())
 
 
+def _disabled_buckets(recipe: Path) -> set[str]:
+    return {
+        bucket
+        for product in yaml.safe_load(recipe.read_text())["products"]
+        if product.get("testmon") is False
+        for bucket in product["test_case"]
+    }
+
+
 def main() -> None:
     """Restore each baseline, run the existing selector, and upload its plan."""
     if os.environ["TARGET_BRANCH"] != "main":
@@ -38,6 +49,13 @@ def main() -> None:
     generation = f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
     baseline_generation = os.environ.get("TESTMON_GENERATION", "")
     temporary = Path(os.environ["RUNNER_TEMP"])
+    testmon_disabled_buckets = _disabled_buckets(temporary / "unit-tests.yaml")
+    if baseline_generation:
+        # Either checkout can opt out, including when the baseline predates the recipe flag.
+        recipe = (
+            Path("tests/test_utils/recipes") / platform.removeprefix("dgx_") / "unit-tests.yaml"
+        )
+        testmon_disabled_buckets.update(_disabled_buckets(recipe))
     cache_dir = Path("assets_dir/testmon")
     plan = "assets_dir/testmon-plan/plan.json"
     matrix = []
@@ -51,6 +69,10 @@ def main() -> None:
     # Restore sequentially: the path is part of the existing cache version.
     for entry in json.loads(os.environ["BUCKETS"]):
         bucket = entry["bucket"]
+        if bucket in testmon_disabled_buckets:
+            matrix.append({**entry, "mode": "testmon-disabled"})
+            summary.append(f"| `{bucket}` | full (Testmon disabled in recipe) | true |")
+            continue
         logger.info("Selecting %s", bucket)
         identity = _python(
             "testmon_cache.py",

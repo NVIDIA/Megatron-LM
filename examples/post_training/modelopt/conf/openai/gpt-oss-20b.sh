@@ -7,7 +7,6 @@ else
     TOKENIZER_MODEL=${HF_MODEL_CKPT}
 fi
 
-# WAR: enable-gpt-oss is a temporary workaround for using the default GPT-OSS config
 MODEL_ARGS=" \
     --save-interval 100000 \
     --micro-batch-size 1 \
@@ -47,7 +46,12 @@ MODEL_ARGS=" \
     --glu-linear-offset 1.0 \
     --softmax-type learnable \
     --window-attn-skip-freq 2 \
-    --enable-gpt-oss \
+    --position-embedding-type yarn \
+    --rotary-scaling-factor 32.0 \
+    --yarn-original-max-position-embeddings 4096 \
+    --yarn-beta-fast 32.0 \
+    --yarn-beta-slow 1.0 \
+    --no-yarn-correction-range-round-to-int \
     --activation-func-clamp-value 7.0 \
     --window-size 127,0 \
 "

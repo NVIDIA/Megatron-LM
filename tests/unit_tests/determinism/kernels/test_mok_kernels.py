@@ -11,9 +11,10 @@ from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exac
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
 
+@pytest.mark.parametrize("padded", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("num_experts,topk", [(31, 6), (1024, 8)])
-def test_routing_map_forward_and_backward_replay(dtype, num_experts, topk):
+def test_routing_map_forward_and_backward_replay(dtype, num_experts, topk, padded):
     seeded()
     num_tokens = 4096
     tokens = torch.arange(num_tokens, device="cuda")
@@ -26,14 +27,21 @@ def test_routing_map_forward_and_backward_replay(dtype, num_experts, topk):
     routing_map.scatter_(1, expert_indices, valid_routes)
     probs = torch.randn((num_tokens, num_experts), device="cuda", dtype=dtype, requires_grad=True)
     upstream = torch.randn((num_tokens, topk), device="cuda", dtype=torch.float32)
+    inputs = (probs, routing_map, topk)
+    if padded:
+        # Batch-first [2, seq] mask of the sequence-first tokens (token = seq_idx * 2 + batch_idx),
+        # a strided view; every fifth token is padding and keeps no routes.
+        padding_mask = (tokens.view(-1, 2).t() % 5) == 0
+        inputs += (padding_mask,)
+        valid_routes = valid_routes & (tokens % 5 != 0)[:, None]
 
     outputs, gradients = assert_replays_bit_exact(
         routing_map_to_mok_inputs,
-        (probs, routing_map, topk),
+        inputs,
         grad_outputs={"out[0]": upstream},
         replays=3,
         contention=True,
-        what=f"MOK routing map[{dtype}, experts={num_experts}, topk={topk}]",
+        what=f"MOK routing map[{dtype}, experts={num_experts}, topk={topk}, padded={padded}]",
     )
 
     expected_indices = expert_indices.masked_fill(~valid_routes, num_experts).sort(dim=1).values

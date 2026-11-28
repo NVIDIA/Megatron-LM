@@ -216,6 +216,7 @@ class ViTModel(MegatronModule):
             "transformer-engine."
         )
 
+        self.pg_collection = pg_collection
         self.patch_dim = patch_dim
         self.img_h = img_h
         self.img_w = img_w

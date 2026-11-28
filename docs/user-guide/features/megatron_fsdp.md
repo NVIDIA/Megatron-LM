@@ -1,11 +1,11 @@
-<!---
+{/*
    Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
    and proprietary rights in and to this software, related documentation
    and any modifications thereto. Any use, reproduction, disclosure or
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
--->
+*/}
 
 # Megatron-FSDP
 
@@ -306,25 +306,19 @@ torchrun --nproc_per_node=8 --nnodes=1 \
 
 ### FSDP Fundamentals
 
-```{figure} ../../images/megatron_fsdp/DDP_vs_FSDP.png
-:alt: FSDP Pipeline
-:align: center
+![FSDP Pipeline](../../images/megatron_fsdp/DDP_vs_FSDP.png)
 
 Comparison between Distributed Data Parallelism (DDP) and Fully-Sharded Data Parallelism (FSDP). While gradients are all-reduced in DDP, they are sharded and reduce-scattered with FSDP.
 
 Source: Meta AI, Ott, Myle, et al. “Fully Sharded Data Parallel: Faster AI Training with Fewer GPUs.” _Facebook Engineering_, 15 July 2021, https://engineering.fb.com/2021/07/15/open-source/fsdp/.
-```
 
 **Fully Sharded Data Parallelism (FSDP)** is a type of distributed data parallelism (DDP) that shards optimizer state, weight gradients (`wgrad`), and model weights across devices that ingest data-parallel samples for data-parallel training or inference. Activations (`fprop`) and data gradients (`dgrad`) are not sharded or distributed, and are preserved for the backward pass, but can be recomputed during the backward pass, offloaded to CPU, or sharded / routed using other parallelisms such as tensor parallelism (TP), context parallelism (CP), or expert parallelism (EP).
 
-```{figure} ../../images/megatron_fsdp/zero3_model_state.png
-:alt: ZeRO-3 Model State
-:align: center
+![ZeRO-3 Model State](../../images/megatron_fsdp/zero3_model_state.png)
 
 Sharded memory profiles for ZeRO-1 (optimizer state), ZeRO-2 (optimizer state and gradients), and ZeRO-3 (optimizer state, gradients, and parameters).
 
 Source: Zero-Redundancy Optimizer Model State Partition Diagram. From _The Ultra-Scale Playbook: Training LLMs on GPU Clusters_ by Tazi, Nouamane, et al. HuggingFace, 2025, https://huggingface.co/spaces/nanotron/ultrascale-playbook.
-```
 
 The core principles of FSDP are:
 
@@ -341,12 +335,9 @@ From these core principles, software requirements can be derived:
 
 FSDP can also be visualized as a decomposition of the all-reduce collective used in DDP into a gradient reduce-scatter, distributed optimization step, and parameter all-gather.
 
-```{figure} ../../images/megatron_fsdp/FSDP_Allreduce.png
-:alt: FSDP RS & AG
-:align: center
+![FSDP RS & AG](../../images/megatron_fsdp/FSDP_Allreduce.png)
 
 Source: Feng, Wei, Will Constable, and Yifan Mao. “Getting Started with Fully Sharded Data Parallel (FSDP2).” _PyTorch Tutorials_, 17 Mar. 2022, https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html.
-```
 
 ### FSDP Unit Modules
 
@@ -369,12 +360,9 @@ Megatron-FSDP accepts a list of `str` or `class` paths representing FSDP unit mo
 
 Once a model is partitioned into unit modules, computation is overlapped with communication based on the granularity of the FSDP unit module. Depending on the size of the compute and communication kernels, fine-tuning the unit module size and grouping configuration can impact performance and elicit trade-offs between overlap and memory when using FSDP.
 
-```{figure} ../../images/megatron_fsdp/fsdp_streams.png
-:alt: FSDP Streams
-:align: center
+![FSDP Streams](../../images/megatron_fsdp/fsdp_streams.png)
 
 Each color-coded block in the compute and communication streams, merged and categorized in the simplified (and worst-case) scenario where SM resources are under contention, correspond to a _single_ FSDP unit module.
-```
 
 Compute-communication overlaps are orchestrated using **CUDA streams** that capture and parallelize serial operations. All collectives associated with all combinations of `{DP-Inner, DP-Outer}` and `{AG, RS}` are scheduled and tracked with separate streams and communicators / `ProcessGroup`(s).
 
@@ -410,23 +398,17 @@ Megatron-FSDP uses a `Tensor._typed_storage()._resize_(bytes)`-based allocator t
 
 To support these optimizations, Megatron-FSDP uses **double-buffering**, which assigns 2 persistently-allocated buffers to FSDP units in an alternating pattern, hard-limiting the memory overhead for parameter and gradient buffer allocation and ensuring that no more than 2 FSDP units are computed or communicated concurrently.
 
-```{figure} ../../images/megatron_fsdp/fsdp_double_buffer.png
-:alt: FSDP Double Buffering
-:align: center
+![FSDP Double Buffering](../../images/megatron_fsdp/fsdp_double_buffer.png)
 
 Visualization of double buffering in Megatron-FSDP. Even- and odd-indexed FSDP units share the same un-sharded parameter and gradient buffers, overwriting incumbent data as needed during runtime. Megatron-FSDP ensures that no more than two FSDP units are un-sharded at any point during runtime.
-```
 
 With double-buffering, Megatron-FSDP does not need to allocate memory after initialization, which can reduce memory fragmentation and improve performance. However, double-buffering requires _depth-wise model symmetry_, where even- and odd-indexed FSDP units have identical size during runtime. If double-buffering is utilized, Megatron-FSDP computes the **_mode_** of FSDP unit sizes as the symmetrical double-buffer size, and any FSDP units not symmetrical to the computed size will default to the `_resize_(bytes)`-based allocator (or persistently allocated for extremely large and asymmetrical layers that affect performance significantly like `torch.nn.Embedding` when the low-level argument `fsdp_db_use_persist_buf_on_alloc_fail` is set).
 
 Not all model architectures support depth-wise model symmetry. For example, hybrid architectures like **Nemotron** are a combination of Transformer, Mamba, and MoE blocks that are asymmetrical in size and data-type. To double-buffer these model architectures, we need a pool of buffers that can support any FSDP unit, which can be computed from the _**maximum**_ of all FSDP units, and this "MaxPool" of (now symmetric) buffers of maximum size, shape, and dtype can be double-buffered.
 
-```{figure} ../../images/megatron_fsdp/maxpool_allocator.png
-:alt: MaxPoolAllocator
-:align: center
+![MaxPoolAllocator](../../images/megatron_fsdp/maxpool_allocator.png)
 
 Visualizing the MaxPoolAllocator initialization in Megatron-FSDP. Iterating through all FSDP units, data buckets are categorized by data-type, sorted from small to large, and compared to the current MaxPool. If there are not enough buckets in the pool to support the unit, buckets are added to the pool (with size 0). If the largest buckets of the pool are not large enough to support the buckets in the unit (assigned to the pool from smallest to largest), the buckets in the pool are enlarged. After this process, we arrive at a minimal set of buckets that can double-buffer every FSDP unit in the model.
-```
 
 ### Data-Parallel Sharding Strategies
 
@@ -464,14 +446,11 @@ Megatron-FSDP supports a variety of sharding strategies over a variety of distri
 
 #### Understanding Hybrid-FSDP (HFSDP)
 
-```{figure} ../../images/megatron_fsdp/hfsdp.png
-:alt: Hybrid-FSDP Topology
-:align: center
+![Hybrid-FSDP Topology](../../images/megatron_fsdp/hfsdp.png)
 
 Hybrid-FSDP (HFSDP) is a variation of HSDP where the optimizer state in particular is sharded across both DP-Inner and DP-Outer, i.e. all data-parallel ranks, which further reduces memory utilization. In other words, intra-node sharding and communication uses ZeRO-3, while inter-node sharding and communication uses ZeRO-1. Parameters and gradients are converted from and to the fully-sharded optimizer state during optimization steps only, reducing the frequency of inter-node communications.
 
 Inspired by the artistry in the DHEN (Zhang, Luo, Liu, Meta, et al., 2022) paper: https://arxiv.org/abs/2203.11014
-```
 
 **Hybrid-Fully Sharded Data Parallelism (HFSDP)** is a slight modification to HSDP that fully-shards the optimizer state across all data-parallel ranks and introduces outer-level all-gather and reduce-scatter collectives to map fully-sharded parameters and gradients into partially-sharded parameters and gradients.
 
@@ -490,23 +469,17 @@ The modified algorithm has the following characteristics:
 
 In addition to improved memory utilization, HFSDP communications are split in communication size (bytes communicated), communication topology (DP-Inner and DP-Outer groups), and communication domain (NVLink and InfiniBand) across two sharding stages.
 
-```{figure} ../../images/megatron_fsdp/fsdp_v_hfsdp_streams.png
-:alt: Hybrid-FSDP Streams
-:align: center
+![Hybrid-FSDP Streams](../../images/megatron_fsdp/fsdp_v_hfsdp_streams.png)
 
 Inter-node communications can also be parallelized with intra-node communications using separate CUDA streams.
-```
 
 #### Mixing FSDP & Model Parallelism
 
 Megatron-FSDP is also compatible with a variety of model parallelisms that shard the model state, such as **Tensor Parallelism (TP)** and **Expert Parallelism (EP)**. When sharding model states across multiple dimensions in the device topology, _**FSDP sharding is always performed last**_, because FSDP collectives un-shard and re-shard parameters and gradients immediately before and after computation. Thus, FSDP sharding mechanics are implemented over tensor and expert parallel (strided) shards.
 
-```{figure} ../../images/megatron_fsdp/mixed_sharding.png
-:alt: Mixed Model Parallelism
-:align: center
+![Mixed Model Parallelism](../../images/megatron_fsdp/mixed_sharding.png)
 
 Wheneveer FSDP is composed with other model parallelisms, FSDP sharding is always exercised last to seamlessly integrate with existing model shards.
-```
 
 Megatron-FSDP uses `torch.distributed.DeviceMesh` to describe and configure communications across devices in data-parallel group(s). Because heterogeneous models that have mixed layers, such as [Hybrid Mamba-Transformer](https://arxiv.org/abs/2504.03624) or [Mixture-of-Experts (MoE)](https://arxiv.org/abs/1701.06538) models, require different parallelism configurations, multiple `DeviceMesh`(s) may be required for specific layers that require distinct distributed topologies for optimal memory efficiency and performance.
 
@@ -515,18 +488,15 @@ Currently, Megatron-FSDP supports two `DeviceMesh`(s), one for dense / non-exper
 - Dense modules typically have a `DeviceMesh` with data parallel, tensor parallel, and context parallel dimensions, where the data parallel dimension is used for FSDP. Typically, both data-parallel and context-parallel ranks are used for sharding in FSDP.
 - Mixture-of-experts modules typically have a `DeviceMesh` with data parallel, tensor parallel, and expert parallel dimensions, where the data parallel dimension is used for FSDP.
 
-For more information about Mixture-of-Experts in Megatron-Core, refer to the [Megatron-Core User Guide - MoE](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/features/moe.html).
+For more information about Mixture-of-Experts in Megatron-Core, refer to the [Megatron-Core User Guide - MoE](moe.md).
 
 #### Non-Uniform / Un-Even Model Sharding
 
 While `torch.distributed.tensor.DTensor` defaults to per-parameter sharding, where Tensors are split evenly on `dim=0` across the data-parallel domain, Megatron-FSDP uses **non-uniform or un-even `DTensor` shards** of a (flattened) group of parameters associated with an FSDP unit.
 
-```{figure} ../../images/megatron_fsdp/uneven_sharding.png
-:alt: Non-Uniform Sharding
-:align: center
+![Non-Uniform Sharding](../../images/megatron_fsdp/uneven_sharding.png)
 
 Comparison of FSDP2 per-parameter sharding and Megatron-FSDP per-unit or per-module sharding. FSDP2 requires `COPY` operations to move parameters and gradients in and out of communication buffers to reduce the frequency of NCCL collective calls, while Megatron-FSDP assigns sliced views of contiguous communication buffers to parameters associated with an FSDP unit.
-```
 
 While complex and less user-intuitive, an un-evenly sharded data structure enables a few performance benefits without introducing expensive `COPY` operations to set up communication and computation buffers:
 
@@ -541,12 +511,9 @@ In particular, contiguous memory is only half the requirement for high-performan
 
 Megatron-FSDP supports `dim=0` sharding, which computes the _**least-common multiple (LCM) of `p.shape[1:]` for all parameters `p` in an FSDP unit**_ and _**pads the un-sharded buffer to the closest multiple of `DP x LCM(p.shape[1:])`**_, forming a "DP-LCM" partition with `LCM`-length parts to ensure that DP-sharding boundaries do not violate chunks of data for coordinates of `dim=0`.
 
-```{figure} ../../images/megatron_fsdp/lcm_dim0_shard.png
-:alt: Flat Buffer Sharding Algorithm
-:align: center
+![Flat Buffer Sharding Algorithm](../../images/megatron_fsdp/lcm_dim0_shard.png)
 
 Visualization of how parameters are assigned un-evenly to the flat per-unit buffer sharded across DP ranks. With the LCM algorithm, every slice of `dim=0` is never bisected by FSDP. Algorithms and compute kernels can leverage this locality and contiguity.
-```
 
 1. When a parameter is _divisble by the LCM_, it can be inserted at any index multiple of the LCM in the buffer that is free. `p[i]` chunks of this parameter by definition divide the LCM, and thus align with the DP-LCM sharding grid.
 2. When a parameter _is larger than but not divisible by the LCM_, the remainder `r` populates a fraction of another LCM part, so a "conjugate" parameter that also exceeds the LCM with a "conjugate" remainder `r'` that is less than or equal to `LCM - r` is installed to fill the remaining space and align with the DP-LCM sharding grid.
@@ -569,12 +536,9 @@ Visualization of how parameters are assigned un-evenly to the flat per-unit buff
 
 Quantization is an extremely important feature for Megatron-FSDP as it reduces memory utilization and communication size for both activations and parameters, which directly affects the viability and performance of FSDP.
 
-```{figure} ../../images/megatron_fsdp/quantized_param_gather.png
-:alt: Quantized Model Parameters & FSDP
-:align: center
+![Quantized Model Parameters & FSDP](../../images/megatron_fsdp/quantized_param_gather.png)
 
 Visualization of Megatron-FSDP's training loop when using quantized weights from TransformerEngine. Every optimization step updates the quantized representation of sharded model weights, which have reduced communication size.
-```
 
 While TransformerEngine handles activation quantization, Megatron-FSDP shards quantized weights for AG.
 
@@ -583,12 +547,9 @@ While TransformerEngine handles activation quantization, Megatron-FSDP shards qu
 0. _**Distributed Optimization Step**_ - Non-quantized accumulated gradient shards from quantized GEMMs are applied to high-precision main weight shards.
 0. _**Sharded Quantization**_ - Sharded main weights are quantized to update the quantized compute weights for subsequent training steps.
 
-```{figure} ../../images/megatron_fsdp/sharded_quantization.png
-:alt: Sharded Quantization
-:align: center
+![Sharded Quantization](../../images/megatron_fsdp/sharded_quantization.png)
 
 Sharded quantization involves reducing maxima to compute a global set of scaling factors for local / sharded quantization.
-```
 
 In particular, _sharded quantization_ minimizes communication size and memory utilization by communicating scaling factors instead of main weights.
 

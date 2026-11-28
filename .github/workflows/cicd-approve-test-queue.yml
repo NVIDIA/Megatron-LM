@@ -31,6 +31,10 @@ jobs:
   approve-queue:
     runs-on: ubuntu-latest
     environment: main
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
     if: github.repository == 'NVIDIA/Megatron-LM'
     strategy:
       matrix:
@@ -69,7 +73,8 @@ jobs:
 
       - name: Approve waiting deployments
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT }}
+          APPROVAL_TOKEN: ${{ secrets.PAT }}
+          READ_TOKEN: ${{ github.token }}
           MAX_CONCURRENCY: ${{ vars.MAX_CONCURRENCY || 1 }}
           MAX_CONCURRENCY_DEV: ${{ vars.MAX_CONCURRENCY_DEV }}
           MAX_CONCURRENCY_OTHERS: ${{ vars.MAX_CONCURRENCY_OTHERS }}
@@ -88,15 +93,18 @@ jobs:
           import time
 
           # GitHub API configuration
-          GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+          APPROVAL_TOKEN = os.environ["APPROVAL_TOKEN"]
+          READ_TOKEN = os.environ["READ_TOKEN"]
           REPO = os.environ["GITHUB_REPOSITORY"]
           CONTRIBUTOR_TYPE = os.environ["CONTRIBUTOR_TYPE"]
           INTERNAL_SERVICE_ACCOUNTS = {"svcnemo-autobot"}
           MAX_PRS_PER_USER_PER_BRANCH = 2
           CICD_WORKFLOW_NAME = "CICD Megatron-LM"
           FUNCTIONAL_TEST_LABEL = "Run functional tests"
+          MERGE_QUEUE_JOBS_LABEL = "Run Merge-Queue jobs"
+          FUNCTIONAL_TEST_LABELS = {FUNCTIONAL_TEST_LABEL, MERGE_QUEUE_JOBS_LABEL}
           RUN_TESTS_LABEL = "Run tests"
-          RUN_ALL_TESTS_LABELS = {FUNCTIONAL_TEST_LABEL, RUN_TESTS_LABEL}
+          RUN_ALL_TESTS_LABELS = FUNCTIONAL_TEST_LABELS | {RUN_TESTS_LABEL}
           ALLOW_PR_RUN_ALL_TESTS = (
               os.environ.get("ALLOW_PR_RUN_ALL_TESTS", "").strip().lower() != "false"
           )
@@ -119,11 +127,12 @@ jobs:
               sso_users = json.load(f)
 
           # Headers for GitHub API
-          headers = {
-              "Authorization": f"token {GITHUB_TOKEN}",
+          read_headers = {
+              "Authorization": f"token {READ_TOKEN}",
               "Accept": "application/vnd.github.v3+json",
               "X-GitHub-Api-Version": "2022-11-28",
           }
+          approval_headers = {**read_headers, "Authorization": f"token {APPROVAL_TOKEN}"}
 
           MAX_RATE_LIMIT_WAIT = 60
 
@@ -143,9 +152,9 @@ jobs:
               for attempt in range(max_retries):
                   try:
                       if method == "GET":
-                          response = requests.get(url, headers=headers, timeout=30)
+                          response = requests.get(url, headers=read_headers, timeout=30)
                       else:
-                          response = requests.post(url, headers=headers, json=data, timeout=30)
+                          response = requests.post(url, headers=approval_headers, json=data, timeout=30)
                       wait = get_rate_limit_wait(response)
                       if wait is None and response.status_code == 429:
                           wait = 2 ** attempt
@@ -249,7 +258,7 @@ jobs:
 
           def has_functional_test_label(workflow_run):
               """Return whether a PR workflow has opted into functional tests."""
-              return FUNCTIONAL_TEST_LABEL in get_pr_labels(workflow_run)
+              return bool(FUNCTIONAL_TEST_LABELS & get_pr_labels(workflow_run))
 
           def matches_contributor(workflow_run, contributor_type):
               """Return True if the workflow run matches the contributor type (ignores branch)."""
@@ -372,7 +381,7 @@ jobs:
                   )
                   continue
 
-              runs_functional_tests = FUNCTIONAL_TEST_LABEL in workflow_labels
+              runs_functional_tests = bool(FUNCTIONAL_TEST_LABELS & workflow_labels)
               if runs_functional_tests and functional_test_workflow_running:
                   print(
                       f"Skipping functional-test workflow {workflow_name} with Run Id: {workflow_id}; "

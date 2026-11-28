@@ -27,6 +27,9 @@ import torch
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.contexts.mtp_context_mixin import MTPContextMixin
 from megatron.core.inference.contexts.mtp_metadata import MTPMetadata
+from megatron.core.inference.text_generation_controllers.mtp_controller_mixin import (
+    MTPControllerMixin,
+)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -282,6 +285,39 @@ class TestMtpCommitPassDecode:
         assert token_ids == [1001, 1002, 1004]
         assert context.finalize_prefill_calls == 1
 
+    def test_async_compaction_reads_each_request_from_its_own_forward_rows(self):
+        """After async compaction, rows come from the pending forward through the row map.
+
+        The pending forward ran requests A, B and C in rows 0-2, 3-5 and 6-8. A finished, and
+        compaction moved C into A's slot, so the batch is now (C, B) while the hidden states and
+        input tokens keep the forward's order. C must commit rows 6 and 7, not A's rows 0 and 1.
+        """
+        context = _make_context(num_decode_requests=2)
+        model = _make_model()
+        controller = _make_controller(context, model)
+        controller._accepted_token_counts_per_request[:2] = torch.tensor(
+            [2, 1], device=DEVICE, dtype=torch.int64
+        )
+        token_row_indices = torch.tensor([6, 7, 8, 3, 4, 5], device=DEVICE)
+
+        issued = controller._mtp_commit_pass(
+            context,
+            model,
+            _hidden(9),
+            num_decode_requests=2,
+            active_request_count=2,
+            base_position=torch.tensor([30, 7], device=DEVICE),
+            token_row_indices=token_row_indices,
+        )
+
+        assert issued is True
+        call = context.setup_prefill_calls[-1]
+        assert call["append_counts"].cpu().tolist() == [2, 1]
+        assert call["request_start_positions"].cpu().tolist() == [27, 5]
+        forward = model.mtp_layer_calls[-1]
+        assert _row_ids(forward["hidden_states"]) == [6, 7, 3]
+        assert forward["next_token_ids"].view(-1).cpu().tolist() == [1007, 1008, 1004]
+
     def test_request_with_no_accepted_drafts_contributes_nothing(self):
         """A rejected-everything request still occupies a row, with count 0."""
         context = _make_context(num_decode_requests=2)
@@ -451,10 +487,11 @@ class TestMtpCommitPassPrefill:
     def test_a_carry_at_the_wrong_position_raises(self):
         """A carry only applies at the position it recorded, and a mismatch is a bug.
 
-        `_compute_prefix_match` gives up a carry-holding continuation chunk's entire prefix
-        match so its seam lands exactly at the carried position. Reaching the commit pass with a
-        mismatch means that back-off stopped holding, and skipping the seam would leave a
-        committed position unwritten -- a silent acceptance regression.
+        `_compute_prefix_match` takes no prefix skip for a carry-holding continuation chunk (it
+        may still inherit matched blocks contiguous with its inherited run; a match after a gap
+        is declined), so its seam lands exactly at the carried position. Reaching the commit
+        pass with a mismatch means that back-off stopped holding, and skipping the seam would
+        leave a committed position unwritten -- a silent acceptance regression.
         """
         context = _make_context(
             prefill_query_lengths=(3,), prefill_kv_offsets=(8,), request_ids=[42]
@@ -1689,3 +1726,114 @@ class TestMtpKvCacheCombinations:
             f"{scenario_name}: real rank issued {len(model.all_forwards)} MTP forwards, "
             f"idle rank issued {len(dummy)}"
         )
+
+
+class TestMoeDispatchSpansRanks:
+    """Idle-rank dummy forwards are gated on the dispatch (tp_ep) group, not on EP alone."""
+
+    @staticmethod
+    def _controller(ep_size, etp_size, group=None):
+        context = SimpleNamespace(expert_tensor_and_model_parallel_group=group)
+        return SimpleNamespace(
+            inference_wrapped_model=SimpleNamespace(inference_context=context),
+            model_config=SimpleNamespace(
+                expert_model_parallel_size=ep_size, expert_tensor_parallel_size=etp_size
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "ep_size, etp_size, expected",
+        [(1, 1, False), (2, 1, True), (1, 4, True), (2, 2, True)],
+        ids=["no-moe-parallelism", "ep-only", "etp-only", "ep-and-etp"],
+    )
+    def test_falls_back_to_config_without_a_group(self, ep_size, etp_size, expected):
+        controller = self._controller(ep_size, etp_size)
+        assert MTPControllerMixin._moe_dispatch_spans_ranks(controller) is expected
+
+    @pytest.mark.parametrize("group_size, expected", [(1, False), (4, True)])
+    def test_uses_the_tp_ep_group_size_when_available(self, group_size, expected):
+        # The group decides even when the config alone would say otherwise.
+        controller = self._controller(ep_size=1, etp_size=1, group=object())
+        with mock.patch(
+            "megatron.core.inference.text_generation_controllers.mtp_controller_mixin.get_pg_size",
+            return_value=group_size,
+        ):
+            assert MTPControllerMixin._moe_dispatch_spans_ranks(controller) is expected
+
+    @pytest.mark.parametrize("kv_cache_on", [False, True])
+    def test_idle_rank_runs_dummy_forwards_under_expert_tp_only(self, kv_cache_on):
+        """EP == 1, ETP > 1: the idle rank must still issue its dummy MTP forwards."""
+        context = _make_context(num_decode_requests=0)
+        context.enable_mtp_kv_cache = kv_cache_on
+        model = _make_model()
+
+        def compute_mtp_single_step(**kwargs):
+            model.all_forwards.append(("mtp_step", kwargs))
+            hidden = kwargs["hidden_states"]
+            n = hidden.shape[0] if hidden is not None else 1
+            return hidden, torch.zeros((n, 1, VOCAB_SIZE), device=DEVICE)
+
+        model.compute_mtp_single_step = compute_mtp_single_step
+        controller = _make_controller(context, model)
+        controller.num_mtp_depths = 2
+        controller.model_config.expert_model_parallel_size = 1
+        controller.model_config.expert_tensor_parallel_size = 4
+        controller._mtp_resolved_padded_count = None
+        context.expert_tensor_and_model_parallel_group = None
+
+        patches = _identity_sp_patches()
+        with patches[0], patches[1]:
+            controller._run_dummy_serial_mtp_forward()
+
+        assert len(model.all_forwards) == 2 + (1 if kv_cache_on else 0)
+
+    @pytest.mark.parametrize("sp_enabled, tp_size", [(False, 1), (True, 2)])
+    def test_eager_pp_stages_agree_on_the_logits_broadcast_shape(self, sp_enabled, tp_size):
+        """EP == 1, ETP > 1, PP > 1, eager: every stage joins the PP broadcast at one shape.
+
+        Non-final stages hold no MTP layer, so they never build the dummy tensors, but they
+        still receive the last stage's per-depth logits broadcast.
+        """
+        num_mtp_depths = 2
+        shapes = {}
+        for is_last_stage in (True, False):
+            context = _make_context(num_decode_requests=0)
+            context.enable_mtp_kv_cache = False
+            model = _make_model()
+
+            def compute_mtp_single_step(**kwargs):
+                hidden = kwargs["hidden_states"]
+                return hidden, torch.zeros((hidden.shape[0], 1, VOCAB_SIZE), device=DEVICE)
+
+            model.compute_mtp_single_step = compute_mtp_single_step
+            controller = _make_controller(context, model, sp_enabled=sp_enabled, tp_size=tp_size)
+            controller.num_mtp_depths = num_mtp_depths
+            controller.model_config.expert_model_parallel_size = 1
+            controller.model_config.expert_tensor_parallel_size = 4
+            context.expert_tensor_and_model_parallel_group = None
+            controller._mtp_resolved_padded_count = None
+            controller._is_last_pp_stage = is_last_stage
+            controller.model_is_pipeline_parallel = True
+            controller.pp_group = None
+            controller._logits_dtype = torch.float32
+
+            broadcast = mock.Mock(side_effect=lambda size, **kwargs: kwargs["tensor"])
+            patches = _identity_sp_patches()
+            with (
+                patches[0],
+                patches[1],
+                mock.patch(
+                    "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
+                    "broadcast_from_last_pipeline_stage",
+                    broadcast,
+                ),
+            ):
+                controller._run_dummy_serial_mtp_forward()
+
+            assert broadcast.call_count == num_mtp_depths
+            shapes[is_last_stage] = [call.args[0] for call in broadcast.call_args_list]
+            if not is_last_stage:
+                assert all(call.kwargs["tensor"] is None for call in broadcast.call_args_list)
+
+        expected = [[tp_size if sp_enabled else 1, VOCAB_SIZE]] * num_mtp_depths
+        assert shapes[True] == shapes[False] == expected

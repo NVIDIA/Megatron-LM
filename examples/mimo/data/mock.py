@@ -237,18 +237,19 @@ def _collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     }
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
+def train_valid_test_datasets_provider(train_val_test_num_samples, *, image_sequence_length):
     """Provide datasets for training, validation, and testing."""
     from megatron.core import mpu
-    from megatron.training import get_args
+    from megatron.training import get_args, get_run_config
 
     args = get_args()
+    cfg = get_run_config()
 
     # Print some info to confirm args are available
     print(f"Creating datasets with batch size: {args.micro_batch_size}")
     print(f"Image size: {args.image_size}")
-    print(f"Image sequence length: {args.image_seq_length}")
-    print(f"Total sequence length: {args.total_seq_length}")
+    print(f"Image sequence length: {image_sequence_length}")
+    print(f"Total sequence length: {cfg.model.transformer.max_seq_length_per_sample}")
 
     # Only build dataset on tensor parallel rank 0
     if mpu.get_tensor_model_parallel_rank() == 0:
@@ -258,8 +259,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         train_dataset = MockVLMDataset(
             size=train_val_test_num_samples[0],
             image_size=args.image_size,
-            seq_len=args.total_seq_length,
-            image_seq_length=args.image_seq_length,
+            seq_len=cfg.model.transformer.max_seq_length_per_sample,
+            image_seq_length=image_sequence_length,
             pad_token_id=args.pad_token_id,
             image_token_id=args.image_token_id,
         )
@@ -268,8 +269,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         valid_dataset = MockVLMDataset(
             size=train_val_test_num_samples[1] if train_val_test_num_samples[1] > 0 else 100,
             image_size=args.image_size,
-            seq_len=args.total_seq_length,
-            image_seq_length=args.image_seq_length,
+            seq_len=cfg.model.transformer.max_seq_length_per_sample,
+            image_seq_length=image_sequence_length,
             pad_token_id=args.pad_token_id,
             image_token_id=args.image_token_id,
         )

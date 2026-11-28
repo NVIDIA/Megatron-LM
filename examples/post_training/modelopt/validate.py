@@ -1,7 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Sample Generate GPT."""
-import functools
 import json
 import os
 import sys
@@ -15,15 +14,16 @@ from utils import get_hf_tokenizer
 
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+from megatron.post_training.model_config import (
+    build_inference_models,
+    modelopt_inference_config_from_args,
+)
 from megatron.post_training.utils import get_mtbench_chat_data
-from megatron.training import get_args, get_model, initialize_megatron
+from megatron.training import get_args, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import set_run_config
 from megatron.training.utils import print_rank_0
-from model_provider import model_provider
 
 warnings.filterwarnings('ignore')
 
@@ -61,9 +61,9 @@ def add_ar_validation_args(parser):
     return parser
 
 
-def check_arguments():
+def check_arguments(args=None):
     """Checking user arguments."""
-    args = get_args()
+    args = get_args() if args is None else args
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print_rank_0("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
@@ -100,10 +100,11 @@ if __name__ == "__main__":
         })
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    check_arguments(args)
+    cfg = modelopt_inference_config_from_args(args)
+    set_run_config(cfg)
     initialize_megatron(training=False)
 
-    check_arguments()
 
     args = get_args()
 
@@ -121,11 +122,11 @@ if __name__ == "__main__":
         ground_truth = [None for _ in range(len(prompts))]
 
     tokenizer = get_hf_tokenizer()
-    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
+    model = build_inference_models(cfg)
 
     report_current_memory_info()
 
-    if args.load is not None:
+    if cfg.checkpoint.load is not None:
         load_checkpoint(model, None, None, strict=not args.untie_embeddings_and_output_weights)
         print_rank_0("Done loading checkpoint")
 

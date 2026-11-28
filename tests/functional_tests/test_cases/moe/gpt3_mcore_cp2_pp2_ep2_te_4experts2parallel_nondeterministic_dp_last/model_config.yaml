@@ -44,6 +44,8 @@ MODEL_ARGS:
   --hidden-dropout: 0.0
   --attention-dropout: 0.0
   --num-experts: 4
+  --moe-token-dispatcher-type: allgather
+  --no-moe-grouped-gemm: true
   --moe-router-load-balancing-type: sinkhorn
   --moe-router-topk: 1
   --no-gradient-accumulation-fusion: true

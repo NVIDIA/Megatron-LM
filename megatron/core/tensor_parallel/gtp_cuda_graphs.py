@@ -21,10 +21,7 @@ from typing import Callable, Iterable, Optional, Self
 
 import torch
 
-from megatron.core.tensor_parallel.gtp_symmetric_memory import (
-    gtp_symm_pool_ctx,
-    is_gtp_symm_pool_registered,
-)
+from megatron.core.tensor_parallel.gtp_symmetric_memory import gtp_symm_pool_ctx, uses_gtp_symm_pool
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -82,7 +79,7 @@ class GraphWgradRingSlot:
     @classmethod
     def allocate(cls, param, *, key: tuple, index: int = 0) -> Self:
         """Allocate padded persistent storage; the caller records its initial ready event."""
-        symm = is_gtp_symm_pool_registered(param.group)
+        symm = uses_gtp_symm_pool(param.group, collective="rs")
         with gtp_symm_pool_ctx(param.group) if symm else nullcontext():
             tensor = torch.empty(
                 param._unsharded_shape_padded,

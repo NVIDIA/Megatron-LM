@@ -236,6 +236,31 @@ def test_nvtx_range(msg, suffix):
     util.configure_nvtx_profiling(False)
 
 
+def test_nvtx_range_names_itself_from_the_calling_frame(monkeypatch):
+    """Without a message a range is named `<module>.<function>` of its caller, read from the
+    frame alone: the source file is not looked at (a forward pass opens hundreds of ranges)."""
+    pushed = []
+    monkeypatch.setattr(torch.cuda.nvtx, "range_push", pushed.append)
+    monkeypatch.setattr(torch.cuda.nvtx, "range_pop", lambda: None)
+
+    def _no_source_lookup(*args, **kwargs):
+        raise AssertionError("an NVTX range looked its caller up in the source")
+
+    monkeypatch.setattr(util.inspect, "getframeinfo", _no_source_lookup)
+    monkeypatch.setattr(util.inspect, "getmodule", _no_source_lookup)
+
+    def _a_caller():
+        util.nvtx_range_push(suffix="part")
+        util.nvtx_range_pop(suffix="part")
+
+    util.configure_nvtx_profiling(True)
+    try:
+        _a_caller()
+    finally:
+        util.configure_nvtx_profiling(False)
+    assert pushed == [f"{__name__}._a_caller.part"]
+
+
 def test_nvtx_decorator():
     # Track function execution
     execution_tracker = {'decorated': False, 'decorated_with_message': False}

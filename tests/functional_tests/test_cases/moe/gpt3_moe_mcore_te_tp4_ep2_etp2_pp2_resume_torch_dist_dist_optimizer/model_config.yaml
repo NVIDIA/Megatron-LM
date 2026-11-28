@@ -45,13 +45,12 @@ MODEL_ARGS:
   --sequence-parallel: true
   --num-experts: 8
   --use-distributed-optimizer: true
-  --moe-token-dispatcher-type: alltoall
+  # Exercise the default alltoall dispatcher and grouped experts, including optimizer resume.
   --moe-router-load-balancing-type: aux_loss
   --moe-router-topk: 2
   --moe-router-dtype: fp32
   --moe-ffn-hidden-size: 1024
   --moe-shared-expert-intermediate-size: 512
-  --moe-grouped-gemm: true
   --ckpt-fully-parallel-load: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true

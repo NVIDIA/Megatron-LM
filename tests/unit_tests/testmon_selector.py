@@ -78,6 +78,8 @@ def _run(args: argparse.Namespace) -> int:
 
     selection_plugin = None
     if args.mode == "baseline":
+        # pytest-cov combines its own files at exit; separate ranks so they never race.
+        os.environ["COVERAGE_FILE"] = f".coverage.unit_tests.rank{rank}"
         if rank == 0:
             database = _database(args.cache_dir, args.phase)
             _clear_database_files(database)

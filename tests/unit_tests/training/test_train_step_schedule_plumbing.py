@@ -9,6 +9,7 @@ from unittest import mock
 import pytest
 
 from megatron.training import training as training_mod
+from megatron.training.models import T5ModelConfig
 
 
 @pytest.fixture(autouse=True)
@@ -36,7 +37,9 @@ class _RerunThroughOptimizer(_Rerun):
         return False, False, 0
 
 
-def _run(*, args_overrides=None, model=None, optimizer=None, config=None, **kwargs):
+def _run(
+    *, args_overrides=None, model=None, optimizer=None, config=None, distillation=None, **kwargs
+):
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -60,7 +63,16 @@ def _run(*, args_overrides=None, model=None, optimizer=None, config=None, **kwar
         mock.patch.object(training_mod, "get_timers", return_value=mock.MagicMock()),
         mock.patch.object(training_mod, "get_rerun_state_machine", return_value=_Rerun()),
         mock.patch.object(training_mod, "get_num_microbatches", return_value=1),
-        mock.patch.object(training_mod, "has_nvidia_modelopt", False),
+        mock.patch.object(training_mod, "has_nvidia_modelopt", distillation is not None),
+        mock.patch.object(
+            training_mod,
+            "is_distillation_model",
+            return_value=distillation is not None,
+            create=True,
+        ),
+        mock.patch.object(
+            training_mod, "get_tensor_shapes_adjust_fn_for_distillation", distillation, create=True
+        ),
     ):
         result = training_mod.train_step(
             forward_step_func=lambda *a, **k: None,
@@ -94,10 +106,39 @@ def test_train_step_returns_scheduled_microbatch_count():
     assert captured['data_iterator'] is packed_iterator
 
 
-def test_train_step_forwards_schedule_plumbing():
+@pytest.mark.parametrize("encoder_decoder", [False, True])
+def test_train_step_forwards_schedule_plumbing(run_config, encoder_decoder):
+    run_config.model.transformer.max_seq_length_per_sample = 32
+    if encoder_decoder:
+        run_config.model = T5ModelConfig(
+            transformer=run_config.model.transformer,
+            seq_length=128,
+            encoder_num_layers=2,
+            encoder_seq_length=32,
+            decoder_seq_length=16,
+        )
     p2p, pg = object(), object()
     captured = _run(p2p_communicator=p2p, pg_collection=pg)
     assert captured["p2p_communicator"] is p2p and captured["pg_collection"] is pg
+    assert captured["seq_length"] == 32
+    assert "decoder_seq_length" not in captured
+
+
+def test_distillation_shape_kwargs_remain_compatible_with_core(run_config):
+    from megatron.core.pipeline_parallel.schedules import get_tensor_shapes
+
+    run_config.model.transformer.max_seq_length_per_sample = 32
+
+    def distillation(model, **kwargs):
+        assert get_tensor_shapes(
+            **kwargs,
+            config=run_config.model.transformer,
+            tp_group=mock.Mock(size=lambda: 1),
+            cp_group=mock.Mock(size=lambda: 1),
+        ) == [(32, 1, run_config.model.transformer.hidden_size)]
+        return None
+
+    _run(args_overrides={"modelopt_enabled": True}, distillation=distillation)
 
 
 def test_train_step_defaults_to_none():
@@ -187,7 +228,20 @@ def test_model_process_groups_are_found_through_model_wrappers():
     assert training_mod._get_model_pg_collection(wrapped_model) is pg_collection
 
 
-def test_train_step_invokes_tensor_metric_observer_before_optimizer():
+@pytest.mark.parametrize("check_success", [None, False, True])
+@pytest.mark.parametrize("skip_norm_sync", [None, False, True])
+def test_train_step_invokes_tensor_metric_observer_before_optimizer(
+    run_config, check_success, skip_norm_sync
+):
+    if check_success is not None:
+        run_config.train.check_optimizer_step_success = check_success
+    if skip_norm_sync is not None:
+        run_config.train.skip_sync_grad_norm_across_mp = skip_norm_sync
+    check_success = True if check_success is None else check_success
+    skip_norm_sync = False if skip_norm_sync is None else skip_norm_sync
+    run_config.optimizer.log_num_zeros_in_grad = True
+    success_reduction = mock.Mock(return_value=False)
+    stat_reduction = mock.Mock(side_effect=lambda value, group: value + 5.0)
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -239,17 +293,13 @@ def test_train_step_invokes_tensor_metric_observer_before_optimizer():
         mock.patch.object(training_mod, "is_pp_last_stage", return_value=False),
         mock.patch.object(training_mod, "_get_samples_seen_in_iteration", return_value=1),
         mock.patch.object(
-            training_mod,
-            "logical_and_across_model_parallel_group",
-            side_effect=lambda value, group: value,
+            training_mod, "logical_and_across_model_parallel_group", side_effect=success_reduction
         ),
         mock.patch.object(
-            training_mod,
-            "reduce_max_stat_across_model_parallel_group",
-            side_effect=lambda value, group: value,
+            training_mod, "reduce_max_stat_across_model_parallel_group", side_effect=stat_reduction
         ),
     ):
-        training_mod.train_step(
+        result = training_mod.train_step(
             forward_step_func=lambda *a, **k: None,
             data_iterator=iter([]),
             model=model,
@@ -263,7 +313,19 @@ def test_train_step_invokes_tensor_metric_observer_before_optimizer():
 
     assert events == ["observer", "optimizer"]
     assert model[0].force_all_reduce is False
-    scheduler.step.assert_called_once_with(increment=1)
+    if check_success:
+        success_reduction.assert_called_once_with(True, group=pg_collection.mp)
+        scheduler.step.assert_not_called()
+        assert result[1] == 1
+    else:
+        success_reduction.assert_not_called()
+        scheduler.step.assert_called_once_with(increment=1)
+        assert result[1] == 0
+    assert result[5] == (1.0 if skip_norm_sync else 6.0)
+    assert result[6] == 5.0
+    calls = [] if skip_norm_sync else [mock.call(1.0, group=pg_collection.mp)]
+    calls.append(mock.call(0, group=pg_collection.mp))
+    assert stat_reduction.call_args_list == calls
 
 
 def test_train_step_scopes_forward_tensor_observation_around_schedule():

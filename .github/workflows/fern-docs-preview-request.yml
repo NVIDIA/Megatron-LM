@@ -1,0 +1,47 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Follow copy-pr-bot's synchronized branches, including contributions from forks.
+# This workflow never receives Fern credentials. The workflow_run consumer on
+# main independently resolves the PR and validates its immutable source revision.
+name: Fern docs (preview request)
+
+on:
+  push:
+    branches:
+      - 'pull-request/[0-9]+'
+    paths:
+      - 'docs/**'
+      - 'fern/**'
+      - '.github/actions/setup-fern/**'
+      - '.github/actions/preview-fern/**'
+      - '.github/scripts/fern_docs_preview.py'
+      - '.github/scripts/test_fern_docs_preview.py'
+      - '.github/workflows/fern-docs-preview*.yml'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: fern-preview-request-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-flight:
+    if: github.repository == 'NVIDIA/Megatron-LM'
+    uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
+    with:
+      workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160 # pragma: allowlist secret

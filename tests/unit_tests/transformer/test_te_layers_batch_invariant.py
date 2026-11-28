@@ -17,8 +17,8 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    HAVE_DEEPGEMM_BF16,
     assert_te_supports_batch_invariant_attention,
+    get_batch_invariant_backend,
     matmul_persistent,
     mean_batch_invariant,
     set_batch_invariant_mode,
@@ -739,6 +739,63 @@ def test_te_layernorm_linear_parity():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("layer_cls", [TEColumnParallelLinear, TELayerNormColumnParallelLinear])
+def test_te_linear_3d_input_backward_parity(layer_cls):
+    """A [seq, batch, hidden] input trains through the replaced GEMM and RMSNorm kernels."""
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+
+    def build_layer(batch_invariant_mode):
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            batch_invariant_mode=batch_invariant_mode,
+            flash_attention_version=_BIK_FA_VERSION if batch_invariant_mode else None,
+            params_dtype=torch.bfloat16,
+            normalization="RMSNorm",
+            layernorm_epsilon=1e-5,
+            attention_backend=AttnBackend.flash,
+        )
+        torch.manual_seed(321)
+        return layer_cls(
+            input_size=cfg.hidden_size,
+            output_size=256,
+            config=cfg,
+            init_method=init_method_normal(cfg.init_method_std),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+
+    layer_bik, layer_regular = build_layer(True), build_layer(False)
+    x = torch.randn(6, 8, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_clone = x.clone().detach().requires_grad_(True)
+
+    out_regular, _ = layer_regular(x_clone)
+    grad_output = torch.randn_like(out_regular)
+    out_regular.backward(grad_output.clone())
+
+    # Backward runs inside the context too, as it does when the mode is enabled for training.
+    with set_batch_invariant_mode(True, backend="triton"):
+        out_bik, _ = layer_bik(x)
+        out_bik.backward(grad_output)
+
+    assert out_bik.shape == out_regular.shape == (6, 8, 256)
+    tols = _tols(torch.bfloat16)
+    torch.testing.assert_close(out_bik, out_regular, **tols)
+    torch.testing.assert_close(x.grad, x_clone.grad, **tols)
+    torch.testing.assert_close(layer_bik.weight.grad, layer_regular.weight.grad, **tols)
+
+    Utils.destroy_model_parallel()
+
+
 # Some tolerance for numerical differences between cuBLASLt and Triton
 def _tols(dtype: torch.dtype):
     if dtype == torch.float16:
@@ -851,6 +908,28 @@ def test_bik_te_general_gemm_numerical_parity(dtype):
     torch.testing.assert_close(C_bik, C_ref, **_tols(dtype))
 
 
+@pytest.mark.parametrize(
+    "layout,a_shape,b_shape,out_shape",
+    [
+        pytest.param("TN", (48, 32), (5, 7, 32), (5, 7, 48), id="forward"),
+        pytest.param("NN", (48, 32), (5, 7, 48), (5, 7, 32), id="dgrad"),
+        pytest.param("NT", (5, 7, 32), (5, 7, 48), (48, 32), id="wgrad"),
+    ],
+)
+def test_bik_te_general_gemm_flattens_nd_operands(layout, a_shape, b_shape, out_shape):
+    """N-D operands are flattened before the layout's transposes, as in TE's own GEMM."""
+    torch.manual_seed(7)
+    A = torch.randn(*a_shape, **_device(torch.bfloat16))
+    B = torch.randn(*b_shape, **_device(torch.bfloat16))
+
+    C_ref = _te_general_gemm(A, B, out_dtype=torch.bfloat16, layout=layout)[0]
+    with set_batch_invariant_mode(True, backend="triton"):
+        C_bik = _te_general_gemm(A, B, out_dtype=torch.bfloat16, layout=layout)[0]
+
+    assert C_ref.shape == C_bik.shape == out_shape
+    torch.testing.assert_close(C_bik, C_ref, **_tols(torch.bfloat16))
+
+
 @pytest.mark.parametrize("rows", [1, 4, 8, 32, 64, 96, 127, 128, 129, 160, 192, 224, 255, 256, 257])
 def test_bik_te_general_gemm_triton_strided_weight_is_bit_exact(rows):
     """A partial M tile and strided weight preserve bits across batch sizes."""
@@ -871,23 +950,8 @@ def test_bik_te_general_gemm_triton_strided_weight_is_bit_exact(rows):
     assert weight.stride(1) == 1
 
 
-@pytest.mark.skipif(not HAVE_DEEPGEMM_BF16, reason="DeepGEMM bf16 bindings are unavailable")
-def test_bik_te_general_gemm_deepgemm_backend_supports_fp32_router():
-    torch.manual_seed(123)
-    M1, M2, K, N = 37, 23, 128, 128
-    A1 = torch.randn(M1, K, **_device(torch.float32))
-    A2 = torch.randn(M2, K, **_device(torch.float32))
-    A = torch.cat([A1, A2], dim=0)
-    B = torch.randn(K, N, **_device(torch.float32))
-
-    with set_batch_invariant_mode(True, backend="deepgemm"):
-        full = _te_general_gemm(A, B, out_dtype=torch.float32, layout="TN")[0]
-        chunks = torch.cat(
-            [
-                _te_general_gemm(A1, B, out_dtype=torch.float32, layout="TN")[0],
-                _te_general_gemm(A2, B, out_dtype=torch.float32, layout="TN")[0],
-            ],
-            dim=1,
-        )
-
-    assert torch.equal(full, chunks)
+def test_deepgemm_backend_is_deprecated_to_te_native():
+    """The removed DeepGEMM dense backend still enables, as te_native, with a warning."""
+    with pytest.warns(DeprecationWarning, match="deepgemm"):
+        with set_batch_invariant_mode(True, backend="deepgemm"):
+            assert get_batch_invariant_backend() == "te_native"

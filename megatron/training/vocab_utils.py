@@ -8,6 +8,41 @@ from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.utils import print_rank_0
 
 
+def model_vocab_size(
+    vocab_size: int | None,
+    *,
+    should_pad_vocab: bool,
+    make_vocab_size_divisible_by: int,
+    tensor_model_parallel_size: int,
+) -> int:
+    """Return the vocabulary dimension used by embeddings and output projections.
+
+    The supplied ``vocab_size`` may be raw or already padded. If
+    ``should_pad_vocab`` is True, round up to a multiple of
+    ``make_vocab_size_divisible_by * tensor_model_parallel_size``; otherwise
+    return it unchanged. For example, size 261 with alignment 128 and TP=2
+    gives 512 with padding enabled, or 261 with padding disabled.
+
+    Tokenizer-resolved padded sizes must be passed with ``should_pad_vocab=False``
+    so they are not padded again. This calculation does not build a tokenizer
+    or update configuration fields.
+
+    Raises:
+        ValueError: If ``vocab_size`` is still None. Tokenizer-derived vocabulary
+            must be resolved before model construction or warmup.
+    """
+    if vocab_size is None:
+        raise ValueError("Model vocabulary must be resolved before model construction or warmup.")
+    if should_pad_vocab:
+        return calculate_padded_vocab_size(
+            vocab_size,
+            make_vocab_size_divisible_by,
+            tensor_model_parallel_size,
+            logging_enabled=False,
+        )
+    return vocab_size
+
+
 def calculate_padded_vocab_size(
     vocab_size: int,
     make_vocab_size_divisible_by: int,

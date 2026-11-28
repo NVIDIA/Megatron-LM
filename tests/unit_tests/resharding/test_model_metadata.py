@@ -9,12 +9,9 @@ import pytest
 import torch
 
 from megatron.core.resharding import refit
+from megatron.core.resharding.execution import _prepare_refit_dtypes
 from megatron.core.resharding.planner import _extract_module_metadata, _find_source_metadata
-from megatron.core.resharding.refit import (
-    _get_parallel_config,
-    _harmonize_buffer_dtypes,
-    _unwrap_model_cores,
-)
+from megatron.core.resharding.refit import _get_parallel_config, _unwrap_model_cores
 from megatron.core.resharding.utils import ReshardPlan, TransferOp, get_refit_tensor_dict
 from megatron.core.transformer.module import Float16Module, MegatronModule
 
@@ -60,6 +57,37 @@ def test_ordinary_models_keep_native_names_and_root_ownership():
     assert entry.name == entry.resolved_name == "child.weight"
     with pytest.raises(ValueError, match="Module must have pg_collection"):
         metadata(torch.nn.Module())
+
+
+def test_vit_constructor_groups_support_refit_metadata(monkeypatch):
+    from megatron.core.models.vision import vit_model
+
+    decoder_groups = []
+
+    def decoder(**kwargs):
+        decoder_groups.append(kwargs["pg_collection"])
+        return torch.nn.Module()
+
+    monkeypatch.setattr(vit_model, "HAVE_TE", True)
+    monkeypatch.setattr(vit_model, "TransformerBlock", decoder)
+    pg = groups((2, 3))
+    model = vit_model.ViTModel(
+        transformer_config=SimpleNamespace(hidden_size=2),
+        transformer_layer_spec=None,
+        patch_dim=1,
+        img_h=1,
+        img_w=1,
+        ln_pre=False,
+        pos_emb_type="none",
+        pg_collection=pg,
+    )
+
+    entries = metadata(model)
+    assert len(entries) == 1
+    assert entries[0].name == "patch_embed.proj.weight"
+    assert entries[0].tensor_parallel_group_ranks == [2, 3]
+    assert entries[0].data_parallel_group_ranks == [2, 3]
+    assert decoder_groups[0] is pg
 
 
 @pytest.mark.parametrize("explicit_none", [False, True])
@@ -351,19 +379,26 @@ def test_buffer_dtypes_match_transfer_ids_across_different_storage_names(
 
     def gather(gathered, local, group=None):
         calls.append(local)
-        assert local == ({7: torch.float32}, {7: "inference.state", 9: "inference.state"})
+        receive_dtype = torch.bfloat16 if len(calls) == 1 else torch.float32
+        assert local == (
+            {7: torch.float32},
+            {
+                7: (True, receive_dtype, "inference.state"),
+                9: (True, receive_dtype, "inference.state"),
+            },
+        )
         gathered[:] = [local, ({9: torch.float16 if conflicting_shard else torch.float32}, {})]
 
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
     monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     if conflicting_shard:
         with pytest.raises(ValueError, match="Source shards disagree on buffer dtype"):
-            _harmonize_buffer_dtypes(plan, source, target)
+            _prepare_refit_dtypes(plan, source, target)
         return
-    _harmonize_buffer_dtypes(plan, source, target)
-    assert plan.buffer_dtypes == {"inference.state": torch.float32}
+    _prepare_refit_dtypes(plan, source, target)
     assert target["inference"].state.dtype == torch.float32
     assert get_refit_tensor_dict(target) is not old_tensors
     assert get_refit_tensor_dict(target)["inference.state"] is target["inference"].state
-    _harmonize_buffer_dtypes(plan, source, target)
-    assert len(calls) == 1
+    _prepare_refit_dtypes(plan, source, target)
+    assert len(calls) == 2

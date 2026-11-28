@@ -129,11 +129,16 @@ def test_mhc_mtp_requires_hybrid_contract():
 @pytest.mark.internal
 class TestHybridStackMHC:
     def setup_method(self, method):
+        # Dtype/autocast cases can exhaust Dynamo's cache and make checkpoint's
+        # no-grad pass fall back to eager arithmetic while the reference stays compiled.
+        torch._dynamo.reset()
         Utils.initialize_model_parallel(1, 1)
+        torch.manual_seed(123)
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+        torch._dynamo.reset()
 
     @pytest.mark.parametrize("learned_output_contract", [False, True])
     def test_constructor_and_sharded_state(self, learned_output_contract):

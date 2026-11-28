@@ -2,12 +2,9 @@
 
 import argparse
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from megatron.core.inference.shards_spec import spec_declares_disaggregation
-
-if TYPE_CHECKING:
-    from megatron.core.distributed import DistributedDataParallelConfig
 
 SubmissionGranularity = Literal["R", "G", "B"]
 ConsumptionGranularity = Literal["G", "B"]
@@ -264,28 +261,6 @@ class RLConfig:
             and self.rl_offload_optimizer_during_inference
             and not self.rl_training_cuda_graphs
         )
-
-    def validate_ddp_config(self, ddp_config: "DistributedDataParallelConfig") -> None:
-        """Check the requested and RL-required layouts without changing either config."""
-        if (
-            ddp_config.grad_buffer_offload or self.requires_grad_buffer_offload
-        ) and ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-            raise ValueError(
-                "Gradient-buffer offload is incompatible with "
-                "--reuse-grad-buf-for-mxfp8-param-ag: "
-                "parameters share the gradient-buffer storage that offload releases."
-            )
-
-    def finalize_ddp_config(self, ddp_config: "DistributedDataParallelConfig") -> None:
-        """Apply the RL layout during container finalization, before DDP allocates buffers.
-
-        Unlike validation, this updates the run's owned config so checkpoint metadata
-        and model construction see the same effective layout. Do not change the RL
-        offload policy after model setup; the buffer layout is fixed at construction.
-        """
-        self.validate_ddp_config(ddp_config)
-        if self.requires_grad_buffer_offload:
-            ddp_config.grad_buffer_offload = True
 
     def uses_separate_inference_model(
         self, *, context_parallel_size: int, inference_shards: str | None

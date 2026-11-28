@@ -25,7 +25,7 @@ from megatron.core.utils import (
     log_single_rank,
 )
 
-from .optimizer_config import ParamKey, ParamPredicate
+from .optimizer_config import OptimizerConfig, ParamKey, ParamPredicate
 
 try:
     from emerging_optimizers import registry
@@ -34,11 +34,14 @@ try:
         OrthogonalizedOptimizer,
         get_muon_scale_factor,
     )
+    from emerging_optimizers.orthogonalized_optimizers.muon import Muon
     from emerging_optimizers.orthogonalized_optimizers.muon_utils import NSCoeffT, newton_schulz_tp
 
     # It is necessary to import optimizers for the registry to work.
     from emerging_optimizers.scalar_optimizers import Lion  # pylint: disable=unused-import
     from emerging_optimizers.soap import SOAP  # pylint: disable=unused-import
+
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.muon import FsdpMuon
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
@@ -137,6 +140,15 @@ def _create_emerging_optimizer(config, param_groups, eopt_name, model_chunks, pg
     )
     optimizer = optimizer_cls(param_groups, **eopt_kwargs)
     return optimizer, entry.init_state_fn
+
+
+def _create_fsdp_emerging_optimizer(
+    config: OptimizerConfig, param_groups: list[dict[str, Any]]
+) -> torch.optim.Optimizer:
+    """Build FsdpMuon."""
+    kwargs = _kwargs_from_config(Muon, "muon", config)
+    kwargs["weight_decay_method"] = "decoupled" if config.decoupled_weight_decay else "l2"
+    return FsdpMuon(param_groups, **kwargs)
 
 
 # ===========================================================================

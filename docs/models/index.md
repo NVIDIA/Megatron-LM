@@ -1,11 +1,11 @@
-<!---
+{/*
    Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
    and proprietary rights in and to this software, related documentation
    and any modifications thereto. Any use, reproduction, disclosure or
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
--->
+*/}
 
 # Supported Models
 
@@ -17,10 +17,6 @@ For converting HuggingFace models to Megatron format, use [Megatron Bridge](http
 
 See the [Megatron Bridge supported models list](https://github.com/NVIDIA-NeMo/Megatron-Bridge?tab=readme-ov-file#supported-models) for the complete and up-to-date list of supported models.
 
-```{toctree}
-:maxdepth: 1
-
-llms
-multimodal
-../llama_mistral
-```
+- [Language Models](llms.md)
+- [Multimodal Models](multimodal.md)
+- [Llama, Mistral and other Llama-like model support in Megatron-LM](../llama_mistral.md)

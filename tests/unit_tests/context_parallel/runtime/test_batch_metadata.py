@@ -50,14 +50,14 @@ def test_dynamic_cp_singleton_runtime_group_keeps_the_batch_unsharded():
         )
 
     assert requested_sizes == [1]
-    assert batch["hybrid_cp_group"] is singleton
+    assert batch["dynamic_cp_group"] is singleton
     torch.testing.assert_close(batch["tokens"], tokens)
     torch.testing.assert_close(batch["labels"], tokens + 1)
 
 
 def test_dynamic_cp_group_resolution_prefers_the_scheduled_group():
     scheduled = _mock_group(2)
-    batch = {"local_cp_size": 2, "hybrid_cp_group": scheduled}
+    batch = {"local_cp_size": 2, "dynamic_cp_group": scheduled}
 
     def group_func(group_size):
         raise AssertionError("an attached runtime group must not be looked up again")
@@ -80,8 +80,8 @@ def test_dynamic_cp_group_resolution_rejects_inconsistent_metadata(
         _resolve_dynamic_cp_group_for_batch({"local_cp_size": local_cp_size}, group_func)
 
 
-@pytest.mark.parametrize("is_hybrid_cp", [True, False])
-def test_layout_views_carry_the_runtime_tp_cp_group_under_dynamic_cp(is_hybrid_cp):
+@pytest.mark.parametrize("dynamic_cp", [True, False])
+def test_layout_views_carry_the_runtime_tp_cp_group_under_dynamic_cp(dynamic_cp):
     singleton = _mock_group(1)
     tp_cp_group = object()
     tokens = torch.arange(8).view(1, 8)
@@ -93,8 +93,8 @@ def test_layout_views_carry_the_runtime_tp_cp_group_under_dynamic_cp(is_hybrid_c
         "cu_seqlens": torch.tensor([[0, 8]], dtype=torch.int32),
         "cu_seqlens_padded": torch.tensor([[0, 8]], dtype=torch.int32),
         "max_seqlen": torch.tensor([8], dtype=torch.int32),
-        "local_cp_size": torch.tensor([1], dtype=torch.int32) if is_hybrid_cp else None,
-        "hybrid_cp_group": singleton if is_hybrid_cp else None,
+        "local_cp_size": torch.tensor([1], dtype=torch.int32) if dynamic_cp else None,
+        "dynamic_cp_group": singleton if dynamic_cp else None,
     }
 
     with (
@@ -104,14 +104,14 @@ def test_layout_views_carry_the_runtime_tp_cp_group_under_dynamic_cp(is_hybrid_c
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="contiguous",
-            dynamic_cp=is_hybrid_cp,
+            dynamic_cp=dynamic_cp,
             cp_group=singleton,
             additional_layouts={"zigzag"},
             tp_cp_group=tp_cp_group,
         )
 
     for layout in ("contiguous", "zigzag"):
-        expected = tp_cp_group if is_hybrid_cp else None
+        expected = tp_cp_group if dynamic_cp else None
         assert cp_batch.get_packed_seq_params(layout).tp_cp_group is expected
 
 

@@ -16,6 +16,7 @@ Public API:
 
 import json
 import os
+import shutil
 import tarfile
 import tempfile
 from dataclasses import asdict
@@ -62,10 +63,16 @@ def _load_omegaconf(path: str):
 
 
 def _torch_load(path: str) -> Any:
+    # SECURITY: .nemo archives are untrusted input. Never allow full pickle
+    # deserialization (weights_only=False) and never fall back to it when the
+    # installed torch lacks the ``weights_only`` kwarg.
     try:
-        return torch.load(path, map_location="cpu", weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location="cpu")
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError as e:
+        raise RuntimeError(
+            "Refusing to load .nemo weights: installed torch does not support "
+            "torch.load(weights_only=True). Please upgrade torch."
+        ) from e
 
 
 def _load_json(path: str | Path) -> Dict[str, Any]:
@@ -228,15 +235,26 @@ def _extract_member(tar: tarfile.TarFile, member_name: str, out_dir: str) -> str
                 break
             seen.append(member.name)
             if os.path.basename(member.name) == member_name:
+                if not member.isreg():
+                    raise ValueError(
+                        f"Archive member {member.name!r} is not a regular file; refusing to extract"
+                    )
+                # Write to a fixed flat filename so the archive-controlled member
+                # path is never used on the filesystem (no traversal/symlinks).
+                dest = os.path.join(out_dir, member_name)
                 try:
-                    tar.extract(member, out_dir)
+                    src = tar.extractfile(member)
+                    if src is None:
+                        raise ValueError(f"Cannot read archive member {member.name!r}")
+                    with src, open(dest, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
                 except tarfile.ReadError as e:
                     raise ValueError(
                         f"Archive ended unexpectedly while extracting {member.name} "
                         f"from {tar.name}. The archive may be truncated or the member "
                         f"size metadata may not match the stored payload."
                     ) from e
-                return os.path.join(out_dir, member.name)
+                return dest
     except tarfile.ReadError as e:
         raise ValueError(
             f"Archive ended unexpectedly while searching for {member_name}; "

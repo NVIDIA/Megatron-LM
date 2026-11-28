@@ -11,6 +11,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.models.gpt import GPTModel
 from megatron.core.utils import unwrap_model
+from megatron.post_training.utils import is_distillation_model
 from megatron.training import get_args
 
 
@@ -104,7 +105,8 @@ def loss_func(
     }
 
     # Add per-model LM loss breakdown for logging only when KD is NOT active
-    kd_active = model.training and args.export_kd_teacher_load
+    # Follow the built model, not the CLI: distillation is configured by the run config.
+    kd_active = model.training and is_distillation_model(model)
     if not kd_active:
         try:
             is_full_model = (param_loss_item is None) or (param_loss_item.detach().abs() == 0)
@@ -119,7 +121,7 @@ def loss_func(
             report['lm loss (budget)'] = report['lm loss']
             report['lm loss (full)'] = (zero_num, zero_den)
 
-    if model.training and args.export_kd_teacher_load:
+    if kd_active:
         # [ModelOpt]: Handle knowledge distillation.
         # The installed balancer with skip_lm_loss=True drops student_loss (param_loss) from
         # the total. Add loss_lm back manually to restore the router gradient signal.

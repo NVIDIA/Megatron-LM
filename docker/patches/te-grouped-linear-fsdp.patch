@@ -1,0 +1,43 @@
+Restore the prequantized discrete-weight contract changed by TE #3613:
+https://github.com/NVIDIA/TransformerEngine/commit/aac5cb4abb470bf7c73028a7e2545bb6abb76b23
+
+MCore FSDPv2 gathers MXFP8 rowwise planes for forward, then columnwise planes
+before backward. Enabling columnwise usage during forward makes quantize_weight
+request unavailable data. Preserve the parameter's quantizer usage, matching
+TE's ordinary Linear. Leave single_grouped_weight and unquantized weights intact.
+
+Applies to NVIDIA/TransformerEngine d05e4b83f3da7035e0bfae2d635608be86829bed.
+Upstream context is licensed under Apache-2.0:
+https://github.com/NVIDIA/TransformerEngine/blob/d05e4b83f3da7035e0bfae2d635608be86829bed/LICENSE
+
+diff --git a/transformer_engine/pytorch/module/grouped_linear.py b/transformer_engine/pytorch/module/grouped_linear.py
+--- a/transformer_engine/pytorch/module/grouped_linear.py
++++ b/transformer_engine/pytorch/module/grouped_linear.py
+@@ -325,12 +325,9 @@
+             for weight_quantizer in args.weight_quantizers:
+                 weight_quantizer.set_usage(rowwise=True, columnwise=columnwise_usage)
+         elif isinstance(weights[0], QuantizedTensorStorage):
++            # FSDP materializes rowwise and columnwise planes in separate phases.
++            # Preserve the parameter quantizers, as in Linear's prequantized path.
+             args.weight_quantizers = [weight._quantizer for weight in weights]
+-            for weight_quantizer in args.weight_quantizers:
+-                weight_quantizer.set_usage(
+-                    rowwise=True,
+-                    columnwise=True if columnwise_usage else None,
+-                )
+     if args.output_quantizers[0] is not None:
+         for output_quantizer in args.output_quantizers:
+             output_quantizer.set_usage(rowwise=True, columnwise=False)
+@@ -1497,11 +1494,8 @@
+         update_ws = is_first_microbatch is None or is_first_microbatch
+         for idx, weight in enumerate(weights):
+             if isinstance(weight, QuantizedTensorStorage):
++                # FSDP may have materialized only the forward (rowwise) planes.
+                 weight_quantizer = weight._quantizer
+-                weight_quantizer.set_usage(
+-                    rowwise=True,
+-                    columnwise=True if columnwise_usage else None,
+-                )
+             else:
+                 weight_quantizer = weight_quantizers[idx]
+                 weight_quantizer.set_usage(rowwise=True, columnwise=columnwise_usage)

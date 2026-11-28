@@ -1,0 +1,158 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Opens a draft PR linking a final core_vX.Y.Z release from the Archives page.
+# Nightly continues to use the content on main; this does not snapshot a release.
+# Requires FERN_DOCS_BOT_FORK=owner/repository and the BOT_ID/BOT_KEY app installed
+# on both the upstream repository and that personal fork.
+
+name: Fern docs (version bump)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Released archive version to add, for example 0.21.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fern-docs-version-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    if: |
+      github.repository == 'NVIDIA/Megatron-LM'
+      && (github.event_name == 'workflow_dispatch'
+          || (!github.event.release.prerelease
+              && startsWith(github.event.release.tag_name, 'core_v')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version || github.event.release.tag_name }}
+        run: |
+          VERSION="${INPUT_VERSION#core_v}"
+          VERSION="${VERSION#v}"
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$INPUT_VERSION' is not a final X.Y.Z release."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve personal fork
+        id: fork
+        env:
+          FORK: ${{ vars.FERN_DOCS_BOT_FORK }}
+        run: |
+          if ! [[ "$FORK" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9_.-]+$ ]] || [ "${FORK,,}" = "${GITHUB_REPOSITORY,,}" ]; then
+            echo "::error::Set FERN_DOCS_BOT_FORK to a personal fork (owner/repository)."
+            exit 1
+          fi
+          echo "owner=${FORK%%/*}" >> "$GITHUB_OUTPUT"
+          echo "repository=${FORK#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Get upstream app token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          permission-contents: read
+          permission-pull-requests: write
+
+      - name: Verify fork
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          FORK: ${{ vars.FERN_DOCS_BOT_FORK }}
+        run: |
+          gh api "repos/$FORK" --jq '{fork, source: .source.full_name}' |
+            jq -e --arg source "$GITHUB_REPOSITORY" '.fork == true and .source == $source'
+
+      - name: Get fork app token
+        id: fork-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.BOT_ID }}
+          private-key: ${{ secrets.BOT_KEY }}
+          owner: ${{ steps.fork.outputs.owner }}
+          repositories: ${{ steps.fork.outputs.repository }}
+          permission-contents: write
+
+      - name: Checkout main
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Add release archive
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("fern/versions/archives.mdx")
+          text = path.read_text()
+          version = os.environ["VERSION"]
+          release = tuple(map(int, version.split(".")))
+          entry = (
+              f"- [Megatron Core v{version}]"
+              f"(https://archive.docs.nvidia.com/megatron-core/developer-guide/{version}/index.html)\n"
+          )
+          pattern = r"(?m)^- \[Megatron Core v([0-9]+\.[0-9]+\.[0-9]+)\]\([^\n]+\)\n"
+          entries = list(re.finditer(pattern, text))
+          if not entries:
+              raise SystemExit(f"No release archive list found in {path}")
+          if any(match.group(1) == version for match in entries):
+              print(f"Archive already lists {version}; nothing to do.")
+          else:
+              position = next(
+                  (match.start() for match in entries
+                   if tuple(map(int, match.group(1).split("."))) < release),
+                  entries[-1].end(),
+              )
+              path.write_text(text[:position] + entry + text[position:])
+          PYTHON
+
+      - name: Open draft PR
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch-token: ${{ steps.fork-token.outputs.token }}
+          push-to-fork: ${{ vars.FERN_DOCS_BOT_FORK }}
+          branch: docs/fern-version-${{ steps.version.outputs.version }}
+          base: main
+          add-paths: fern/versions/archives.mdx
+          signoff: true
+          sign-commits: true
+          draft: always-true
+          commit-message: 'docs: link ${{ steps.version.outputs.version }} in Fern archives'
+          title: 'docs: link ${{ steps.version.outputs.version }} in Fern archives'
+          body: |
+            Adds the released ${{ steps.version.outputs.version }} developer guide to Fern's Archives page.
+            Nightly remains the default documentation version.
+
+            Verify the archive URL before merging, then publish with a docs/v* tag or manual dispatch.

@@ -8,7 +8,7 @@ import torch.distributed
 
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, te_reads_legacy_grouped_env
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -29,7 +29,7 @@ def cleanup():
 def set_env():
     """Configure TE env vars for MoE unit tests.
 
-    ``NVTE_CUTEDSL_FUSED_GROUPED_MLP`` enables TE's cuDSL fused grouped MLP path.
+    ``NVTE_CUTEDSL_FUSED_GROUPED_MLP`` enables TE's cuDSL fused grouped MLP path on TE before 2.21.
     The kernel additionally requires SM100 (Blackwell), so on H100/A100 CI this
     is a no-op; setting it here means the kernel is picked up automatically when
     Blackwell hardware joins the unit-test matrix.
@@ -37,7 +37,8 @@ def set_env():
     if is_te_min_version("1.3"):
         os.environ['NVTE_FLASH_ATTN'] = '0'
         os.environ['NVTE_FUSED_ATTN'] = '0'
-    os.environ['NVTE_CUTEDSL_FUSED_GROUPED_MLP'] = '1'
+    if te_reads_legacy_grouped_env():
+        os.environ['NVTE_CUTEDSL_FUSED_GROUPED_MLP'] = '1'
 
 
 @pytest.fixture(scope="session")

@@ -10,6 +10,7 @@ ENV_VARS:
 MODEL_ARGS:
   # Precision
   --bf16: true
+  --grad-reduce-in-bf16: true
   --fp8-format: hybrid
   --fp8-recipe: mxfp8
   --fp8-param-gather: true

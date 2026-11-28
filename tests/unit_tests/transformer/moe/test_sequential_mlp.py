@@ -1,4 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+import warnings
+
 import pytest
 import torch
 
@@ -7,7 +9,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodu
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import SequentialMLP
+from megatron.core.transformer.moe.experts import SequentialMLP, _warn_sequential_mlp_deprecated
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
 from megatron.core.transformer.spec_utils import get_submodules
@@ -28,6 +30,7 @@ class TestParallelSequentialMLP:
             hidden_size=12,
             num_attention_heads=4,
             num_moe_experts=num_moe_experts,
+            moe_grouped_gemm=False,
             use_cpu_initialization=True,
             activation_func=torch.nn.functional.silu,
             gated_linear_unit=True,
@@ -44,6 +47,19 @@ class TestParallelSequentialMLP:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    def test_deprecation_warning(self):
+        _warn_sequential_mlp_deprecated.cache_clear()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", FutureWarning)
+            for _ in range(2):
+                MoELayer(self.sequential_mlp.config, self.sequential_mlp.submodules)
+        deprecations = [
+            w
+            for w in caught
+            if w.category is FutureWarning and "SequentialMLP is deprecated" in str(w.message)
+        ]
+        assert len(deprecations) == (1 if Utils.rank == 0 else 0)
 
     @pytest.mark.internal
     def test_constructor(self):

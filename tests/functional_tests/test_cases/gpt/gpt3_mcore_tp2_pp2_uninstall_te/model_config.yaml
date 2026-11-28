@@ -6,6 +6,8 @@ ENV_VARS:
   SKIP_PYTEST: 1
 BEFORE_SCRIPT: |
   pip uninstall -y transformer_engine || true
+  uv pip uninstall --python "$(uv run --no-sync python -c 'import sys; print(sys.executable)')" transformer_engine
+  uv run --no-sync python -c 'import importlib.util; assert importlib.util.find_spec("transformer_engine") is None, "Transformer Engine remains importable in the workload environment"'
   pip uninstall -y Apex || true ## TODO: remove once Apex dependency has been removed completely
 MODEL_ARGS:
   --num-layers: 12

@@ -1375,18 +1375,16 @@ class MegatronFSDP(torch.nn.Module):
                 )
         else:
             self.synchronize_param_gather()
-            for bucket_id in range(self.all_gather_pipeline.num_buckets):
+            # Leave sharded weights to the forward pre-hooks, which gather them one FSDP unit at a
+            # time and over DP-Outer when needed, as they do after finish_grad_sync().
+            bucket_ids = [
+                bucket_id
+                for bucket_id, group in enumerate(self.param_and_grad_buffer.parameter_groups)
+                if group.model_weight_buffer is not None and not group.has_sharded_model_weights()
+            ]
+            for bucket_id in bucket_ids:
                 self.all_gather_pipeline.async_bucket_gather(bucket_id=bucket_id, bwd=False)
-                group = self.param_and_grad_buffer.parameter_groups[bucket_id]
-                if group.model_weight_buffer is None:
-                    continue
-
-                if group.model_weight_buffer.is_data_distributed:
-                    # If model weight is sharded, we wait for the all-gather to complete and
-                    # then release the bucket immediately to save memory usage.
-                    self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
-
-            for bucket_id in range(self.all_gather_pipeline.num_buckets):
+            for bucket_id in bucket_ids:
                 self.all_gather_pipeline.wait_bucket_ready(bucket_id, False)
 
     def start_grad_sync(self, *unused):
