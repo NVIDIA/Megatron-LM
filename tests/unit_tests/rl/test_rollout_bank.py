@@ -5,7 +5,9 @@
 import asyncio
 import json
 from collections import Counter
-from contextlib import aclosing
+from contextlib import aclosing, nullcontext
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -27,6 +29,8 @@ from megatron.rl.rollout_bank import (
 from megatron.rl.types import Rollout as SharedRollout
 from megatron.rl.types import RolloutGroup as SharedRolloutGroup
 from megatron.rl.types import TokenRollout as SharedTokenRollout
+from megatron.training.config import RLConfig
+from megatron.training.state import TrainState
 from tests.unit_tests.rl.test_rollout_generation import MockGenerator, MockInferenceInterface
 
 
@@ -240,6 +244,60 @@ def test_checkpoint_compacts_at_consumption_boundary(tmp_path, consumed_offset, 
         assert {group.uid for group in restarted.restore(checkpoint_iteration + 1)} == {
             never_consumed
         }
+
+
+def test_skipped_inference_marks_consumed_groups(tmp_path, monkeypatch):
+    """Groups consumed without an inference switch are marked like collected ones."""
+    loop = asyncio.new_event_loop()
+    bank = RolloutBank(str(tmp_path))
+    train_state = TrainState(iteration=1)
+    request = GroupedRolloutRequest(
+        num_groups=2, rollouts_per_group=1, inference_interface=MockInferenceInterface()
+    )
+    # One batch of generation lag: the next batch is banked while the trainer trains.
+    pipeline = RolloutPipeline(
+        MockGenerator(), request, parallel_generation_tasks=2, bank=bank, initial_batch_id=1
+    )
+    generator = pipeline.run()
+    monkeypatch.setattr(rl_utils, "_ROLLOUT_BANK", bank)
+    monkeypatch.setattr(rl_utils, "_ROLLOUT_PIPELINE", pipeline)
+    monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", generator)
+    monkeypatch.setattr(rl_utils, "get_asyncio_loop", lambda: loop)
+    monkeypatch.setattr(rl_utils, "get_args", lambda: SimpleNamespace())
+    monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
+    monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=RLConfig()))
+    monkeypatch.setattr(rl_utils, "get_nvtx_range", lambda: lambda *args, **kwargs: nullcontext())
+    monkeypatch.setattr(rl_utils, "lang_rl_log_dir", None)
+    try:
+        bank.set_collection(1)
+        first = [loop.run_until_complete(anext(generator)) for _ in range(2)]
+        bank.mark_consumed_many([group.uid for group in first], 2)
+        train_state.iteration = 2
+        with (
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.broadcast_object_list"),
+            patch("torch.are_deterministic_algorithms_enabled", return_value=False),
+        ):
+            assert rl_utils.can_skip_inference()
+            skipped, _ = rl_utils.get_environment_rollouts(
+                [MagicMock()],
+                inference_model=None,
+                optimizer=MagicMock(),
+                n_prompts=2,
+                samples_per_group=1,
+                run_inference=False,
+            )
+    finally:
+        loop.run_until_complete(generator.aclose())
+        loop.close()
+
+    # Step 3 trained the skipped groups: a restart from checkpoint 3 must not train
+    # them again.
+    bank.checkpoint(3)
+    bank.close()
+    trained = {group.uid for group in first + skipped}
+    assert len(trained) == 4
+    assert not trained & {group.uid for group in RolloutBank(str(tmp_path)).recover(3)}
 
 
 def _env_group(env_id, problem_id):
