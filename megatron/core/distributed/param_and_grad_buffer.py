@@ -1018,8 +1018,11 @@ def _compute_default_per_buffer_param_layout(
 ) -> 'PerBufferParamLayout':
     """Compute parameter layout for the non-distributed-optimizer case.
 
-    No padding is applied. Parameters are iterated in reverse order (backprop order)
-    and grouped into buckets of approximately `bucket_size` elements.
+    Each parameter starts on a 64-element boundary, as in the distributed optimizer's
+    layout, so every `param.main_grad` view is 16-byte aligned: kernels that write
+    gradients into it, such as Transformer Engine's grouped GEMM, require that. Buckets
+    are not padded. Parameters are iterated in reverse order (backprop order) and grouped
+    into buckets of approximately `bucket_size` elements.
 
     Args:
         params: List of parameters to lay out.
@@ -1040,6 +1043,7 @@ def _compute_default_per_buffer_param_layout(
     bucket_id = 0
 
     for param in params[::-1]:
+        param_start_index = pad_param_start(param_start_index)
         this_numel = param.data.nelement()
         param_end_index = param_start_index + this_numel
         param_index_map[param] = (param_start_index, param_end_index, bucket_id)

@@ -6,7 +6,7 @@ These tests verify the pure-computation layout functions without requiring
 GPU or distributed setup:
 - pad_to_divisor, pad_param_start, pad_bucket_end (shared padding utilities)
 - group_params_for_buffers (parameter grouping by dtype/expert)
-- _compute_default_per_buffer_param_layout (no-padding layout)
+- _compute_default_per_buffer_param_layout (64-element param starts, unpadded buckets)
 - DistributedOptimizer._compute_per_buffer_param_layout (padded layout)
 - DistributedOptimizer.compute_full_param_layout (end-to-end layout)
 """
@@ -169,16 +169,17 @@ class TestGroupParamsForBuffers:
 
 class TestDefaultParamLayout:
 
-    def test_single_bucket_no_padding(self):
-        """With bucket_size=None, all params go in one bucket with no padding."""
+    def test_single_bucket(self):
+        """With bucket_size=None, all params go in one bucket."""
         params = _make_params((100, 100), (50, 50))
         layout = _compute_default_per_buffer_param_layout(params, bucket_size=None)
 
-        # Params iterated in reverse: params[1] first (2500 elems), params[0] second (10000).
+        # Params iterated in reverse: params[1] first (2500 elems), params[0] second (10000),
+        # starting at 2560, the next 64-element boundary.
         assert layout.param_index_map[params[1]] == (0, 2500, 0)
-        assert layout.param_index_map[params[0]] == (2500, 12500, 0)
-        assert layout.bucket_indices == [(0, 12500)]
-        assert layout.per_bucket_numel_unpadded == [12500]
+        assert layout.param_index_map[params[0]] == (2560, 12560, 0)
+        assert layout.bucket_indices == [(0, 12560)]
+        assert layout.per_bucket_numel_unpadded == [12560]
 
     def test_multiple_buckets(self):
         """Params should split into buckets when exceeding bucket_size."""
@@ -186,21 +187,21 @@ class TestDefaultParamLayout:
         layout = _compute_default_per_buffer_param_layout(params, bucket_size=15000)
 
         # Reverse order: params[2], params[1], params[0]. Each is 10000 elems.
-        # After params[2]: 10000 < 15000, continue.
-        # After params[1]: 20000 >= 15000, finalize bucket.
-        # After params[0]: 10000 < 15000, finalize at end.
-        assert len(layout.bucket_indices) == 2
-        assert layout.per_bucket_numel_unpadded[0] == 20000
-        assert layout.per_bucket_numel_unpadded[1] == 10000
+        # After params[2] at [0, 10000): 10000 < 15000, continue.
+        # After params[1] at [10048, 20048): 20048 >= 15000, finalize bucket.
+        # After params[0] at [20096, 30096): 10048 < 15000, finalize at end.
+        assert layout.bucket_indices == [(0, 20048), (20048, 30096)]
+        assert layout.per_bucket_numel_unpadded == [20048, 10048]
 
-    def test_no_padding_applied(self):
-        """Default layout should never add padding."""
+    def test_param_starts_are_64_element_aligned(self):
+        """Each param starts on a 64-element boundary, so its main_grad is 16-byte aligned."""
         params = _make_params((97,), (103,))
         layout = _compute_default_per_buffer_param_layout(params, bucket_size=None)
 
-        total_numel = 97 + 103
-        assert layout.bucket_indices == [(0, total_numel)]
-        assert layout.per_bucket_numel_unpadded == [total_numel]
+        assert layout.param_index_map[params[1]] == (0, 103, 0)
+        assert layout.param_index_map[params[0]] == (128, 225, 0)
+        assert layout.bucket_indices == [(0, 225)]
+        assert layout.per_bucket_numel_unpadded == [225]
 
     def test_single_param(self):
         params = _make_params((256,))

@@ -150,9 +150,9 @@ def test_bucket_sizes(
         divisor = math.lcm(parallel_state.get_data_parallel_world_size(), 128)
         return _pad_if_needed(numel_unpadded, divisor)
 
-    def _pad_param_if_needed(numel_unpadded):
-        # Want 64-byte alignment for params.
-        return _pad_if_needed(numel_unpadded, 64)
+    def _pad_param(param_start_index):
+        # Every param starts on a 64-element boundary of the buffer.
+        return math.ceil(param_start_index / 64) * 64
 
     if bucket_size is None:
         # If bucket_size is infinite (None), number of buckets should be 1.
@@ -175,13 +175,17 @@ def test_bucket_sizes(
             numel_in_each_bucket.append(param_sizes[-1])
             numel_padded_in_each_bucket.append(_pad_bucket_if_needed(param_sizes[-1]))
             param_sizes = param_sizes[:-1]
-        # Iterate through params in backward direction.
+        # Iterate through params in backward direction. Without the distributed optimizer,
+        # buckets are not padded, so a bucket can start off a 64-element boundary: align each
+        # param's offset in the buffer, not in its bucket.
+        bucket_start = sum(numel_padded_in_each_bucket)
         for param_size in param_sizes[::-1]:
-            numel_in_last_bucket = _pad_param_if_needed(numel_in_last_bucket)
+            numel_in_last_bucket = _pad_param(bucket_start + numel_in_last_bucket) - bucket_start
             numel_in_last_bucket += param_size
             if numel_in_last_bucket >= bucket_size:
                 numel_in_each_bucket.append(numel_in_last_bucket)
                 numel_padded_in_each_bucket.append(_pad_bucket_if_needed(numel_in_last_bucket))
+                bucket_start += numel_padded_in_each_bucket[-1]
                 numel_in_last_bucket = 0
         if numel_in_last_bucket > 0:
             numel_in_each_bucket.append(numel_in_last_bucket)
@@ -261,6 +265,40 @@ def test_param_to_index_alignment_with_padding():
         "Expected padding to be applied between params. "
         "Ensure model dimensions are chosen such that param sizes are not multiples of 64."
     )
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("bucket_size", [None, 10])
+@pytest.mark.parametrize("grad_reduce_in_fp32", [False, True])
+@pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+def test_main_grads_are_16_byte_aligned(
+    bucket_size: Optional[int], grad_reduce_in_fp32: bool, use_distributed_optimizer: bool
+):
+    """Every param.main_grad view starts on a 16-byte boundary.
+
+    Kernels that write gradients straight into main_grad require that, e.g. Transformer
+    Engine's grouped GEMM for MoE expert weights. With 3x3 weights and 3-element biases,
+    packing the params back to back would leave most main_grads off 16-byte boundaries.
+    """
+    Utils.initialize_model_parallel()
+
+    model, _, _ = get_model_and_buffers(
+        input_dim=3,
+        output_dim=3,
+        num_layers=4,
+        bias=True,
+        shared_embedding=False,
+        bucket_size=bucket_size,
+        use_distributed_optimizer=use_distributed_optimizer,
+        overlap_grad_reduce=True,
+        average_in_collective=False,
+        grad_reduce_in_fp32=grad_reduce_in_fp32,
+    )
+
+    for name, param in model.module.named_parameters():
+        offset = param.main_grad.data_ptr() % 16
+        assert offset == 0, f"main_grad of {name} starts {offset} bytes past a 16-byte boundary"
 
     Utils.destroy_model_parallel()
 
@@ -779,8 +817,8 @@ class TestNVFP4IndexMaps:
             average_in_collective=False,
         )
 
-        # Pre-compute layout for distributed optimizer (with padding);
-        # otherwise use default (no padding).
+        # Pre-compute layout for distributed optimizer (with bucket padding);
+        # otherwise use default (param starts padded, buckets not padded).
         param_layout = None
         if use_distributed_optimizer:
             param_layout = DistributedOptimizer._compute_per_buffer_param_layout(
@@ -818,18 +856,20 @@ class TestNVFP4IndexMaps:
 
         return buffer, params
 
-    def test_exact_index_values_no_padding(self):
+    def test_exact_index_values_without_distributed_optimizer(self):
         """Verify exact index map values for a simple case without distributed optimizer."""
         param_shapes = [('layer0.weight', (100, 100)), ('layer1.weight', (100, 100))]
         buffer, params = self._make_buffer(param_shapes, nvfp4_param_indices={0, 1})
 
-        # Buffer processes params in reverse order: params[1] first, params[0] second.
+        # Buffer processes params in reverse order: params[1] first, params[0] second, at the
+        # next 64-element boundary. The packed map only serves the param buffer, which only the
+        # distributed optimizer allocates, and is not padded here.
         assert buffer.param_index_map[params[1]] == (0, 10000, 0)
-        assert buffer.param_index_map[params[0]] == (10000, 20000, 0)
+        assert buffer.param_index_map[params[0]] == (10048, 20048, 0)
         assert buffer.nvfp4_packed_param_index_map[params[1]] == (0, 5000, 0)
         assert buffer.nvfp4_packed_param_index_map[params[0]] == (5000, 10000, 0)
 
-        assert buffer.numel == 20000
+        assert buffer.numel == 20048
         assert buffer.nvfp4_packed_numel == 10000
 
     def test_non_nvfp4_exact_values_match_original(self):
@@ -837,10 +877,10 @@ class TestNVFP4IndexMaps:
         param_shapes = [('layer0.weight', (100, 100)), ('layer1.weight', (100, 100))]
         buffer, params = self._make_buffer(param_shapes)
 
-        # Without NVFP4 or distributed optimizer, no padding: offsets are contiguous.
+        # Without NVFP4 or distributed optimizer, params start on 64-element boundaries.
         assert buffer.param_index_map[params[1]] == (0, 10000, 0)
-        assert buffer.param_index_map[params[0]] == (10000, 20000, 0)
-        assert buffer.numel == 20000
+        assert buffer.param_index_map[params[0]] == (10048, 20048, 0)
+        assert buffer.numel == 20048
 
     def test_nvfp4_multi_bucket_param_to_index(self):
         """param_to_index in each bucket should be relative to that bucket's full-numel offset."""
@@ -933,8 +973,8 @@ class TestNVFP4IndexMaps:
 
         large_unpacked_start = 0
         large_unpacked_end = 100 * 200  # 20000.
-        small_unpacked_start = large_unpacked_end
-        small_unpacked_end = small_unpacked_start + 10 * 20  # 20200.
+        small_unpacked_start = 20032  # The next 64-element boundary.
+        small_unpacked_end = small_unpacked_start + 10 * 20  # 20232.
 
         assert buffer.param_index_map[params[1]] == (large_unpacked_start, large_unpacked_end, 0)
         assert buffer.param_index_map[params[0]] == (small_unpacked_start, small_unpacked_end, 0)
