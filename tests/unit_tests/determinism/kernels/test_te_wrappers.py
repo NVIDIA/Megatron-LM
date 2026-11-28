@@ -615,6 +615,183 @@ class TestTEWrappers:
             module, (x,), replays=3, contention=True, what="TERowParallelLinear"
         )
 
+    @pytest.mark.parametrize(
+        "layer_name", ["TEColumnParallelLinear", "TELayerNormColumnParallelLinear"]
+    )
+    def test_unsupported_buffer_name_disables_tp_comm_overlap_for_that_layer_only(self, layer_name):
+        """A layer whose userbuffer name TE does not know must not change overlap elsewhere."""
+        config = _config(tp_comm_overlap=True)
+
+        def build(tp_comm_buffer_name: str) -> torch.nn.Module:
+            return getattr(te_ext, layer_name)(
+                HIDDEN,
+                FFN,
+                config=config,
+                init_method=init_method_normal(0.02),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name=tp_comm_buffer_name,
+            )
+
+        with pytest.warns(UserWarning, match="q_up_proj"):
+            unsupported = build("q_up_proj")
+        supported = build("fc1")
+
+        assert config.tp_comm_overlap is True
+        assert unsupported.ub_name is None
+        assert supported.ub_name == "fc1"
+
+    @pytest.mark.parametrize(
+        "layer_name", ["TEColumnParallelLinear", "TELayerNormColumnParallelLinear"]
+    )
+    @pytest.mark.parametrize(
+        "precision",
+        [dict(fp4="e2m1"), dict(fp8="hybrid", fp8_recipe="blockwise")],
+        ids=["fp4", "blockwise_fp8"],
+    )
+    def test_precision_without_userbuffers_builds_without_tp_comm_overlap(
+        self, layer_name, precision
+    ):
+        """TE userbuffers do not support FP4 or blockwise FP8, so the layer runs without overlap."""
+        config = _config(tp_comm_overlap=True, **precision)
+
+        with pytest.warns(UserWarning, match="FP4 or blockwise FP8"):
+            layer = getattr(te_ext, layer_name)(
+                HIDDEN,
+                FFN,
+                config=config,
+                init_method=init_method_normal(0.02),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="fc1",
+            )
+
+        assert config.tp_comm_overlap is True
+        assert layer.ub_name is None
+
+    @pytest.mark.parametrize(
+        "layer_name", ["TEColumnParallelLinear", "TELayerNormColumnParallelLinear"]
+    )
+    @pytest.mark.parametrize("bf16_last_layer", [False, True])
+    def test_bf16_layer_in_fp8_model_overlaps_only_with_bf16_user_buffers(
+        self, layer_name, bf16_last_layer
+    ):
+        """A layer the quantization recipe keeps in BF16 needs BF16 userbuffers to overlap."""
+        recipe = RecipeConfig.from_config_dict(
+            {
+                "configs": {
+                    "bf16": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {},
+                    }
+                },
+                "matchers": {
+                    "fc1": {
+                        "config": "bf16",
+                        "type": "glob",
+                        "pattern": "*mlp.linear_fc1",
+                        "enabled": True,
+                    }
+                },
+            }
+        )
+        config = _config(
+            tp_comm_overlap=True,
+            fp8="hybrid",
+            fp8_recipe="tensorwise",
+            quant_recipe=recipe,
+            first_last_layers_bf16=bf16_last_layer,
+            num_layers_at_start_in_bf16=0,
+            num_layers_at_end_in_bf16=1 if bf16_last_layer else 0,
+        )
+        warning = (
+            nullcontext()
+            if bf16_last_layer
+            else pytest.warns(UserWarning, match="registers no BF16 user buffers")
+        )
+
+        with warning:
+            layer = getattr(te_ext, layer_name)(
+                HIDDEN,
+                FFN,
+                config=config,
+                init_method=init_method_normal(0.02),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="fc1",
+                name="decoder.layers.0.mlp.linear_fc1",
+            )
+
+        assert config.tp_comm_overlap is True
+        assert layer.ub_name == ("fc1" if bf16_last_layer else None)
+
+    def test_delay_wgrad_compute_builds_without_bulk_wgrad_overlap(self):
+        """TE rejects bulk wgrad overlap with delayed wgrad, so the layer overlaps without it."""
+        config = _config(
+            tp_comm_overlap=True,
+            delay_wgrad_compute=True,
+            overlap_moe_expert_parallel_comm=True,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_grouped_gemm=True,
+            moe_token_dispatcher_type="alltoall",
+            expert_model_parallel_size=4,
+            add_bias_linear=False,
+        )
+
+        with pytest.warns(UserWarning, match="Disabling tp_comm_bulk_wgrad"):
+            layer = te_ext.TELayerNormColumnParallelLinear(
+                HIDDEN,
+                FFN,
+                config=config,
+                init_method=init_method_normal(0.02),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="fc1",
+            )
+
+        assert config.tp_comm_bulk_wgrad is True
+        assert layer.ub_name == "fc1"
+        assert layer.ub_bulk_wgrad is False
+
+    def test_lm_head_without_buffer_name_builds_while_tp_comm_overlap_is_on(self):
+        """The TE LM head has no userbuffer, so it runs without overlap and changes no other layer."""
+        config = _config(
+            tp_comm_overlap=True, fp8="hybrid", fp8_recipe="mxfp8", fp8_output_proj=True
+        )
+
+        def build(input_size: int, tp_comm_buffer_name: str) -> torch.nn.Module:
+            return te_ext.TEColumnParallelLinear(
+                input_size,
+                HIDDEN,
+                config=config,
+                init_method=init_method_normal(0.02),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name=tp_comm_buffer_name,
+            )
+
+        with pytest.warns(UserWarning, match="mtp_eh_proj"):
+            build(2 * HIDDEN, "mtp_eh_proj")
+        lm_head = te_ext.TELMHeadColumnParallelLinear(
+            HIDDEN, FFN, config=config, init_method=init_method_normal(0.02), bias=False
+        )
+        supported = build(HIDDEN, "fc1")
+
+        assert config.tp_comm_overlap is True
+        assert lm_head.ub_name is None
+        assert supported.ub_name == "fc1"
+
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
     @pytest.mark.parametrize("zero_centered_gamma", [False, True])
     def test_te_layernorm_column_parallel_linear_replays(self, normalization, zero_centered_gamma):

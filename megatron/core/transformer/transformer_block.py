@@ -2,6 +2,7 @@
 
 import logging
 from contextlib import nullcontext
+from copy import copy
 from dataclasses import dataclass
 from typing import List, Optional, Set, Union, cast
 
@@ -14,7 +15,7 @@ from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import get_fp8_context, is_first_last_bf16_layer
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.ops.norm.fused_layer_norm import FusedLayerNorm
@@ -41,6 +42,7 @@ from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     get_pg_rank,
+    is_te_min_version,
     make_viewless_tensor,
 )
 
@@ -348,6 +350,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 layer_config = self.config.get_config_for_layer(global_layer_number)
             else:
                 layer_config = self.config
+            if (
+                layer_config.fp8
+                and layer_config.tp_comm_overlap
+                and not is_te_min_version("2.7.0")
+                and is_first_last_bf16_layer(layer_config, global_layer_number - 1)
+            ):
+                # Transformer Engine before 2.7 registers user buffers for one precision only.
+                layer_config = copy(layer_config)
+                layer_config.tp_comm_overlap = False
 
             # Get appropriate quantization context (FP8 and FP4 are mutually exclusive)
             if layer_config.fp8:

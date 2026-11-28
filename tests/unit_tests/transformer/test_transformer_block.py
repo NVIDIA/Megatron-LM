@@ -19,6 +19,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import capture_tensor_observations
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import transformer_block
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
@@ -96,6 +97,41 @@ class _ResidualObservationLayer(torch.nn.Module, BaseTransformerLayer):
 
     def forward(self, hidden_states, **kwargs):
         return hidden_states + 1, None
+
+
+@pytest.mark.parametrize("te_registers_bf16_buffers", [True, False])
+def test_bf16_last_layer_in_fp8_model_overlaps_only_with_bf16_user_buffers(
+    monkeypatch, te_registers_bf16_buffers
+):
+    """Transformer Engine before 2.7 has FP8 user buffers only, so a BF16 layer skips overlap."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    monkeypatch.setattr(
+        transformer_block, "is_te_min_version", lambda version: te_registers_bf16_buffers
+    )
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=8,
+        tensor_model_parallel_size=2,
+        tp_comm_overlap=True,
+        fp8="hybrid",
+        fp8_recipe="tensorwise",
+        first_last_layers_bf16=True,
+        num_layers_at_start_in_bf16=0,
+        num_layers_at_end_in_bf16=1,
+    )
+    try:
+        block = TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec())
+        fp8_layer, bf16_layer = block.layers
+
+        assert config.tp_comm_overlap is True
+        assert fp8_layer.mlp.linear_fc1.ub_name == "fc1"
+        assert fp8_layer.self_attention.linear_proj.ub_name == "proj"
+        expected = ("fc1", "proj") if te_registers_bf16_buffers else (None, None)
+        assert bf16_layer.mlp.linear_fc1.ub_name == expected[0]
+        assert bf16_layer.self_attention.linear_proj.ub_name == expected[1]
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class TestParallelTransformerBlock:

@@ -142,10 +142,19 @@ def test_tp_user_buffer_overrides_reach_model_config(adapter, overrides):
 
 
 @pytest.mark.parametrize("te_version", ["1.8.0", "1.9.0", "2.7.0"])
-@pytest.mark.parametrize("fp8,bf16_layers", [(None, 0), ("hybrid", 0), ("hybrid", 1)])
+@pytest.mark.parametrize(
+    "fp8,bf16_layers,bf16_mtp",
+    [
+        (None, 0, False),
+        ("hybrid", 0, False),
+        ("hybrid", 1, False),
+        ("hybrid", 0, True),
+        (None, 0, True),
+    ],
+)
 @pytest.mark.parametrize("override_source", ["none", "dict", "file"])
 def test_tp_user_buffers_use_config_and_explicit_batch_shape(
-    monkeypatch, tmp_path, te_version, fp8, bf16_layers, override_source
+    monkeypatch, tmp_path, te_version, fp8, bf16_layers, bf16_mtp, override_source
 ):
     from transformer_engine.pytorch import module as te_module
 
@@ -159,6 +168,8 @@ def test_tp_user_buffers_use_config_and_explicit_batch_shape(
         fp8_recipe="tensorwise",
         first_last_layers_bf16=bool(bf16_layers),
         num_layers_at_start_in_bf16=bf16_layers,
+        mtp_num_layers=1 if bf16_mtp else None,
+        keep_mtp_in_bf16=bf16_mtp,
         tp_comm_bootstrap_backend="gloo",
     )
     overrides = {"qkv_fprop": {"method": "ring_exchange"}}
@@ -194,7 +205,7 @@ def test_tp_user_buffers_use_config_and_explicit_batch_shape(
     expected = dict(shape=[144, 128], tp_size=2, ub_cfgs={} if source is None else overrides)
     if te_version == "2.7.0":
         expected["quantization_modes"] = [modes.FP8 if fp8 else modes.NONE]
-        if bf16_layers:
+        if fp8 and (bf16_layers or bf16_mtp):
             expected["quantization_modes"].append(modes.NONE)
     else:
         expected["use_fp8"] = fp8 is not None
@@ -204,6 +215,52 @@ def test_tp_user_buffers_use_config_and_explicit_batch_shape(
         expected["bootstrap_backend"] = "gloo"
         create_group.assert_not_called()
     initialize_ub.assert_called_once_with(**expected)
+
+
+@pytest.mark.parametrize("bf16_layers,bf16_mtp", [(1, False), (0, True)])
+def test_bf16_tp_user_buffers_drop_atomic_gemm(monkeypatch, bf16_layers, bf16_mtp):
+    """Atomic GEMM is FP8 only: the BF16 buffers of an FP8 model register first, without it."""
+    from transformer_engine.pytorch import module as te_module
+
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=128,
+        num_attention_heads=8,
+        tensor_model_parallel_size=2,
+        fp8="hybrid",
+        fp8_recipe="tensorwise",
+        first_last_layers_bf16=bool(bf16_layers),
+        num_layers_at_start_in_bf16=bf16_layers,
+        mtp_num_layers=1 if bf16_mtp else None,
+        keep_mtp_in_bf16=bf16_mtp,
+    )
+    overrides = {
+        "qkv_fprop": {"method": "ring_exchange", "atomic_gemm": 1},
+        "proj_fprop": {"method": "ring_exchange", "atomic_gemm": 1},
+        "fc1_fprop": {"method": "ring_exchange", "aggregate": 0},
+    }
+    initialize_ub = Mock()
+    modes = SimpleNamespace(NONE="none", FP8="fp8")
+    monkeypatch.setattr(te_module.base, "initialize_ub", initialize_ub)
+    monkeypatch.setattr(te_module.base, "UserBufferQuantizationMode", modes, raising=False)
+    monkeypatch.setattr(initialize, "is_te_min_version", lambda minimum: True)
+
+    initialize._initialize_tp_communicators(
+        config, sequence_length=96, micro_batch_size=3, tp_comm_overlap_cfg=overrides
+    )
+
+    bf16_overrides = {
+        "qkv_fprop": {"method": "ring_exchange"},
+        "proj_fprop": {"method": "ring_exchange"},
+        "fc1_fprop": {"method": "ring_exchange", "aggregate": 0},
+    }
+    initialize_ub.assert_called_once_with(
+        shape=[288, 128],
+        tp_size=2,
+        quantization_modes=[modes.NONE, modes.FP8],
+        ub_cfgs=[bf16_overrides, overrides],
+        bootstrap_backend=config.tp_comm_bootstrap_backend,
+    )
 
 
 @pytest.mark.parametrize("external_mapping", [None, False, True])
