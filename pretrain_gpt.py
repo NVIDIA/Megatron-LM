@@ -16,7 +16,7 @@ from megatron.rank_log_setup import suppress_duplicate_logs_off_rank0
 suppress_duplicate_logs_off_rank0()
 
 from functools import lru_cache, partial
-from typing import List, Optional
+from typing import Optional
 
 import torch
 
@@ -30,7 +30,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -60,6 +59,7 @@ from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.datasets.utils import get_dataset_input_length
 from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.initialize import _get_embedding_ranks as get_embedding_ranks
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
@@ -453,20 +453,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     )
 
 
-def get_embedding_ranks(pp_ranks: List[int]):
-    """Get the embedding ranks."""
-    embedding_ranks = [pp_ranks[0]]
-    if len(pp_ranks) > 1:
-        cfg = get_run_config()
-        if cfg.model.share_embeddings_and_output_weights:
-            embedding_ranks.append(pp_ranks[-1])
-        mtp_ranks = get_mtp_ranks(pp_ranks, cfg.model.transformer)
-        embedding_ranks.extend(mtp_ranks)
-    embedding_ranks = list(set(embedding_ranks))
-    embedding_ranks = sorted(embedding_ranks)
-    return embedding_ranks
-
-
 if __name__ == "__main__":
     # Timestamp right after entering __main__ block (after all imports/library setup)
     _MAIN_ENTRY_TIME = time.time()
@@ -502,5 +488,4 @@ if __name__ == "__main__":
         ModelType.encoder_or_decoder,
         forward_step,
         store=store,
-        get_embedding_ranks=get_embedding_ranks,
     )

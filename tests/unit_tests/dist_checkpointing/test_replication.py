@@ -96,10 +96,7 @@ class TestLocalCheckpointingReplication:
 
         mock_args = parse_args(ignore_unknown_args=True)
         mock_args.save_tokenizer_assets = False
-        with (
-            mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
-            mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
-        ):
+        with mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args):
             self.local_ckpt_dir = (
                 root_tmp_dir / "subdir"
             )  # Test handling of non-existent directories

@@ -1247,12 +1247,13 @@ def preprocess_common_state_dict(common_state_dict):
 
     # Convert args key of type namespace to dictionary
     preprocessed_common_state_dict = copy.deepcopy(common_state_dict)
-    preprocessed_common_state_dict['args'] = vars(preprocessed_common_state_dict['args'])
-    # Remove rank and local rank from state dict if it exists, since they are expected to be different
-    preprocessed_common_state_dict['args'].pop('local_rank', None)
-    preprocessed_common_state_dict['args'].pop('rank', None)
+    if 'args' in preprocessed_common_state_dict:
+        preprocessed_common_state_dict['args'] = vars(preprocessed_common_state_dict['args'])
+        # CLI launch metadata differs by rank and is absent in config-only runs.
+        preprocessed_common_state_dict['args'].pop('local_rank', None)
+        preprocessed_common_state_dict['args'].pop('rank', None)
     if (
-        preprocessed_common_state_dict['args']['use_distributed_optimizer']
+        get_run_config().optimizer.use_distributed_optimizer
         and "optimizer" in preprocessed_common_state_dict
     ):
         def reorder_inner_param_groups(optimizer_state_dict):
@@ -1386,8 +1387,8 @@ def pretrain(
             to set already parse arguments.
         get_embedding_ranks: a function that takes a list of ranks for a pipeline
             group and returns those ranks that should have word embeddings.
-            For most models, these are the first and last pipeline stages.
-            If None, defaults to returning the first and last pipeline stages.
+            If None, GPT/Hybrid configs select input, tied-output, and MTP stages
+            automatically; other models default to the first and last stages.
         get_position_embedding_ranks: a function that takes a list of ranks for
             a pipeline group and returns those ranks that should have position
             embeddings. For most models, this is only the first pipeline stage.
@@ -1725,7 +1726,7 @@ def pretrain(
     callback_manager.callback_context.checkpointing_context = checkpointing_context
     callback_manager.trigger("on_setup_start")
 
-    if args.train_full_dataset:
+    if getattr(args, 'train_full_dataset', False):
         # The scheduler must know the training horizon before model and optimizer setup.
         cfg_container.train.train_samples = _get_train_full_dataset_sample_count(
             args, train_valid_test_dataset_provider
@@ -1877,7 +1878,6 @@ def pretrain(
             print_rank_0('training ...')
 
         iteration = 0
-        args.curr_iteration = iteration
         # Mirrors train()'s own loop-entry condition, so the "misaligned save_interval"
         # fallback below can skip when there was nothing left to train this invocation
         # (e.g. resubmitting an already-finished job) instead of redoing a redundant save.
@@ -2243,7 +2243,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     args = get_args()
     if config is None:
         config = cfg.model.transformer
-    args.model_type = model_type
+    if args is not None:
+        args.model_type = model_type
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -2443,7 +2444,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 def get_optimizer_param_scheduler(optimizer):
     """Build the learning rate scheduler."""
     cfg = get_run_config()
-    args = get_args()
 
     if cfg.train.train_iters is None and cfg.train.train_samples is None:
         raise Exception('either train-iters or train-samples should be provided.')
@@ -2675,7 +2675,7 @@ def setup_model_and_optimizer(
             model,
             config_overrides=optim_cfg_overrides,
             use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
-            dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+            dump_param_to_param_group_map=cfg.logger.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
@@ -2686,7 +2686,7 @@ def setup_model_and_optimizer(
     setup_dp_group = _get_memory_report_dp_group(_get_model_pg_collection(model[0]))
     report_memory("(after model and optimizer build)", process_group=setup_dp_group)
 
-    if args.moe_use_upcycling:
+    if getattr(args, 'moe_use_upcycling', False):
         torch.distributed.barrier()
         assert not checkpoint_exists(cfg.checkpoint.save), (
             "The upcycling destination directory already exists. "
@@ -2756,7 +2756,7 @@ def setup_model_and_optimizer(
 
     if (
         cfg.checkpoint.load is not None or cfg.checkpoint.pretrained_checkpoint is not None
-    ) and not args.moe_use_upcycling:
+    ) and not getattr(args, 'moe_use_upcycling', False):
         one_logger and one_logger.log_metrics(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
@@ -4381,7 +4381,6 @@ def checkpoint_and_decide_exit(
     --exit-duration-in-mins is set). Actual exit happens in main training loop
     based on the return value of this function."""
     cfg = get_run_config()
-    args = get_args()
     timers = get_timers()
 
     # Exit based on signal handler.
@@ -4473,8 +4472,8 @@ def checkpoint_and_decide_exit(
         cfg.train.exit_interval
         and iteration % cfg.train.exit_interval == 0
     ) or (
-        args.phase_transition_iterations
-        and iteration in args.phase_transition_iterations
+        cfg.train.phase_transition_iterations
+        and iteration in cfg.train.phase_transition_iterations
     ):
         if cfg.checkpoint.save and not saved_checkpoint:
             save_checkpoint_and_time(
@@ -5226,7 +5225,7 @@ def train(
             embedding_min_norm_metrics = None
 
             if (
-                getattr(args, "embedding_min_norm", None) is not None
+                cfg.optimizer.embedding_min_norm is not None
                 and iteration % cfg.logger.log_interval == 0
             ):
                 embedding_min_norm_metrics = _consume_embedding_min_norm_metrics(optimizer)
@@ -5460,7 +5459,6 @@ def evaluate(
 ):
     """Evaluation."""
     callback_manager = normalize_callbacks(callback_manager)
-    args = get_args()
     cfg = get_run_config()
     sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
@@ -5699,7 +5697,6 @@ def evaluate_and_print_results(
     """Helper function to evaluate and dump results on screen."""
     cfg = get_run_config()
     callback_manager = normalize_callbacks(callback_manager)
-    args = get_args()
     train_state = get_train_state()
     if write_to_tensorboard:
         writer = get_tensorboard_writer()
@@ -5822,13 +5819,11 @@ def get_train_valid_test_num_samples():
     """Train/valid/test num samples."""
 
     cfg = get_run_config()
-    args = get_args()
     train_state = get_train_state()
 
     return calculate_train_valid_test_num_samples(
         cfg.train,
         cfg.validation,
-        phase_transition_iterations=args.phase_transition_iterations,
         iteration=train_state.iteration if train_state is not None else 0,
     )
 
@@ -5837,7 +5832,6 @@ def calculate_train_valid_test_num_samples(
     train: TrainingConfig,
     validation: ValidationConfig,
     *,
-    phase_transition_iterations: list[int] | None,
     iteration: int,
 ) -> tuple[int, int | None, int]:
     """Calculate dataset sample counts without model or runtime initialization."""
@@ -5869,8 +5863,8 @@ def calculate_train_valid_test_num_samples(
     test_samples = validation.eval_iters * eval_global_batch_size
 
     # Get train_samples in current phase.
-    if phase_transition_iterations:
-        phase_transition_samples = [0] + [t * train.global_batch_size for t in phase_transition_iterations] + [train.train_samples]
+    if train.phase_transition_iterations:
+        phase_transition_samples = [0] + [t * train.global_batch_size for t in train.phase_transition_iterations] + [train.train_samples]
         current_sample = iteration * train.global_batch_size
         last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)
         next_transition_sample = min(s for s in phase_transition_samples if s > current_sample)
@@ -5897,7 +5891,6 @@ def build_train_valid_test_data_loaders(
 ):
     """Build pretraining data loaders."""
 
-    args = get_args()
     train_state = get_train_state()
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
@@ -5910,8 +5903,8 @@ def build_train_valid_test_data_loaders(
     backfill_consumed_samples_from_iteration()
 
     # Get consumed train samples in this phase.
-    if args.phase_transition_iterations:
-        last_transition = max(iteration for iteration in (0, *args.phase_transition_iterations) if iteration <= train_state.iteration)
+    if cfg.train.phase_transition_iterations:
+        last_transition = max(iteration for iteration in (0, *cfg.train.phase_transition_iterations) if iteration <= train_state.iteration)
         consumed_train_samples_in_current_phase = (train_state.iteration - last_transition) * cfg.train.global_batch_size
     else:
         consumed_train_samples_in_current_phase = train_state.consumed_train_samples
@@ -5998,7 +5991,6 @@ def build_train_valid_test_data_iterators(
     """Build pretraining data iterators."""
 
     cfg = get_run_config()
-    args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(

@@ -7,6 +7,8 @@ from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass, replace
 from typing import Any, Mapping, Type, TypeVar
 
+import torch
+
 try:
     import yaml
 
@@ -475,18 +477,38 @@ class PretrainConfigContainer(ConfigContainerBase):
             raise ValueError("Training requires a model config")
         if getattr(self.model, "transformer", None) is None:
             raise ValueError("Training requires model.transformer to be configured")
-        optimizer = self._optimizer_with_model_precision()
+        effective = self
+        transformer = self.model.transformer
+        if not self._finalized and callable(getattr(transformer, "finalize", None)):
+            # Deferred recipes have not derived topology or initialization settings yet.
+            # Validate their resolved values without changing the user's editable config.
+            # Copy the outer dataclass explicitly: its attribute forwarding can delegate
+            # __deepcopy__ to the nested transformer and return the wrong config type.
+            effective = replace(
+                self,
+                model=replace(self.model, transformer=copy.deepcopy(transformer)),
+                rng=replace(self.rng),
+            )
+            # Core post-init also sets this process-wide precision flag. Validation
+            # must leave it alone, including when a config check raises.
+            matmul = torch.backends.cuda.matmul
+            allow_bf16_reduction = matmul.allow_bf16_reduced_precision_reduction
+            try:
+                ConfigContainerBase._finalize(effective)
+            finally:
+                matmul.allow_bf16_reduced_precision_reduction = allow_bf16_reduction
+        optimizer = effective._optimizer_with_model_precision()
         if self.train.freeze_all_layers:
             # Resolve aliases on the private copy first: Muon derives its layer-wise path
             # from use_distributed_optimizer, which the frozen policy then disables.
             optimizer.finalize_optimizer_config()
             optimizer = replace(optimizer, **dict.fromkeys(_FROZEN_OPTIMIZER_FLAGS, False))
         # Every optimizer check sees the policy that will run; the live config stays unchanged.
-        effective = replace(self, optimizer=optimizer)
+        effective = replace(effective, optimizer=optimizer)
         ConfigContainerBase.validate(effective)
         # Config-only topology checks also run when validating a recipe off-cluster.
         # Launch world-size checks remain in the runtime parallel-size helpers.
-        transformer = self.model.transformer
+        transformer = effective.model.transformer
         if (
             transformer.max_seq_length_per_sample is not None
             and transformer.max_seq_length_per_sample <= 0
@@ -519,13 +541,13 @@ class PretrainConfigContainer(ConfigContainerBase):
         effective._validate_checkpoint()
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
-        self._validate_distillation()
-        self._validate_offline_distillation()
+        effective._validate_distillation()
+        effective._validate_offline_distillation()
         if self.train.freeze_all_layers and transformer.freeze_base_model_for_mtp:
             raise ValueError("freeze_all_layers cannot be combined with freeze_base_model_for_mtp.")
-        global_batch_size, _, _ = self._resolve_batch_sizes()
+        global_batch_size, _, _ = effective._resolve_batch_sizes()
         effective._validate_ddp_config()
-        self._validate_rl_config(global_batch_size)
+        effective._validate_rl_config(global_batch_size)
         optimizer.validate_run(
             ddp_config=self.ddp,
             use_torch_fsdp2=isinstance(self.ddp, TorchFullyShardedDataParallelConfig),
@@ -541,7 +563,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             skip_train=self.validation.skip_train,
             weight_decay=self.optimizer.weight_decay,
         )
-        self._validate_data_section()
+        effective._validate_data_section()
 
     def _validate_distillation(self) -> None:
         """Check distillation against the student model and training settings.
@@ -930,6 +952,9 @@ class PretrainConfigContainer(ConfigContainerBase):
 
             warn_rank_0('enabling --no-load-optim when skipping training.')
             self.checkpoint.load_optim = False
+        # Resolve model-derived topology before dataset and batch-size calculations,
+        # and model precision before deriving the optimizer settings below.
+        super()._finalize()
         dataset = self.data.dataset
         transformer = self.model.transformer
         data_parallel_size = None
@@ -977,8 +1002,6 @@ class PretrainConfigContainer(ConfigContainerBase):
                     )
         batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
         self._validate_rl_config(batch_sizes[0])
-        # Resolve RNG and model settings before deriving optimizer precision.
-        super()._finalize()
         optimizer = self._optimizer_with_model_precision()
         changes = {
             name: (getattr(self.optimizer, name), getattr(optimizer, name))

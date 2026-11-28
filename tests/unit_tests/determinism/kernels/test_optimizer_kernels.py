@@ -49,12 +49,10 @@ class TestGradNormAndClip:
 
     @pytest.mark.parametrize("bf16", [False, True])
     @pytest.mark.parametrize("expert", [False, True])
-    def test_param_norm_uses_model_precision(self, monkeypatch, run_config, bf16, expert):
+    def test_param_norm_uses_model_precision(self, run_config, bf16, expert):
         """Config-owned precision selects the same weights as the legacy norm path."""
         from megatron.training.utils import common_utils
 
-        # Deliberately disagree with legacy args to exercise config ownership.
-        monkeypatch.setattr(common_utils, "get_args", lambda: SimpleNamespace(bf16=not bf16))
         run_config.model.transformer.bf16 = bf16
         model = torch.nn.Linear(2, 1, bias=False, device="cuda", dtype=torch.bfloat16)
         model.weight.data.fill_(3)

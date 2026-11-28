@@ -28,7 +28,7 @@ def test_step_success_is_world_min():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires >= 2 ranks.")
-def test_param_norm_combines_disjoint_module_grids(monkeypatch):
+def test_param_norm_combines_disjoint_module_grids():
     """Parameter logging sums module norms without reading global model-parallel state."""
     from examples.mimo.training.topology import ModuleGridSpec, create_topology
     from megatron.training.utils import common_utils
@@ -68,9 +68,6 @@ def test_param_norm_combines_disjoint_module_grids(monkeypatch):
         else:
             model.modality_submodules[active_name] = active_module
 
-        monkeypatch.setattr(
-            common_utils, "get_args", lambda: SimpleNamespace(bf16=False, use_megatron_fsdp=False)
-        )
         assert common_utils.calc_params_l2_norm(
             model, pg_collection=topology.schedule_pg_collection
         ) == pytest.approx(20**0.5)
