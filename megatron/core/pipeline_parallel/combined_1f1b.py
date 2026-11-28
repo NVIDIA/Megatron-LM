@@ -2,7 +2,7 @@
 
 import contextlib
 from contextlib import nullcontext
-from typing import List, Union
+from typing import List, Optional, Union
 
 import torch
 
@@ -50,6 +50,7 @@ def combined_1f1b_schedule_for_no_pipelining(
     no_sync_func,
     total_num_tokens,
     check_first_val_step,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Scheduler for 1f1b with no pipelining.
 
@@ -93,6 +94,7 @@ def combined_1f1b_schedule_for_no_pipelining(
         checkpoint_activations_microbatch=None,
         is_first_microbatch=check_first_val_step(True),
         current_microbatch=0,
+        cp_group=cp_group,
     )
     # The forward step is executed in parallel with the backward step of another microbatch
     # EP A2A in forward step is hidden by the attention/mlp computation in the backward step
@@ -117,6 +119,7 @@ def combined_1f1b_schedule_for_no_pipelining(
                 is_first_microbatch=check_first_val_step((i + 1) == 0),
                 current_microbatch=(i + 1),
                 fsdp_wrapper=fsdp_wrapper,
+                cp_group=cp_group,
             )
     total_num_tokens += num_tokens
     # The backward step for the last microbatch is executed alone, no a2a overlapping
@@ -160,6 +163,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     pre_backward=None,
     post_forward=None,
     post_backward=None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Helper method to run combined forward and backward step for A2A communication hiding.
     This method merges the functionality of `forward_step_helper` and `backward_step_helper` and
@@ -263,6 +267,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
             else None
         ),
         current_microbatch=f_microbatch_id,
+        cp_group=cp_group,
     )
     # forward post process
     if f_model_chunk_id is not None:
@@ -304,6 +309,7 @@ def combined_forward_backward_step(
     current_microbatch=None,
     encoder_decoder_xattn=False,
     fsdp_wrapper=None,
+    cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
     """Merged forward and backward step for combined 1f1b scheduler.
 
@@ -494,6 +500,7 @@ def combined_forward_backward_step(
             collect_non_loss_data,
             num_microbatches,
             forward_data_store,
+            cp_group=cp_group,
         )
         # Set the schedule plan and loss function to the output tensor
         # This is used to get the schedule plan and loss function in the backward pass
