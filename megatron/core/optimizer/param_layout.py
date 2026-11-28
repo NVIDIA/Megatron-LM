@@ -54,10 +54,9 @@ class BufferKey:
         grad_dtype: Gradient reduction dtype.
         is_expert_parallel: Whether the buffer holds expert-parallel parameters,
             which use a separate data-parallel group.
-        is_managed_by_layer_wise_optimizer: Whether parameters in this buffer are
-            managed by :class:`LayerWiseDistributedOptimizer` (shard-aligned layout
-            so each whole param lives in one shard). Non-LayerWise params get
-            :class:`DistributedOptimizer`'s byte-level layout in a separate buffer.
+        is_managed_by_layer_wise_optimizer: Whether :class:`LayerWiseDistributedOptimizer`
+            assigns each parameter in this buffer to one owner rank. Its sibling
+            :class:`DistributedOptimizer` uses a separate buffer with a byte-level layout.
     """
 
     param_dtype: torch.dtype
@@ -79,9 +78,9 @@ class PerBufferParamLayout:
         param_indices: The index of each param among same-dtype params (using the "fake"
             high-precision dtype for FP8/NVFP4 params). Needed for loading non-native-fp8
             checkpoints in native-fp8 mode. Order matches param_index_map iteration order.
-        num_optimizer_shards: Number of optimizer shards. Set by the distributed optimizer
-            that computes the layout so that shard assignment at runtime uses the same
-            value. ``None`` for non-distributed-optimizer layouts.
+        num_optimizer_shards: Number of equal-size shards in each DDP bucket, or ``None``
+            when the buffer has no such partition. Compact LayerWise tracks whole-parameter
+            ownership separately.
     """
 
     param_index_map: Dict[torch.nn.Parameter, Tuple[int, int, int]] = field(default_factory=dict)

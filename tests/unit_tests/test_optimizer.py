@@ -2038,7 +2038,8 @@ def test_emerging_optimizer_expert_grad_norm_covers_egtp_remat_shards():
         + model.experts.weight.numel() * sum(i**2 for i in range(1, num_expert_shards + 1))
     ) ** 0.5
 
-    assert optimizer.get_grad_norm() == pytest.approx(expected_grad_norm, rel=1e-6)
+    # The chained norm stays on the device for optimizer-step CUDA graph capture.
+    assert float(optimizer.get_grad_norm()) == pytest.approx(expected_grad_norm, rel=1e-6)
 
 
 def _chain_member(param_groups):

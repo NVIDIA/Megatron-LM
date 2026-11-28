@@ -1349,7 +1349,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             if len(steps) != 0:
                 assert len(steps) == 1, f"steps: {steps}"
                 step = torch.tensor(steps[0], dtype=torch.float32, device="cpu")
-                for v in self.optimizer.state.values():
+                for v in state_dict_state.values():
                     if "step" in v:
                         v["step"] = step.detach().clone()
 
@@ -2909,7 +2909,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Split the target buffer into two separate buffers.
             fp8_state_dict, non_fp8_state_dict = {}, {}
             for key in ('param',) + self.optimizer_state_keys:
-                tensor = state_dict[non_fp8_gbuf_idx][non_fp8_param_and_grad_dtype][key]
+                # Read the source at its checkpoint index; the outputs keep the current one.
+                tensor = state_dict[dtype_to_gbuf_idx[non_fp8_dtype_key]][non_fp8_dtype_key][key]
                 fp8_tensor = torch.empty([fp8_offsets[-1]], dtype=tensor.dtype)
                 non_fp8_tensor = torch.empty([non_fp8_offsets[-1]], dtype=tensor.dtype)
 
@@ -3632,9 +3633,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             ):
                 if not bucket_group.buckets:
                     continue
-                if _bucket_is_managed_by_layer_wise_optimizer(
-                    bucket_group.buckets[0], default_for_untagged=False
-                ):
+                if _bucket_is_managed_by_layer_wise_optimizer(bucket_group.buckets[0]):
                     continue
                 model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
 

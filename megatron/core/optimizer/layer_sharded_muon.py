@@ -22,7 +22,11 @@ from typing import Any, Callable, Iterator, Literal
 import torch
 from torch.optim.optimizer import ParamsT
 
-from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
+from megatron.core.optimizer.emerging_optimizers import (
+    _BATCHED_NS_MIN_EO_VERSION,
+    _BATCHED_SYRK_MIN_EO_VERSION,
+    TensorParallelMuon,
+)
 from megatron.core.optimizer.layer_sharded_a2a import (
     params_by_home,
     route_from_ns_home,
@@ -62,13 +66,8 @@ __all__ = ["LayerShardedMuon", "ParamShardSpec", "ParamSharding", "tp_partition_
 
 logger = logging.getLogger(__name__)
 
-# newton_schulz() accepts a batched (3-D) input from this release on (PR #170); 0.2.0 fails
-# inside torch.addmm ("mat1 must be a matrix") on the first step. The per-matrix path
-# (ns_batch_size=1) uses the 2-D API every release ships.
-_BATCHED_NS_MIN_EO_VERSION = "0.3.0"
-# newton_schulz() dispatches 3-D inputs to the batched SYRK step (batched_tsyrk_ex, PR #276)
-# from this release on; older releases raise TypeError on a 3-D input with use_syrk.
-_BATCHED_SYRK_MIN_EO_VERSION = "0.5.0a0"
+# The per-matrix path (ns_batch_size=1) uses the 2-D newton_schulz() API every release ships;
+# batched NS needs _BATCHED_NS_MIN_EO_VERSION (and _BATCHED_SYRK_MIN_EO_VERSION with SYRK).
 # SM architectures emerging-optimizers validated the SYRK kernel on (its Muon.__init__).
 _SYRK_VALIDATED_SMS = ((8, 0), (9, 0), (10, 0), (10, 3))
 

@@ -272,7 +272,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
-        use_layer_wise_param_layout: bool = True,
+        layer_wise_param_layout: str = "padded",
         device: torch.device | str | None = None,
     ) -> list[HybridModel]:
         """Build model stages and wrap for distributed training.
@@ -290,8 +290,8 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             mixed_precision_wrapper: Mixed precision wrapper, e.g. ``Float16Module``
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
-            use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
-                controls whether to compute and supply a shard-aligned param layout to DDP.
+            layer_wise_param_layout: See
+                ``OptimizerConfig.layer_wise_param_layout``.
 
         Returns:
             List of model stages.
@@ -312,7 +312,7 @@ class HybridModelBuilder(ModelBuilder[HybridModel, HybridModelConfig]):
             composed_pre_wrap_hook,
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
-            use_layer_wise_param_layout=use_layer_wise_param_layout,
+            layer_wise_param_layout=layer_wise_param_layout,
             device=device,
         )
 

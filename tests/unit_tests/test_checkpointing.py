@@ -1773,20 +1773,29 @@ class TestBuildShardedStateDictMetadata:
         metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fsdp_dtensor'
 
-    def test_layer_wise_only_still_sets_sharding_type(self, run_config):
-        # Arg parser flips ``use_distributed_optimizer`` off when Muon is in
-        # use, but the LayerWise + DistOpt split path still has a DistOpt
-        # sub-optimizer for non-Muon params, so the metadata is required.
-        _describe_metadata_run(run_config, use_layer_wise_distributed_optimizer=True)
+    @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+    def test_layer_wise_sets_sharding_type(self, run_config, use_distributed_optimizer):
+        # Both explicit LayerWise selection and distributed Muon own a DistOpt sibling.
+        _describe_metadata_run(
+            run_config,
+            use_distributed_optimizer=use_distributed_optimizer,
+            use_layer_wise_distributed_optimizer=True,
+        )
+        run_config.optimizer.optimizer = "muon"
+        run_config.optimizer.finalize_optimizer_config()
         metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
-    def test_layer_wise_with_fully_reshardable(self, run_config):
+    @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
+    def test_layer_wise_with_fully_reshardable(self, run_config, use_distributed_optimizer):
         _describe_metadata_run(
             run_config,
+            use_distributed_optimizer=use_distributed_optimizer,
             use_layer_wise_distributed_optimizer=True,
             dist_ckpt_optim_fully_reshardable=True,
         )
+        run_config.optimizer.optimizer = "muon"
+        run_config.optimizer.finalize_optimizer_config()
         metadata = _build_sharded_state_dict_metadata(dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
 
