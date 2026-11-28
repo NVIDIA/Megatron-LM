@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import megatron.core.transformer.transformer_config as transformer_config_module
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
@@ -71,6 +72,40 @@ def test_mhc_pipeline_tensor_shapes(enabled, streams, pp_size, tp_size, cp_size,
         cp_group=SimpleNamespace(size=lambda: cp_size),
     )
     assert shape == ([()] if variable else [(32 // tp_size // cp_size, 2, width)])
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("tp_size,cp_size", [(1, 1), (2, 1), (1, 2), (2, 2)])
+def test_fixed_packed_pipeline_tensor_shapes(enabled, tp_size, cp_size, monkeypatch):
+    monkeypatch.setattr(transformer_config_module, "is_te_min_version", lambda _: True)
+    config = TransformerConfig(
+        num_layers=4,
+        hidden_size=64,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.float32,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=tp_size > 1,
+        context_parallel_size=cp_size,
+        enable_mhc_connections=enabled,
+        mhc_num_residual_streams=4,
+        pipeline_p2p_fixed_shape=True,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=32,
+        pad_packed_seq_alignment="max",
+    )
+    assert config.variable_seq_lengths
+    # max_seqlen_per_dp_cp_rank is already per CP rank and packed batches are flattened to one
+    # sequence, so seq_length, micro_batch_size and the CP size do not enter the shape.
+    shape = get_tensor_shapes(
+        seq_length=512,
+        decoder_seq_length=None,
+        micro_batch_size=2,
+        config=config,
+        tp_group=SimpleNamespace(size=lambda: tp_size),
+        cp_group=SimpleNamespace(size=lambda: cp_size),
+    )
+    assert shape == [(32 // tp_size, 1, 64 * (4 if enabled else 1))]
 
 
 def test_mhc_pipeline_rejects_ep_overlap():

@@ -463,6 +463,17 @@ class ModelParallelConfig:
         should only be set if the sequence length varies by microbatch within a global batch.
     """
 
+    pipeline_p2p_fixed_shape: bool = False
+    """Skip the per-transfer pipeline shape exchange for packed sequences padded to a fixed size.
+
+    Sequence packing sets ``variable_seq_lengths``, which makes every pipeline send/recv first
+    exchange the tensor shape and copy it to the host. When every packed micro-batch is padded to
+    ``max_seqlen_per_dp_cp_rank`` (``pad_packed_seq_alignment='max'`` or equal to that length),
+    the inter-stage activation is always ``(max_seqlen_per_dp_cp_rank, 1, hidden)``, so the
+    receive buffers can be allocated from the config instead. Requires a sequence-packing
+    scheduler and static context parallelism. Has no effect when ``mtp_standalone`` is True.
+    """
+
     overlap_p2p_comm: bool = False
     """When True some of the peer to peer communication for pipeline parallelism will overlap with
        computation. Must be False if batch_p2p_comm is true.
@@ -720,3 +731,37 @@ class ModelParallelConfig:
                 )
             # Needed for passing variable sequences between pp stages.
             self.variable_seq_lengths = True
+
+        if self.pipeline_p2p_fixed_shape:
+            if self.sequence_packing_scheduler is None:
+                raise ValueError("pipeline_p2p_fixed_shape requires a sequence_packing_scheduler.")
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape is not supported with dynamic_context_parallel; "
+                    "the local packed length changes with the per-batch CP size."
+                )
+            if self.pad_packed_seq_alignment not in ("max", self.max_seqlen_per_dp_cp_rank):
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape requires pad_packed_seq_alignment='max' or "
+                    "pad_packed_seq_alignment equal to max_seqlen_per_dp_cp_rank "
+                    f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
+                )
+            if (
+                self.sequence_parallel
+                and self.max_seqlen_per_dp_cp_rank % self.tensor_model_parallel_size != 0
+            ):
+                raise ValueError(
+                    "pipeline_p2p_fixed_shape with sequence_parallel requires "
+                    f"max_seqlen_per_dp_cp_rank ({self.max_seqlen_per_dp_cp_rank}) to be "
+                    f"divisible by tensor_model_parallel_size ({self.tensor_model_parallel_size})."
+                )
+            self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
+
+    def _warn_if_pipeline_p2p_fixed_shape_has_no_effect(self) -> None:
+        """Warn when standalone MTP keeps the dynamic pipeline shape exchange enabled."""
+        if self.pipeline_p2p_fixed_shape and self.mtp_standalone:
+            warnings.warn(
+                "pipeline_p2p_fixed_shape has no effect when mtp_standalone=True: the pipeline "
+                "shape exchange stays enabled.",
+                stacklevel=2,
+            )
