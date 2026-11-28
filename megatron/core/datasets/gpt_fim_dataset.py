@@ -151,7 +151,9 @@ class GPTFIMDataset(GPTDataset):
                 self.dataset.get(
                     self.document_index[doc_index_beg],
                     offset=doc_index_beg_offset,
-                    length=doc_index_end_offset - doc_index_beg_offset + 1,
+                    length=doc_index_end_offset
+                    - doc_index_beg_offset
+                    + self.config.add_extra_token_to_sequence,
                 )
             )
 
@@ -163,7 +165,11 @@ class GPTFIMDataset(GPTDataset):
 
                 # Add the sample part
                 offset = 0 if i > doc_index_beg else doc_index_beg_offset
-                length = None if i < doc_index_end else doc_index_end_offset + 1
+                length = (
+                    None
+                    if i < doc_index_end
+                    else doc_index_end_offset + self.config.add_extra_token_to_sequence
+                )
                 sample_parts.append(
                     self.dataset.get(self.document_index[i], offset=offset, length=length)
                 )
@@ -199,6 +205,11 @@ class GPTFIMDataset(GPTDataset):
             sample = np.concatenate([sample, np.full((-1 * diff), self.pad_tok_id)])
 
         assert sample.shape[0] == sample_len
+
+        # Pad a short (e.g. last partial) sample to full length, as GPTDataset does.
+        target_len = self.config.sequence_length + self.config.add_extra_token_to_sequence
+        if sample_len < target_len:
+            sample = np.concatenate([sample, np.full(target_len - sample_len, self.pad_tok_id)])
 
         return (
             np.array(sample, dtype=np.int64),
