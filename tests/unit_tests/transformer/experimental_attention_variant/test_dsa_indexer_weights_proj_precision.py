@@ -126,6 +126,26 @@ def test_fp32_weights_projection_ensures_weight_ready_before_direct_gemm(monkeyp
     assert events == ["ready", "gemm"]
 
 
+def test_shared_fp32_weights_projection_accumulates_both_visits():
+    projection = torch.nn.Linear(1, 1, bias=False, device="cuda", dtype=torch.bfloat16)
+    torch.nn.init.ones_(projection.weight)
+    projection.is_first_microbatch = True
+    projection.fuse_wgrad_accumulation = True
+    projection.weight.main_grad = torch.zeros_like(projection.weight, dtype=torch.float32)
+    projection.weight.grad_added_to_main_grad = False
+    projection.weight.zero_out_wgrad = True
+    indexer = SimpleNamespace(linear_weights_proj=projection, _weights_proj_te_gemm_supported=False)
+    x = torch.full((1, 1), 3.0, device="cuda", dtype=torch.bfloat16)
+    first = dsa_module._dsa_weights_projection_fp32(x, indexer)
+    second = dsa_module._dsa_weights_projection_fp32((first + 4).bfloat16(), indexer)
+    second.sum().backward()
+
+    # Backward adds 7 from the second visit, then 3 from the first visit.
+    torch.testing.assert_close(
+        projection.weight.main_grad, torch.full_like(projection.weight.main_grad, 10.0)
+    )
+
+
 def test_absorbed_mla_backward_dw_flushes_owned_dsa_indexer_in_order():
     events = []
 

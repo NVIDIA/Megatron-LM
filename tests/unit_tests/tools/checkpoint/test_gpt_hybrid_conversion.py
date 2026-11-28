@@ -79,6 +79,15 @@ class TestPatternParsing:
         result = parse_hybrid_layer_pattern("M*-EG")
         assert result == ['M', '*', '-', 'E', 'G']
 
+    @pytest.mark.parametrize("pattern", [":*-:", ":*:-:"])
+    def test_recurrence_boundaries_do_not_count_as_layers(self, pattern):
+        assert parse_hybrid_layer_pattern(pattern) == ['*', '-']
+
+    @pytest.mark.parametrize("pattern", [":*-", ":*-::", ":*-:|*-"])
+    def test_invalid_recurrence_boundaries(self, pattern):
+        with pytest.raises(ValueError, match="Hybrid recurrence"):
+            parse_hybrid_layer_pattern(pattern)
+
     def test_invalid_symbol(self):
         with pytest.raises(ValueError, match="Invalid layer symbol"):
             parse_hybrid_layer_pattern("M*X")
