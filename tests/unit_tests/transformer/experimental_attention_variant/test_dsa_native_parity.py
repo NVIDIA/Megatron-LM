@@ -234,18 +234,29 @@ def _reference_absorbed_output_and_sparse_loss(case, topk_indices: torch.Tensor)
     return output, loss
 
 
+def _fake_cudnn_indexer_scores(q_bshd, k_bshd, w_bsh, ratio, sm_scale, q_causal_offsets=None):
+    """Emulate the cuDNN indexer kernel: weighted ReLU scores with the ratio causal mask.
+
+    Row i keeps keys [0, (q_causal_offsets[b] + i + 1) // ratio), like the kernel does.
+    """
+    b, sq, idx_nh, _ = q_bshd.shape
+    sk = k_bshd.size(1)
+    k_bdk = k_bshd[:, :, 0, :].float().transpose(1, 2).contiguous()
+    scores = torch.zeros((b, sq, sk), dtype=torch.float32)
+    for head_idx in range(idx_nh):
+        head_scores = torch.bmm(q_bshd[:, :, head_idx, :].float(), k_bdk).relu()
+        scores = scores + head_scores * w_bsh[:, :, head_idx].float().unsqueeze(-1)
+    offsets = torch.zeros(b) if q_causal_offsets is None else q_causal_offsets.cpu()
+    kept = (offsets.view(b, 1, 1) + torch.arange(sq).view(1, sq, 1) + 1) // ratio
+    key_ids = torch.arange(sk).view(1, 1, sk)
+    return {"scores": scores.masked_fill(key_ids >= kept.clamp(max=sk), float("-inf")) * sm_scale}
+
+
 def test_cudnn_indexer_topk_varlen_uses_logical_query_positions(monkeypatch):
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
-            b, sq, _, _ = q_bshd.shape
-            sk = k_bshd.size(1)
-            key_ids = torch.arange(sk, dtype=torch.float32).view(1, 1, sk).expand(b, sq, sk)
-            query_ids = torch.arange(sq).view(1, sq, 1)
-            scores = key_ids.clone().masked_fill(
-                torch.arange(sk).view(1, 1, sk) > query_ids, float("-inf")
-            )
-            return {"scores": scores}
+        def indexer_forward_wrapper(q, k, w, ratio, sm_scale, q_causal_offsets=None):
+            return _fake_cudnn_indexer_scores(q, k, w, ratio, sm_scale, q_causal_offsets)
 
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
@@ -277,19 +288,8 @@ def test_cudnn_indexer_topk_varlen_uses_logical_query_positions(monkeypatch):
 def test_cudnn_indexer_topk_score_chunks_preserve_global_query_offsets(monkeypatch):
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
-            b, sq, idx_nh, _ = q_bshd.shape
-            sk = k_bshd.size(1)
-            scores = torch.zeros((b, sq, sk), dtype=torch.float32)
-            k_bdk = k_bshd[:, :, 0, :].float().transpose(1, 2).contiguous()
-            for head_idx in range(idx_nh):
-                head_scores = torch.bmm(q_bshd[:, :, head_idx, :].float(), k_bdk).relu()
-                head_scores = head_scores * w_bsh[:, :, head_idx].float().unsqueeze(-1)
-                scores = scores + head_scores
-            local_seq_lens = ((torch.arange(sq) + 1) // ratio).clamp(max=sk)
-            key_ids = torch.arange(sk).view(1, 1, sk)
-            scores.masked_fill_(key_ids >= local_seq_lens.view(1, sq, 1), float("-inf"))
-            return {"scores": scores * sm_scale}
+        def indexer_forward_wrapper(q, k, w, ratio, sm_scale, q_causal_offsets=None):
+            return _fake_cudnn_indexer_scores(q, k, w, ratio, sm_scale, q_causal_offsets)
 
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
@@ -330,7 +330,7 @@ def test_cudnn_indexer_topk_score_chunks_preserve_global_query_offsets(monkeypat
 def test_cudnn_indexer_topk_tie_break_prefers_lower_indices(monkeypatch):
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
+        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale, q_causal_offsets=None):
             return {"scores": torch.zeros((1, 1, 4), dtype=torch.float32)}
 
         @staticmethod
@@ -360,8 +360,8 @@ def test_cudnn_indexer_topk_tie_break_prefers_lower_indices(monkeypatch):
 def test_cudnn_indexer_topk_repeated_varlen_ends_keep_distinct_query_rows(monkeypatch):
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
-            raise AssertionError("repeated varlen ends must not scatter through one score row")
+        def indexer_forward_wrapper(q, k, w, ratio, sm_scale, q_causal_offsets=None):
+            return _fake_cudnn_indexer_scores(q, k, w, ratio, sm_scale, q_causal_offsets)
 
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
@@ -398,8 +398,8 @@ def test_cudnn_indexer_topk_repeated_varlen_ends_keep_distinct_query_rows(monkey
 def test_cudnn_indexer_topk_nonlocal_varlen_ends_avoid_global_score_rows(monkeypatch):
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
-            raise AssertionError("non-local varlen ends must not allocate global score rows")
+        def indexer_forward_wrapper(q, k, w, ratio, sm_scale, q_causal_offsets=None):
+            return _fake_cudnn_indexer_scores(q, k, w, ratio, sm_scale, q_causal_offsets)
 
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
@@ -434,8 +434,8 @@ def test_cudnn_indexer_topk_nonlocal_varlen_ends_avoid_global_score_rows(monkeyp
 def test_cudnn_indexer_topk_local_varlen_keeps_compact_query_rows(monkeypatch):
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
-            raise AssertionError("local varlen must score with logical ends before masking")
+        def indexer_forward_wrapper(q, k, w, ratio, sm_scale, q_causal_offsets=None):
+            return _fake_cudnn_indexer_scores(q, k, w, ratio, sm_scale, q_causal_offsets)
 
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
@@ -870,7 +870,7 @@ def test_cudnn_indexer_topk_single_packed_cp_real_kernel_uses_bottom_right_align
 def test_cudnn_indexer_topk_indices_only_filters_masked_varlen_scores(monkeypatch):
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
+        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale, q_causal_offsets=None):
             scores = (
                 torch.arange(8, dtype=torch.float32)
                 .view(1, 1, 8)
@@ -915,7 +915,7 @@ def test_cudnn_indexer_topk_indices_only_filters_masked_varlen_scores(monkeypatc
 def test_cudnn_indexer_topk_indices_only_compacts_invalid_prefix_entries(monkeypatch):
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
+        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale, q_causal_offsets=None):
             scores = (
                 torch.arange(8, dtype=torch.float32)
                 .view(1, 1, 8)
@@ -1003,7 +1003,7 @@ def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(monkeypatch)
 
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q, k, w, ratio, sm_scale):
+        def indexer_forward_wrapper(q, k, w, ratio, sm_scale, q_causal_offsets=None):
             return {"scores": torch.zeros((1, 1, 4), dtype=torch.float32)}
 
         @staticmethod
@@ -1037,7 +1037,7 @@ def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(monkeypatch)
 def test_cudnn_indexer_topk_scores_reapply_varlen_bounds(monkeypatch):
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q, k, w, ratio, sm_scale):
+        def indexer_forward_wrapper(q, k, w, ratio, sm_scale, q_causal_offsets=None):
             return {"scores": torch.zeros((1, 1, 8), dtype=torch.float32)}
 
         @staticmethod
@@ -1432,8 +1432,8 @@ def test_dsa_fwd_flash_mla_pads_topk_to_flashmla_block(monkeypatch):
 def test_cudnn_indexer_topk_scores_local_varlen_keeps_compact_query_rows(monkeypatch):
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q, k, w, ratio, sm_scale):
-            raise AssertionError("local varlen must score with logical ends before masking")
+        def indexer_forward_wrapper(q, k, w, ratio, sm_scale, q_causal_offsets=None):
+            return _fake_cudnn_indexer_scores(q, k, w, ratio, sm_scale, q_causal_offsets)
 
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
