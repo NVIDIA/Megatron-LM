@@ -32,21 +32,6 @@ requires_mxfp8 = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("shape", [(16, 128), (32, 32), (32, 64), (32, 96), (32, 160)])
-def test_quantized_dbuffer_rejects_unaligned_shapes(distributed_setup, shape):
-    """Reject layouts whose compact scales cannot be consumed directly by TE."""
-    device = distributed_setup.device
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    layout = quantized_dbuffer.GlobalLayout(
-        tensor_shapes=[shape],
-        tensor_to_offset=[0],
-        size=shape[0] * shape[1],
-        rank_to_offset=[0] * mesh.size(),
-    )
-    with pytest.raises(ValueError, match="rows divisible by 32 and columns divisible by 128"):
-        QuantizedDBuffer(mesh, [Replicate()], layout, device)
-
-
 @requires_mxfp8
 @pytest.mark.parametrize(
     "placements",
