@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import functools
 import inspect
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -128,6 +129,20 @@ try:
     HAVE_FUSED_QKV_ROPE = True
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
+
+
+@functools.lru_cache(maxsize=None)
+def _fa4_can_split_kv(device_index: Optional[int]) -> bool:
+    """Whether FlashAttention-4 can split the KV sequence on a device.
+
+    FA4 splits KV only on SM100/SM110 (flash-attn-4 4.0.0b36, flash_attn/cute/interface.py). Its
+    Hopper forward asserts against split-KV, which dynamic inference requests past ~512 KV tokens,
+    or at any length under CUDA graphs. Cached per device, so the attention forward does not query
+    the device.
+    """
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability(device_index)[0] in (10, 11)
 
 
 class LinearQkvInterface(Protocol):
@@ -315,6 +330,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         self.attention_type = attention_type
         self.batch_invariant_mode = config.batch_invariant_mode
         self.flash_attention_version = config.flash_attention_version
+        if torch.cuda.is_available():
+            # Read the device for FlashAttention-4's num_splits here, off the forward path.
+            _fa4_can_split_kv(torch.cuda.current_device())
 
         # Cache the YaRN concentration factor (a.k.a. attention factor / mscale),
         # which is a pure function of the config and is reused on every forward
@@ -1089,6 +1107,14 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # Auto: prefer the newest available generation.
         return HAVE_FA4, (HAVE_FA3 and not HAVE_FA4)
 
+    def _fa4_num_splits(self, device: torch.device) -> int:
+        """``num_splits`` for FlashAttention-4: 0 lets its heuristic split the KV sequence.
+
+        Split-KV stays off (1) in batch-invariant mode, which needs a fixed reduction order,
+        and where FA4 cannot split KV.
+        """
+        return 0 if _fa4_can_split_kv(device.index) and not self.batch_invariant_mode else 1
+
     def flash_decode_and_prefill(
         self,
         q: Tensor,
@@ -1168,7 +1194,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                     softmax_scale=softmax_scale,
                     causal=True,
                     window_size=window_size,
-                    num_splits=0 if not self.batch_invariant_mode else 1,
+                    num_splits=self._fa4_num_splits(q.device),
                     return_lse=need_lse,
                     **softcap_kwargs,
                 )
@@ -1316,7 +1342,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         softmax_scale=softmax_scale,
                         causal=True,
                         window_size=window_size,
-                        num_splits=0 if not self.batch_invariant_mode else 1,
+                        num_splits=self._fa4_num_splits(q.device),
                         return_lse=need_lse,
                         **softcap_kwargs,
                     )
