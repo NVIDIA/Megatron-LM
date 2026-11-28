@@ -594,6 +594,33 @@ def test_checkpoint_preserves_runtime_state_without_aliasing():
     assert merged.ttft == 0.25
 
 
+def test_merge_reports_kv_epoch_of_a_checkpoint_not_yet_readmitted():
+    """A checkpoint computes no KV until it is re-admitted, which stamps it, so before then a
+    merge (a live snapshot, or the generation it resumes) reports the earlier KV stamps."""
+    request = _make_dynamic_request(
+        generated_tokens=[8, 9], policy_epoch=[(0, 4), (4, 5)], kv_cache_epoch=[(0, 4), (4, 5)]
+    )
+    request.finish_reason = "stop"  # a stop detected before the checkpoint; completion pending
+    record = DynamicInferenceRequestRecord.from_request(request)
+    record.checkpoint()
+    assert record[-1].kv_cache_epoch is None
+
+    assert record.merge().kv_cache_epoch == [(0, 4), (4, 5)]
+    snapshot = LiveRequestSnapshot.from_record(record)
+    assert snapshot.record.kv_cache_epoch == [(0, 4), (4, 5)]
+
+    # The resumed generation already ended, so it is served without being re-admitted.
+    served = DynamicInferenceRequestRecord.from_resumed_generation(
+        _make_dynamic_request(), ResumedGeneration.from_snapshot(snapshot), generation_epoch=5
+    ).merge()
+    assert served.status is Status.COMPLETED
+    assert (served.policy_epoch, served.kv_cache_epoch) == ([(0, 4), (4, 5)], [(0, 4), (4, 5)])
+
+    # Once re-admitted, the checkpoint's own stamp describes its recomputed KV.
+    record[-1].kv_cache_epoch = [(0, 6)]
+    assert record.merge().kv_cache_epoch == [(0, 6)]
+
+
 def test_dynamic_inference_request_serialize_strips_event_add_engine():
     """DynamicInferenceRequest.serialize() omits `event_add_engine` (it's a
     pointer into `events`, not independent state); on deserialize we get the

@@ -1412,11 +1412,15 @@ class DynamicInferenceRequestRecord:
         policy_epoch = (
             latest_request.policy_epoch.copy() if latest_request.policy_epoch is not None else None
         )
-        kv_cache_epoch = (
-            latest_request.kv_cache_epoch.copy()
-            if latest_request.kv_cache_epoch is not None
-            else None
+        # A checkpoint starts unstamped and computes no KV until it is re-admitted, which
+        # stamps it. Until then, the generated tokens were produced from the KV that the
+        # earlier segments' stamps describe, so a merge before re-admission (a snapshot taken
+        # during a suspend, or a resumed generation that already ended) reports those.
+        kv_source = next(
+            (request for request in reversed(self.requests) if request.kv_cache_epoch is not None),
+            None,
         )
+        kv_cache_epoch = kv_source.kv_cache_epoch.copy() if kv_source is not None else None
         ttft = next((request.ttft for request in self.requests if request.ttft is not None), None)
         # Preserve KV handoff metadata when merging request segments.
         disaggregated_params = self.requests[-1].disaggregated_params
